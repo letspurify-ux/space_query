@@ -2171,6 +2171,19 @@ fn core_backend_traits_allow_only_documented_derived_default_methods() {
                 &[
                     "may_need_preservation_after_statement",
                     "requires_transaction_decision_after_statement",
+                    // Derived, and deliberately NOT a backend's to answer: it
+                    // folds the family's own per-statement answer
+                    // (`effects_for_single_statement`, which every backend must
+                    // implement) over the statements of one executor UNIT. A
+                    // unit can hold several statements — a custom MySQL
+                    // `DELIMITER` makes `SELECT 1; INSERT …` one statement as
+                    // far as the executor is concerned — and every rule in this
+                    // file reads the LEADING one, so a backend that answered
+                    // here would answer for the first statement only. That is
+                    // the defect this default exists to make unrepresentable,
+                    // which is the opposite of a policy decision left
+                    // unimplemented.
+                    "effects_for_sql",
                 ],
             )],
         ),

@@ -5522,12 +5522,23 @@ impl DatabaseConnection {
         !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#'))
     }
 
+    /// Quote an Oracle identifier for a statement the app writes — the tab's
+    /// `ALTER SESSION SET CURRENT_SCHEMA` above all.
+    ///
+    /// Text that is ALREADY one quoted identifier is passed through, and the
+    /// question "is it?" is asked of `sql_text::is_quoted_identifier`, which
+    /// checks the inner text is well formed. It used to be asked as "does it
+    /// start and end with a double quote", which is a different question:
+    /// `"A"; DROP TABLE X --"` answers yes to it and is two statements once this
+    /// hands it back untouched. No Oracle catalog can produce such a name (a
+    /// quoted identifier cannot contain a `"` there), so this was a false premise
+    /// rather than a reachable bug — but a quoter is the wrong place to keep one.
     pub(crate) fn quote_oracle_identifier(identifier: &str) -> String {
         let trimmed = identifier.trim();
         if trimmed.is_empty() {
             return "\"\"".to_string();
         }
-        if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        if crate::sql_text::is_quoted_identifier(trimmed) {
             return trimmed.to_string();
         }
         if Self::oracle_identifier_needs_quotes(trimmed) {

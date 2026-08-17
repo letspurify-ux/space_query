@@ -314,7 +314,9 @@ pub fn sql_literal(
 pub fn sql_literal_for_value(db_type: DatabaseType, kind: SqlValueKind, value: &str) -> String {
     let mysql_family = db_type.is_mysql_or_mariadb();
     match kind {
-        SqlValueKind::Number | SqlValueKind::Boolean => value.trim().to_string(),
+        SqlValueKind::Number | SqlValueKind::Boolean => {
+            numeric_literal_or_quoted(value, kind, mysql_family)
+        }
         SqlValueKind::Temporal => {
             if mysql_family {
                 // MySQL and MariaDB accept the ISO text the grid already shows.
@@ -336,6 +338,82 @@ pub fn sql_literal_for_value(db_type: DatabaseType, kind: SqlValueKind, value: &
         }
         SqlValueKind::String | SqlValueKind::Unknown => quoted_string(value, mysql_family),
     }
+}
+
+/// A number is emitted as SQL TEXT, so it has to BE a number.
+///
+/// This is the one place a value the app did not write becomes part of a
+/// statement without quotes — a CSV cell on its way into an `INSERT`, a bind
+/// answer substituted into MySQL-family text — and an unchecked value carries
+/// whatever it says INTO the statement: a cell holding
+/// `1); DROP TABLE x; INSERT INTO t (a) VALUES (2` closes the `VALUES` list and
+/// adds statements of its own, which the app then runs as the user's script.
+///
+/// So a value this cannot prove is a numeric literal is QUOTED instead, exactly
+/// as the result grid's own cell editor already treats everything typed into it
+/// (`sql_literal_from_input`: user text is a string literal unless the user
+/// writes `=expr`). The server then rejects it for a numeric column, which is an
+/// honest error about the value — not a statement nobody asked for. Callers that
+/// know the value came from a person say so themselves: the bind prompt refuses
+/// the run and names the placeholder rather than quietly comparing against a
+/// string.
+fn numeric_literal_or_quoted(value: &str, kind: SqlValueKind, mysql_family: bool) -> String {
+    let trimmed = value.trim();
+    let provable = is_plain_numeric_literal(trimmed)
+        // `TRUE`/`FALSE` are how a boolean is written where one exists, and
+        // quoting them would make the server read `'TRUE'` as 0.
+        || (kind == SqlValueKind::Boolean
+            && (trimmed.eq_ignore_ascii_case("TRUE") || trimmed.eq_ignore_ascii_case("FALSE")));
+    if provable {
+        trimmed.to_string()
+    } else {
+        quoted_string(value, mysql_family)
+    }
+}
+
+/// Whether this text is a plain SQL numeric literal: an optional sign, digits
+/// with at most one decimal point, and an optional exponent.
+///
+/// Nothing else — no hex, no thousands separator, no `Inf`/`NaN`, no expression,
+/// no trailing anything. The question is not "could some server parse this as a
+/// number" but "is this text safe to put in a statement unquoted", and only a
+/// shape this simple answers yes.
+pub(crate) fn is_plain_numeric_literal(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut idx = 0usize;
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        idx += 1;
+    }
+    let mut digits = 0usize;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+        digits += 1;
+    }
+    if idx < bytes.len() && bytes[idx] == b'.' {
+        idx += 1;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return false;
+    }
+    if idx < bytes.len() && matches!(bytes[idx], b'e' | b'E') {
+        idx += 1;
+        if matches!(bytes.get(idx), Some(b'+' | b'-')) {
+            idx += 1;
+        }
+        let mut exponent_digits = 0usize;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+            exponent_digits += 1;
+        }
+        if exponent_digits == 0 {
+            return false;
+        }
+    }
+    idx == bytes.len()
 }
 
 fn quoted_string(value: &str, mysql_family: bool) -> String {
@@ -456,6 +534,120 @@ mod tests {
     use super::*;
 
     const NULL_TEXT: &str = "NULL";
+
+    /// An identifier the app did not write is quoted as ONE identifier, or not
+    /// passed through at all.
+    ///
+    /// Both quoters used to hand text back untouched when it merely started and
+    /// ended with the identifier delimiter — a different question from "is this
+    /// one quoted identifier", which is what they meant. No catalog can produce
+    /// such a name on either family (Oracle cannot hold a `"` in a quoted
+    /// identifier, and the MySQL quoter always doubles), so this was a false
+    /// premise in a quoter rather than a reachable bug.
+    #[test]
+    fn an_identifier_is_only_passed_through_when_it_is_one() {
+        // Well formed: passed through unchanged, so generated SQL keeps reading
+        // the way a person writes it.
+        for name in ["\"HR\"", "\"Mixed Case\"", "\"A\"\"B\""] {
+            assert_eq!(
+                quote_column_name(DatabaseType::Oracle, name),
+                name,
+                "a well-formed quoted identifier is already quoted"
+            );
+        }
+        // Not one identifier: quoted as a whole, so it cannot become statements.
+        for name in [
+            "\"A\"; DROP TABLE X --\"",
+            "\"A\" || \"B\"",
+            "\"A\".\"B\"; DELETE FROM t --\"",
+        ] {
+            let quoted = quote_column_name(DatabaseType::Oracle, name);
+            assert!(
+                quoted.starts_with('"') && quoted.ends_with('"') && quoted.contains("\"\""),
+                "{name:?} is not one identifier and must be quoted whole, got {quoted}"
+            );
+            assert!(
+                !quoted.contains("; DROP TABLE X --\"") || quoted.contains("\"\""),
+                "and its inner quotes must be doubled so it cannot end early"
+            );
+        }
+        // The MySQL family always wraps and doubles, so the same text is inert.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let quoted = quote_column_name(db_type, "a`; DROP TABLE x; --");
+            assert_eq!(quoted, "`a``; DROP TABLE x; --`");
+        }
+    }
+
+    /// A value the app did not write becomes SQL text here, so a "number" that
+    /// is not one must not be emitted unquoted.
+    ///
+    /// This is the only place a value crosses into a statement without quotes: a
+    /// CSV cell on its way into an `INSERT`, a bind answer substituted into
+    /// MySQL-family text. A cell holding
+    /// `1); DROP TABLE x; INSERT INTO t (a) VALUES (2` closed the `VALUES` list
+    /// and added statements of its own, which the app then ran as the user's
+    /// script — and the connection's read-only guard had already judged the text
+    /// the value was not yet in.
+    #[test]
+    fn a_number_literal_is_only_emitted_for_a_value_that_is_one() {
+        for db_type in [
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+            DatabaseType::Oracle,
+        ] {
+            // Real numbers, in every shape a driver or a file produces.
+            for value in [
+                "0",
+                "1",
+                "-1",
+                "+1",
+                "1.5",
+                "-1.50",
+                ".5",
+                "1.",
+                "1e3",
+                "-1.5E+10",
+                "12345678901234567890123",
+            ] {
+                assert_eq!(
+                    sql_literal_for_value(db_type, SqlValueKind::Number, value),
+                    value.trim(),
+                    "{db_type}: {value} is a number and must be emitted as one"
+                );
+            }
+            // And anything else is quoted, so it can only ever be a VALUE.
+            for value in [
+                "1); DROP TABLE x; INSERT INTO t (a) VALUES (2",
+                "1 OR 1=1",
+                "1; SET GLOBAL max_connections = 5000",
+                "abc",
+                "1,234",
+                "0x1F",
+                "",
+                "--1",
+                "1 2",
+            ] {
+                let literal = sql_literal_for_value(db_type, SqlValueKind::Number, value);
+                assert!(
+                    literal.starts_with('\'') && literal.ends_with('\''),
+                    "{db_type}: {value:?} is not a number and must be quoted, got {literal}"
+                );
+                assert!(
+                    !literal.contains("DROP TABLE") || literal.contains("'"),
+                    "{db_type}: a quoted value cannot leave its literal"
+                );
+            }
+            // `TRUE`/`FALSE` are how a boolean is written, and quoting them
+            // would have the server read `'TRUE'` as 0.
+            for value in ["TRUE", "false", "1", "0"] {
+                assert_eq!(
+                    sql_literal_for_value(db_type, SqlValueKind::Boolean, value),
+                    value.trim(),
+                    "{db_type}: {value} is a boolean literal"
+                );
+            }
+        }
+    }
 
     fn selection(
         db_type: DatabaseType,

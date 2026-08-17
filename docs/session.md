@@ -190,6 +190,29 @@ applied to the tab's retained session in place (MySQL `USE`, Oracle
 transaction state — an open transaction simply continues in the new scope, and
 the commit/rollback/discard decision stays where it belongs, at tab close.
 
+**A tab keeps its scope when its connection comes back up.** Scope is a per-tab
+setting like auto-commit and the transaction-mode pin, and those two survive a
+reconnect (TM S22 pins the mode half live); this was the one of the three that a
+successful connect silently reset, so a tab that had been working in `HR` came
+back running in the login schema with an empty selector and nothing said about
+it. A scope the new server does not have is NOT a reason to drop it —
+`SessionScopeAssertion::ScopeUnavailable` already answers that case, tolerating
+the statements and saying so once per run (live TM S46), and session preparation
+tolerates it too on every backend (Oracle falls back to the login schema on
+ORA-01435; the MySQL family resets the session to no database). The one thing
+that clears it is a connection that came back as a different DATABASE TYPE,
+where a schema name cannot mean what it meant — the sanitization
+`effective_transaction_mode` already makes for the sibling pin.
+
+The binding is the source of truth and the card follows it: nothing is pushed
+onto the cards at connect, because `start_connection_metadata_refresh` reads the
+tab's binding and states its scope on the card as it refreshes. A background
+tab's card therefore stays empty until it is activated, which is what a
+disconnect leaves behind anyway — its catalog is gone until something reloads
+it. The script-`CONNECT` reset (`QueryProgress::ConnectionChanged`) looks like
+the same event and is not: there a DIFFERENT connection replaced the tab's, and
+the worker has already dropped the batch's scope for the same reason.
+
 The reverse direction — a statement that moves the session (`USE`,
 `ALTER SESSION SET CURRENT_SCHEMA`) — goes through one choke point,
 `note_batch_scope_change`. It records the new scope where the running batch
@@ -207,11 +230,25 @@ the one the tab is on (`SessionHandBackOwner::is_current`), and is the tab still
 bound to what this batch resolved (`TabConnectionBinding::set_scope_if_revision`
 — the worker's door; the bare `set_scope` belongs to the UI thread, which owns
 the tab). Neither question implies the other: a rebind does not move the
-operation id, and a new execution does not move the revision. Three sites write
-it from a worker and no other may: the MySQL family's `USE` command, the OCI
-`ALTER SESSION SET CURRENT_SCHEMA`, and its thin twin. (An in-SCRIPT `USE` moves
-only the tab's pooled session, records only its own batch cell, and leaves the
-binding to the window.) A refused write says which of the two questions refused
+operation id, and a new execution does not move the revision. TWO sites write it
+from a worker and no other may: the OCI `ALTER SESSION SET CURRENT_SCHEMA` and
+its thin twin — both drivers hold ONE session for the whole batch, so where that
+session sits is a fact about the tab for as long as the batch runs.
+
+The MySQL family's `USE` is deliberately not among them: it records only its own
+batch cell and leaves the tab's binding to the window. That family re-acquires
+its session per statement, so the batch cell is what the rest of the script
+asserts, the retained lease records where the session really ended up, and
+`ScopeChangedNotice` moves the tab and its card. (This said THREE and named "the
+MySQL family's `USE` command" first. It was counting a `USE` implementation
+inside the ORACLE batch loop, whose comment read "MySQL USE command" and which
+could never run — a batch there holds an Oracle connection. That decoy also had
+a guard requiring it to write the connection's stored database and bump the pool
+epoch, which is what round 9 removed from the live MySQL loop for splitting
+sibling tabs off their database. There is now one `USE` implementation, and the
+Oracle loop's arm only says the command belongs to another family.)
+
+A refused write says which of the two questions refused
 it, because a tab naming one schema while a live session sits in another is the
 state this whole rule exists to keep explicable. The batch's own record of the
 scope is never gated on either question — the session really did move, so the
@@ -313,27 +350,75 @@ both guards ask the first from one place:
 
 - `sql_classification::statement_reconfigures_the_server` — Oracle `ALTER
   SYSTEM`, and the MySQL family's `SET GLOBAL`/`SET PERSIST`, `FLUSH`, `KILL`,
-  `RESET MASTER|REPLICA|SLAVE|PERSIST`, `PURGE BINARY LOGS` and replication
-  control. Neither server refuses these for a read-only TRANSACTION, so a guard
-  that leans on the server lets them through: Oracle's own list of what a
-  read-only transaction permits includes `ALTER SYSTEM`, and the MySQL family's
-  read-only session characteristic constrains table writes, not server
-  administration. `SqlEditorWidget::transaction_mode_refusal_for_statement` asks
-  it first and on EVERY backend, which is what closed the same hole in the tab's
-  pin — the Oracle allowlist had kept `ALTER SYSTEM` out by omission, and the
-  MySQL family, which delegates to the server, refused none of them at all.
-  It asks about every statement in the text rather than its leading words: one
-  unit can hold several (a custom MySQL `DELIMITER` makes `SELECT 1; SET GLOBAL
-  …` one statement as far as the executor is concerned), and reading only the
-  front let a server change ride behind a leading read. This guard never had
-  that gap — several statements classify as `Script`, which is not provably a
-  read — so it is the tab pin's half of the same answer.
-- lock ACQUISITION (`StatementSessionEffects::acquires_a_lock_other_sessions_wait_for`)
-  — taking a lock is not a read, and other sessions wait for it. Only the
-  connection guard asks this one: the tab's pin follows Oracle's own list, which
-  permits `LOCK TABLE`. The RELEASE forms stay allowed for the reason `COMMIT`
-  does — a connection can be marked read-only while it already holds one, and
-  refusing the release would strand it.
+  `SHUTDOWN`, `RESET MASTER|PERSIST|QUERY`, `PURGE BINARY LOGS`,
+  `ALTER INSTANCE`, every `CLONE` form, `CACHE INDEX`, `LOAD INDEX INTO CACHE`,
+  `INSTALL`/`UNINSTALL` in every spelling (PLUGIN, COMPONENT, MariaDB's SONAME)
+  and replication control. Neither
+  server refuses these for a read-only TRANSACTION, so a guard that leans on the
+  server lets them through: Oracle's own list of what a read-only transaction
+  permits includes `ALTER SYSTEM`, and the MySQL family's read-only session
+  characteristic constrains table writes, not server administration. What belongs
+  in the list is decided by that one question and nothing else — account and
+  privilege statements (`CREATE USER`, `GRANT`, `SET PASSWORD`) and every other
+  data-dictionary DDL are deliberately NOT here, because they write tables and a
+  read-only transaction refuses them, so both guards get their answer from the
+  server.
+  `SqlEditorWidget::transaction_mode_refusal_for_statement` asks it first and on
+  EVERY backend, which is what closed the same hole in the tab's pin — the
+  Oracle allowlist had kept `ALTER SYSTEM` out by omission, and the MySQL
+  family, which delegates to the server, refused none of them at all.
+
+  Two things it does NOT decide for itself, because deciding them here is how
+  the answer drifted from the questions beside it:
+
+  - the SCOPE of a `SET`. It asks whether ANY assignment targets
+    `GLOBAL`/`PERSIST`, not whether all of them do. One `SET` may mix scopes —
+    `SET SESSION sql_mode = '', GLOBAL net_read_timeout = 31` is one statement
+    both servers accept — and it used to be asked through the predicate that
+    answers "is EVERY assignment server-scoped?", which is the right question
+    for "does this leave session state behind?" and the wrong one here. The two
+    quantifiers now sit at the two questions and share one walk over the
+    assignments.
+  - which statements are replication control. It asks the classifier's own
+    `mysql_replication_words`, which matches the NOUN after an optional MariaDB
+    `ALL`. A second list written here missed `START ALL SLAVES` / `STOP ALL
+    SLAVES`, which is exactly what that rule's comment warns about: the verbs
+    are shared with `START TRANSACTION`, so a spelling one list misses is read
+    as a transaction of the user's.
+
+  It is asked of ONE statement. Splitting a text into its statements belongs to
+  each guard, not to this clause: one unit can hold several (a custom MySQL
+  `DELIMITER` makes `SELECT 1; SET GLOBAL …` one statement as far as the
+  executor is concerned), and that is true of every question a read-only guard
+  asks. This guard splits in `read_only_block_reason`; the tab's pin splits in
+  `transaction_mode_refusal_for_statement`. While this clause split for itself
+  instead, the clause beside it in the tab's pin — the explicit READ WRITE
+  escape — still read the leading words, so the same leading read hid that one.
+- a statement that writes a FILE on the server (`SELECT … INTO OUTFILE`,
+  `INTO DUMPFILE`) — it reads tables and writes next to the data directory, and
+  MySQL 8.0.46 runs it inside a read-only transaction (measured). The classifier
+  reads it as the SELECT it starts with, which is why BOTH guards missed it: a
+  read is provably a read. `SELECT … INTO @var` stays allowed, because that writes
+  session state.
+- lock ACQUISITION — taking a lock is not a read, and other sessions wait for
+  it. BOTH guards ask this one, from the same place as the clauses above
+  (`read_only_shared_refusal`, which answers with whichever clause refused).
+  It used to be the connection guard's alone, and asked of one statement KIND
+  (`SessionControl`), which left two holes: a tab pinned READ ONLY could hold
+  `LOCK TABLES … READ`, a MySQL backup lock, the global read lock, a named
+  `GET_LOCK` or an Oracle `LOCK TABLE` — all measured to RUN inside a read-only
+  transaction, unlike `LOCK TABLES … WRITE`, which MySQL 8.0.46 refuses — and
+  `SELECT GET_LOCK('x', -1)` slipped past the connection's guard as well, because
+  a locking function call classifies as a read. The MySQL family's forms are asked of the statement EFFECTS
+  (`StatementSessionEffects::acquires_a_lock_other_sessions_wait_for`), where a
+  lock that outlives the transaction already has to be tracked and where MariaDB's
+  `BACKUP STAGE`/`BACKUP LOCK` were taught alongside `LOCK INSTANCE FOR BACKUP`;
+  Oracle's `LOCK TABLE` is named in the classifier instead, because it dies with
+  its transaction and recording it as session lock state would leave every tab
+  that ran one asking for a resolution it can never clear. The RELEASE forms stay
+  allowed for the reason `COMMIT` does — a connection can be marked read-only, or
+  a tab pinned, while it already holds one, and refusing the release would strand
+  it.
 
 The check runs in `execute_sql_with_mysql_delimiter_after_lazy_cancel`, the one
 place every editor entry point funnels through, ahead of both the transaction

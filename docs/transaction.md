@@ -56,6 +56,51 @@ A MySQL/MariaDB one-shot `SET TRANSACTION` override stays on the same physical
 session until the next transaction-starting statement consumes it. Oracle
 transaction mode follows the first-statement constraint.
 
+### One executor UNIT can hold several statements, and the ledger answers for all of them
+
+Every rule above reads the LEADING words of the statement it is given, which is
+only true of a single statement. A unit is not always one: a custom MySQL
+`DELIMITER` makes `SELECT 1; INSERT INTO t VALUES (1)` one statement as far as
+the executor is concerned, `CLIENT_MULTI_STATEMENTS` is on, and the server runs
+both. Read from the leading statement, such a unit answered *"this left nothing
+on the session"* — so an open transaction, a temporary table, a prepared
+statement and a changed charset all went back to the pool unrecorded, the tab was
+never offered the commit, and the next statement's session preparation (whose
+first setup statement is `ROLLBACK`) threw the work away. `SqlKind::Script` is the
+one kind the connection's read-only guard refuses outright, which is why the same
+blindness never reached it.
+
+`StatementSessionPostProcessor` therefore has two methods and a backend
+implements only the first: `effects_for_single_statement()` answers about ONE
+statement, and `effects_for_sql()` — not a backend's to override — splits the
+unit with the executor's own splitter and folds the answers in the order the
+statements run. A unit holding one statement answers exactly as it always did:
+the fold is the identity over one element, and it answers about the text AS
+GIVEN, because the splitter normalizes what it returns (it strips comments, and a
+MySQL executable comment such as `SELECT … /*!80000 FOR UPDATE */` carries
+statement text the server really runs).
+
+The fold does not guess the NET effect, because the net effect is not readable
+from a merge: `INSERT; COMMIT` and `COMMIT; INSERT` leave different sessions and
+merge identically. It keeps the model's own rule instead — everything that ADDS
+state or uncertainty is taken from either statement, and nothing that says
+something ENDED is claimed from either, because a claim is only lowered by an
+ANSWER. Consuming a pending one-shot `SET TRANSACTION` is the exception that
+proves the rule: consumption is permanent, so it is folded rather than dropped.
+
+Only a unit that really DROPPED an ending is marked as one the app could not
+read (`may_open_untracked_transaction`), which is what sends the batch end to the
+server for an answer instead of filing a guess. With nothing in the unit ending
+anything the fold is exact and nothing is guessed — otherwise every script
+written under a custom `DELIMITER` would ask its tab to commit two plain reads.
+
+The same split serves every other question about what a unit left behind —
+`fold_over_unit_statements()`, asked by the transaction-mode adoption, the
+auto-commit adoption, the `USE` that moves the session's database, and the
+`DROP DATABASE` that takes it away. Each of those used to read the leading
+statement too. Guard:
+`every_question_about_what_a_unit_left_on_the_session_asks_every_statement`.
+
 ## Tab-scoped transaction mode
 
 > Implementation: `SqlEditorWidget::tab_transaction_mode_override`
@@ -102,6 +147,34 @@ execution is not blocked.
 One-shot `SET TRANSACTION ...` forms, unqualified `@@` assignments,
 GLOBAL/PERSIST scopes, and unrecognized values are NOT adopted; they keep the
 conservative override-residue tracking described above.
+
+Both adoptions — this one and auto-commit's — are asked of every statement in
+the unit, from the split above, and the LAST statement that sets a value is the
+one the session was left with (the two halves of the mode merge separately, so
+`SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE; SET SESSION TRANSACTION
+READ ONLY` in one unit adopts as both). Read from the leading statement,
+`SELECT 1; SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE` moved the
+SESSION while the tab's pin, the toolbar and the Tools menu kept the old value —
+the screen-equals-session guarantee broken by a leading `SELECT 1;`, with the
+override residue never adopted away either; its auto-commit twin left the app
+offering Commit and Rollback for work the server had already committed.
+
+**On the MySQL family the adoption is not a batch-loop step but part of ONE
+"the statement succeeded" step**, `record_successful_mysql_batch_statement()`,
+which also applies the statement's effects to the batch ledger and answers with
+the scope change the statement made. The reason is the reason the read-only gate
+moved to the session acquisition: that family runs a statement down one of three
+paths (the streaming SELECT, the lazy fetch, the plain executor) and the dispatch
+between them reads the LEADING keyword of the unit, so a unit the adoption cares
+about is classified as a displayable SELECT and takes a path of its own. While
+the four steps were spelled out in the plain executor's branch they were simply
+not taken for such a unit. The scope change comes back as a `#[must_use]`
+`MySqlBatchScopeChange` rather than being reported inside that step, because
+recording it where the batch reads its scope and reporting it to the window are
+one step (`note_batch_scope_change`) that each branch performs where its own
+output order puts it — and a branch that drops the value does not compile clean.
+Both Oracle loops still adopt inline: each of them handles every statement of its
+batch in one place, so there is no second path to forget.
 
 ### A setting change that changes nothing is not a change
 
@@ -210,8 +283,9 @@ reading the answer would otherwise leave an open read-only transaction that
 `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` cannot see, and every later batch would
 fail with ORA-01453.
 
-Those rules are not a call site's to keep. All three Oracle sites — the OCI
-batch, the thin batch and the thin lazy SELECT — state the mode through
+Those rules are not a call site's to keep. All FOUR Oracle sites — the OCI
+batch, the thin batch, the thin lazy SELECT and the OCI post-`CONNECT`
+injection — state the mode through
 `apply_oracle_transaction_mode_statements_with`, which owns the whole shape: the
 session-default reset is the one statement it does NOT record, every other one is
 recorded before its round trip, ORA-01453 is `TransactionStillOpen`, and anything
@@ -222,6 +296,20 @@ The thin batch used to make it whatever came back, so a batch whose mode
 application really failed filed its session with the claim settled by an answer
 the server never gave, while the OCI twin recorded nothing — one script, two
 answers, from the code that was meant to make them one.
+
+The post-`CONNECT` injection was the fourth site and the one that did not go
+through the function owning that shape: it stated the mode with
+`DatabaseConnection::apply_oracle_transaction_mode`, read ORA-01453 as a hard
+failure and tore down a connection it had just authenticated for it, told the
+tracker nothing about the transaction its own `SET TRANSACTION` had just opened,
+and recorded the effects of a DIFFERENT statement list from the one it ran (no
+`tab_selected`, no connection default, so a tab that had actively selected
+`Default` isolation was not put back to the NEW connection's level). It now
+builds ONE `OracleTransactionModeApplication` for both, keeps the server's
+ANSWER rather than a flag — so the claim it later makes to the tracker can be
+read against the reply it rests on — and the thin driver's equivalent (which
+applies the mode lazily after a `CONNECT`) reaches the same function. TM S8, S50
+and S55 drive this path.
 
 **Nothing the session carries delays stating the mode.** A batch states the
 tab's pinned mode before its first statement whatever the session it was handed
@@ -277,30 +365,108 @@ list of what a read-only transaction permits is SELECT (without FOR UPDATE),
 SAVEPOINT, and the client allowlist follows it — refusing `ALTER SESSION SET
 NLS_DATE_FORMAT` while the app issues `ALTER SESSION SET CURRENT_SCHEMA` on that
 same session, and while allowing the ISOLATION_LEVEL form, was an arbitrary line.
-`ALTER SYSTEM` is the one exception kept out: the pin is the user saying this tab
-changes nothing, and reconfiguring the instance is a change whatever the
-transaction semantics say.
+`ALTER SYSTEM` and `LOCK TABLE` are the two exceptions kept out: the pin is the
+user saying this tab changes nothing, and reconfiguring the instance — or making
+every other session wait — is a change whatever the transaction semantics say.
 
-That exception is not the allowlist's to remember, and it is not Oracle's alone.
-`transaction_mode_refusal_for_statement` asks
-`sql_classification::statement_reconfigures_the_server` FIRST and on every
-backend, so the answer cannot depend on a keyword being absent from a list, and
-the MySQL family — which otherwise delegates to the server — refuses `SET
-GLOBAL`, `FLUSH`, `KILL` and replication control too. No server keeps this
-promise for a read-only transaction: Oracle permits `ALTER SYSTEM` inside one,
-and the MySQL family's session characteristic constrains table writes, not server
-administration. The connection's own read-only guard asks the same function, so
-the app's two read-only guards can no longer answer differently
-(see [read-only connections](session.md#read-only-connections)).
+Those exceptions are not the allowlist's to remember, and they are not Oracle's
+alone. `transaction_mode_refusal_for_statement` asks
+`sql_classification::read_only_shared_refusal` FIRST and on every backend, so the
+answer cannot depend on a keyword being absent from a list. That shared answer has
+THREE clauses, and it is the whole half the two read-only guards must answer
+identically — because a server's read-only transaction does not reliably refuse
+these, and which ones it does refuse is a property of the version rather than of
+the promise. Measured on MySQL 8.0.46 under `SET SESSION TRANSACTION READ ONLY`:
+`SET GLOBAL`, `FLUSH TABLES WITH READ LOCK`, `CACHE INDEX`, `LOCK TABLES … READ`,
+`LOCK INSTANCE FOR BACKUP`, `GET_LOCK` and `SELECT … INTO OUTFILE` all RUN, while
+`LOCK TABLES … WRITE` and `ALTER INSTANCE` are refused; Oracle permits
+`ALTER SYSTEM` and `LOCK TABLE` inside one by its own documented rule. So the app
+answers for itself:
+
+- **a statement that reconfigures the SERVER rather than this session** — `SET
+  GLOBAL`/`PERSIST` (any assignment of one, not all of them), `FLUSH`, `KILL`,
+  `SHUTDOWN`, replication control in every spelling the classifier knows,
+  `RESET MASTER|PERSIST|QUERY`, `PURGE BINARY|MASTER`, `ALTER INSTANCE`, every
+  `CLONE` form, `CACHE INDEX`, `LOAD INDEX INTO CACHE`, `INSTALL`/`UNINSTALL`
+  (PLUGIN, COMPONENT and MariaDB's SONAME — the VERB is the question), and
+  Oracle's `ALTER SYSTEM`. What belongs in that list is ONE question — is the
+  statement's target the SERVER or the instance rather than this session and its
+  data? Account and privilege statements (`CREATE USER`, `GRANT`,
+  `SET PASSWORD`) and every other data-dictionary DDL are deliberately NOT there:
+  they write tables, so a read-only transaction refuses them and both guards get
+  their answer from the server. The statements listed write no table at all.
+- **a statement that writes a FILE on the server** — `SELECT … INTO OUTFILE` and
+  `INTO DUMPFILE`, which read tables and write next to the data directory. The
+  classifier reads them as the SELECT they start with, so this is the one clause
+  BOTH guards used to miss: a read is provably a read. `SELECT … INTO @var` stays
+  allowed — that writes session state, which a read-only session may do.
+- **a statement that takes a LOCK other sessions wait for** — `LOCK TABLES`,
+  `FLUSH TABLES WITH READ LOCK`, `LOCK INSTANCE FOR BACKUP`, MariaDB's
+  `BACKUP STAGE`/`BACKUP LOCK`, a named `GET_LOCK`, and Oracle's `LOCK TABLE`.
+  Asked of the statement EFFECTS for the MySQL family, where a lock that outlives
+  the transaction already has to be tracked; named in the classifier for Oracle,
+  whose `LOCK TABLE` dies with its transaction, so recording it as session lock
+  state would leave every tab that ran one asking for a resolution it can never
+  clear. The RELEASE forms stay allowed for the reason COMMIT is — a tab can be
+  pinned while it already holds one.
+
+The connection's own read-only guard asks the same function, so the app's two
+read-only guards can no longer answer differently
+(see [read-only connections](session.md#read-only-connections)). They differ on
+DATA by design and only there: the connection refuses anything not provably a
+read, while the tab lets the server refuse the writes. The lock clause is the
+sharpest example of why the split matters — while it was asked of one statement
+KIND (`SessionControl`), `SELECT GET_LOCK('x', -1)` slipped past the connection's
+guard as well, because a locking function call classifies as a read.
 
 Reaching the MySQL family took one more step, and it is why that half was missing
 in the first place: **nothing on that family's execution path called the shared
 answer at all.** Its batch kept a gate of its own that asked only about the
 explicit READ WRITE escape, spelled inline. Both questions now live in
-`transaction_mode_refusal_for_statement`, and `execute_mysql_sql` — the one place
-every MySQL-family batch statement passes — asks it, in the position both Oracle
-batch loops keep theirs. Every backend's batch now asks one question, so a family
-cannot remember one half of it and forget the other.
+`transaction_mode_refusal_for_statement`.
+
+### Where each family asks it, and why the MySQL family does not ask it in a batch loop
+
+Both Oracle batch loops ask once per statement, before they choose how to run it,
+and the Oracle thin LAZY select — the one Oracle path that runs a statement
+without a batch loop — asks it in the condition that elects it, so a refused
+statement simply falls through to the batch, which reports the one answer.
+
+The MySQL family asks it in `acquire_mysql_pooled_session`, the one function
+every statement of that family passes to get the session it runs on, and NOT in
+any of its executors. That is not a preference. This family runs a statement down
+one of three paths — the streaming SELECT, the lazy fetch, the plain executor —
+and the dispatch between them reads the LEADING keyword of the unit. A unit can
+hold more than one statement (a custom `DELIMITER` makes `SELECT 1; SET GLOBAL …`
+one statement as far as the executor is concerned), so a unit the gate refuses is
+classified as a displayable SELECT and takes a path of its own. While the gate
+lived in `execute_mysql_sql` it was therefore not asked at all for such a unit,
+and a READ ONLY tab really moved `@@GLOBAL.net_read_timeout` on MySQL 8.0 (live
+**TM S61**, which fails at that baseline while **S60** — the same statement
+standing alone — passes). Asking where the session is handed over makes the
+answer independent of how the statement will be executed, and a new execution
+path inherits it by construction. The grid-edit save reaches the same acquisition
+through `run_mysql_pooled_action_with_timeout`.
+
+### Every clause of that answer is asked of every statement, from ONE split
+
+The entry point splits the text with the executor's own splitter and asks the
+clauses of each statement it finds. Splitting inside a clause is what the
+server-change clause used to do, and the clause beside it — the explicit READ
+WRITE escape — still read the leading words, so the same leading read that hid a
+server change also hid `SELECT 1; SET TRANSACTION READ WRITE`, which disarms the
+pin for the next transaction. A `;` inside a string, a comment or a PL/SQL block
+is not a boundary, and a tool command never reaches the server at all
+(`read_only_block_reason` owns the two that would leave the connection). The
+split passes no custom delimiter deliberately: the caller hands over what the
+executor already treats as one statement, so any delimiter in force has been
+consumed and the default `;` is what may still be hiding inside it — splitting
+with it can only find more statements to ask about, never fewer.
+
+Oracle has no reachable form of this: its splitter ends a statement at `;` or
+`/`, so no Oracle unit holds two statements, and the Oracle loops hand the gate
+one statement at a time. The fix is common to all four backends all the same,
+because the rule is about the question and not about the family.
 
 ### Unrunnable isolation/access pairs are refused at selection
 
@@ -617,7 +783,10 @@ auto-commit like any other statement, which their own live probes now pin:
 
 - `verify_grid_save_live` — a tab pinned READ ONLY refuses the save and leaves
   the row untouched, unpinning lets the identical save through, and a save on
-  an auto-commit tab survives a later `ROLLBACK`.
+  an auto-commit tab survives a later `ROLLBACK`. The save also brackets itself
+  by what the SESSION holds rather than by the tab's auto-commit flag, so it can
+  never commit an explicit transaction of the user's (see
+  [grid editing](result_ui.md#grid-editing)).
 - `verify_import_live` — a READ ONLY tab refuses the generated import script
   and the target table stays empty; the same script succeeds once unpinned, and
   an import on an auto-commit tab survives a later `ROLLBACK`.

@@ -626,6 +626,61 @@ fn verify(target: Target) -> Result<(), String> {
     }
     println!("    PASS(6): grid save on an auto-commit tab survived a later ROLLBACK");
 
+    // (7) ... and it must not commit work that is not its own. An auto-commit
+    // tab CAN hold an explicit transaction — `START TRANSACTION` survives
+    // auto-commit ON, deliberately — and MySQL's `START TRANSACTION` implicitly
+    // COMMITS whatever the session already holds. A save that opened one of its
+    // own therefore committed the user's uncommitted work for them,
+    // unrecoverably, and reported only its own success. MySQL family only: the
+    // Oracle save nests in a SAVEPOINT and has no transaction to open, and an
+    // Oracle tab with auto-commit ON cannot be holding work in the first place.
+    if !target.is_oracle() {
+        let _ = h.run("COMMIT");
+        h.editor.set_tab_auto_commit(true);
+        // The user's own transaction, opened explicitly over auto-commit.
+        h.run("START TRANSACTION")?;
+        h.run(&format!("UPDATE {t} SET NAME = 'MINE' WHERE ID = 2"))?;
+        let own_events = grid_save(&mut h, target, t, 48, "AUTOCOMMITTED", "SAVED_INSIDE")
+            .map_err(|e| format!("grid save inside the user's transaction: {e}"))?;
+        let own_result = last_result(&own_events)
+            .ok_or("grid save inside the user's transaction produced no terminal result")?;
+        if !own_result.success {
+            return Err(format!(
+                "grid save failed inside the user's own transaction: {:?}",
+                own_result.message
+            ));
+        }
+        println!(
+            "(7) save inside the user's transaction: msg={:?}",
+            own_result.message
+        );
+        h.editor.set_tab_auto_commit(false);
+        let _ = h.run("ROLLBACK");
+        let mine = h.run(&format!("SELECT ID, NAME FROM {t} WHERE ID = 2"))?;
+        let mine_name = cell_by_col(&mine, "NAME").unwrap_or_default();
+        if mine_name == "MINE" {
+            return Err(format!(
+                "BUG: the grid save committed the user's own uncommitted work \
+                 (NAME={mine_name:?} survived a ROLLBACK)"
+            ));
+        }
+        // And the save itself is part of that same transaction, so the rollback
+        // takes it back too — which is what makes the message honest: it must
+        // not have claimed the rows were committed.
+        let saved = h.run(&format!("SELECT ID, NAME FROM {t} WHERE ID = 1"))?;
+        let saved_name = cell_by_col(&saved, "NAME").unwrap_or_default();
+        if saved_name == "SAVED_INSIDE" {
+            return Err(format!(
+                "BUG: the grid save committed itself inside the user's transaction \
+                 (NAME={saved_name:?} survived a ROLLBACK)"
+            ));
+        }
+        println!(
+            "    PASS(7): a save inside the user's own transaction committed nothing \
+             (theirs or its own)"
+        );
+    }
+
     // Cleanup.
     let _ = h.run("COMMIT");
     let _ = h.run(&target.drop_sql(t));

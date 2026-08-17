@@ -1065,6 +1065,140 @@ impl TransactionSessionState {
     }
 }
 
+/// How an operation the APP runs on the user's session brackets its own
+/// statements.
+///
+/// Such an operation — a grid-edit save is the one that has several statements
+/// to apply — needs two things that meet in exactly one place: it must be
+/// ATOMIC, and it must never resolve work that is not its own. Under auto-commit
+/// the only way to be atomic is to open a transaction, and MySQL's
+/// `START TRANSACTION` implicitly COMMITS whatever the session already holds. An
+/// auto-commit tab CAN hold an open transaction — an explicit
+/// `START TRANSACTION` survives auto-commit ON, and the app supports that on
+/// purpose — so a grid save on such a tab committed the user's uncommitted work
+/// for them, unrecoverably, and reported only its own success.
+///
+/// The answer is therefore not "is auto-commit on" but "is there anything of the
+/// user's to lose": when there may be, the operation nests inside the user's
+/// transaction with a SAVEPOINT and leaves the commit/rollback decision where it
+/// belongs, exactly as the manual-commit path always did. Oracle's own grid-edit
+/// DML meets the same rule by construction — its block opens with `SAVEPOINT`
+/// and it has no `START TRANSACTION` to reach for — which is why this states the
+/// rule for all four backends rather than for the one that broke it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppOperationTransactionScope {
+    /// Nothing of the user's can be lost: the operation opens a transaction of
+    /// its own and commits it.
+    OwnTransaction,
+    /// The session may already carry the user's work: nest, and leave the
+    /// decision to them.
+    NestedInCallersTransaction,
+}
+
+impl AppOperationTransactionScope {
+    /// Whether an operation running in this scope commits its own work.
+    pub fn commits_its_own_work(self) -> bool {
+        matches!(self, Self::OwnTransaction)
+    }
+}
+
+/// The scope an app-run operation must use on a session that already carries
+/// `prior_state`. See [`AppOperationTransactionScope`].
+pub fn app_operation_transaction_scope(
+    auto_commit: bool,
+    prior_state: RetainedSessionState,
+) -> AppOperationTransactionScope {
+    if auto_commit && !prior_state.may_have_uncommitted_work() {
+        AppOperationTransactionScope::OwnTransaction
+    } else {
+        AppOperationTransactionScope::NestedInCallersTransaction
+    }
+}
+
+/// What a whole executor UNIT answers, and whether it held more than one
+/// statement — the second half is knowledge of its own, because a unit the app
+/// cannot read as one statement is a unit whose net effect it has to have the
+/// server settle.
+pub(crate) struct UnitAnswer<T> {
+    pub(crate) answer: T,
+    pub(crate) held_several_statements: bool,
+}
+
+/// Ask a question of every statement in one executor UNIT and combine the
+/// answers in the order the statements run.
+///
+/// ONE split for every question about what a unit left on the session, because
+/// each of those questions used to read the LEADING statement of the unit and a
+/// unit can hold several: a custom MySQL `DELIMITER` makes
+/// `SELECT 1; SET autocommit = 1` one statement as far as the executor is
+/// concerned, and the server runs both. The read-only guards learned this first
+/// and each learned it separately — a clause that splits for itself is a clause
+/// the next one has to remember to copy — so the session ledger, the
+/// transaction-mode adoption, the auto-commit adoption and the scope notice all
+/// ask it here instead.
+///
+/// The text AS GIVEN is always answered first, and the statements found inside
+/// it are combined on top: for a unit holding one statement that is the whole
+/// answer (the splitter normalizes what it returns — it strips comments, and a
+/// MySQL executable comment carries statement text the server really runs), and
+/// for a unit holding several it is the answer the leading-word rules give,
+/// which the later statements can only add to.
+pub(crate) fn fold_over_unit_statements<T>(
+    db_type: DatabaseType,
+    sql: &str,
+    mut single: impl FnMut(&str) -> T,
+    mut merge: impl FnMut(T, T) -> T,
+) -> UnitAnswer<T> {
+    let items =
+        crate::db::query::QueryExecutor::split_script_items_for_db_type_with_mysql_delimiter(
+            sql,
+            Some(db_type),
+            // No custom delimiter: the caller hands over what the executor
+            // already treats as ONE statement, so any delimiter in force has
+            // been consumed and the default `;` is what may still be hiding
+            // inside it. Splitting with it can only find MORE statements to
+            // answer for, never fewer.
+            None,
+        );
+    let mut statements = items
+        .iter()
+        .filter_map(|item| match item {
+            crate::db::query::ScriptItem::Statement(statement) => Some(statement.as_str()),
+            // A tool command is the client's own and never reaches the server,
+            // so it leaves nothing on the session.
+            crate::db::query::ScriptItem::ToolCommand(_) => None,
+        })
+        .collect::<Vec<_>>();
+    // A repeated statement is not a second statement. Oracle's splitter replays
+    // the previous statement for a standalone `/` by pushing the SAME text
+    // again, and every answer in this model is idempotent under repetition —
+    // running one statement twice leaves the session where running it once does.
+    // Counting the replay made `COMMIT;` followed by `/` look like a unit whose
+    // order could not be read, and the fold then refused to carry its own
+    // COMMIT.
+    statements.dedup();
+    let as_given = single(sql);
+    if statements.len() < 2 {
+        return UnitAnswer {
+            answer: as_given,
+            held_several_statements: false,
+        };
+    }
+    UnitAnswer {
+        answer: statements.into_iter().fold(as_given, |folded, statement| {
+            merge(folded, single(statement))
+        }),
+        held_several_statements: true,
+    }
+}
+
+/// The later answer wins, which is what "where did the session END UP" means
+/// for a value a statement SETS. Used by every unit-folded question whose answer
+/// is a value rather than an accumulation of state.
+pub(crate) fn later_unit_answer_wins<T>(earlier: Option<T>, later: Option<T>) -> Option<T> {
+    later.or(earlier)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StatementSessionEffects {
     pub(crate) state_hint: TransactionStatementStateHint,
@@ -1318,6 +1452,226 @@ impl StatementSessionEffects {
     /// whose body the app cannot read.
     pub(crate) fn may_open_untracked_transaction(self) -> bool {
         self.transaction.may_open_untracked_transaction
+    }
+
+    /// What the session carries after this statement AND THEN `next` have run
+    /// on it.
+    ///
+    /// One executor unit can hold several statements — a custom MySQL
+    /// `DELIMITER` makes `SELECT 1; INSERT …` one statement as far as the
+    /// executor is concerned, and the server runs both — so a question asked of
+    /// the leading statement is a question a leading read can hide. It hid
+    /// everything this model exists to track: such a unit was filed as leaving
+    /// NOTHING behind, so an open transaction, a temporary table, a prepared
+    /// statement and a changed charset all went back to the pool unrecorded,
+    /// the tab was never offered the commit, and the next statement's session
+    /// preparation (whose first setup statement is `ROLLBACK`) threw the work
+    /// away.
+    ///
+    /// The composition does not guess the NET effect, because the net effect is
+    /// not readable from two merged answers: `INSERT; COMMIT` and
+    /// `COMMIT; INSERT` leave different sessions and merge identically. It
+    /// keeps the model's own rule instead — everything that ADDS state or
+    /// uncertainty is taken from either statement, and nothing SUBTRACTIVE is
+    /// claimed from either, because a claim is only ever lowered by an ANSWER
+    /// (a server probe, a replaced session). [`Self::for_unit`] additionally
+    /// marks the transaction as one the app could not read, which is what makes
+    /// the batch-end settlement ask the server and correct a conservative claim
+    /// rather than leave the tab holding it.
+    fn then(self, next: Self) -> Self {
+        Self {
+            state_hint: TransactionStatementStateHint {
+                // Subtractive: `RESET CONNECTION` beside another statement
+                // cannot be read as "the session is back to birth state".
+                clears_session_state: false,
+                may_leave_session_bound_state: self.state_hint.may_leave_session_bound_state
+                    || next.state_hint.may_leave_session_bound_state,
+                may_leave_untracked_session_state: self
+                    .state_hint
+                    .may_leave_untracked_session_state
+                    || next.state_hint.may_leave_untracked_session_state,
+                may_hold_session_lock: self.state_hint.may_hold_session_lock
+                    || next.state_hint.may_hold_session_lock,
+                requires_retention_when_autocommit_off: self
+                    .state_hint
+                    .requires_retention_when_autocommit_off
+                    || next.state_hint.requires_retention_when_autocommit_off,
+                requires_transaction_decision_after_success: self
+                    .state_hint
+                    .requires_transaction_decision_after_success
+                    || next.state_hint.requires_transaction_decision_after_success,
+                changes_auto_commit: self.state_hint.changes_auto_commit
+                    || next.state_hint.changes_auto_commit,
+            },
+            transaction: StatementTransactionEffects {
+                // Subtractive, all three: they are the fields the fold reads to
+                // LOWER a transaction claim.
+                clears_state: false,
+                has_implicit_commit: false,
+                releases_physical_session: false,
+                opens_or_preserves_state: self.transaction.opens_or_preserves_state
+                    || next.transaction.opens_or_preserves_state,
+                skip_auto_commit: self.transaction.skip_auto_commit
+                    || next.transaction.skip_auto_commit,
+                requires_decision_after_success: self.transaction.requires_decision_after_success
+                    || next.transaction.requires_decision_after_success,
+                changes_transaction_mode: self.transaction.changes_transaction_mode
+                    || next.transaction.changes_transaction_mode,
+                starts_state: self.transaction.starts_state || next.transaction.starts_state,
+                may_leave_uncommitted_work: self.transaction.may_leave_uncommitted_work
+                    || next.transaction.may_leave_uncommitted_work,
+                rollback_targets_savepoint: self.transaction.rollback_targets_savepoint
+                    || next.transaction.rollback_targets_savepoint,
+                control_starts_chain: self.transaction.control_starts_chain
+                    || next.transaction.control_starts_chain,
+                may_open_untracked_transaction: self.transaction.may_open_untracked_transaction
+                    || next.transaction.may_open_untracked_transaction,
+            },
+            session_residue: StatementSessionResidueEffects {
+                // Subtractive: a unit that also cleared something cannot be
+                // read as having cleared it LAST.
+                clears_statement_diagnostics: false,
+                clears_all_session_residue: false,
+                // NOT subtractive, and the difference is the order: consuming a
+                // pending one-shot `SET TRANSACTION` is permanent, so whichever
+                // statement of the unit did it, the unit did it. Dropping it
+                // would leave the tab believing an override the server has
+                // already spent is still armed.
+                consumes_next_transaction_mode_override: self
+                    .session_residue
+                    .consumes_next_transaction_mode_override
+                    || next.session_residue.consumes_next_transaction_mode_override,
+                creates_temporary_table: self.session_residue.creates_temporary_table
+                    || next.session_residue.creates_temporary_table,
+                creates_prepared_statement: self.session_residue.creates_prepared_statement
+                    || next.session_residue.creates_prepared_statement,
+                sets_user_variable: self.session_residue.sets_user_variable
+                    || next.session_residue.sets_user_variable,
+                sets_session_setting: self.session_residue.sets_session_setting
+                    || next.session_residue.sets_session_setting,
+                sets_found_rows: self.session_residue.sets_found_rows
+                    || next.session_residue.sets_found_rows,
+                sets_statement_diagnostics: self.session_residue.sets_statement_diagnostics
+                    || next.session_residue.sets_statement_diagnostics,
+                sets_next_transaction_mode_override: self
+                    .session_residue
+                    .sets_next_transaction_mode_override
+                    || next.session_residue.sets_next_transaction_mode_override,
+                sets_transaction_mode_override: self.session_residue.sets_transaction_mode_override
+                    || next.session_residue.sets_transaction_mode_override,
+                may_leave_unknown_state: self.session_residue.may_leave_unknown_state
+                    || next.session_residue.may_leave_unknown_state,
+            },
+            // A lock either statement takes may still be held; a release either
+            // one issued cannot be read as the last word on it.
+            table_lock: if self.acquires_table_lock() || next.acquires_table_lock() {
+                StatementTableLockEffect::Acquires
+            } else {
+                StatementTableLockEffect::None
+            },
+            flush_table_lock: if self.acquires_flush_table_lock()
+                || next.acquires_flush_table_lock()
+            {
+                StatementFlushTableLockEffect::Acquires
+            } else {
+                StatementFlushTableLockEffect::None
+            },
+            backup_lock: if self.acquires_backup_lock() || next.acquires_backup_lock() {
+                StatementBackupLockEffect::Acquires
+            } else {
+                StatementBackupLockEffect::None
+            },
+            named_lock: StatementNamedLockEffect {
+                acquires: self.named_lock.acquires || next.named_lock.acquires,
+                releases_one: false,
+                releases_all: false,
+            },
+        }
+    }
+
+    /// Whether this statement's own answer says something ENDED — the one class
+    /// of claim [`Self::then`] cannot carry, because carrying it would depend on
+    /// an order a merge cannot read.
+    fn claims_something_ended(self) -> bool {
+        self.transaction.clears_state
+            || self.transaction.has_implicit_commit
+            || self.transaction.releases_physical_session
+            || self.state_hint.clears_session_state
+            || self.session_residue.clears_all_session_residue
+            || self.releases_table_lock()
+            || self.releases_flush_table_lock()
+            || self.releases_backup_lock()
+            || self.named_lock.releases_one
+            || self.named_lock.releases_all
+    }
+
+    /// The answer for a whole executor UNIT, folded from the statements it
+    /// holds in the order they run.
+    ///
+    /// The text AS GIVEN is always answered for, and the statements found
+    /// inside it are folded on top. Both halves matter:
+    ///
+    /// - the text as given is the only honest input for a unit holding ONE
+    ///   statement, which is every case that existed before this fold: the
+    ///   splitter normalizes what it hands back — it strips comments, and a
+    ///   MySQL executable comment (`SELECT … /*!80000 FOR UPDATE */`) carries
+    ///   statement text the server really runs, so a locking read judged from
+    ///   the split text stops looking like one;
+    /// - the statements inside it are what a leading-word rule cannot see, and
+    ///   they are the whole reason this exists.
+    fn for_unit(db_type: DatabaseType, sql: &str, mut single: impl FnMut(&str) -> Self) -> Self {
+        // Whether the fold had to DROP an ending. That is the only thing the
+        // merge cannot answer: with no statement in the unit ending anything,
+        // the folded answer is exact — every statement's state simply adds up,
+        // in any order. It is when one of them commits, rolls back, releases the
+        // session or releases a lock that the order decides the outcome, and a
+        // merge cannot read the order (`INSERT; COMMIT` and `COMMIT; INSERT`
+        // merge identically). Only then is the transaction a guess.
+        //
+        // Keeping this narrow is not a nicety: marking every unit as a guess
+        // would file a script written under a custom `DELIMITER` as holding a
+        // transaction after two plain reads, and its tab would offer a commit
+        // for nothing.
+        let dropped_an_ending = std::cell::Cell::new(false);
+        let UnitAnswer {
+            answer: folded,
+            held_several_statements,
+        } = fold_over_unit_statements(
+            db_type,
+            sql,
+            |statement| {
+                let effects = single(statement);
+                if effects.claims_something_ended() {
+                    dropped_an_ending.set(true);
+                }
+                effects
+            },
+            Self::then,
+        );
+        // And a dropped ending only matters where there is something for it to
+        // have ended. A unit whose statements cannot leave uncommitted work
+        // between them has no transaction to be unsure about, whatever the order
+        // — at most an implicit read transaction, which every probe in this model
+        // already ignores. So `SELECT 1; COMMIT` is not a session that may be
+        // holding work: reading it as one had the tab claim "transaction open"
+        // and offer a commit for a transaction its own text had just ended.
+        let could_be_holding_work = folded.may_leave_uncommitted_work()
+            || folded.starts_transaction_state()
+            || folded.opens_or_preserves_transaction_state()
+            || folded.requires_transaction_decision_after_success();
+        if !held_several_statements || !dropped_an_ending.get() || !could_be_holding_work {
+            return folded;
+        }
+        Self {
+            transaction: StatementTransactionEffects {
+                // The app cannot read what THIS unit left, and that is knowledge
+                // in its own right: it is what sends the batch end to the server
+                // for an answer instead of filing the guess.
+                may_open_untracked_transaction: true,
+                ..folded.transaction
+            },
+            ..folded
+        }
     }
 }
 
@@ -2160,7 +2514,32 @@ impl TransactionControlOutcome {
 }
 
 pub(crate) trait StatementSessionPostProcessor: Sync {
-    fn effects_for_sql(&self, sql: &str) -> StatementSessionEffects;
+    /// Which family this post-processor answers for. Asked by
+    /// [`Self::effects_for_sql`] so the split below is the executor's own.
+    fn db_type(&self) -> DatabaseType;
+
+    /// What ONE statement leaves on the session.
+    ///
+    /// Every rule inside reads the leading words of the statement it is given,
+    /// which is only true of a single statement — so a backend answers here and
+    /// the splitting is not its to remember.
+    fn effects_for_single_statement(&self, sql: &str) -> StatementSessionEffects;
+
+    /// What the executor UNIT the app is about to run leaves on the session.
+    ///
+    /// Deliberately NOT overridable by a backend, and the reason is the defect
+    /// it closes: a unit can hold several statements (a custom MySQL
+    /// `DELIMITER` makes `SELECT 1; INSERT …` one statement as far as the
+    /// executor is concerned, and the server runs both), every rule below
+    /// reads the LEADING statement, and the result was that such a unit was
+    /// filed as leaving nothing on the session at all. The split and the fold
+    /// live here, once, for all four backends — the same shape the read-only
+    /// guards took when the same trap was found in them.
+    fn effects_for_sql(&self, sql: &str) -> StatementSessionEffects {
+        StatementSessionEffects::for_unit(self.db_type(), sql, |statement| {
+            self.effects_for_single_statement(statement)
+        })
+    }
 
     fn may_need_preservation_after_statement(
         &self,
@@ -2890,12 +3269,28 @@ pub(crate) fn mysql_set_autocommit_value(sql: &str) -> Option<bool> {
     mysql_normalized_autocommit_bool(&value)
 }
 
+/// The auto-commit value this UNIT leaves the session with, if it sets one.
+///
+/// Asked of every statement in the unit, from the shared split
+/// ([`fold_over_unit_statements`]), and the LAST one that sets it wins. Reading
+/// only the leading statement let `SELECT 1; SET autocommit = 1` move the
+/// session while the tab's pin, the Tools menu and the status bar kept the old
+/// value — so the app went on offering Commit and Rollback for work the server
+/// had already committed.
 pub(crate) fn mysql_set_autocommit_value_for_db_type(
     db_type: DatabaseType,
     sql: &str,
 ) -> Option<bool> {
-    let effective_sql = mysql_effective_statement_sql_for_db_type(db_type, sql);
-    mysql_set_autocommit_value(&effective_sql)
+    fold_over_unit_statements(
+        db_type,
+        sql,
+        |statement| {
+            let effective_sql = mysql_effective_statement_sql_for_db_type(db_type, statement);
+            mysql_set_autocommit_value(&effective_sql)
+        },
+        later_unit_answer_wins,
+    )
+    .answer
 }
 
 fn mysql_normalized_autocommit_bool(value: &str) -> Option<bool> {
@@ -3151,6 +3546,16 @@ impl SessionTransactionModeChange {
         self.isolation.is_none() && self.access_mode.is_none()
     }
 
+    /// The change the session is left with after this one and then `next` — per
+    /// half, because the two halves are set independently and a later statement
+    /// says nothing about the half it does not mention.
+    fn then(self, next: Self) -> Self {
+        Self {
+            isolation: next.isolation.or(self.isolation),
+            access_mode: next.access_mode.or(self.access_mode),
+        }
+    }
+
     pub fn applied_to(self, mode: TransactionMode) -> TransactionMode {
         TransactionMode::new(
             self.isolation.unwrap_or(mode.isolation),
@@ -3165,7 +3570,32 @@ impl SessionTransactionModeChange {
 /// next transaction (`SET TRANSACTION ...`, unqualified `@@` assignments)
 /// return `None`; so do statements whose target value is not recognized —
 /// those still leave the conservative session-residue tracking in place.
+///
+/// Asked of every statement in the UNIT, from the one split every such question
+/// shares ([`fold_over_unit_statements`]). A unit can hold several statements,
+/// and reading only the leading one left the SESSION on a level the tab's pin
+/// and the toolbar did not show — the screen-equals-session guarantee broken by
+/// a leading `SELECT 1;`, with the mode-override residue never adopted away
+/// either. Both halves of the mode are merged separately, so
+/// `SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE; SET SESSION
+/// TRANSACTION READ ONLY` in one unit adopts as both.
 pub fn session_transaction_mode_change_for_statement(
+    db_type: DatabaseType,
+    sql: &str,
+) -> Option<SessionTransactionModeChange> {
+    fold_over_unit_statements(
+        db_type,
+        sql,
+        |statement| session_transaction_mode_change_for_single_statement(db_type, statement),
+        |earlier, later| match (earlier, later) {
+            (Some(earlier), Some(later)) => Some(earlier.then(later)),
+            (earlier, later) => later_unit_answer_wins(earlier, later),
+        },
+    )
+    .answer
+}
+
+fn session_transaction_mode_change_for_single_statement(
     db_type: DatabaseType,
     sql: &str,
 ) -> Option<SessionTransactionModeChange> {
@@ -4143,12 +4573,25 @@ fn mysql_statement_releases_flush_table_lock_for_analysis(
         || mysql_reset_connection_statement(analysis)
 }
 
+/// MySQL's `LOCK INSTANCE FOR BACKUP` and MariaDB's `BACKUP STAGE`, which are
+/// the same thing under two spellings: a server-wide lock that outlives the
+/// transaction and blocks other sessions' DDL until it is released. MariaDB's
+/// `BACKUP LOCK <table>` is its per-table twin.
 fn mysql_statement_acquires_backup_lock_for_analysis(analysis: &SqlStatementAnalysis<'_>) -> bool {
-    mysql_statement_starts_with_words(analysis, &["LOCK", "INSTANCE"])
+    if mysql_statement_starts_with_words(analysis, &["LOCK", "INSTANCE"]) {
+        return true;
+    }
+    if mysql_statement_starts_with_words(analysis, &["BACKUP", "LOCK"]) {
+        return true;
+    }
+    mysql_statement_starts_with_words(analysis, &["BACKUP", "STAGE"])
+        && !mysql_statement_releases_backup_lock_for_analysis(analysis)
 }
 
 fn mysql_statement_releases_backup_lock_for_analysis(analysis: &SqlStatementAnalysis<'_>) -> bool {
     mysql_statement_starts_with_words(analysis, &["UNLOCK", "INSTANCE"])
+        || mysql_statement_starts_with_words(analysis, &["BACKUP", "STAGE", "END"])
+        || mysql_statement_starts_with_words(analysis, &["BACKUP", "UNLOCK"])
         || mysql_reset_connection_statement(analysis)
 }
 
@@ -5126,7 +5569,11 @@ fn mysql_session_residue_effects_for_analysis(
 }
 
 impl StatementSessionPostProcessor for OracleStatementSessionPostProcessor {
-    fn effects_for_sql(&self, sql: &str) -> StatementSessionEffects {
+    fn db_type(&self) -> DatabaseType {
+        DatabaseType::Oracle
+    }
+
+    fn effects_for_single_statement(&self, sql: &str) -> StatementSessionEffects {
         let analysis = SqlStatementAnalysis::new_for_db_type(DatabaseType::Oracle, sql);
         let words = analysis.words();
         let transaction_control_outcome = oracle_transaction_control_outcome_for_words(words);
@@ -5153,7 +5600,11 @@ impl StatementSessionPostProcessor for OracleStatementSessionPostProcessor {
 }
 
 impl StatementSessionPostProcessor for MysqlStatementSessionPostProcessor {
-    fn effects_for_sql(&self, sql: &str) -> StatementSessionEffects {
+    fn db_type(&self) -> DatabaseType {
+        self.db_type
+    }
+
+    fn effects_for_single_statement(&self, sql: &str) -> StatementSessionEffects {
         let effective_sql = mysql_effective_statement_sql_for_db_type(self.db_type, sql);
         let analysis = SqlStatementAnalysis::new_for_db_type(self.db_type, &effective_sql);
         let state_hint =
@@ -5232,6 +5683,290 @@ impl StatementSessionPostProcessor for MysqlStatementSessionPostProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One executor unit can hold several statements, and what the LATER ones
+    /// leave on the session is not the leading statement's to hide.
+    ///
+    /// A custom MySQL `DELIMITER` makes `SELECT 1; INSERT …` one statement as
+    /// far as the executor is concerned and the server runs both. Every rule in
+    /// this file reads the leading words, so such a unit used to answer "this
+    /// left nothing on the session": the open transaction, a temporary table, a
+    /// prepared statement and a changed charset all went back to the pool
+    /// unrecorded, the tab was never offered the commit, and the next
+    /// statement's session preparation (`ROLLBACK` first) threw the work away.
+    #[test]
+    fn a_unit_of_several_statements_answers_for_every_statement_in_it() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let post_processor = statement_session_post_processor_for(db_type);
+
+            let hidden_dml = post_processor.effects_for_sql("SELECT 1; INSERT INTO t VALUES (1)");
+            assert!(
+                hidden_dml.may_leave_uncommitted_work(),
+                "{db_type}: the INSERT behind the read leaves work"
+            );
+            assert!(
+                !hidden_dml.may_open_untracked_transaction(),
+                "{db_type}: nothing in this unit ENDS anything, so the fold is exact and the \
+                 transaction is not a guess"
+            );
+            // A unit that also ends something is the one the merge cannot read,
+            // because the outcome depends on an order it does not see: that IS a
+            // guess, and it is what sends the batch end to the server for an
+            // answer instead of filing it.
+            assert!(
+                post_processor
+                    .effects_for_sql("SELECT 1; INSERT INTO t VALUES (1); COMMIT")
+                    .may_open_untracked_transaction(),
+                "{db_type}: a unit that commits inside itself cannot be read by a merge"
+            );
+            assert!(
+                !post_processor
+                    .effects_for_sql("SELECT 1; SELECT 2")
+                    .may_open_untracked_transaction(),
+                "{db_type}: and two reads are not a guess either — a script written under a \
+                 custom DELIMITER must not ask its tab to commit nothing"
+            );
+            // Nor is a unit that ends a transaction it never gave anything to
+            // hold: with no statement in it able to leave work, the order cannot
+            // matter, and claiming otherwise had the tab offer a commit for a
+            // transaction its own text had just ended.
+            for sql in ["SELECT 1; COMMIT", "SELECT 1; ROLLBACK"] {
+                let effects = post_processor.effects_for_sql(sql);
+                assert!(
+                    !effects.may_open_untracked_transaction()
+                        && !effects.may_leave_uncommitted_work(),
+                    "{db_type}: {sql} leaves nothing to be unsure about"
+                );
+            }
+            // A routine body is NOT split, even though it is full of semicolons:
+            // the executor's own splitter merges it back, so the app never reads
+            // a procedure's INSERT as one this session ran.
+            for sql in [
+                "CREATE PROCEDURE p() BEGIN INSERT INTO t VALUES (1); COMMIT; END",
+                "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.a = 1; END",
+                "CREATE FUNCTION f() RETURNS INT DETERMINISTIC BEGIN RETURN 1; END",
+            ] {
+                assert_eq!(
+                    post_processor.effects_for_sql(sql),
+                    post_processor.effects_for_single_statement(sql),
+                    "{db_type}: a routine body is one statement: {sql}"
+                );
+            }
+            assert!(
+                retained_session_state_after_statement(
+                    post_processor,
+                    RetainedSessionState::default(),
+                    hidden_dml,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+                .requires_physical_session_preservation(),
+                "{db_type}: so the session stays with its tab instead of going back to the pool"
+            );
+
+            for sql in [
+                "SELECT 1; CREATE TEMPORARY TABLE tt (a int)",
+                "SELECT 1; PREPARE s FROM 'SELECT 1'",
+                "SELECT 1; SET @x = 1",
+                "SELECT 1; SET NAMES utf8mb4",
+            ] {
+                assert!(
+                    post_processor
+                        .effects_for_sql(sql)
+                        .may_leave_session_residue()
+                        || post_processor
+                            .effects_for_sql(sql)
+                            .state_hint
+                            .may_leave_untracked_session_state,
+                    "{db_type}: residue behind a leading read is still residue: {sql}"
+                );
+            }
+            assert!(
+                post_processor
+                    .effects_for_sql("SELECT 1; LOCK TABLES t WRITE")
+                    .acquires_a_lock_other_sessions_wait_for(),
+                "{db_type}: a lock taken behind a leading read is still held"
+            );
+
+            // Nothing is INVENTED either: a unit of two reads is still two
+            // reads, or every script written under a custom delimiter would ask
+            // its tab for a commit decision it does not need.
+            let two_reads = post_processor.effects_for_sql("SELECT 1; SELECT 2");
+            assert!(
+                !two_reads.may_leave_uncommitted_work() && !two_reads.may_leave_session_residue(),
+                "{db_type}: two reads leave nothing"
+            );
+
+            // A single statement answers exactly as it always did: the fold is
+            // the identity over one element, which is what keeps every other
+            // rule in this file written against the shape it was written for.
+            for sql in [
+                "INSERT INTO t VALUES (1)",
+                "COMMIT",
+                "CREATE TEMPORARY TABLE tt (a int)",
+                "UNLOCK TABLES",
+                "RESET CONNECTION",
+                "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            ] {
+                assert_eq!(
+                    post_processor.effects_for_sql(sql),
+                    post_processor.effects_for_single_statement(sql),
+                    "{db_type}: one statement must answer unchanged: {sql}"
+                );
+            }
+
+            // And no SUBTRACTIVE claim is read out of a unit, because the order
+            // inside it is not readable from a merge: `INSERT; COMMIT` and
+            // `COMMIT; INSERT` leave different sessions and merge identically.
+            // A claim is lowered by an ANSWER — here, the batch-end probe.
+            let read_then_commit = post_processor.effects_for_sql("SELECT 1; COMMIT");
+            assert!(
+                !read_then_commit.clears_transaction_state()
+                    && !read_then_commit.has_implicit_commit(),
+                "{db_type}: a unit may not claim it ended the transaction"
+            );
+            assert!(
+                !post_processor
+                    .effects_for_sql("SELECT 1; UNLOCK TABLES")
+                    .releases_table_lock(),
+                "{db_type}: nor that it released a lock"
+            );
+            assert!(
+                !post_processor
+                    .effects_for_sql("SELECT 1; RESET CONNECTION")
+                    .releases_physical_session(),
+                "{db_type}: nor that the session went back to birth state"
+            );
+        }
+
+        // Oracle's splitter ends a statement at `;` or `/`, so its units hold
+        // one statement each and its answers are unchanged. A PL/SQL block is
+        // ONE statement to that splitter even though it is full of semicolons,
+        // and it must not be folded into its own inner statements.
+        let oracle = statement_session_post_processor_for(DatabaseType::Oracle);
+        for sql in [
+            "UPDATE t SET c = 1",
+            "COMMIT",
+            "BEGIN UPDATE t SET c = 1; COMMIT; END;",
+            "SET TRANSACTION READ ONLY",
+            // A REPEATED statement is not a second statement: Oracle's splitter
+            // replays the previous one for a standalone `/` by pushing the same
+            // text again. Counting that made `COMMIT` followed by `/` a unit
+            // whose order could not be read, and the fold then refused to carry
+            // its own COMMIT.
+            "COMMIT;\n/",
+            "UPDATE t SET c = 1;\n/",
+        ] {
+            assert_eq!(
+                oracle.effects_for_sql(sql),
+                oracle.effects_for_single_statement(sql),
+                "Oracle: {sql}"
+            );
+        }
+    }
+
+    /// A session change hiding behind a leading read in one unit is still the
+    /// session's state, so the tab has to adopt it.
+    ///
+    /// The two adoption readers answered about the leading statement, so
+    /// `SELECT 1; SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE` moved the
+    /// SESSION while the tab's pin, the toolbar and the Tools menu kept the old
+    /// value — the screen-equals-session guarantee broken by a leading
+    /// `SELECT 1;`, with the mode-override residue never adopted away either, and
+    /// the auto-commit twin leaving the app to offer Commit and Rollback for work
+    /// the server had already committed.
+    #[test]
+    fn a_session_change_behind_a_leading_read_is_still_adopted() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(
+                session_transaction_mode_change_for_statement(
+                    db_type,
+                    "SELECT 1; SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+                ),
+                Some(SessionTransactionModeChange {
+                    isolation: Some(TransactionIsolation::Serializable),
+                    access_mode: None,
+                }),
+                "{db_type}: the session really is SERIALIZABLE afterwards"
+            );
+            // Both halves are merged, because a later statement says nothing
+            // about the half it does not mention.
+            assert_eq!(
+                session_transaction_mode_change_for_statement(
+                    db_type,
+                    "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE; \
+                     SET SESSION TRANSACTION READ ONLY"
+                ),
+                Some(SessionTransactionModeChange {
+                    isolation: Some(TransactionIsolation::Serializable),
+                    access_mode: Some(TransactionAccessMode::ReadOnly),
+                }),
+                "{db_type}"
+            );
+            // And the LAST statement that sets a value is the one the session
+            // was left with.
+            assert_eq!(
+                session_transaction_mode_change_for_statement(
+                    db_type,
+                    "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE; \
+                     SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
+                ),
+                Some(SessionTransactionModeChange {
+                    isolation: Some(TransactionIsolation::ReadCommitted),
+                    access_mode: None,
+                }),
+                "{db_type}"
+            );
+            assert_eq!(
+                mysql_set_autocommit_value_for_db_type(db_type, "SELECT 1; SET autocommit = 1"),
+                Some(true),
+                "{db_type}: the session really commits per statement afterwards"
+            );
+            // The LAST statement that sets it is the one the session was left
+            // with. (A unit that STARTS with `SET AUTOCOMMIT` is this client's
+            // own SQL*Plus-style command and never reaches the server as SQL,
+            // which is why the read below leads with a query.)
+            assert_eq!(
+                mysql_set_autocommit_value_for_db_type(
+                    db_type,
+                    "SELECT 1; SET autocommit = 1; SET autocommit = 0"
+                ),
+                Some(false),
+                "{db_type}: the last one wins"
+            );
+            // A unit that changes nothing about the session still says so.
+            assert_eq!(
+                session_transaction_mode_change_for_statement(db_type, "SELECT 1; SELECT 2"),
+                None,
+                "{db_type}"
+            );
+            assert_eq!(
+                mysql_set_autocommit_value_for_db_type(db_type, "SELECT 1; SELECT 2"),
+                None,
+                "{db_type}"
+            );
+        }
+
+        // Oracle answers unchanged: its splitter ends a statement at `;` or `/`,
+        // so a unit holds one statement, and a PL/SQL block is one statement even
+        // though it is full of semicolons.
+        assert_eq!(
+            session_transaction_mode_change_for_statement(
+                DatabaseType::Oracle,
+                "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE"
+            ),
+            Some(SessionTransactionModeChange {
+                isolation: Some(TransactionIsolation::Serializable),
+                access_mode: None,
+            })
+        );
+        assert_eq!(
+            session_transaction_mode_change_for_statement(DatabaseType::Oracle, "BEGIN NULL; END;"),
+            None
+        );
+    }
 
     #[test]
     fn lock_wait_timeout_requires_decision_only_for_dirty_transaction_candidates() {

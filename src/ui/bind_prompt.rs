@@ -373,6 +373,41 @@ pub fn prepare(sql: &str, db_type: DatabaseType, params: &[BindParam]) -> Prepar
     }
 }
 
+/// The refusal for an answer the app would otherwise put into the statement as
+/// SQL text.
+///
+/// Only the MySQL family substitutes answers INTO the text (Oracle passes them
+/// as real binds), and only a Number answer is emitted unquoted there. A value
+/// that is not a number therefore has two bad ends and no good one: emitted as
+/// written it carries whatever it says into the statement, and quoted it silently
+/// becomes a string comparison — `WHERE id = 'abc'` matches the rows where `id`
+/// is 0 on a server that coerces. The value came from a person, so the honest
+/// answer is to say which placeholder is wrong and not run.
+///
+/// [`crate::ui::grid_sql_export::sql_literal_for_value`] still quotes an
+/// unprovable number, because its other callers (a CSV import, the grid's SQL
+/// export) have no person to ask.
+pub fn non_numeric_answer_message(db_type: DatabaseType, params: &[BindParam]) -> Option<String> {
+    if !db_type.is_mysql_or_mariadb() {
+        return None;
+    }
+    params.iter().find_map(|param| {
+        if param.param_type != BindParamType::Number {
+            return None;
+        }
+        let value = param.effective_value()?;
+        if crate::ui::grid_sql_export::is_plain_numeric_literal(value.trim()) {
+            return None;
+        }
+        Some(format!(
+            "{} was answered with {:?}, which is not a number. \
+             Enter a numeric value, or change its type to Text to compare it as one.",
+            param.label,
+            value.trim()
+        ))
+    })
+}
+
 fn literal_for(param: &BindParam) -> String {
     let Some(value) = param.effective_value() else {
         return "NULL".to_string();

@@ -5520,9 +5520,13 @@ impl ResultTableWidget {
         if trimmed.is_empty() {
             return "\"\"".to_string();
         }
-        if trimmed.starts_with('"') && trimmed.ends_with('"') {
-            return trimmed.to_string();
-        }
+        // The branch that used to stand here asked "does it start and end with a
+        // double quote" and handed such text back untouched — a different
+        // question from the one below, which checks the quoted identifier is well
+        // formed. `"A"; DROP TABLE X --"` answers yes to the first and is two
+        // statements. The well-formed case is handled identically by the branch
+        // below (strip, then re-quote with doubling), so removing it loses
+        // nothing.
         if crate::sql_text::is_quoted_identifier(trimmed) {
             let unquoted = crate::sql_text::strip_identifier_quotes(trimmed);
             return format!("\"{}\"", unquoted.replace('"', "\"\""));
@@ -10895,15 +10899,33 @@ impl ResultTableWidget {
     /// as success. Qualifying the name instead would change how it resolves --
     /// a public synonym stops resolving once a schema is put in front of it --
     /// so the save says no rather than writing somewhere else.
+    /// "No scope" is a VALUE here, not a missing answer: it means the session
+    /// resolves unqualified names in the login schema (Oracle) or the
+    /// connection's own database (MySQL family). The one door that installs a
+    /// result's rows records the tab's scope as it does so
+    /// ([`ResultTabsWidget::start_streaming_by_id`]), so `None` is never
+    /// "unknown" — and reading it as "nothing to disagree with" is what let a
+    /// staged INSERT be saved into another schema after the tab moved INTO or
+    /// OUT OF a scope. Only agreement is agreement.
+    ///
+    /// The connection, generation, pool epoch, database type and a scope picked
+    /// in the object browser are answered before this by the result's own
+    /// ORIGIN (`ExecutionOrigin`, compared in
+    /// `MainWindow::result_origin_is_current_for_tab`). What reaches here is the
+    /// scope change the origin cannot refuse: a statement of the user's own
+    /// script (`ALTER SESSION SET CURRENT_SCHEMA`, `USE`) moved the session, and
+    /// the notice that follows it re-stamps the result's origin because the rest
+    /// of that batch really does run there.
     fn rowid_edit_scope_moved(source_scope: Option<&str>, current_tab_scope: Option<&str>) -> bool {
         match (
             Self::normalized_scope(source_scope),
             Self::normalized_scope(current_tab_scope),
         ) {
-            // Nothing recorded: this result predates the scope being tracked,
-            // or the tab never had one. Nothing to disagree with.
-            (None, _) | (_, None) => false,
+            (None, None) => false,
             (Some(source), Some(current)) => !source.eq_ignore_ascii_case(&current),
+            // One side names a scope and the other does not, so the rows were
+            // read somewhere the tab no longer is.
+            (None, Some(_)) | (Some(_), None) => true,
         }
     }
 
@@ -11504,12 +11526,23 @@ mod row_edit_sql_tests {
             Some("schema_a"),
             Some("SCHEMA_A")
         ));
-        // Nothing recorded on one side or the other: the tab follows the
-        // connection's own default, which the execution path asserts for every
-        // statement anyway.
-        assert!(!ResultTableWidget::rowid_edit_scope_moved(None, Some("HR")));
-        assert!(!ResultTableWidget::rowid_edit_scope_moved(Some("HR"), None));
-        assert!(!ResultTableWidget::rowid_edit_scope_moved(
+        // Same tab, no scope on either side: it follows the connection's own
+        // default, and it has not moved.
+        assert!(!ResultTableWidget::rowid_edit_scope_moved(None, None));
+        // CHANGED, with its reason. These three used to be "not a move",
+        // because no scope on one side was read as no answer on that side. It is
+        // an ANSWER: the tab resolves unqualified names in the login schema (or
+        // the connection's own database), which is a DIFFERENT schema from the
+        // one the other side names. The rows were read in one and the save would
+        // be written in the other — the very failure the first assertion above
+        // exists for, in the direction that was let through. The old reasoning
+        // ("the execution path asserts the tab's scope for every statement
+        // anyway") is what makes it a defect rather than what saves it: that
+        // assertion is exactly how the unqualified name comes to resolve
+        // somewhere else.
+        assert!(ResultTableWidget::rowid_edit_scope_moved(None, Some("HR")));
+        assert!(ResultTableWidget::rowid_edit_scope_moved(Some("HR"), None));
+        assert!(ResultTableWidget::rowid_edit_scope_moved(
             Some("  "),
             Some("HR")
         ));

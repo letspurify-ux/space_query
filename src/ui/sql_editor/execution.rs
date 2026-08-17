@@ -614,6 +614,51 @@ struct OracleThinSelectStreamOutcome {
     timed_out: bool,
 }
 
+/// The tab a MySQL-family batch runs for, as far as the session changes a
+/// SUCCESSFUL statement makes are concerned: the slots those changes are
+/// mirrored into, and the channel that tells the screen about them.
+///
+/// Bundled so that recording them is ONE call from every branch that runs a
+/// statement. Spelled out at a call site, they were spelled out in one branch of
+/// three.
+struct MySqlTabSessionSlots<'a> {
+    sender: &'a QueryProgressSender,
+    /// The mode the rest of THIS batch runs under, which an adopted
+    /// session-scoped statement moves.
+    active_transaction_mode: &'a std::cell::Cell<crate::db::TransactionMode>,
+    tab_transaction_mode_override: &'a Arc<Mutex<Option<crate::db::TransactionMode>>>,
+    tab_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
+    current_operation_autocommit: Option<&'a Arc<Mutex<bool>>>,
+}
+
+/// Who files what a successful statement left on the session.
+///
+/// The batch's own ledger, except when a lazy fetch takes the session over with
+/// the statement's effects in hand: it files them when it ends, and adding them
+/// to the batch's ledger as well would file the same work twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MySqlSessionLedgerOwner {
+    Batch,
+    LazyFetchThatTookTheSession,
+}
+
+/// A scope change a successful statement made, on its way to the one step that
+/// records it where the batch reads its scope AND reports it to the window.
+///
+/// `#[must_use]`, and that is the point: the branch that runs a statement is the
+/// branch that has to report the move, and the two branches that never did are
+/// the reason this is a value instead of a side effect.
+#[must_use = "a scope change that is not reported leaves the rest of the script asserting the scope the session has left"]
+struct MySqlBatchScopeChange(Option<(String, Option<String>)>);
+
+impl MySqlBatchScopeChange {
+    fn report(self, record_scope: impl FnOnce(&str), sender: &QueryProgressSender) {
+        if let Some((message, selected_scope)) = self.0 {
+            SqlEditorWidget::note_batch_scope_change(record_scope, sender, message, selected_scope);
+        }
+    }
+}
+
 struct MySqlSelectStreamOutcome {
     raw_column_names: Vec<String>,
     last_select_row: Option<Vec<String>>,
@@ -1588,6 +1633,18 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                     && break_column.is_none()
                     && compute_config.is_none()
                     && SqlEditorWidget::oracle_select_can_use_lazy_fetch(statement_effects)
+                    // This is the one Oracle path that runs a statement
+                    // WITHOUT the batch loop, so it is the one place the tab's
+                    // mode would otherwise never be asked. A refusal does not
+                    // need an error branch of its own: falling through hands
+                    // the statement to the batch, which asks the same question
+                    // and reports the one answer.
+                    && SqlEditorWidget::transaction_mode_refusal_for_statement(
+                        crate::db::DatabaseType::Oracle,
+                        selected_transaction_mode,
+                        &sql_to_execute,
+                    )
+                    .is_none()
                 {
                     if let Ok(resolved_binds) =
                         SqlEditorWidget::oracle_thin_resolve_binds(&sql_to_execute, &session)
@@ -8111,6 +8168,10 @@ impl SqlEditorWidget {
         let statement_effects =
             Self::mysql_statement_session_effects_for_sql_for_db_type(db_type, marker_sql);
         let scope_report = SessionScopeReport::default();
+        // How the save bracketed itself, which is also what its message may
+        // claim: a save nested in the user's own transaction is saved and NOT
+        // committed, whatever the tab's auto-commit says.
+        let save_scope = std::cell::Cell::new(None);
         let execution = Self::run_mysql_pooled_action_with_timeout(
             shared_connection,
             pooled_db_session,
@@ -8131,8 +8192,14 @@ impl SqlEditorWidget {
             None,
             marker_sql,
             statement_effects,
-            |conn| {
-                crate::db::execute_mysql_result_edit(conn, request, auto_commit, || {
+            |conn, prior_retained_state| {
+                // Not the tab's auto-commit flag: a save that opens a
+                // transaction of its own would implicitly COMMIT an explicit
+                // transaction the user already had open on this session.
+                let scope =
+                    crate::db::app_operation_transaction_scope(auto_commit, prior_retained_state);
+                save_scope.set(Some(scope));
+                crate::db::execute_mysql_result_edit(conn, request, scope, || {
                     load_mutex_bool(cancel_flag)
                         || !Self::operation_snapshot_is_current(current_operation_id, operation_id)
                 })
@@ -8145,7 +8212,13 @@ impl SqlEditorWidget {
                     &base,
                     db_type,
                     Some(result_messages::TransactionFeedbackStatement::Dml),
-                    auto_commit,
+                    // What the save really did, not what the tab's flag would
+                    // have implied: nested in the user's open transaction it
+                    // committed nothing, and saying otherwise would tell them
+                    // the rows are safe when a rollback still takes them back.
+                    save_scope
+                        .get()
+                        .is_some_and(crate::db::AppOperationTransactionScope::commits_its_own_work),
                 );
                 (message, true, false, None)
             }
@@ -8257,6 +8330,15 @@ impl SqlEditorWidget {
             source_path: None,
         }];
 
+        // Everything a successful statement of this batch mirrors into its TAB,
+        // resolved once so every statement branch records it with one call.
+        let tab_session_slots = MySqlTabSessionSlots {
+            sender,
+            active_transaction_mode: &active_transaction_mode,
+            tab_transaction_mode_override,
+            tab_auto_commit_override,
+            current_operation_autocommit,
+        };
         let mut mysql_batch_effects = crate::db::MySqlBatchSessionEffects::for_db_type(db_type);
         // The tab's database is asserted per statement here (the session is
         // re-acquired per statement too), so this latch is what keeps one
@@ -8283,10 +8365,10 @@ impl SqlEditorWidget {
             MySqlBatchStatementSuccess,
             MySqlBatchStatementError,
         > {
+            // A `USE` anywhere in the unit moved the session, so the encoding
+            // has to be read again — not only a unit that STARTS with one.
             let refresh_encoding_after =
-                crate::db::query::mysql_executor::MysqlExecutor::is_use_statement_for_db_type(
-                    db_type, sql,
-                );
+                SqlEditorWidget::mysql_unit_moves_session_database(db_type, sql).is_some();
             let statement_effects =
                 SqlEditorWidget::mysql_statement_session_effects_for_sql_for_db_type(db_type, sql);
             if let Err(message) =
@@ -8301,24 +8383,14 @@ impl SqlEditorWidget {
                     statement_reached_server: false,
                 });
             }
-            // The MySQL family's tab-mode gate, in the position both Oracle
-            // loops keep theirs. It used to ask only one of the two questions
-            // the tab's mode answers — the explicit READ WRITE escape — spelled
-            // out here rather than asked, so the OTHER one never reached the
-            // family's execution path at all: nothing on it called the shared
-            // answer, and a READ ONLY tab could still run `SET GLOBAL`, `FLUSH`
-            // or `KILL`, which no server refuses for a read-only transaction.
-            if let Some(message) = SqlEditorWidget::transaction_mode_refusal_for_statement(
-                db_type,
-                active_transaction_mode.get(),
-                sql,
-            ) {
-                return Err(MySqlBatchStatementError {
-                    message,
-                    effects: statement_effects,
-                    statement_reached_server: false,
-                });
-            }
+            // The tab-mode gate is NOT here. It lives where the session is
+            // handed to a statement (`acquire_mysql_pooled_session`), because
+            // this closure is only one of the family's execution paths and the
+            // dispatch that picks between them reads the leading keyword — so a
+            // unit that starts with a SELECT went to the streaming path and was
+            // never asked. `run_mysql_pooled_action_with_timeout` below reaches
+            // that acquisition, and the refusal comes back as this statement's
+            // error, exactly as it did from here.
             let sql_to_execute = crate::db::query::mysql_executor::MysqlExecutor::statement_sql_preserving_found_rows_for_db_type(
                 db_type,
                 sql,
@@ -8347,7 +8419,7 @@ impl SqlEditorWidget {
                 None,
                 sql,
                 statement_effects,
-                |mysql_conn| {
+                |mysql_conn, _| {
                     statement_reached_server.set(true);
                     mysql_batch_executed_sql_statement.set(true);
                     crate::db::query::mysql_executor::MysqlExecutor::execute_for_db_type_with_cancel(
@@ -8425,7 +8497,7 @@ impl SqlEditorWidget {
                     None,
                     sql,
                     statement_effects,
-                    |mysql_conn| {
+                    |mysql_conn, _| {
                         statement_reached_server.set(true);
                         mysql_batch_executed_sql_statement.set(true);
                         SqlEditorWidget::execute_mysql_batch_select_streaming(
@@ -9417,6 +9489,10 @@ impl SqlEditorWidget {
                             db_activity,
                             auto_commit,
                             active_transaction_mode.get(),
+                            // A lazily streamed SELECT is still a statement of
+                            // this tab, and it asks the tab's mode through the
+                            // same acquisition every other statement does.
+                            &sql_text,
                             Some(sender),
                             false,
                             None,
@@ -9511,6 +9587,32 @@ impl SqlEditorWidget {
                                     };
                                 let session_id = next_lazy_fetch_session_id
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // A lazily streamed SELECT is a statement of
+                                // this tab too, and the unit it came in can hold
+                                // more than the SELECT the dispatch read: the
+                                // same one step records what it changed. Its
+                                // effects travel with the session to the lazy
+                                // fetch, which files them when it ends, so the
+                                // batch's ledger is not the owner here.
+                                SqlEditorWidget::record_successful_mysql_batch_statement(
+                                    db_type,
+                                    sql_text.as_str(),
+                                    &[],
+                                    statement_effects,
+                                    MySqlSessionLedgerOwner::LazyFetchThatTookTheSession,
+                                    &mut auto_commit,
+                                    &tab_session_slots,
+                                    &mut mysql_batch_effects,
+                                    || {
+                                        Self::connection_info_snapshot_for_ui(
+                                            shared_connection,
+                                            db_activity,
+                                        )
+                                        .map(|info| info.service_name.trim().to_string())
+                                        .filter(|database| !database.is_empty())
+                                    },
+                                )
+                                .report(|scope| store_batch_scope(&execution_scope, scope), sender);
                                 SqlEditorWidget::emit_statement_start(
                                     sender,
                                     result_index,
@@ -9625,12 +9727,6 @@ impl SqlEditorWidget {
                             !result_statement_start_emitted,
                         ) {
                             Ok(outcome) => {
-                                SqlEditorWidget::apply_successful_mysql_batch_statement_effects(
-                                    sql_text.as_str(),
-                                    auto_commit,
-                                    statement_effects,
-                                    &mut mysql_batch_effects,
-                                );
                                 let stop_after_success =
                                     SqlEditorWidget::mysql_batch_success_requires_stop(
                                         statement_effects,
@@ -9641,11 +9737,39 @@ impl SqlEditorWidget {
                                     mut result,
                                     was_cancelled,
                                 } = outcome;
+                                let executed_auto_commit = auto_commit;
+                                // A streamed SELECT is a statement of this tab
+                                // like any other, and the unit it came in can
+                                // hold more than a SELECT: this is the one step
+                                // that records what it changed.
+                                let scope_change =
+                                    SqlEditorWidget::record_successful_mysql_batch_statement(
+                                        db_type,
+                                        sql_text.as_str(),
+                                        std::slice::from_ref(&result),
+                                        statement_effects,
+                                        MySqlSessionLedgerOwner::Batch,
+                                        &mut auto_commit,
+                                        &tab_session_slots,
+                                        &mut mysql_batch_effects,
+                                        || {
+                                            Self::connection_info_snapshot_for_ui(
+                                                shared_connection,
+                                                db_activity,
+                                            )
+                                            .map(|info| info.service_name.trim().to_string())
+                                            .filter(|database| !database.is_empty())
+                                        },
+                                    );
+                                scope_change.report(
+                                    |scope| store_batch_scope(&execution_scope, scope),
+                                    sender,
+                                );
                                 SqlEditorWidget::apply_mysql_transaction_feedback_for_db_type(
                                     db_type,
                                     &mut result,
                                     &sql_text,
-                                    auto_commit,
+                                    executed_auto_commit,
                                 );
                                 if !result.message.trim().is_empty() {
                                     SqlEditorWidget::append_spool_output(
@@ -9756,73 +9880,36 @@ impl SqlEditorWidget {
                     }
                     match execute_mysql_sql(sql_text.as_str(), auto_commit, &mysql_batch_effects) {
                         Ok(success) => {
-                            SqlEditorWidget::apply_successful_mysql_batch_statement_effects(
-                                sql_text.as_str(),
-                                auto_commit,
-                                success.effects,
-                                &mut mysql_batch_effects,
-                            );
-                            let mut adopted_transaction_mode = active_transaction_mode.get();
-                            if SqlEditorWidget::adopt_session_transaction_mode_change_after_statement(
-                                db_type,
-                                &sql_text,
-                                &mut adopted_transaction_mode,
-                                Some(tab_transaction_mode_override),
-                                sender,
-                            ) {
-                                mysql_batch_effects.adopt_session_transaction_mode_override();
-                            }
-                            active_transaction_mode.set(adopted_transaction_mode);
                             let stop_after_success =
                                 SqlEditorWidget::mysql_batch_success_requires_stop(success.effects);
                             let results = success.results;
-                            let autocommit_change =
-                                SqlEditorWidget::mysql_autocommit_change_after_successful_statement_for_db_type(
-                                    db_type, &sql_text, &results,
-                                );
-                            let current_database_notice =
-                                if crate::db::query::mysql_executor::MysqlExecutor::is_use_statement_for_db_type(
+                            // Everything this statement changed for its tab, in
+                            // the one step every branch that runs a statement
+                            // takes.
+                            // The value this statement RAN under, which is
+                            // what its own feedback describes: a `SET
+                            // autocommit` adopted below governs the statements
+                            // AFTER it.
+                            let executed_auto_commit = auto_commit;
+                            let scope_change =
+                                SqlEditorWidget::record_successful_mysql_batch_statement(
                                     db_type,
-                                    &sql_text,
-                                ) {
-                                    let info = Self::connection_info_snapshot_for_ui(
-                                        shared_connection,
-                                        db_activity,
-                                    );
-                                    let current_database = info
-                                        .as_ref()
+                                    sql_text.as_str(),
+                                    &results,
+                                    success.effects,
+                                    MySqlSessionLedgerOwner::Batch,
+                                    &mut auto_commit,
+                                    &tab_session_slots,
+                                    &mut mysql_batch_effects,
+                                    || {
+                                        Self::connection_info_snapshot_for_ui(
+                                            shared_connection,
+                                            db_activity,
+                                        )
                                         .map(|info| info.service_name.trim().to_string())
-                                        .filter(|database| !database.is_empty());
-                                    results
-                                        .iter()
-                                        .find(|result| result.success && !result.is_select)
-                                        .map(|result| {
-                                            let parsed_database =
-                                                crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name_for_db_type(
-                                                    db_type,
-                                                    &result.sql,
-                                                )
-                                                    .or_else(|| crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name_for_db_type(
-                                                        db_type,
-                                                        &sql_text,
-                                                    ));
-                                            // The statement's own target, not
-                                            // the connection's database: a
-                                            // successful `USE` moved THIS
-                                            // tab's session there, and the
-                                            // connection's stored name is
-                                            // deliberately left alone.
-                                            let selected_scope =
-                                                parsed_database.or_else(|| current_database.clone());
-                                            let message = selected_scope
-                                                .as_deref()
-                                                .map(SqlEditorWidget::current_database_changed_message)
-                                                .unwrap_or_else(|| result.message.clone());
-                                            (message, selected_scope)
-                                        })
-                                } else {
-                                    None
-                                };
+                                        .filter(|database| !database.is_empty())
+                                    },
+                                );
                             if load_mutex_bool(cancel_flag) {
                                 stop_execution = true;
                             }
@@ -9832,7 +9919,7 @@ impl SqlEditorWidget {
                                     db_type,
                                     &mut result,
                                     &sql_text,
-                                    auto_commit,
+                                    executed_auto_commit,
                                 );
 
                                 if result.is_select {
@@ -9885,27 +9972,8 @@ impl SqlEditorWidget {
                                     break;
                                 }
                             }
-                            if let Some(enabled) = autocommit_change {
-                                #[rustfmt::skip]
-                                store_mutex_bool_option(tab_auto_commit_override, Some(enabled));
-                                auto_commit = enabled;
-                                if let Some(operation_autocommit) = current_operation_autocommit {
-                                    SqlEditorWidget::update_current_operation_autocommit(
-                                        operation_autocommit,
-                                        enabled,
-                                    );
-                                }
-                                let _ = sender.send(QueryProgress::AutoCommitChanged { enabled });
-                                app::awake();
-                            }
-                            if let Some((message, selected_scope)) = current_database_notice {
-                                SqlEditorWidget::note_batch_scope_change(
-                                    |scope| store_batch_scope(&execution_scope, scope),
-                                    sender,
-                                    message,
-                                    selected_scope,
-                                );
-                            }
+                            scope_change
+                                .report(|scope| store_batch_scope(&execution_scope, scope), sender);
                             if stop_after_success {
                                 SqlEditorWidget::emit_script_message(
                                     sender,
@@ -10537,6 +10605,16 @@ impl SqlEditorWidget {
             }
         }
 
+        // Asked after the answers are remembered, so the next prompt replays the
+        // value the user has to correct.
+        if let Some(message) =
+            crate::ui::bind_prompt::non_numeric_answer_message(db_type, &answered)
+        {
+            Self::show_alert_dialog(&message);
+            self.emit_status(&message);
+            return None;
+        }
+
         let prepared = crate::ui::bind_prompt::prepare(sql, db_type, &answered);
         if !prepared.session_binds.is_empty() {
             let mut guard = session
@@ -10607,6 +10685,7 @@ impl SqlEditorWidget {
             self.emit_status(&message);
             return false;
         }
+        let sql_before_binds = sql;
 
         // All editor execution entry points funnel through this SQL-aware
         // preflight after statement/selection extraction. Keeping the check
@@ -10628,6 +10707,23 @@ impl SqlEditorWidget {
             None => return false,
         };
         let sql = bind_prompted_sql.as_str();
+
+        // The read-only guard, asked a SECOND time — of the text that will
+        // actually run. On the MySQL family the answers are substituted INTO the
+        // text, so what the first ask above judged is not necessarily what
+        // reaches the server; the ask above is what keeps a refusal from costing
+        // the user a filled-in dialog first, and this one is what makes the
+        // answer about the statement. `sql_literal_for_value` already refuses to
+        // emit a value it cannot prove is a number without quotes, so the two
+        // asks agree for every ordinary answer — but a guard that judges one text
+        // and lets another run is the shape this app keeps finding bugs in.
+        if bind_prompted_sql != sql_before_binds {
+            if let Some(message) = self.read_only_refusal(sql, initial_mysql_delimiter.as_deref()) {
+                Self::show_alert_dialog(&message);
+                self.emit_status(&message);
+                return false;
+            }
+        }
 
         if let Some(session_id) = self.active_lazy_fetch_session() {
             if Self::internal_result_edit_request_id(sql).is_some() {
@@ -12963,11 +13059,85 @@ impl SqlEditorWidget {
                                                     Self::next_batch_statement_requires_transaction_first(
                                                         &frames,
                                                     );
+                                                // ONE value for the statements
+                                                // this injection runs and for
+                                                // the effects re-recorded after
+                                                // the fresh session is filed
+                                                // clean, so the two cannot
+                                                // describe different
+                                                // statements. It also names the
+                                                // NEW connection's default,
+                                                // which is what a tab that
+                                                // selected `Default` isolation
+                                                // asks to be put back to.
+                                                let post_connect_transaction_mode =
+                                                    OracleTransactionModeApplication {
+                                                        mode: next_active_transaction_mode,
+                                                        tab_selected:
+                                                            load_mutex_transaction_mode_option(
+                                                                &tab_transaction_mode_override,
+                                                            ),
+                                                        default_isolation:
+                                                            next_default_transaction_isolation,
+                                                    };
+                                                // The server's ANSWER, kept
+                                                // rather than reduced to a
+                                                // flag: what the tracker is
+                                                // told below is a claim about
+                                                // the server, so the reply it
+                                                // rests on has to still be
+                                                // readable where the claim is
+                                                // made.
+                                                let mut post_connect_mode_applied = None;
                                                 if !next_statement_opens_its_own_transaction {
-                                                    if let Err(err) = crate::db::DatabaseConnection::apply_oracle_transaction_mode(
-                                                        prepared_conn.as_ref(),
-                                                        next_active_transaction_mode,
-                                                    ) {
+                                                    // The fourth Oracle site that
+                                                    // states the tab's mode, and it
+                                                    // used to be the one that did
+                                                    // not go through the function
+                                                    // owning that shape: it read
+                                                    // ORA-01453 as a hard failure
+                                                    // and tore down a connection it
+                                                    // had just authenticated.
+                                                    let applied =
+                                                        SqlEditorWidget::apply_oracle_transaction_mode_statements_with(
+                                                            post_connect_transaction_mode,
+                                                            // Nothing is recorded from
+                                                            // here: the clear below
+                                                            // drops what the batch
+                                                            // claimed about the session
+                                                            // this CONNECT replaces, and
+                                                            // the effects are re-recorded
+                                                            // after it. A failure tears
+                                                            // the candidate down, so
+                                                            // there is no session left
+                                                            // to be wrong about.
+                                                            |_| {},
+                                                            |tx_sql| {
+                                                                prepared_conn
+                                                                    .execute(tx_sql, &[])
+                                                                    .map(|_| ())
+                                                                    .map_err(|err| err.to_string())
+                                                            },
+                                                        );
+                                                    let failure = match applied {
+                                                        // Both are the server's answer
+                                                        // about this session, so both
+                                                        // reach the tracker below: the
+                                                        // mode applied, or ORA-01453
+                                                        // says a transaction was
+                                                        // already open and the pin
+                                                        // belongs to the next one.
+                                                        Ok(answer @ (OracleTransactionModeApplied::Yes
+                                                        | OracleTransactionModeApplied::TransactionStillOpen)) => {
+                                                            post_connect_mode_applied = Some(answer);
+                                                            None
+                                                        }
+                                                        Ok(OracleTransactionModeApplied::Failed(
+                                                            message,
+                                                        )) => Some(message),
+                                                        Err(message) => Some(message),
+                                                    };
+                                                    if let Some(err) = failure {
                                                         if let Some(mut guard) =
                                                             crate::db::try_lock_connection(
                                                                 &candidate_connection,
@@ -13108,15 +13278,23 @@ impl SqlEditorWidget {
                                                 // this branch drops.
                                                 oracle_transaction_boundary
                                                     .note_new_session();
-                                                if !next_statement_opens_its_own_transaction {
+                                                if matches!(
+                                                    post_connect_mode_applied,
+                                                    Some(
+                                                        OracleTransactionModeApplied::Yes
+                                                            | OracleTransactionModeApplied::TransactionStillOpen
+                                                    )
+                                                ) {
+                                                    // No Oracle probe can see the
+                                                    // transaction the pin just
+                                                    // opened on the NEW session.
+                                                    oracle_transaction_boundary
+                                                        .note_transaction_mode_stated(
+                                                            post_connect_transaction_mode.mode,
+                                                        );
                                                     Self::record_applied_oracle_transaction_mode_effects(
                                                         &mut cleanup,
-                                                        OracleTransactionModeApplication {
-                                                            mode: active_transaction_mode,
-                                                            tab_selected: None,
-                                                            default_isolation:
-                                                                crate::db::TransactionIsolation::Default,
-                                                        },
+                                                        post_connect_transaction_mode,
                                                     );
                                                 }
                                                 shared_connection = candidate_connection;
@@ -13348,105 +13526,34 @@ impl SqlEditorWidget {
                                         );
                                     }
                                 }
-                                // MySQL USE command — switch database and refresh metadata
-                                ToolCommand::Use { ref database } => {
-                                    let use_result = {
-                                        let mut cg = lock_connection_with_activity(
-                                            &shared_connection,
-                                            db_activity.clone(),
-                                        );
-                                        let db_type = cg.db_type();
-                                        let execute_result = if let Some(mysql_conn) =
-                                            cg.get_mysql_connection_mut()
-                                        {
-                                            let use_sql = SqlEditorWidget::format_tool_command(
-                                                &ToolCommand::Use {
-                                                    database: database.clone(),
-                                                },
-                                            );
-                                            crate::db::query::mysql_executor::MysqlExecutor::execute_for_db_type(
-                                                mysql_conn, &use_sql, db_type,
-                                            )
-                                            .map(|_| ())
-                                            .map_err(|err| format!("Error: {err}"))
-                                        } else {
-                                            Err("Error: USE command is only supported for MySQL/MariaDB connections".to_string())
-                                        };
-
-                                        match execute_result {
-                                            Ok(()) => match cg.sync_mysql_current_database_name() {
-                                                Ok(_) => {
-                                                    crate::db::refresh_pool_session_context_cache_for_shared_connection(
-                                                        &shared_connection,
-                                                        &cg,
-                                                    );
-                                                    Ok(SqlEditorWidget::connection_info_for_ui(
-                                                        cg.get_info(),
-                                                    ))
-                                                }
-                                                Err(err) => Err(format!(
-                                                    "Error: Current database changed in this session, but the global database selection could not be synchronized: {err}"
-                                                )),
-                                            },
-                                            Err(err) => Err(err),
-                                        }
-                                    };
-                                    match use_result {
-                                        Ok(info) => {
-                                            let current_database = info.service_name.trim();
-                                            let current_database = if current_database.is_empty() {
-                                                database.trim()
-                                            } else {
-                                                current_database
-                                            };
-                                            let notice =
-                                                SqlEditorWidget::current_database_changed_message(
-                                                    current_database,
-                                                );
-                                            SqlEditorWidget::emit_script_output(
-                                                &sender,
-                                                &session,
-                                                SqlEditorWidget::message_lines(&notice),
-                                            );
-                                            SqlEditorWidget::note_batch_scope_change(
-                                                |scope| {
-                                                    // The batch that moved the
-                                                    // session is the one that
-                                                    // says where it now is —
-                                                    // the cell its own loop
-                                                    // reads AND the tab's
-                                                    // binding, which is what
-                                                    // the card and every later
-                                                    // acquisition read. The
-                                                    // thin loop has always done
-                                                    // both; leaving the binding
-                                                    // to the UI thread meant the
-                                                    // tab learned late, or (if
-                                                    // the notice was dropped)
-                                                    // not at all.
-                                                    SqlEditorWidget::record_batch_scope_on_tab_binding(
-                                                        &connection_binding_for_worker,
-                                                        binding_revision,
-                                                        &crate::db::SessionHandBackOwner::for_operation(
-                                                            Some(&current_operation_id),
-                                                            operation_id,
-                                                        ),
-                                                        scope,
-                                                    );
-                                                    store_batch_scope(&operation_scope, scope)
-                                                },
-                                                &sender,
-                                                notice,
-                                                Some(current_database.to_string()),
-                                            );
-                                        }
-                                        Err(msg) => {
-                                            SqlEditorWidget::emit_script_message(
-                                                &sender, &session, "USE", &msg,
-                                            );
-                                            command_error = true;
-                                        }
-                                    }
+                                // `USE` on an ORACLE batch, which is the only
+                                // kind of batch that reaches this loop: this
+                                // branch exists to say so.
+                                //
+                                // It used to carry a whole MySQL implementation
+                                // — `USE` on the SHARED LIVE connection plus
+                                // `sync_mysql_current_database_name()`, a
+                                // connection-wide database write and a
+                                // pool-epoch bump that round 9 removed from the
+                                // MySQL loop for splitting sibling tabs off
+                                // their database. It could not run (a batch
+                                // here holds an Oracle connection, and a script
+                                // `CONNECT` makes another one), and the MySQL
+                                // family's own `USE` lives in
+                                // `execute_mysql_batch`. Keeping it was not
+                                // free: its comment said "MySQL USE command",
+                                // so the tab-binding write belonged to it in
+                                // the docs and in a guard, and the live MySQL
+                                // path was credited with a rule it does not
+                                // follow.
+                                ToolCommand::Use { .. } => {
+                                    SqlEditorWidget::emit_script_message(
+                                        &sender,
+                                        &session,
+                                        "USE",
+                                        "Error: USE command is only supported for MySQL/MariaDB connections",
+                                    );
+                                    command_error = true;
                                 }
                                 // MySQL-specific commands — execute as raw SQL via the connection
                                 ToolCommand::ShowDatabases
@@ -22681,7 +22788,13 @@ impl SqlEditorWidget {
             // keyword away from admitting it, and the connection's own
             // read-only guard has to reach the same answer from a different
             // shape.
-            || crate::sql_text::starts_with_keyword_token(&upper, "LOCK TABLE")
+            // `LOCK TABLE`, which Oracle's own list permits, is refused before
+            // this allowlist is reached, for the reason `ALTER SYSTEM` is: it
+            // changes nothing of the data and everything for the sessions that
+            // now wait, and Oracle runs it inside a read-only transaction — so
+            // the connection's read-only guard refused it while a tab's pin
+            // allowed it. Asked as
+            // `sql_classification::read_only_shared_refusal`.
             || crate::sql_text::starts_with_keyword_token(&upper, "SET ROLE")
             || crate::sql_text::starts_with_keyword_token(&upper, "ALTER SESSION")
             || matches!(
@@ -22719,6 +22832,19 @@ impl SqlEditorWidget {
     /// statement, which the server HONOURS over the session characteristic, and
     /// a statement that reconfigures the SERVER, which is asked first and on
     /// every backend below.
+    ///
+    /// Asked of EVERY statement in the text, from ONE split. A unit can hold
+    /// more than one statement — a custom MySQL `DELIMITER` makes
+    /// `SELECT 1; SET GLOBAL …` one statement as far as the executor is
+    /// concerned — so a question asked of the leading words is a question a
+    /// leading read can hide. Splitting here rather than inside one of the
+    /// clauses is the point: while only the server-change clause split for
+    /// itself, the READ WRITE escape beside it still read the front of the unit
+    /// and `SELECT 1; SET TRANSACTION READ WRITE` disarmed the pin. The
+    /// splitter is the executor's own, so a `;` inside a string, a comment or a
+    /// PL/SQL block is not a statement boundary; a tool command is the client's
+    /// own and never reaches the server, and `read_only_block_reason` answers
+    /// for the two of those that would leave this connection behind.
     pub(super) fn transaction_mode_refusal_for_statement(
         db_type: crate::db::DatabaseType,
         mode: crate::db::TransactionMode,
@@ -22727,16 +22853,39 @@ impl SqlEditorWidget {
         if mode.access_mode != crate::db::TransactionAccessMode::ReadOnly {
             return None;
         }
-        // "This tab changes nothing" is a promise about the SERVER as much as
-        // about the data, and no server keeps it for a read-only TRANSACTION:
-        // Oracle's own list of what one permits includes `ALTER SYSTEM`, and
-        // the MySQL family's session characteristic constrains table writes,
-        // not server administration. So this is asked on every backend, ahead
-        // of the question of who enforces the rest — and from the same place
-        // the connection's read-only guard asks it, so the two cannot answer
-        // differently again.
-        if crate::db::sql_classification::statement_reconfigures_the_server(db_type, sql) {
-            return Some(Self::read_only_server_change_block_message());
+        // No custom delimiter: the caller hands over what the executor already
+        // treats as ONE statement, so any delimiter in force has been consumed
+        // and the default `;` is what may still be hiding inside it. Splitting
+        // with it can only find MORE statements to ask about, never fewer.
+        QueryExecutor::split_script_items_for_db_type_with_mysql_delimiter(sql, Some(db_type), None)
+            .iter()
+            .find_map(|item| match item {
+                ScriptItem::Statement(statement) => {
+                    Self::transaction_mode_refusal_for_single_statement(db_type, mode, statement)
+                }
+                ScriptItem::ToolCommand(_) => None,
+            })
+    }
+
+    /// The refusal for ONE statement. Every clause here is a question about a
+    /// single statement, because the text was split by the caller above.
+    fn transaction_mode_refusal_for_single_statement(
+        db_type: crate::db::DatabaseType,
+        mode: crate::db::TransactionMode,
+        sql: &str,
+    ) -> Option<String> {
+        // "This tab changes nothing" is a promise about the SERVER and about
+        // the other sessions on it, as much as about the data — and no server
+        // keeps either half for a read-only TRANSACTION: Oracle's own list of
+        // what one permits includes `ALTER SYSTEM` and `LOCK TABLE`, and the
+        // MySQL family's session characteristic constrains table writes, not
+        // server administration and not locks. So this is asked on every
+        // backend, ahead of the question of who enforces the rest — and from
+        // the same place the connection's read-only guard asks it, so the two
+        // cannot answer differently again.
+        if let Some(reason) = crate::db::sql_classification::read_only_shared_refusal(db_type, sql)
+        {
+            return Some(Self::read_only_shared_block_message(reason));
         }
         if !db_type.transaction_mode_requires_first_statement(mode) {
             // The SESSION carries the mode here and the server refuses the
@@ -22754,14 +22903,14 @@ impl SqlEditorWidget {
         (!Self::oracle_read_only_allows_statement(sql)).then(Self::oracle_read_only_block_message)
     }
 
-    /// The refusal a Read only tab gives for a statement that reconfigures the
-    /// server, on every backend. Worded from the shared reason so the tab's pin
-    /// and the connection's read-only flag describe the same refusal the same
-    /// way.
-    fn read_only_server_change_block_message() -> String {
+    /// The refusal a Read only tab gives for a statement the server's own
+    /// read-only transaction does not reliably refuse — one that reconfigures the
+    /// server, writes a file on it, or takes a lock other sessions wait for.
+    /// Worded from the shared REASON so the tab's pin and the connection's
+    /// read-only flag describe the same refusal the same way.
+    fn read_only_shared_block_message(reason: &str) -> String {
         format!(
-            "Error: Read only mode blocks {}. Switch to Read write to run this statement.",
-            crate::db::sql_classification::READ_ONLY_SERVER_CHANGE_REFUSAL
+            "Error: Read only mode blocks {reason}. Switch to Read write to run this statement."
         )
     }
 
@@ -23568,6 +23717,99 @@ impl SqlEditorWidget {
         batch_effects: &mut crate::db::MySqlBatchSessionEffects,
     ) {
         batch_effects.apply_successful_statement_effects(sql, auto_commit, effects);
+    }
+
+    /// Record everything a SUCCESSFUL MySQL-family statement changed: the
+    /// batch's session ledger, the tab's two pinned options, and where the
+    /// session now sits.
+    ///
+    /// ONE step, because it was four steps spelled out in ONE of this family's
+    /// three statement branches. A statement of that family runs down the
+    /// streaming SELECT, the lazy fetch, or the plain executor, and the dispatch
+    /// between them reads the LEADING keyword of the unit — so
+    /// `SELECT 1; SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE` (one
+    /// statement to the executor under a custom `DELIMITER`, both run by the
+    /// server) took the SELECT path, where none of these steps existed. The
+    /// session really moved while the tab's pin, the toolbar, the Tools menu and
+    /// the batch's scope cell all kept the old answer, and the transaction-mode
+    /// override residue was never adopted away either. The same trap that had
+    /// put the read-only gate on one of three paths.
+    ///
+    /// The scope change comes back as a `#[must_use]` value rather than being
+    /// reported here: recording it and reporting it are one step
+    /// ([`Self::note_batch_scope_change`]) which each branch performs where its
+    /// own output order puts it, and a branch that drops it does not compile
+    /// clean.
+    #[allow(clippy::too_many_arguments)]
+    fn record_successful_mysql_batch_statement(
+        db_type: crate::db::DatabaseType,
+        sql: &str,
+        results: &[QueryResult],
+        effects: crate::db::StatementSessionEffects,
+        ledger_owner: MySqlSessionLedgerOwner,
+        auto_commit: &mut bool,
+        slots: &MySqlTabSessionSlots<'_>,
+        batch_effects: &mut crate::db::MySqlBatchSessionEffects,
+        connection_database: impl FnOnce() -> Option<String>,
+    ) -> MySqlBatchScopeChange {
+        let files_with_the_batch = ledger_owner == MySqlSessionLedgerOwner::Batch;
+        if files_with_the_batch {
+            Self::apply_successful_mysql_batch_statement_effects(
+                sql,
+                *auto_commit,
+                effects,
+                batch_effects,
+            );
+        }
+
+        let mut adopted_transaction_mode = slots.active_transaction_mode.get();
+        if Self::adopt_session_transaction_mode_change_after_statement(
+            db_type,
+            sql,
+            &mut adopted_transaction_mode,
+            Some(slots.tab_transaction_mode_override),
+            slots.sender,
+        ) && files_with_the_batch
+        {
+            batch_effects.adopt_session_transaction_mode_override();
+        }
+        slots.active_transaction_mode.set(adopted_transaction_mode);
+
+        if let Some(enabled) = Self::mysql_autocommit_change_after_successful_statement_for_db_type(
+            db_type, sql, results,
+        ) {
+            store_mutex_bool_option(slots.tab_auto_commit_override, Some(enabled));
+            *auto_commit = enabled;
+            if let Some(operation_autocommit) = slots.current_operation_autocommit {
+                Self::update_current_operation_autocommit(operation_autocommit, enabled);
+            }
+            let _ = slots
+                .sender
+                .send(QueryProgress::AutoCommitChanged { enabled });
+            app::awake();
+        }
+
+        MySqlBatchScopeChange(
+            Self::mysql_unit_moves_session_database(db_type, sql).and_then(|parsed_database| {
+                // The statement's own target, not the connection's database: a
+                // successful `USE` moved THIS tab's session there, and the
+                // connection's stored name is deliberately left alone.
+                let selected_scope = parsed_database.or_else(connection_database);
+                let message = selected_scope
+                    .as_deref()
+                    .map(Self::current_database_changed_message)
+                    .unwrap_or_else(|| {
+                        results
+                            .iter()
+                            .find(|result| result.success && !result.is_select)
+                            .map(|result| result.message.clone())
+                            .unwrap_or_default()
+                    });
+                // The move is still recorded by the session sync; an empty
+                // notice is not a notice.
+                (!message.trim().is_empty()).then_some((message, selected_scope))
+            }),
+        )
     }
 
     /// Mirrors a successful session-scoped transaction-mode statement (`SET
@@ -24436,6 +24678,25 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Hand the tab's pooled MySQL/MariaDB session to the statement that is
+    /// about to run on it.
+    ///
+    /// `statement_sql` is not bookkeeping: it is what the tab's transaction
+    /// mode is asked about, HERE, because this is the one function every
+    /// MySQL-family statement passes to get the session it runs on. The
+    /// refusal used to sit in `execute_mysql_sql` instead, which is only one
+    /// of the family's execution paths — the streaming SELECT, the lazy fetch
+    /// and the grid-edit save reach the server without it. And the dispatch
+    /// that chooses between them reads the LEADING keyword, so one unit
+    /// holding several statements (a custom `DELIMITER` makes
+    /// `SELECT 1; SET GLOBAL …` one statement as far as the executor is
+    /// concerned) took the SELECT path and the tab's READ ONLY pin was never
+    /// asked at all. Asking where the session is handed over makes the answer
+    /// independent of how the statement is going to be executed, and a future
+    /// execution path inherits it by construction.
+    ///
+    /// Asked before any lease is taken, so a refusal costs no session and has
+    /// nothing to hand back.
     fn acquire_mysql_pooled_session(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
@@ -24443,6 +24704,7 @@ impl SqlEditorWidget {
         db_activity: &str,
         auto_commit: bool,
         transaction_mode: crate::db::TransactionMode,
+        statement_sql: &str,
         session_pool_sender: Option<&QueryProgressSender>,
         require_existing_session: bool,
         required_resolution_action: Option<RetainedSessionResolutionAction>,
@@ -24467,6 +24729,13 @@ impl SqlEditorWidget {
             (context, activity)
         };
         let db_display_name = context.connection_info.db_type.display_name();
+        if let Some(message) = Self::transaction_mode_refusal_for_statement(
+            context.connection_info.db_type,
+            transaction_mode,
+            statement_sql,
+        ) {
+            return Err(message);
+        }
 
         // `scope_already_prepared` is set by the branches that acquire a FRESH
         // pooled session: `prepare_mysql_pooled_session_or_retry_once` has
@@ -25803,6 +26072,14 @@ impl SqlEditorWidget {
             || statement_effects.may_leave_uncommitted_work()
     }
 
+    /// Whether the statement the app is about to run drops the database it
+    /// names as current.
+    ///
+    /// Asked of EVERY statement in the unit, from the shared split: one unit can
+    /// hold several statements (a custom `DELIMITER` makes `SELECT 1; DROP
+    /// DATABASE app` one statement as far as the executor is concerned), and
+    /// reading the leading one left the session and the connection naming a
+    /// database the server had dropped.
     fn mysql_statement_drops_current_database(
         db_type: crate::db::DatabaseType,
         statement_sql: &str,
@@ -25812,11 +26089,52 @@ impl SqlEditorWidget {
         if stored.is_empty() {
             return false;
         }
-        crate::db::query::mysql_executor::MysqlExecutor::drop_database_statement_database_name_for_db_type(
+        crate::db::transaction::fold_over_unit_statements(
             db_type,
             statement_sql,
+            |statement| {
+                crate::db::query::mysql_executor::MysqlExecutor::drop_database_statement_database_name_for_db_type(
+                    db_type,
+                    statement,
+                )
+                .is_some_and(|dropped| dropped == stored)
+            },
+            |earlier, later| earlier || later,
         )
-        .is_some_and(|dropped| dropped == stored)
+        .answer
+    }
+
+    /// Where a UNIT left this session's database, when it moved it at all.
+    ///
+    /// The outer `Option` is "did a `USE` in here move the session", the inner
+    /// one is the database name it moved to — unreadable names keep the answer
+    /// the caller had before (the connection's own current database), which is
+    /// what a `USE` whose target this client cannot parse always fell back to.
+    ///
+    /// Asked of every statement in the unit and the LAST `USE` wins, because
+    /// that is the one the session was left in. Reading the leading statement
+    /// meant a `USE` behind a leading read moved the session with nothing said
+    /// about it: no notice, no batch scope cell, and the encoding not re-read.
+    fn mysql_unit_moves_session_database(
+        db_type: crate::db::DatabaseType,
+        sql: &str,
+    ) -> Option<Option<String>> {
+        crate::db::transaction::fold_over_unit_statements(
+            db_type,
+            sql,
+            |statement| {
+                crate::db::query::mysql_executor::MysqlExecutor::is_use_statement_for_db_type(
+                    db_type, statement,
+                )
+                .then(|| {
+                    crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name_for_db_type(
+                        db_type, statement,
+                    )
+                })
+            },
+            crate::db::transaction::later_unit_answer_wins,
+        )
+        .answer
     }
 
     /// Which databases a successful statement moved, asked once so the read
@@ -26517,7 +26835,12 @@ impl SqlEditorWidget {
         action: F,
     ) -> Result<T, String>
     where
-        F: FnOnce(&mut mysql::PooledConn) -> Result<T, MysqlError>,
+        // The action is handed the session AND what that session already
+        // carries: an operation of the APP's own that has several statements to
+        // apply has to know whether opening a transaction of its own would
+        // commit work of the user's (see
+        // `crate::db::app_operation_transaction_scope`).
+        F: FnOnce(&mut mysql::PooledConn, RetainedSessionState) -> Result<T, MysqlError>,
     {
         // A one-shot `SET TRANSACTION ...` has to be the first statement of its
         // transaction, so the session has to be prepared back to a boundary for
@@ -26558,6 +26881,7 @@ impl SqlEditorWidget {
             log_context,
             auto_commit,
             transaction_mode,
+            statement_sql,
             session_pool_sender,
             require_existing_session,
             required_resolution_action,
@@ -26844,7 +27168,7 @@ impl SqlEditorWidget {
         }
 
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            action(&mut conn)
+            action(&mut conn, prior_retained_state)
                 .map_err(|err| SqlEditorWidget::mysql_error_message(&err, effective_query_timeout))
         }));
 
@@ -31589,7 +31913,18 @@ mod query_execution_cleanup_tests {
             // not to refuse what the server itself allows. Refusing these read
             // as arbitrary next to the `ALTER SESSION SET CURRENT_SCHEMA` the
             // app issues on that very session.
-            "lock table t in exclusive mode",
+            //
+            // CHANGED, with its reason: `lock table` used to be in this list and
+            // is now refused BEFORE the allowlist is reached, by the answer both
+            // read-only guards share. It belongs to the same exception
+            // `ALTER SYSTEM` does — it changes nothing of the data and
+            // everything for the sessions that now wait, and Oracle runs it
+            // inside a read-only transaction — and while only the allowlist knew
+            // about it, the connection's read-only guard refused it (as a `LOCK`
+            // statement) while a tab's READ ONLY pin allowed it. Two guards, one
+            // statement, two answers. The allowlist half of the rule is
+            // asserted where the shared answer is
+            // (`a_read_only_tab_refuses_a_statement_that_reconfigures_the_server`).
             "set role dba",
             "alter session set nls_date_format = 'YYYY-MM-DD'",
         ] {
@@ -31659,11 +31994,27 @@ mod query_execution_cleanup_tests {
             ),
             (
                 crate::db::DatabaseType::MySQL,
-                &["SET GLOBAL max_connections = 100", "FLUSH PRIVILEGES"][..],
+                &[
+                    "SET GLOBAL max_connections = 100",
+                    "FLUSH PRIVILEGES",
+                    // One `SET` may mix scopes, and a session assignment
+                    // beside a global one does not make the global one
+                    // harmless.
+                    "SET SESSION sql_mode = '', GLOBAL max_connections = 100",
+                ][..],
             ),
             (
                 crate::db::DatabaseType::MariaDB,
-                &["SET GLOBAL max_connections = 100", "KILL QUERY 5"][..],
+                &[
+                    "SET GLOBAL max_connections = 100",
+                    "KILL QUERY 5",
+                    "SET GLOBAL max_connections = 100, SESSION sql_mode = ''",
+                    // MariaDB's multi-source spelling: the noun is not the
+                    // second word, which is why the answer is asked of the
+                    // classifier instead of a second list.
+                    "START ALL SLAVES",
+                    "STOP ALL SLAVES",
+                ][..],
             ),
         ];
         for (db_type, statements) in server_changes {
@@ -31740,14 +32091,13 @@ mod query_execution_cleanup_tests {
             );
         }
 
-        // The Oracle allowlist is unchanged: what Oracle's own read-only
-        // transaction permits still runs, and the session-local twin of
-        // `ALTER SYSTEM` is the sharpest case — the app issues one on this very
-        // session for the tab's own scope.
+        // The Oracle allowlist is otherwise unchanged: what Oracle's own
+        // read-only transaction permits still runs, and the session-local twin
+        // of `ALTER SYSTEM` is the sharpest case — the app issues one on this
+        // very session for the tab's own scope.
         for sql in [
             "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY'",
             "ALTER SESSION SET CURRENT_SCHEMA = HR",
-            "LOCK TABLE t IN EXCLUSIVE MODE",
             "SET ROLE ALL",
             "SELECT 1 FROM DUAL",
             "COMMIT",
@@ -31755,6 +32105,103 @@ mod query_execution_cleanup_tests {
             assert!(
                 refusal(crate::db::DatabaseType::Oracle, read_only, sql).is_none(),
                 "the Oracle read-only allowlist must still allow {sql}"
+            );
+        }
+
+        // A lock other sessions wait for is refused on EVERY backend, and by
+        // both guards, because the server's own read-only transaction does not
+        // reliably refuse one: measured on MySQL 8.0.46, `LOCK TABLES … READ`, a
+        // backup lock, the global read lock and a named `GET_LOCK` all run inside
+        // one (only `LOCK TABLES … WRITE` is refused), and Oracle's own list
+        // permits `LOCK TABLE`. Only the tab's pin used to allow these — the
+        // connection's read-only guard already refused them, and `GET_LOCK`
+        // slipped past even that because a locking function call classifies as a
+        // read.
+        for (db_type, sql) in [
+            (
+                crate::db::DatabaseType::Oracle,
+                "LOCK TABLE t IN EXCLUSIVE MODE",
+            ),
+            (crate::db::DatabaseType::MySQL, "LOCK TABLES t WRITE"),
+            (crate::db::DatabaseType::MySQL, "LOCK TABLES t READ"),
+            (crate::db::DatabaseType::MySQL, "SELECT GET_LOCK('x', -1)"),
+            (crate::db::DatabaseType::MySQL, "LOCK INSTANCE FOR BACKUP"),
+            (crate::db::DatabaseType::MariaDB, "BACKUP STAGE START"),
+            (crate::db::DatabaseType::MariaDB, "SELECT GET_LOCK('x', -1)"),
+        ] {
+            let message = refusal(db_type, read_only, sql)
+                .unwrap_or_else(|| panic!("{db_type} must refuse {sql}"));
+            assert!(
+                message.contains(crate::db::sql_classification::READ_ONLY_LOCK_REFUSAL),
+                "{db_type} {sql} refused for the wrong reason: {message}"
+            );
+            // ... and the connection's own guard says the same thing about it.
+            let connection_reason =
+                crate::db::sql_classification::read_only_shared_refusal(db_type, sql)
+                    .unwrap_or_else(|| panic!("the shared answer must refuse {db_type} {sql}"));
+            assert_eq!(
+                connection_reason,
+                crate::db::sql_classification::READ_ONLY_LOCK_REFUSAL
+            );
+        }
+        // A statement that writes a FILE on the server is the third thing no
+        // server refuses a read-only transaction: it reads tables and writes
+        // next to the data directory, and the classifier reads it as the SELECT
+        // it starts with — so BOTH guards used to let it through.
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            for sql in [
+                "SELECT * FROM t INTO OUTFILE '/tmp/x'",
+                "SELECT payload INTO DUMPFILE '/tmp/x' FROM t WHERE id = 1",
+            ] {
+                let message = refusal(db_type, read_only, sql)
+                    .unwrap_or_else(|| panic!("{db_type} must refuse {sql}"));
+                assert!(
+                    message.contains(crate::db::sql_classification::READ_ONLY_SERVER_FILE_REFUSAL),
+                    "{db_type} {sql} refused for the wrong reason: {message}"
+                );
+                assert_eq!(
+                    crate::db::sql_classification::read_only_shared_refusal(db_type, sql),
+                    Some(crate::db::sql_classification::READ_ONLY_SERVER_FILE_REFUSAL),
+                    "and the connection's guard must say the same about {sql}"
+                );
+            }
+            // Writing SESSION state is exactly what a read-only session may do.
+            assert!(
+                refusal(db_type, read_only, "SELECT * FROM t INTO @v").is_none(),
+                "{db_type}: `INTO @var` writes session state, not the server"
+            );
+            // Server code, in every spelling: MySQL's PLUGIN/COMPONENT and
+            // MariaDB's SONAME. The verb is the question.
+            for sql in [
+                "INSTALL PLUGIN p SONAME 'p.so'",
+                "INSTALL COMPONENT 'file://c'",
+                "INSTALL SONAME 'ha_x'",
+                "UNINSTALL PLUGIN p",
+                "UNINSTALL SONAME 'ha_x'",
+            ] {
+                let message = refusal(db_type, read_only, sql)
+                    .unwrap_or_else(|| panic!("{db_type} must refuse {sql}"));
+                assert!(
+                    message
+                        .contains(crate::db::sql_classification::READ_ONLY_SERVER_CHANGE_REFUSAL),
+                    "{db_type} {sql} refused for the wrong reason: {message}"
+                );
+            }
+        }
+        // The RELEASE forms stay allowed: a tab can be pinned while it already
+        // holds one, and refusing the release would strand it.
+        for (db_type, sql) in [
+            (crate::db::DatabaseType::MySQL, "UNLOCK TABLES"),
+            (crate::db::DatabaseType::MySQL, "UNLOCK INSTANCE"),
+            (crate::db::DatabaseType::MySQL, "SELECT RELEASE_LOCK('x')"),
+            (crate::db::DatabaseType::MariaDB, "BACKUP STAGE END"),
+        ] {
+            assert!(
+                refusal(db_type, read_only, sql).is_none(),
+                "{db_type} must still allow {sql}"
             );
         }
 
@@ -31785,17 +32232,116 @@ mod query_execution_cleanup_tests {
             crate::db::DatabaseType::MySQL,
             crate::db::DatabaseType::MariaDB,
         ] {
+            // CHANGED, with its reason: `LOCK TABLES t WRITE` used to be listed
+            // here as the server's answer to give. It is not one the server
+            // gives — a read-only session characteristic constrains table
+            // WRITES, and a lock is not a write — which is why the connection's
+            // own read-only guard has always refused it. It is asserted with the
+            // other locks above.
             for sql in [
                 "INSERT INTO t VALUES (1)",
                 "CREATE TABLE t (c INT)",
                 "SELECT 1",
-                "LOCK TABLES t WRITE",
+                "REPLACE INTO t VALUES (1)",
             ] {
                 assert!(
                     refusal(db_type, read_only, sql).is_none(),
                     "{db_type} {sql} is the server's answer to give"
                 );
             }
+        }
+    }
+
+    /// An admin command hiding behind a leading read in one unit is still sent
+    /// to the server.
+    ///
+    /// The executor hands the server the WHOLE unit — under a custom
+    /// `DELIMITER`, `SELECT 1; SHUTDOWN` is one statement to it and the server
+    /// runs both — so a fragment this client would have consumed as its own
+    /// SQL*Plus-style command at the top level of a script is not its own here.
+    /// Skipping such a fragment let the sharpest server change there is past the
+    /// tab's pin.
+    #[test]
+    fn a_read_only_tab_refuses_an_admin_command_that_rides_inside_a_unit() {
+        let read_only = crate::db::TransactionMode::new(
+            crate::db::TransactionIsolation::Default,
+            crate::db::TransactionAccessMode::ReadOnly,
+        );
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            for sql in [
+                "SELECT 1; SHUTDOWN",
+                "SELECT 1; CACHE INDEX t IN hot_cache",
+                "SELECT 1; ALTER INSTANCE RELOAD TLS",
+                "SELECT 1; INSTALL PLUGIN p SONAME 'p.so'",
+                "SELECT 1; LOAD INDEX INTO CACHE t",
+                "SELECT 1; CLONE LOCAL DATA DIRECTORY = '/tmp/clone'",
+            ] {
+                let message = SqlEditorWidget::transaction_mode_refusal_for_statement(
+                    db_type, read_only, sql,
+                )
+                .unwrap_or_else(|| panic!("{db_type} must refuse {sql}"));
+                assert!(
+                    message
+                        .contains(crate::db::sql_classification::READ_ONLY_SERVER_CHANGE_REFUSAL),
+                    "{db_type} {sql} refused for the wrong reason: {message}"
+                );
+            }
+            // A client command that reaches no server keeps its own answer: at
+            // the top level of a script this client consumes it and says so.
+            assert!(SqlEditorWidget::transaction_mode_refusal_for_statement(
+                db_type,
+                read_only,
+                "SELECT 1; DESCRIBE t"
+            )
+            .is_none());
+        }
+    }
+
+    /// The tab's mode refuses a STATEMENT, and which execution path would have
+    /// run it is none of the answer's business.
+    ///
+    /// This pins the trap that made the MySQL family's gate unreachable where
+    /// it mattered. That family runs a statement down one of several paths —
+    /// the streaming SELECT, the lazy fetch, the plain executor — and the
+    /// dispatch that picks between them reads the LEADING keyword. A unit can
+    /// hold more than one statement (a custom `DELIMITER` makes
+    /// `SELECT 1; SET GLOBAL …` one statement as far as the executor is
+    /// concerned), so a unit the gate refuses is classified as a displayable
+    /// SELECT and takes a path of its own. While the refusal lived inside ONE
+    /// of those paths it was simply not asked, and a READ ONLY tab moved a
+    /// global. It is now asked where the session is handed to the statement
+    /// (`acquire_mysql_pooled_session`), which all of them pass.
+    #[test]
+    fn a_statement_the_tab_mode_refuses_can_still_look_like_a_select_to_the_dispatch() {
+        let read_only = crate::db::TransactionMode::new(
+            crate::db::TransactionIsolation::Default,
+            crate::db::TransactionAccessMode::ReadOnly,
+        );
+        for (db_type, sql) in [
+            (
+                crate::db::DatabaseType::MySQL,
+                "SELECT 1; SET GLOBAL max_connections = 100",
+            ),
+            (
+                crate::db::DatabaseType::MariaDB,
+                "SELECT 1; SET TRANSACTION READ WRITE",
+            ),
+        ] {
+            assert!(
+                crate::db::query::mysql_executor::MysqlExecutor::is_displayable_select_statement_for_db_type(
+                    db_type, sql,
+                ),
+                "{db_type}: the dispatch reads the leading keyword, so this takes the SELECT path"
+            );
+            assert!(
+                SqlEditorWidget::transaction_mode_refusal_for_statement(db_type, read_only, sql)
+                    .is_some(),
+                "{db_type}: and the tab's mode refuses it, so the two must not be asked in the \
+                 same place the path is chosen"
+            );
         }
     }
 

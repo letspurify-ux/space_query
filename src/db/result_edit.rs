@@ -509,10 +509,14 @@ pub fn compile_oracle_guarded_result_edit(statements: &[String]) -> Result<Strin
 
 /// Executes a result-edit request atomically. Existing rows are locked and
 /// compared before any DML runs, and lock acquisition order is deterministic.
+/// `scope` decides how this save brackets itself, and it is NOT the tab's
+/// auto-commit flag: `START TRANSACTION` implicitly commits whatever the session
+/// already holds, and an auto-commit tab can hold an explicit transaction of the
+/// user's. See [`crate::db::AppOperationTransactionScope`].
 pub fn execute_mysql_result_edit(
     conn: &mut PooledConn,
     request: &ResultEditRequest,
-    auto_commit: bool,
+    scope: crate::db::AppOperationTransactionScope,
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Result<usize, MysqlError> {
     if !result_edit_backend_policy(request.descriptor.db_type).supports_structured_requests() {
@@ -522,7 +526,8 @@ pub fn execute_mysql_result_edit(
     }
     validate_request_shape(request).map_err(|message| mysql_edit_error(&message))?;
     let savepoint = format!("SQ_RESULT_EDIT_{}", request.request_id);
-    if auto_commit {
+    let owns_the_transaction = scope.commits_its_own_work();
+    if owns_the_transaction {
         conn.query_drop("START TRANSACTION")?;
     } else {
         conn.query_drop(format!("SAVEPOINT {savepoint}"))?;
@@ -566,7 +571,7 @@ pub fn execute_mysql_result_edit(
         if is_cancelled() {
             return Err(mysql_edit_error("Result edit was cancelled."));
         }
-        if auto_commit {
+        if owns_the_transaction {
             conn.query_drop("COMMIT")?;
         } else {
             conn.query_drop(format!("RELEASE SAVEPOINT {savepoint}"))?;
@@ -575,7 +580,7 @@ pub fn execute_mysql_result_edit(
     })();
 
     if let Err(error) = execution {
-        let rollback_result = if auto_commit {
+        let rollback_result = if owns_the_transaction {
             conn.query_drop("ROLLBACK")
         } else {
             conn.query_drop(format!("ROLLBACK TO SAVEPOINT {savepoint}"))
@@ -1502,6 +1507,62 @@ mod tests {
         assert!(block.ends_with("RAISE;\nEND;"));
     }
 
+    /// A save the app runs on the user's session never opens a transaction over
+    /// work of theirs, on any backend.
+    ///
+    /// MySQL's `START TRANSACTION` implicitly COMMITS whatever the session
+    /// already holds, and an auto-commit tab CAN hold an explicit transaction of
+    /// the user's — the app supports that on purpose — so bracketing the save by
+    /// the tab's auto-commit flag committed their uncommitted work for them and
+    /// reported only the save's own success. The answer is "is there anything of
+    /// the user's to lose", and Oracle's block meets the same rule by
+    /// construction.
+    #[test]
+    fn a_save_never_opens_a_transaction_over_the_users_own_work() {
+        use crate::db::{
+            app_operation_transaction_scope, AppOperationTransactionScope, RetainedSessionState,
+        };
+
+        let clean = RetainedSessionState::default();
+        let carries_work = RetainedSessionState::from_transaction_flags(true, false);
+        assert!(carries_work.may_have_uncommitted_work());
+
+        assert_eq!(
+            app_operation_transaction_scope(true, clean),
+            AppOperationTransactionScope::OwnTransaction,
+            "auto-commit with nothing of the user's open: the save owns its transaction"
+        );
+        assert_eq!(
+            app_operation_transaction_scope(true, carries_work),
+            AppOperationTransactionScope::NestedInCallersTransaction,
+            "auto-commit over the user's OPEN transaction: nest, or START TRANSACTION commits it"
+        );
+        for prior in [clean, carries_work] {
+            assert_eq!(
+                app_operation_transaction_scope(false, prior),
+                AppOperationTransactionScope::NestedInCallersTransaction,
+                "manual commit always nests and leaves the decision to the user"
+            );
+        }
+        assert!(AppOperationTransactionScope::OwnTransaction.commits_its_own_work());
+        assert!(!AppOperationTransactionScope::NestedInCallersTransaction.commits_its_own_work());
+
+        // Oracle's save is the same promise, kept by construction: it nests in a
+        // savepoint and has no transaction-opening statement to reach for.
+        let block = compile_oracle_guarded_result_edit(&[
+            "UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'".to_string(),
+        ])
+        .expect("Oracle edit block");
+        let upper = block.to_uppercase();
+        assert!(upper.contains("SAVEPOINT SQ_RESULT_EDIT"));
+        for opener in ["START TRANSACTION", "SET TRANSACTION", "COMMIT"] {
+            assert!(
+                !upper.contains(opener),
+                "the Oracle save must not open or end a transaction of its own: {opener}"
+            );
+        }
+    }
+
     fn live_test_pool() -> Option<(Pool, DatabaseType)> {
         let host = std::env::var("SPACE_QUERY_TEST_MYSQL_HOST").ok()?;
         let port = std::env::var("SPACE_QUERY_TEST_MYSQL_PORT")
@@ -1632,8 +1693,13 @@ mod tests {
             }],
         };
         assert_eq!(
-            execute_mysql_result_edit(&mut conn, &update, true, || false)
-                .expect("single-row update"),
+            execute_mysql_result_edit(
+                &mut conn,
+                &update,
+                crate::db::AppOperationTransactionScope::OwnTransaction,
+                || false
+            )
+            .expect("single-row update"),
             1
         );
         let values: Vec<(u64, Option<String>)> = conn
@@ -1672,7 +1738,13 @@ mod tests {
                 },
             ],
         };
-        assert!(execute_mysql_result_edit(&mut conn, &insert_batch, true, || false).is_err());
+        assert!(execute_mysql_result_edit(
+            &mut conn,
+            &insert_batch,
+            crate::db::AppOperationTransactionScope::OwnTransaction,
+            || false
+        )
+        .is_err());
         let row_three: Option<u64> = conn
             .query_first("SELECT id FROM sq_result_edit_fixture WHERE id = 3")
             .expect("check rolled-back insert");
@@ -1693,7 +1765,13 @@ mod tests {
                 original_values: stale_originals,
             }],
         };
-        assert!(execute_mysql_result_edit(&mut conn, &stale_delete, true, || false).is_err());
+        assert!(execute_mysql_result_edit(
+            &mut conn,
+            &stale_delete,
+            crate::db::AppOperationTransactionScope::OwnTransaction,
+            || false
+        )
+        .is_err());
         let row_two: Option<u64> = conn
             .query_first("SELECT id FROM sq_result_edit_fixture WHERE id = 2")
             .expect("check conflict preservation");
@@ -1723,9 +1801,13 @@ mod tests {
                 },
             ],
         };
-        assert!(
-            execute_mysql_result_edit(&mut conn, &failed_manual_batch, false, || false).is_err()
-        );
+        assert!(execute_mysql_result_edit(
+            &mut conn,
+            &failed_manual_batch,
+            crate::db::AppOperationTransactionScope::NestedInCallersTransaction,
+            || false
+        )
+        .is_err());
         let prior_work_count: u64 = conn
             .query_first("SELECT COUNT(*) FROM sq_result_edit_fixture WHERE id = 9")
             .expect("check prior transaction work")
@@ -1759,8 +1841,13 @@ mod tests {
             }],
         };
         assert_eq!(
-            execute_mysql_result_edit(&mut conn, &manual_update, false, || false)
-                .expect("manual transaction update"),
+            execute_mysql_result_edit(
+                &mut conn,
+                &manual_update,
+                crate::db::AppOperationTransactionScope::NestedInCallersTransaction,
+                || false
+            )
+            .expect("manual transaction update"),
             1
         );
         let within_transaction: String = conn
@@ -1821,7 +1908,13 @@ mod tests {
                 )],
             }],
         };
-        assert!(execute_mysql_result_edit(&mut conn, &unsafe_update, true, || false).is_err());
+        assert!(execute_mysql_result_edit(
+            &mut conn,
+            &unsafe_update,
+            crate::db::AppOperationTransactionScope::OwnTransaction,
+            || false
+        )
+        .is_err());
         let unchanged_rows: u64 = conn
             .query_first(
                 "SELECT COUNT(*) FROM sq_result_edit_nonunique_fixture WHERE value_text = 'old'",

@@ -1253,3 +1253,65 @@ fn a_mysql_user_variable_is_left_alone_beside_a_substituted_value() {
 
     assert_eq!(prepare(sql, MYSQL, &collected).sql, "CALL p(30, @cnt)");
 }
+
+/// A Number answer that is not a number is refused, not reinterpreted.
+///
+/// On the MySQL family the answer is substituted INTO the statement, and a
+/// Number is the one type emitted without quotes. Both other ends are wrong: as
+/// written it carries whatever it says into the statement (a value of
+/// `1; SET GLOBAL max_connections = 5000` adds a statement of its own, past a
+/// connection read-only guard that judged the text before the value was in it),
+/// and quoted it silently becomes a string comparison — `WHERE id = 'abc'`
+/// matches the rows where `id` is 0 on a server that coerces. The value came
+/// from a person, so the app says which placeholder is wrong.
+#[test]
+fn a_number_answer_that_is_not_a_number_is_refused() {
+    let mut answered = params("SELECT * FROM t WHERE id = ?", MYSQL);
+    assert_eq!(answered.len(), 1);
+    answered[0].param_type = BindParamType::Number;
+
+    for value in [
+        "1; SET GLOBAL max_connections = 5000",
+        "1 OR 1=1",
+        "abc",
+        "1,234",
+    ] {
+        answered[0].value = value.to_string();
+        let message = non_numeric_answer_message(MYSQL, &answered)
+            .unwrap_or_else(|| panic!("{value:?} must be refused"));
+        assert!(
+            message.contains(&answered[0].label) && message.contains("not a number"),
+            "the refusal must name the placeholder and the reason: {message}"
+        );
+    }
+
+    // A real number runs, in every shape.
+    for value in ["30", "-1.5", "+1", ".5", "1e3"] {
+        answered[0].value = value.to_string();
+        assert_eq!(
+            non_numeric_answer_message(MYSQL, &answered),
+            None,
+            "{value}"
+        );
+    }
+
+    // A Text answer is quoted and escaped, so it is a value whatever it says.
+    answered[0].param_type = BindParamType::String;
+    answered[0].value = "1; SET GLOBAL max_connections = 5000".to_string();
+    assert_eq!(non_numeric_answer_message(MYSQL, &answered), None);
+    assert_eq!(
+        prepare("SELECT * FROM t WHERE id = ?", MYSQL, &answered).sql,
+        "SELECT * FROM t WHERE id = '1; SET GLOBAL max_connections = 5000'"
+    );
+
+    // Oracle passes answers as real binds, so nothing of the value becomes SQL
+    // text there and there is nothing to refuse.
+    let mut oracle_answered = params("SELECT * FROM t WHERE id = :id", ORACLE);
+    oracle_answered[0].param_type = BindParamType::Number;
+    oracle_answered[0].value = "1; SET GLOBAL x = 1".to_string();
+    assert_eq!(non_numeric_answer_message(ORACLE, &oracle_answered), None);
+    assert_eq!(
+        prepare("SELECT * FROM t WHERE id = :id", ORACLE, &oracle_answered).sql,
+        "SELECT * FROM t WHERE id = :id"
+    );
+}

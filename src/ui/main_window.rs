@@ -2152,6 +2152,61 @@ impl AppState {
             .filter(|scope| !scope.is_empty())
     }
 
+    /// A tab keeps the scope it chose when its connection comes back up.
+    ///
+    /// Scope is a per-tab setting, like auto-commit and the transaction-mode
+    /// pin, and those two survive a reconnect — the mode half is pinned live by
+    /// TM S22. This was the one of the three that did not: every tab on the
+    /// connection was reset to no scope, silently, so a tab that had been
+    /// working in `HR` came back running in the login schema with an empty
+    /// selector and nothing said about it.
+    ///
+    /// A scope the new server does not have is NOT a reason to drop it here.
+    /// That case already has an answer of its own — `SessionScopeAssertion::
+    /// ScopeUnavailable`, reported once per run on all four backends, with the
+    /// statements tolerated rather than failed (live TM S46) — and being told
+    /// beats being moved without being told. Dropping it here would also make
+    /// the reset unconditional again, since this cannot know what the server
+    /// has without asking it.
+    ///
+    /// The one thing that does clear it: the connection came back as a
+    /// different DATABASE TYPE. A schema name cannot mean what it meant across
+    /// families, and `effective_transaction_mode` sanitizes the sibling pin
+    /// across families for exactly that reason.
+    ///
+    /// Not to be unified with the script-`CONNECT` reset
+    /// (`QueryProgress::ConnectionChanged` → `synchronize_scope_for_tab(tab_id,
+    /// None)`), which looks like the same event and is not: there a DIFFERENT
+    /// connection replaced the tab's, and the worker has already dropped the
+    /// batch's scope for the same reason ("the tab's scope belonged to the
+    /// connection that just went away"). Here the SAME connection came back.
+    ///
+    /// The card follows the binding rather than the other way round, so nothing
+    /// is pushed onto the cards here: `start_connection_metadata_refresh` reads
+    /// the tab's binding and states its scope on the card as it refreshes, and
+    /// every tab on this connection was marked for that refresh by the caller.
+    /// A background tab's card therefore stays empty until it is activated —
+    /// which is what a disconnect leaves behind today too, because its catalog
+    /// is gone until something reloads it.
+    fn keep_tab_scopes_across_connect(
+        &mut self,
+        connection_id: ConnectionId,
+        previous_db_type: DatabaseType,
+        db_type: DatabaseType,
+    ) -> bool {
+        if previous_db_type == db_type {
+            return false;
+        }
+        crate::utils::logging::log_info(
+            "connection",
+            &format!(
+                "Connection {connection_id} came back as {db_type} (was {previous_db_type}); \
+                 clearing the scope of every tab on it"
+            ),
+        );
+        self.synchronize_scope_for_connection(connection_id, None)
+    }
+
     fn synchronize_scope_for_connection(
         &mut self,
         connection_id: ConnectionId,
@@ -14923,11 +14978,20 @@ impl MainWindow {
                                     else {
                                         continue;
                                     };
+                                    // Read BEFORE the new info lands: whether a
+                                    // tab's chosen scope can still mean what it
+                                    // meant is a question about the connection
+                                    // it was chosen on.
+                                    let previous_db_type = runtime.sanitized_info().db_type;
                                     runtime.update_sanitized_info(info.clone());
                                     runtime.set_state(ConnectionRuntimeState::Connected);
                                     s.object_browser.add_runtime(runtime.clone());
                                     s.object_browser.refresh_runtime_labels();
-                                    s.synchronize_scope_for_connection(connection_id, None);
+                                    s.keep_tab_scopes_across_connect(
+                                        connection_id,
+                                        previous_db_type,
+                                        info.db_type,
+                                    );
                                     s.clear_metadata_for_connection(connection_id);
                                     // A reconnect keeps the runtime, so the
                                     // cards on it still carry the previous

@@ -48,6 +48,11 @@
 //       reached it. No server keeps that half of the promise for a read-only
 //       transaction, so the client does; the control run once the pin is gone
 //       is what makes the refusal the pin's doing.
+//   S61 (MySQL family) the same server change BEHIND A LEADING READ. A custom
+//       DELIMITER makes `SELECT 1; SET GLOBAL ...` one statement, the executor
+//       picks its execution path from the leading keyword, and the tab's gate
+//       used to live on only one of those paths - so S60 passed while this did
+//       not. Skipped on Oracle, where no unit can hold two statements.
 //   S30 (MySQL family) the two per-transaction READ WRITE escape forms
 //       (one-shot SET TRANSACTION, START TRANSACTION READ WRITE) are refused
 //       on a READ ONLY tab; Oracle keeps the same promise via its client gate.
@@ -122,6 +127,20 @@
 //       asks the user to resolve work they may never have done. Two batches on
 //       purpose: inside one, S57's correction already covers it and the
 //       scenario would pass against the bug.
+//
+//   S62 (MySQL family) the SESSION LEDGER answers for every statement of a
+//       unit. A custom `DELIMITER` makes `SELECT 1; UPDATE …` one statement to
+//       the executor and the server runs both, so a unit read from its leading
+//       statement was filed as leaving NOTHING behind: the tab was never told it
+//       held work, and the next statement's session preparation (`ROLLBACK`
+//       first, because the session looked clean) threw the write away.
+//   S63 (MySQL family) the same leading read hiding an ADOPTION instead of a
+//       refusal: a session-persistent `SET SESSION TRANSACTION ...` moved the
+//       session while the tab's pin and the toolbar kept the old value.
+//   S64 (all four) a READ ONLY pin refuses a lock other sessions wait for, and
+//       the control leg proves the server would have taken it — Oracle's own
+//       list permits `LOCK TABLE`, and the MySQL family's session
+//       characteristic constrains table writes, not locks.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -2598,6 +2617,241 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         format!("{read_setting} = {restored:?}, expected {before_setting}"),
     );
     h.run("ROLLBACK")?;
+
+    // ---- S61: the same server change, behind a leading read ----------------
+    // S60 derived, changing exactly ONE thing: the statement no longer stands
+    // alone. A custom `DELIMITER` makes `SELECT 1; SET GLOBAL …` a single
+    // statement as far as the executor is concerned, and the executor picks the
+    // path that runs it from the LEADING keyword — so this unit takes the
+    // streaming-SELECT path, which is not the path the tab's mode gate used to
+    // live on. S60 passed against that bug: its statement leads with the server
+    // change, so it took the plain path and was asked.
+    //
+    // MySQL family only, and the reason is the point: on Oracle no unit can
+    // hold two statements (its splitter ends one at `;` or `/`), which is why
+    // this exposure has a family and the fix does not.
+    if target.is_oracle() {
+        println!(
+            "  --- S61 skipped on Oracle: no Oracle unit can hold two statements, so a server \
+             change cannot hide behind a leading read ---"
+        );
+    } else {
+        println!("  --- S61 a READ ONLY tab refuses a server change behind a leading read ---");
+        let hidden = |value: i64| {
+            format!(
+                "DELIMITER $$\nSELECT 1; {}$$\nDELIMITER ;",
+                set_setting(value)
+            )
+        };
+        h.toolbar_transaction_mode(TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        ));
+        let capture = h.run(&hidden(before_setting + 1))?;
+        let refused = capture.results.iter().any(|result| {
+            !result.success
+                && result
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("reconfigures the server")
+        });
+        h.check(
+            "S61 the hidden server change is refused on a READ ONLY tab",
+            refused,
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        let during = h.select_scalar(read_setting)?;
+        h.check(
+            "S61 the refused unit never reached the server",
+            during.trim().parse::<i64>().ok() == Some(before_setting),
+            format!("{read_setting} = {during:?}, was {before_setting}"),
+        );
+
+        // Control group: the identical text once the pin is gone. It also
+        // proves the exposure is real — that the server really does run BOTH
+        // statements of the unit — which a refusal on its own cannot show.
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.run(&hidden(before_setting + 1))?;
+        let after = h.select_scalar(read_setting)?;
+        h.check(
+            "S61 the same text moves the setting once the pin is gone",
+            after.trim().parse::<i64>().ok() == Some(before_setting + 1),
+            format!(
+                "{read_setting} = {after:?}, expected {}",
+                before_setting + 1
+            ),
+        );
+        let _ = h.run(&set_setting(before_setting));
+        let restored = h.select_scalar(read_setting)?;
+        h.check(
+            "S61 the server setting is restored",
+            restored.trim().parse::<i64>().ok() == Some(before_setting),
+            format!("{read_setting} = {restored:?}, expected {before_setting}"),
+        );
+        h.run("ROLLBACK")?;
+    }
+
+    // ---- S62: the ledger answers for every statement of a unit -------------
+    // The same shape as S61, asked of the SESSION LEDGER instead of the
+    // read-only gate: a custom `DELIMITER` makes `SELECT 1; UPDATE …` one
+    // statement as far as the executor is concerned, the server runs both, and
+    // every rule that says what a statement left behind reads the LEADING one.
+    // So the unit was filed as leaving NOTHING: the tab was never told it held
+    // uncommitted work, and the next statement's session preparation — whose
+    // first setup statement is `ROLLBACK`, because the session looked clean —
+    // threw the write away.
+    //
+    // MySQL family only, for S61's reason: no Oracle unit holds two statements.
+    if target.is_oracle() {
+        println!(
+            "  --- S62 skipped on Oracle: no Oracle unit can hold two statements, so a write \
+             cannot hide behind a leading read ---"
+        );
+    } else {
+        println!("  --- S62 a write behind a leading read is filed as the work it is ---");
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
+        let before = h.select_v()?;
+        h.run(&format!(
+            "DELIMITER $$\nSELECT 1; UPDATE SQ_TM_T SET V = {} $$\nDELIMITER ;",
+            before + 1
+        ))?;
+        let state = h
+            .editor
+            .pooled_session_activity_snapshot()
+            .map(|snapshot| snapshot.retained_state());
+        h.check(
+            "S62 the tab is told the hidden write left uncommitted work",
+            state.is_some_and(|state| state.may_have_uncommitted_work()),
+            format!("retained state: {state:?}"),
+        );
+        // The discriminator: one more statement on the same tab. A session filed
+        // as clean is prepared with `ROLLBACK` first, so at the old behaviour the
+        // write was gone by now — and nothing had said so.
+        h.run("SELECT 1")?;
+        let after = h.select_v()?;
+        h.check(
+            "S62 the hidden write survives the tab's next statement",
+            after == before + 1,
+            format!("V = {after}, expected {}", before + 1),
+        );
+        // And it really was uncommitted, so the tab's own rollback reaches it —
+        // which is the other half of being told the truth.
+        h.run("ROLLBACK")?;
+        let rolled_back = h.select_v()?;
+        h.check(
+            "S62 and the tab's rollback reaches it",
+            rolled_back == before,
+            format!("V = {rolled_back}, expected {before}"),
+        );
+    }
+
+    // ---- S63: a session change behind a leading read is adopted ------------
+    // The tab's pin, the toolbar and the Tools menu are the app's claim about
+    // the SESSION. A session-persistent statement hiding behind a leading read
+    // moved the session while all three kept the old value: the same leading
+    // read, this time hiding the adoption instead of the refusal.
+    if target.is_oracle() {
+        println!(
+            "  --- S63 skipped on Oracle: no Oracle unit can hold two statements, so a session \
+             change cannot hide behind a leading read ---"
+        );
+    } else {
+        println!("  --- S63 a session change behind a leading read repins the tab ---");
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.run("DELIMITER $$\nSELECT 1; SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE $$\nDELIMITER ;")?;
+        let pinned = h.editor.tab_transaction_mode_override_value();
+        h.check(
+            "S63 the tab adopted the isolation the unit set",
+            pinned.is_some_and(|mode| mode.isolation == TransactionIsolation::Serializable),
+            format!("tab pin: {pinned:?}"),
+        );
+        // The server's own answer, which is what makes the check above about a
+        // divergence rather than about a flag: the session really did move.
+        let level = h.select_scalar("SELECT @@transaction_isolation")?;
+        h.check(
+            "S63 and the session really is at that level",
+            level.trim().eq_ignore_ascii_case("SERIALIZABLE"),
+            format!("@@transaction_isolation = {level:?}"),
+        );
+        h.run("ROLLBACK")?;
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
+    }
+
+    // ---- S64: a READ ONLY pin refuses a lock other sessions wait for -------
+    // No server refuses one for a read-only TRANSACTION — Oracle's own list of
+    // what one permits includes `LOCK TABLE`, and the MySQL family's session
+    // characteristic constrains table writes, not locks — so the tab's pin is
+    // the only thing that can, exactly as for a server change. The connection's
+    // read-only guard has always refused these; only the tab's pin allowed them.
+    println!("  --- S64 a READ ONLY tab refuses a lock other sessions wait for ---");
+    {
+        let lock_sql = if target.is_oracle() {
+            "LOCK TABLE SQ_TM_T IN EXCLUSIVE MODE"
+        } else {
+            "SELECT GET_LOCK('sq_tm_lock', 0)"
+        };
+        h.toolbar_transaction_mode(TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        ));
+        let capture = h.run(lock_sql)?;
+        let refused = capture.results.iter().any(|result| {
+            !result.success
+                && result
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("takes a lock other sessions wait for")
+        });
+        h.check(
+            "S64 the lock is refused on a READ ONLY tab",
+            refused,
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        // Control group: the same statement once the pin is gone. It proves the
+        // server would have taken the lock, which is why the pin has to answer.
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
+        let allowed = h.run(lock_sql)?;
+        let succeeded =
+            allowed.results.iter().any(|result| result.success) || !allowed.rows.is_empty();
+        h.check(
+            "S64 the same lock is the server's to give once the pin is gone",
+            succeeded,
+            format!(
+                "results: {:?}",
+                allowed
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        if target.is_oracle() {
+            h.run("ROLLBACK")?;
+        } else {
+            h.run("SELECT RELEASE_LOCK('sq_tm_lock')")?;
+            h.run("ROLLBACK")?;
+        }
+        let _ = h.editor.discard_pooled_session_for_close();
+    }
 
     // ---- S31: a pin this database cannot express ---------------------------
     // A tab keeps its pinned mode when it is bound to another database: a tab

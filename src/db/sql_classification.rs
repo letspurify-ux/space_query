@@ -124,24 +124,146 @@ fn read_only_refusal_reason(
     kind: SqlKind,
     analysis: &SqlStatementAnalysis<'_>,
 ) -> Option<String> {
-    if statement_reconfigures_the_server_for_analysis(db_type, analysis) {
-        return Some(READ_ONLY_SERVER_CHANGE_REFUSAL.to_string());
+    if let Some(reason) = read_only_shared_refusal_for_analysis(db_type, sql, analysis) {
+        return Some(reason.to_string());
     }
     match kind {
-        SqlKind::SelectLike | SqlKind::TransactionControl => None,
-        // The one kind that cannot be answered by the kind alone: a lock is
-        // session state, and taking one makes other sessions wait. Its RELEASE
-        // forms stay allowed for the reason COMMIT is — a connection can be
-        // marked read-only while it already holds one, and refusing the release
-        // would strand it.
-        SqlKind::SessionControl => statement_acquires_a_lock_other_sessions_wait_for(db_type, sql)
-            .then(|| "a statement that takes a lock other sessions wait for".to_string()),
+        SqlKind::SelectLike | SqlKind::TransactionControl | SqlKind::SessionControl => None,
         SqlKind::Dml
         | SqlKind::Ddl
         | SqlKind::PlsqlOrProcedure
         | SqlKind::Script
         | SqlKind::Unknown => Some(describe_blocked_statement(kind, analysis.leading_keyword())),
     }
+}
+
+/// The refusal both read-only guards give for a statement that writes a file on
+/// the server. Shared for the reason the other two are.
+pub(crate) const READ_ONLY_SERVER_FILE_REFUSAL: &str =
+    "a statement that writes a file on the server";
+
+/// The refusal both read-only guards give for a statement that takes a lock
+/// other sessions wait for. Shared for the reason the server-change one is.
+pub(crate) const READ_ONLY_LOCK_REFUSAL: &str =
+    "a statement that takes a lock other sessions wait for";
+
+/// Why READ ONLY refuses this statement whatever the SERVER would do about the
+/// data — the half the connection's read-only flag and a query tab's READ ONLY
+/// pin have to answer the same way.
+///
+/// The two guards differ on DATA by design: the connection refuses anything not
+/// provably a read, while the tab lets the server refuse the writes (its
+/// `SET SESSION TRANSACTION READ ONLY` outlives every commit). They cannot
+/// differ here, because a server's read-only transaction does not reliably
+/// refuse these and the app cannot tell per version which ones it will.
+/// Measured on MySQL 8.0.46 under `SET SESSION TRANSACTION READ ONLY`: it
+/// ALLOWS `SET GLOBAL`, `FLUSH TABLES WITH READ LOCK`, `CACHE INDEX`,
+/// `LOCK TABLES … READ`, `LOCK INSTANCE FOR BACKUP`, `GET_LOCK` and
+/// `SELECT … INTO OUTFILE`; it REFUSES `LOCK TABLES … WRITE` and
+/// `ALTER INSTANCE`. Oracle permits `ALTER SYSTEM` and `LOCK TABLE` inside one
+/// by its own documented rule. A guard that leans on the server therefore lets
+/// most of them through and answers differently on the next server version, so
+/// the app answers for itself:
+///
+/// - a statement that reconfigures the SERVER rather than this session, and
+/// - a statement that takes a LOCK other sessions wait for.
+///
+/// Both used to be asked by the connection's guard alone. The tab's pin refused
+/// neither, so a tab promising "this changes nothing" could move a global,
+/// `FLUSH`, `KILL` — and hold `LOCK TABLES`, a MySQL backup lock, or a named
+/// `GET_LOCK` with no timeout, none of which any server refuses a read-only
+/// transaction. The lock half was also asked of ONE statement kind
+/// (`SessionControl`), which let `SELECT GET_LOCK('x', -1)` past the
+/// connection's guard as well: a locking function call classifies as a read.
+pub(crate) fn read_only_shared_refusal(db_type: DatabaseType, sql: &str) -> Option<&'static str> {
+    read_only_shared_refusal_for_analysis(
+        db_type,
+        sql,
+        &SqlStatementAnalysis::new_for_db_type(db_type, sql),
+    )
+}
+
+fn read_only_shared_refusal_for_analysis(
+    db_type: DatabaseType,
+    sql: &str,
+    analysis: &SqlStatementAnalysis<'_>,
+) -> Option<&'static str> {
+    if statement_reconfigures_the_server_for_analysis(db_type, analysis) {
+        return Some(READ_ONLY_SERVER_CHANGE_REFUSAL);
+    }
+    if statement_takes_a_lock_other_sessions_wait_for(db_type, sql, analysis) {
+        return Some(READ_ONLY_LOCK_REFUSAL);
+    }
+    if statement_writes_a_file_on_the_server(db_type, sql) {
+        return Some(READ_ONLY_SERVER_FILE_REFUSAL);
+    }
+    None
+}
+
+/// Whether this statement writes a FILE on the server rather than a table.
+///
+/// `SELECT … INTO OUTFILE` and `INTO DUMPFILE` read tables and write a file in
+/// the server's own filesystem. Measured on MySQL 8.0.46: it runs inside a
+/// read-only transaction and writes the file — the restriction is about table
+/// writes — and the classifier reads the statement as the SELECT it starts with,
+/// so BOTH read-only guards let it through: the connection's because a read is
+/// provably a read, and the tab's because it delegates writes to the server.
+///
+/// `SELECT … INTO @var` (and `INTO var` in a routine) stay allowed: they write
+/// session state, which is exactly what a read-only session may do.
+fn statement_writes_a_file_on_the_server(db_type: DatabaseType, sql: &str) -> bool {
+    match classification_profile_for_db_type(db_type) {
+        // Oracle has no statement form for this. Writing a file there needs
+        // `UTL_FILE` inside PL/SQL, and a PL/SQL block is refused outright by
+        // both guards.
+        SqlClassificationProfile::Oracle => false,
+        SqlClassificationProfile::MySqlCompatible => {
+            sql_contains_word_sequence_any_depth_for_db_type(db_type, sql, &["INTO", "OUTFILE"])
+                || sql_contains_word_sequence_any_depth_for_db_type(
+                    db_type,
+                    sql,
+                    &["INTO", "DUMPFILE"],
+                )
+        }
+    }
+}
+
+/// Whether this statement takes a lock other sessions wait for.
+///
+/// Measured, because the reason has to be the true one: under
+/// `SET SESSION TRANSACTION READ ONLY`, MySQL 8.0.46 refuses `LOCK TABLES …
+/// WRITE` but ALLOWS `LOCK TABLES … READ`, `LOCK INSTANCE FOR BACKUP`,
+/// `FLUSH TABLES WITH READ LOCK` and a named `GET_LOCK`; Oracle's own list of
+/// what a read-only transaction permits includes `LOCK TABLE`. So the server
+/// covers one spelling out of five and the app answers for all of them, the same
+/// way on every backend.
+///
+/// The RELEASE forms stay allowed for the reason COMMIT does — a connection can
+/// be marked read-only, or a tab pinned, while it already holds one, and
+/// refusing the release would strand it.
+fn statement_takes_a_lock_other_sessions_wait_for(
+    db_type: DatabaseType,
+    sql: &str,
+    analysis: &SqlStatementAnalysis<'_>,
+) -> bool {
+    // Oracle's explicit lock statement is named here instead of being taught to
+    // the statement-effects layer, and the reason is worth keeping: that layer
+    // tracks locks which OUTLIVE the transaction (MySQL's `LOCK TABLES`, a
+    // backup lock, a named lock), and it is what makes a session require a
+    // decision before it can be released or reused. Oracle's `LOCK TABLE` dies
+    // with the transaction that took it, so recording it there would leave every
+    // tab that ran one asking for a resolution it can never clear.
+    let explicit_lock_statement = match classification_profile_for_db_type(db_type) {
+        SqlClassificationProfile::Oracle => {
+            analysis.starts_with_words(&["LOCK", "TABLE"])
+                || analysis.starts_with_words(&["LOCK", "TABLES"])
+        }
+        // The MySQL family's own lock statements are all modelled by the
+        // statement-effects layer below, where they belong: theirs outlive the
+        // transaction.
+        SqlClassificationProfile::MySqlCompatible => false,
+    };
+    explicit_lock_statement || statement_acquires_a_lock_other_sessions_wait_for(db_type, sql)
 }
 
 /// The refusal both read-only guards give for a statement that reconfigures the
@@ -173,40 +295,40 @@ pub(crate) const READ_ONLY_SERVER_CHANGE_REFUSAL: &str =
 /// stay allowed: `ALTER SESSION` (the app issues one on this very session for
 /// the tab's own scope), `SET SESSION`/`SET @var`, and `RESET CONNECTION`.
 ///
-/// Asked of the ANALYSIS, so it reads the statement the classifier read: past a
-/// leading comment, and past MariaDB's `SET STATEMENT ... FOR <statement>`
-/// wrapper, which would otherwise hide the very statement being asked about.
+/// What belongs in the list is one question: is the statement's target the
+/// SERVER or the instance, rather than this session and its data? Account and
+/// privilege statements (`CREATE USER`, `GRANT`, `SET PASSWORD`) and every other
+/// data-dictionary DDL are deliberately NOT here — they write tables, so a
+/// read-only transaction refuses them and both guards get their answer from the
+/// server. The statements here write no table at all: a global variable, a
+/// cache, the binary log, another session, the instance's own keys and code.
 ///
-/// And asked of EVERY statement in the text, not of its leading words. One unit
-/// can hold several: a custom MySQL `DELIMITER` makes `SELECT 1; SET GLOBAL …`
-/// one statement as far as the executor is concerned, and reading only the
-/// front of it let a server change ride behind a leading read on a tab pinned
-/// Read only. The connection's guard never had that gap — a text holding
-/// several statements classifies as `Script`, which it refuses outright — so
-/// this is the tab pin's half of the same answer. The splitter is the
-/// executor's own, so a `;` inside a string, a comment or a PL/SQL block is not
-/// a statement boundary.
-pub(crate) fn statement_reconfigures_the_server(db_type: DatabaseType, sql: &str) -> bool {
-    crate::db::query::QueryExecutor::split_script_items_for_db_type_with_mysql_delimiter(
-        sql,
-        Some(db_type),
-        None,
-    )
-    .iter()
-    .any(|item| match item {
-        crate::db::query::ScriptItem::Statement(statement) => {
-            statement_reconfigures_the_server_for_analysis(
-                db_type,
-                &SqlStatementAnalysis::new_for_db_type(db_type, statement),
-            )
-        }
-        // A tool command is the client's own; none of them reaches the server
-        // at all, and `read_only_block_reason` answers for the two that would
-        // leave this connection behind.
-        crate::db::query::ScriptItem::ToolCommand(_) => false,
-    })
-}
-
+/// Whether the server ALSO refuses one of them is not the criterion, because it
+/// varies: measured on MySQL 8.0.46, `SET GLOBAL` and `CACHE INDEX` are allowed
+/// inside a read-only transaction while `ALTER INSTANCE` is refused. Leaning on
+/// that split would make the app's answer a function of the server version, and
+/// "the connection guard refuses it anyway" is no reason to leave one out
+/// either: that guard refuses anything not provably a read, while the tab's pin
+/// delegates the DATA question to the server and has nothing to delegate to
+/// here.
+///
+/// Asked of ONE statement, and of the ANALYSIS of it, so it reads what the
+/// classifier reads: past a leading comment, and past MariaDB's
+/// `SET STATEMENT ... FOR <statement>` wrapper, which would otherwise hide the
+/// very statement being asked about.
+///
+/// Splitting a text into its statements is deliberately NOT this function's
+/// job, although it briefly was. One unit can hold several statements — a
+/// custom MySQL `DELIMITER` makes `SELECT 1; SET GLOBAL …` one statement as far
+/// as the executor is concerned — so reading only the front of a unit lets a
+/// server change ride behind a leading read. But that is true of every question
+/// a read-only guard asks, not of this one, and a clause that splits for itself
+/// is a clause the next one has to remember to copy: the tab pin's OTHER
+/// clause, the explicit READ WRITE escape, did not, and the same leading read
+/// hid that from it too. Both guards therefore split ONCE — the connection's in
+/// [`read_only_block_reason`], the tab's in
+/// `SqlEditorWidget::transaction_mode_refusal_for_statement` — and ask every
+/// question of every statement they find.
 fn statement_reconfigures_the_server_for_analysis(
     db_type: DatabaseType,
     analysis: &SqlStatementAnalysis<'_>,
@@ -222,19 +344,49 @@ fn statement_reconfigures_the_server_for_analysis(
             // `SET GLOBAL`/`SET PERSIST`/`@@global.` — including the
             // `SET GLOBAL TRANSACTION ...` form, which classifies as
             // transaction control and would otherwise be read as harmless.
-            set_sql_affects_only_global_or_persist_scope(sql, mysql_compatible_comments)
+            //
+            // ANY assignment, not all of them: one `SET` may mix scopes, and
+            // asking the "only" form let a global ride along with a session
+            // assignment.
+            set_sql_assigns_any_global_or_persist_scope(sql, mysql_compatible_comments)
                 // Server-wide state: privileges, logs, hosts, table cache.
                 || word(0) == Some("FLUSH")
                 // Ends another session.
                 || word(0) == Some("KILL")
+                // Ends every session, including this one.
+                || word(0) == Some("SHUTDOWN")
+                // The `RESET` nouns that are not replication; the rest are
+                // answered by the classifier's own rule below.
                 || (word(0) == Some("RESET")
-                    && matches!(word(1), Some("MASTER" | "REPLICA" | "SLAVE" | "PERSIST")))
+                    && matches!(word(1), Some("MASTER" | "PERSIST" | "QUERY")))
                 || (word(0) == Some("PURGE") && matches!(word(1), Some("BINARY" | "MASTER")))
-                // `START`/`STOP` name a transaction as well as replication, so
-                // both words are asked.
-                || (matches!(word(0), Some("START" | "STOP"))
-                    && matches!(word(1), Some("REPLICA" | "SLAVE" | "GROUP_REPLICATION")))
-                || (word(0) == Some("CHANGE") && matches!(word(1), Some("MASTER" | "REPLICATION")))
+                // The INSTANCE, not the session: TLS material and the InnoDB
+                // master key.
+                || (word(0) == Some("ALTER") && word(1) == Some("INSTANCE"))
+                // Every `CLONE` form, not just `CLONE INSTANCE`: the LOCAL one
+                // writes a data directory on the server and the remote one
+                // replaces the recipient's data wholesale. Naming one spelling
+                // is how the replication list lost `START ALL SLAVES`.
+                || word(0) == Some("CLONE")
+                // Server-wide caches, which is why they are not table
+                // statements: `CACHE INDEX … IN <key_cache>` and
+                // `LOAD INDEX INTO CACHE` move a table's index blocks into a
+                // key cache the whole server shares.
+                || (word(0) == Some("CACHE") && word(1) == Some("INDEX"))
+                || (word(0) == Some("LOAD") && word(1) == Some("INDEX"))
+                // Loads and unloads server code, in every spelling: MySQL's
+                // `PLUGIN`/`COMPONENT` and MariaDB's `SONAME`. The VERB is the
+                // question — nothing session-local is spelled `INSTALL` — and
+                // naming one noun is how the replication list lost
+                // `START ALL SLAVES`.
+                || matches!(word(0), Some("INSTALL" | "UNINSTALL"))
+                // Replication control, asked of the rule that already knows
+                // every spelling of it — including MariaDB's multi-source
+                // `START ALL SLAVES`, whose noun is not the second word.
+                // Re-deriving the list here is what dropped that form: the
+                // verbs are shared with `START TRANSACTION`, so a spelling this
+                // misses reads as a transaction of the user's.
+                || mysql_replication_words(words)
         }
     }
 }
@@ -1092,111 +1244,108 @@ fn classify_set_sql_for_db_type(
     }
 }
 
+/// Every top-level assignment of a `SET` statement, in the order it wrote them.
+///
+/// `None` when the text is not a `SET` statement at all. The list always holds
+/// at least one element — the tail after the last comma, empty or not — so
+/// `all()` cannot answer "yes" about a statement that assigns nothing.
+///
+/// ONE walk, because three questions are asked of the same list and each used
+/// to walk the text itself. Two of those walks were the same code with the
+/// quantifier flipped, and that is exactly the difference a caller cannot see:
+/// the read-only guards asked "does this reconfigure the server?" through the
+/// walk that answers "is EVERY assignment server-scoped?", so
+/// `SET SESSION sql_mode = '', GLOBAL net_read_timeout = 31` — one statement,
+/// valid on both servers — answered no and changed a global on a tab pinned
+/// Read only. The quantifier now sits at the question, where it can be read.
+fn set_statement_assignments(sql: &str, mysql_compatible_comments: bool) -> Option<Vec<&str>> {
+    let (set_token, _, after_set) = next_top_level_word(sql, 0, mysql_compatible_comments)?;
+    if set_token != "SET" {
+        return None;
+    }
+
+    let mut assignments = Vec::new();
+    let mut assignment_start = after_set;
+    let mut idx = after_set;
+    let mut depth = 0usize;
+    let bytes = sql.as_bytes();
+    while idx < bytes.len() {
+        if let Some(next) = skip_ignored_span(sql, idx, mysql_compatible_comments) {
+            idx = next;
+            continue;
+        }
+        match bytes[idx] {
+            b'(' => {
+                depth = depth.saturating_add(1);
+                idx += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                idx += 1;
+            }
+            b',' if depth == 0 => {
+                assignments.push(&sql[assignment_start..idx]);
+                assignment_start = idx + 1;
+                idx += 1;
+            }
+            _ => idx += 1,
+        }
+    }
+    assignments.push(&sql[assignment_start..]);
+    Some(assignments)
+}
+
 fn set_sql_contains_transaction_control_assignment(
     sql: &str,
     mysql_compatible_comments: bool,
 ) -> bool {
-    let Some((set_token, _, after_set)) = next_top_level_word(sql, 0, mysql_compatible_comments)
-    else {
-        return false;
-    };
-    if set_token != "SET" {
-        return false;
-    }
-
-    let mut assignment_start = after_set;
-    let mut idx = after_set;
-    let mut depth = 0usize;
-    let bytes = sql.as_bytes();
-    while idx < bytes.len() {
-        if let Some(next) = skip_ignored_span(sql, idx, mysql_compatible_comments) {
-            idx = next;
-            continue;
-        }
-        match bytes[idx] {
-            b'(' => {
-                depth = depth.saturating_add(1);
-                idx += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                idx += 1;
-            }
-            b',' if depth == 0 => {
-                if set_assignment_targets_transaction_control(
-                    &sql[assignment_start..idx],
-                    mysql_compatible_comments,
-                ) {
-                    return true;
-                }
-                assignment_start = idx + 1;
-                idx += 1;
-            }
-            _ => idx += 1,
-        }
-    }
-
-    set_assignment_targets_transaction_control(&sql[assignment_start..], mysql_compatible_comments)
+    set_statement_assignments(sql, mysql_compatible_comments).is_some_and(|assignments| {
+        assignments.iter().any(|assignment| {
+            set_assignment_targets_transaction_control(assignment, mysql_compatible_comments)
+        })
+    })
 }
 
+/// Whether a `SET` statement's scope keyword makes it server-wide as a whole —
+/// the question "does this leave session state behind?" is the negative of.
 fn set_sql_affects_only_global_or_persist_scope(
     sql: &str,
     mysql_compatible_comments: bool,
 ) -> bool {
-    let words = statement_words(sql, mysql_compatible_comments);
-    if words.first().is_some_and(|word| word == "SET")
-        && words.get(1).is_some_and(|word| word == "GLOBAL")
-        && words.get(2).is_some_and(|word| word == "TRANSACTION")
-    {
+    if set_sql_is_global_transaction_statement(sql, mysql_compatible_comments) {
         return true;
     }
+    set_statement_assignments(sql, mysql_compatible_comments).is_some_and(|assignments| {
+        assignments.iter().all(|assignment| {
+            set_assignment_targets_global_or_persist_scope(assignment, mysql_compatible_comments)
+        })
+    })
+}
 
-    let Some((set_token, _, after_set)) = next_top_level_word(sql, 0, mysql_compatible_comments)
-    else {
-        return false;
-    };
-    if set_token != "SET" {
-        return false;
+/// Whether ANY assignment of a `SET` statement reaches past this session.
+///
+/// This is the question the read-only guards ask, and it is not the one above:
+/// MySQL lets one statement mix scopes (`SET GLOBAL max_connections = 1000,
+/// SESSION sql_mode = ''`), and a single session-scoped assignment among them
+/// does not make the global one harmless.
+fn set_sql_assigns_any_global_or_persist_scope(sql: &str, mysql_compatible_comments: bool) -> bool {
+    if set_sql_is_global_transaction_statement(sql, mysql_compatible_comments) {
+        return true;
     }
+    set_statement_assignments(sql, mysql_compatible_comments).is_some_and(|assignments| {
+        assignments.iter().any(|assignment| {
+            set_assignment_targets_global_or_persist_scope(assignment, mysql_compatible_comments)
+        })
+    })
+}
 
-    let mut saw_assignment = false;
-    let mut assignment_start = after_set;
-    let mut idx = after_set;
-    let mut depth = 0usize;
-    let bytes = sql.as_bytes();
-    while idx < bytes.len() {
-        if let Some(next) = skip_ignored_span(sql, idx, mysql_compatible_comments) {
-            idx = next;
-            continue;
-        }
-        match bytes[idx] {
-            b'(' => {
-                depth = depth.saturating_add(1);
-                idx += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                idx += 1;
-            }
-            b',' if depth == 0 => {
-                if !set_assignment_targets_global_or_persist_scope(
-                    &sql[assignment_start..idx],
-                    mysql_compatible_comments,
-                ) {
-                    return false;
-                }
-                saw_assignment = true;
-                assignment_start = idx + 1;
-                idx += 1;
-            }
-            _ => idx += 1,
-        }
-    }
-
-    set_assignment_targets_global_or_persist_scope(
-        &sql[assignment_start..],
-        mysql_compatible_comments,
-    ) && (saw_assignment || !sql[assignment_start..].trim().is_empty())
+/// `SET GLOBAL TRANSACTION ...` writes the server's default and carries no
+/// assignment list for the walk above to read.
+fn set_sql_is_global_transaction_statement(sql: &str, mysql_compatible_comments: bool) -> bool {
+    let words = statement_words(sql, mysql_compatible_comments);
+    words.first().is_some_and(|word| word == "SET")
+        && words.get(1).is_some_and(|word| word == "GLOBAL")
+        && words.get(2).is_some_and(|word| word == "TRANSACTION")
 }
 
 pub(crate) fn mysql_set_statement_assigns_session_variable(
@@ -2765,6 +2914,87 @@ mod tests {
             assert_eq!(blocked(db_type, "RESET CONNECTION"), None, "{db_type}");
             assert_eq!(blocked(db_type, "SET ROLE ALL"), None, "{db_type}");
             assert_eq!(blocked(db_type, "START TRANSACTION"), None, "{db_type}");
+        }
+    }
+
+    /// One `SET` may mix scopes, and a session-scoped assignment beside a
+    /// global one does not make the global one harmless.
+    ///
+    /// The rule used to be asked through the predicate that answers "is EVERY
+    /// assignment server-scoped?" — the right question for "does this leave
+    /// session state behind?", and the wrong one for "does this reach past this
+    /// session?". `SET SESSION sql_mode = '', GLOBAL net_read_timeout = 31` is
+    /// one statement both servers accept, and it answered no.
+    #[test]
+    fn read_only_refuses_a_server_change_that_shares_its_statement_with_a_session_one() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            for sql in [
+                "SET SESSION sql_mode = '', GLOBAL net_read_timeout = 31",
+                "SET GLOBAL net_read_timeout = 31, SESSION sql_mode = ''",
+                "SET @@SESSION.sql_mode = '', @@GLOBAL.net_read_timeout = 31",
+                "SET @keep = 1, PERSIST net_read_timeout = 31",
+            ] {
+                let reason =
+                    blocked(db_type, sql).unwrap_or_else(|| panic!("{db_type} must refuse {sql}"));
+                assert!(
+                    reason.contains("reconfigures the server"),
+                    "{db_type} {sql} refused for the wrong reason: {reason}"
+                );
+            }
+            // The session-only spellings of the same statement are NOT server
+            // changes — reading "any assignment" must not turn every
+            // multi-assignment `SET` into one. (The connection's guard refuses
+            // several of these anyway, as a `SET` it cannot prove is a read;
+            // that is its own older rule, and the reason it gives must stay
+            // that one.)
+            for sql in [
+                "SET SESSION sql_mode = '', SESSION sql_safe_updates = 1",
+                "SET sql_mode = '', autocommit = 1",
+                "SET @a = 1, @b = 2",
+                "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            ] {
+                assert!(
+                    read_only_shared_refusal(db_type, sql) != Some(READ_ONLY_SERVER_CHANGE_REFUSAL),
+                    "{db_type} {sql} does not reach past this session"
+                );
+            }
+        }
+    }
+
+    /// Replication control is refused in every spelling the classifier knows,
+    /// because it is asked of the classifier instead of a second list.
+    ///
+    /// The second list is what dropped MariaDB's multi-source forms: their noun
+    /// is not the second word, and the verbs they share with `START
+    /// TRANSACTION` are exactly why the classifier matches the NOUN.
+    #[test]
+    fn read_only_refuses_every_replication_spelling_the_classifier_knows() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            for sql in [
+                "START REPLICA",
+                "STOP SLAVE",
+                "START ALL SLAVES",
+                "STOP ALL SLAVES",
+                "STOP ALL REPLICAS",
+                "RESET REPLICA",
+                "RESET SLAVE ALL",
+                "STOP GROUP_REPLICATION",
+                "CHANGE MASTER TO MASTER_HOST = 'h'",
+                "CHANGE REPLICATION SOURCE TO SOURCE_HOST = 'h'",
+                // Not replication, and server state all the same.
+                "RESET MASTER",
+                "RESET PERSIST",
+            ] {
+                let reason =
+                    blocked(db_type, sql).unwrap_or_else(|| panic!("{db_type} must refuse {sql}"));
+                assert!(
+                    reason.contains("reconfigures the server"),
+                    "{db_type} {sql} refused for the wrong reason: {reason}"
+                );
+            }
+            // The transaction that shares those verbs is not replication.
+            assert_eq!(blocked(db_type, "START TRANSACTION"), None, "{db_type}");
+            assert_eq!(blocked(db_type, "RESET CONNECTION"), None, "{db_type}");
         }
     }
 

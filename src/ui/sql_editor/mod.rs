@@ -1789,7 +1789,7 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             Some(resolution_action),
             mysql_sql,
             crate::db::statement_session_post_processor_for(db_type).effects_for_sql(mysql_sql),
-            |mysql_conn: &mut mysql::PooledConn| mysql_conn.query_drop(mysql_sql),
+            |mysql_conn: &mut mysql::PooledConn, _| mysql_conn.query_drop(mysql_sql),
         )
     }
 

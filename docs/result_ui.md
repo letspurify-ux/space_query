@@ -78,6 +78,38 @@ duplicate locator, cancellation, or execution error rolls back the whole save
 (or only its savepoint inside an existing manual transaction), leaving the
 staged grid changes available for correction or retry.
 
+**A save never opens a transaction over work of the user's.** It has to be
+atomic and it must not resolve what is not its own, and those two meet in one
+place: under auto-commit the only way to be atomic is to open a transaction, and
+MySQL's `START TRANSACTION` implicitly COMMITS whatever the session already
+holds. An auto-commit tab CAN hold one — an explicit `START TRANSACTION` survives
+auto-commit ON, and the app supports that deliberately — so bracketing the save
+by the tab's auto-commit flag committed the user's uncommitted work for them,
+unrecoverably, and reported only the save's own success. The question is "is
+there anything of the user's to lose", answered once for every backend by
+`db::app_operation_transaction_scope()`: with nothing open the save owns its
+transaction and commits it; otherwise it nests in a `SAVEPOINT` and leaves the
+decision to the user, exactly as the manual-commit path always did. Oracle's save
+meets the same rule by construction — its block opens with `SAVEPOINT` and has no
+transaction-opening statement to reach for. The save's own message follows the
+scope it really used, so a nested save never claims the rows are committed.
+
+**A ROWID save is refused once the tab has moved.** The Oracle path names the
+table exactly as the user's `SELECT` did, and the save runs later through the
+tab's own execute path, which asserts whatever scope the tab has THEN — so an
+unqualified name plus a schema change in between resolves against the NEW schema,
+and a staged INSERT lands in a same-named table there and reports success.
+Qualifying the name instead would change how it resolves (a public synonym stops
+resolving once a schema is put in front of it), so the save says no. The
+comparison is total: "no scope" is a VALUE — the login schema, or the
+connection's own database — not a missing answer, because the one door that
+installs a result's rows records the tab's scope as it does so. Reading it as
+"nothing to disagree with" let the same wrong-schema write through whenever the
+tab moved INTO or OUT OF a scope rather than between two. The connection,
+generation, pool epoch, database type and a scope picked in the object browser
+are answered before that by the result's own `ExecutionOrigin`; what reaches this
+check is a scope the user's own script moved.
+
 ## Cell value window
 
 `src/ui/value_viewer.rs`. Opened by double-clicking a cell, or by

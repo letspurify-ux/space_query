@@ -431,9 +431,11 @@ fn oracle_states_the_tabs_transaction_mode_over_a_reused_session() {
         content_code
             .matches("OracleTransactionModeApplied::TransactionStillOpen")
             .count(),
-        5,
+        7,
         "and every site that reads the answer must name it: the one producer, the two OCI \
-         application arms, the thin batch arm and the thin lazy fetch's"
+         application arms, the thin batch arm, the thin lazy fetch's, and the OCI \
+         post-CONNECT injection — which keeps the ANSWER rather than a flag, so the claim it \
+         later makes to the tracker can be read against the reply it rests on"
     );
     assert!(
         !content.contains("Ok(OracleTransactionModeApplied::TransactionStillOpen) => None,"),
@@ -2095,90 +2097,154 @@ fn mysql_use_refreshes_metadata_without_connection_transition() {
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
-    for (start_marker, end_marker, syncs_shared_connection) in [
-        (
-            "ToolCommand::Use { database } =>",
-            "ToolCommand::MysqlDelimiter",
-            false,
-        ),
-        (
-            "ToolCommand::Use { ref database } =>",
-            "// MySQL-specific commands",
-            true,
-        ),
-    ] {
-        let start = content
-            .find(start_marker)
-            .unwrap_or_else(|| panic!("MySQL USE command branch should exist: {start_marker}"));
-        let end = content[start..]
-            .find(end_marker)
-            .map(|offset| start + offset)
-            .unwrap_or_else(|| panic!("USE branch end marker should exist: {end_marker}"));
-        let use_branch = &content[start..end];
+    // CHANGED, with its reason: this used to check TWO `USE` implementations
+    // and REQUIRE the second one to run `USE` on the shared connection and call
+    // `sync_mysql_current_database_name()` — a connection-wide database write
+    // and a pool-epoch bump, which is exactly what round 9 removed from the
+    // MySQL loop for splitting sibling tabs off their database. That second
+    // implementation sat in the ORACLE batch loop and could never run (a batch
+    // there holds an Oracle connection, and a script `CONNECT` makes another
+    // one), so this clause was pinning dead code as required behaviour, and its
+    // "// MySQL USE command" comment made the live path be credited elsewhere
+    // with rules it does not follow. There is now ONE implementation.
+    let start = content
+        .find("ToolCommand::Use { database } =>")
+        .expect("the MySQL USE command branch should exist");
+    let end = content[start..]
+        .find("ToolCommand::MysqlDelimiter")
+        .map(|offset| start + offset)
+        .expect("USE branch end marker should exist");
+    let use_branch = &content[start..end];
 
-        // ONE report of where the session went: ScopeChangedNotice carries
-        // the database the statement itself selected. A second event built
-        // from the connection's stored name would arrive right behind it and
-        // overwrite that with another tab's database.
-        assert!(
-            use_branch.contains("note_batch_scope_change")
-                && !use_branch.contains("QueryProgress::DatabaseChanged"),
-            "USE should report its scope once, from the statement's own target"
-        );
-        if syncs_shared_connection {
-            // This path runs the USE on the shared connection itself, so the
-            // connection's stored database really did move with it.
-            assert!(
-                use_branch.contains("sync_mysql_current_database_name"),
-                "direct USE should synchronize the global database before reporting success"
-            );
-            assert!(
-                use_branch.contains("global database selection could not be synchronized"),
-                "direct USE should fail instead of emitting a stale scope event when global sync fails"
-            );
-        } else {
-            assert!(
-                !use_branch.contains("sync_mysql_current_database_name"),
-                "a pooled tab's USE moves only that tab, not the connection's stored database"
-            );
-        }
-        assert!(
-            use_branch.contains("Some(current_database.to_string())"),
-            "USE should carry the database it selected into the scope change"
-        );
-        assert!(
-            !use_branch.contains("QueryProgress::ConnectionChanged"),
-            "USE is a tab-session database change, not a connection transition that clears all tab sessions"
-        );
-    }
+    // ONE report of where the session went: ScopeChangedNotice carries
+    // the database the statement itself selected. A second event built
+    // from the connection's stored name would arrive right behind it and
+    // overwrite that with another tab's database.
+    assert!(
+        use_branch.contains("note_batch_scope_change")
+            && !use_branch.contains("QueryProgress::DatabaseChanged"),
+        "USE should report its scope once, from the statement's own target"
+    );
+    assert!(
+        !use_branch.contains("sync_mysql_current_database_name"),
+        "a pooled tab's USE moves only that tab, not the connection's stored database"
+    );
+    assert!(
+        use_branch.contains("Some(current_database.to_string())"),
+        "USE should carry the database it selected into the scope change"
+    );
+    assert!(
+        !use_branch.contains("QueryProgress::ConnectionChanged"),
+        "USE is a tab-session database change, not a connection transition that clears all tab sessions"
+    );
+
+    // And no second implementation may come back. The Oracle loop still has a
+    // `USE` arm because its splitter produces the command, but the arm's whole
+    // job is to say the command belongs to another family.
+    assert_eq!(
+        content.matches("ToolCommand::Use { database } =>").count(),
+        1,
+        "exactly one branch may run a USE"
+    );
+    let oracle_arm_start = content
+        .find("ToolCommand::Use { .. } =>")
+        .expect("the Oracle loop should answer USE rather than implement it");
+    let oracle_arm = &content[oracle_arm_start
+        ..oracle_arm_start
+            + content[oracle_arm_start..]
+                .find("// MySQL-specific commands")
+                .expect("the Oracle USE arm should end before the MySQL passthrough commands")];
+    assert!(
+        oracle_arm.contains("only supported for MySQL/MariaDB connections")
+            && !oracle_arm.contains("get_mysql_connection_mut")
+            && !oracle_arm.contains("sync_mysql_current_database_name")
+            && !oracle_arm.contains("note_batch_scope_change"),
+        "the Oracle loop's USE arm must refuse, not re-implement: {oracle_arm}"
+    );
 }
 
 #[test]
 fn mysql_plain_use_statement_updates_scope_and_refreshes_metadata() {
-    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs");
-    let content = fs::read_to_string(&file)
-        .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+    let content = read_source("src/ui/sql_editor/execution.rs");
 
-    let start = content
-        .find("let current_database_notice =")
-        .expect("plain MySQL USE notice branch should exist");
-    let end = content[start..]
-        .find("SqlEditorWidget::emit_timing_if_enabled")
-        .map(|offset| start + offset)
-        .expect("plain MySQL USE notice branch should have an end marker");
-    let branch = &content[start..end];
-
+    // CHANGED, with its reason: this used to slice an inline notice block out of
+    // the MySQL batch's plain-executor branch and assert the three things it
+    // did. The inline block IS the defect it was written next to: that branch is
+    // one of three the family runs a statement down, the dispatch between them
+    // reads the LEADING keyword of the unit, and a unit can hold several
+    // statements — so `SELECT 1; USE other_db` (one statement to the executor
+    // under a custom `DELIMITER`, both run by the server) took the streaming
+    // branch, where no notice, no batch scope cell and no encoding re-read
+    // existed. The same three things are asserted here, in the one step every
+    // branch now takes.
+    let reader = content
+        .find("fn mysql_unit_moves_session_database(")
+        .map(|offset| slice_from(&content, offset, 1400))
+        .expect("one reader must answer where a UNIT left the session's database");
     assert!(
-        branch.contains("use_statement_database_name"),
-        "plain USE should extract the selected database from the executed statement"
+        reader.contains("fold_over_unit_statements")
+            && reader.contains("use_statement_database_name_for_db_type")
+            && reader.contains("later_unit_answer_wins"),
+        "the reader must ask every statement of the unit, and the LAST `USE` wins: {reader}"
+    );
+
+    let record = content
+        .find("fn record_successful_mysql_batch_statement(")
+        .map(|offset| slice_from(&content, offset, 3600))
+        .expect("one step must record what a successful statement changed");
+    assert!(
+        record.contains("Self::mysql_unit_moves_session_database(")
+            && record.contains("selected_scope")
+            && record.contains("MySqlBatchScopeChange("),
+        "the step must carry the selected database into a scope change: {record}"
+    );
+    // Recording it where the batch reads its scope and reporting it to the
+    // window stay ONE step, and the value that carries it cannot be dropped in
+    // silence.
+    let carrier = content
+        .find("struct MySqlBatchScopeChange(")
+        .map(|offset| slice_from(&content, offset, 700))
+        .expect("the scope change must travel as a value");
+    assert!(
+        carrier.contains("note_batch_scope_change("),
+        "reporting a scope change must go through the step that also records it: {carrier}"
     );
     assert!(
-        branch.contains("selected_scope"),
-        "plain USE should carry the selected database into the scope change"
+        content.contains(
+            "#[must_use = \"a scope change that is not reported leaves the rest of the script"
+        ),
+        "and a branch that drops it must not compile clean"
     );
-    assert!(
-        branch.contains("note_batch_scope_change"),
-        "plain USE should record and report its scope change in one step"
+    // Every branch that runs a statement takes that step: the plain executor,
+    // the streaming SELECT and the lazy fetch. One definition plus three calls.
+    assert_eq!(
+        content
+            .matches("record_successful_mysql_batch_statement(")
+            .count(),
+        4,
+        "every MySQL statement branch must record what its statement changed"
+    );
+    // And no MySQL branch may keep a copy of the two adoptions: one branch
+    // having them is what left the other two without them. Production code
+    // only — the test modules below call them too.
+    let production = content
+        .split_once("\nmod session_transaction_mode_adoption_tests {")
+        .map(|(before, _)| before.to_string())
+        .unwrap_or_else(|| content.clone());
+    assert_eq!(
+        production
+            .matches("adopt_session_transaction_mode_change_after_statement(")
+            .count(),
+        4,
+        "the rule itself, the MySQL family's one step, and the two Oracle batch loops — which \
+         each handle every statement of their batch in one place, so they need no second step"
+    );
+    assert_eq!(
+        production
+            .matches("mysql_autocommit_change_after_successful_statement_for_db_type(")
+            .count(),
+        3,
+        "the rule itself, its test-only single-db wrapper, and the MySQL family's one step"
     );
 }
 
@@ -2190,11 +2256,20 @@ fn a_worker_moves_its_tabs_scope_only_while_it_still_owns_the_tab() {
     // its current session was not in — which the next statement's scope
     // assertion then made true, carrying the user's open transaction into it.
     //
-    // Three sites write it from a worker, and the count below is what keeps a
-    // fourth from growing its own rule: the MySQL family's `USE` command, the
-    // OCI `ALTER SESSION SET CURRENT_SCHEMA`, and its thin twin. (The MySQL
-    // family's in-SCRIPT `USE` moves only its pooled session and records only
-    // its own batch cell; the tab's binding follows from the window.)
+    // TWO sites write it from a worker, and the count below is what keeps a
+    // third from growing its own rule: the OCI `ALTER SESSION SET
+    // CURRENT_SCHEMA` and its thin twin.
+    //
+    // CHANGED, with its reason: this said THREE and named the MySQL family's
+    // `USE` command first. It was counting a `USE` implementation inside the
+    // ORACLE batch loop — unreachable, since a batch there holds an Oracle
+    // connection — whose comment read "MySQL USE command". The live MySQL
+    // `USE`, in `execute_mysql_batch`, records only its own batch cell and
+    // leaves the tab's binding to the window, which is correct for a family
+    // that re-acquires its session per statement: the batch cell is what the
+    // rest of the script asserts, the retained lease records where the session
+    // really is, and `ScopeChangedNotice` moves the tab. Both halves of the
+    // claim were wrong, so both are stated here as they are.
     let execution = read_source("src/ui/sql_editor/execution.rs");
     let runtime = read_source("src/db/runtime.rs");
 
@@ -2235,9 +2310,8 @@ fn a_worker_moves_its_tabs_scope_only_while_it_still_owns_the_tab() {
         execution
             .matches("record_batch_scope_on_tab_binding(")
             .count(),
-        4,
-        "the MySQL `USE` command, the OCI schema change and its thin twin must all go through \
-         it (plus its definition)"
+        3,
+        "the OCI schema change and its thin twin must both go through it (plus its definition)"
     );
 
     // And the door itself compares before it writes.
@@ -2867,6 +2941,68 @@ fn scope_synchronization_is_connection_id_scoped_for_oracle_mysql_and_mariadb() 
             && !helper.contains("DatabaseType::MySQL")
             && !helper.contains("DatabaseType::MariaDB"),
         "ConnectionId scope synchronization must use one backend-neutral policy for Oracle, MySQL, and MariaDB"
+    );
+}
+
+/// A reconnect keeps every per-tab setting it can still mean — scope included.
+///
+/// Scope is a per-tab setting like auto-commit and the transaction-mode pin,
+/// and it was the one of the three a reconnect silently reset: the
+/// connect-success handler called `synchronize_scope_for_connection(id, None)`
+/// over every tab of the connection, so a tab that had been working in `HR`
+/// came back running in the login schema with an empty selector and nothing
+/// said about it. A scope the new server does not have is NOT a reason to drop
+/// it — that case has an answer of its own (`SessionScopeAssertion::
+/// ScopeUnavailable`, reported once per run, statements tolerated, live-pinned
+/// by TM S46) — so the blanket reset is gone, and the one thing that still
+/// clears it is a connection that came back as a different DATABASE TYPE,
+/// which is the sanitization `effective_transaction_mode` already makes for the
+/// sibling pin.
+#[test]
+fn a_reconnect_keeps_a_tabs_scope_unless_the_connection_changed_family() {
+    let main_window = read_source("src/ui/main_window.rs");
+
+    let rule_start = main_window
+        .find("fn keep_tab_scopes_across_connect(")
+        .expect("the connect-time scope rule should exist");
+    let rule_end = main_window[rule_start..]
+        .find("\n    fn synchronize_scope_for_connection(")
+        .map(|offset| rule_start + offset)
+        .expect("the reset it guards should follow it");
+    let rule = &main_window[rule_start..rule_end];
+    assert!(
+        rule.contains("if previous_db_type == db_type {") && rule.contains("return false;"),
+        "the same database type must keep every tab's scope: {rule}"
+    );
+    assert!(
+        rule.contains("synchronize_scope_for_connection(connection_id, None)"),
+        "and a family change must still clear it, because a schema name cannot mean what it \
+         meant across families"
+    );
+    assert_eq!(
+        main_window
+            .matches("synchronize_scope_for_connection(connection_id, None)")
+            .count(),
+        1,
+        "only that rule may reset every tab's scope — the connect handler asking for it \
+         directly is the shape this replaced"
+    );
+
+    // Anchored on the read itself rather than on the handler's opening brace:
+    // `ConnectionResult::Success {` also names the two places that SEND it, and
+    // an anchor that matches the wrong one tests nothing.
+    let previous_read = "let previous_db_type = runtime.sanitized_info().db_type;";
+    let previous_at = main_window
+        .find(previous_read)
+        .expect("the connect handler must read the previous database type");
+    let after_read = slice_from(&main_window, previous_at + previous_read.len(), 1600);
+    let update_at = after_read.find("runtime.update_sanitized_info(");
+    let rule_at = after_read.find("s.keep_tab_scopes_across_connect(");
+    assert!(
+        matches!((update_at, rule_at), (Some(update), Some(rule)) if update < rule),
+        "whether a scope can still mean what it meant is a question about the connection it was \
+         chosen on, so the previous database type is read BEFORE the new info replaces it, and \
+         the handler then goes through the rule rather than resetting on its own"
     );
 }
 
@@ -3760,9 +3896,11 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         );
     }
     assert_eq!(
-        answered_sites, 5,
-        "the two OCI pre-batch arms, the two OCI re-application arms, and the thin batch's \
-         one arm for both replies"
+        answered_sites, 6,
+        "the two OCI pre-batch arms, the two OCI re-application arms, the thin batch's one arm \
+         for both replies, and the OCI post-CONNECT injection — which used to state the mode \
+         through a function of its own, tell the tracker nothing, and read ORA-01453 as a \
+         failure worth tearing down a connection it had just authenticated for"
     );
     // ORDER, not just existence — the failure this clause was blind to. The
     // scope assertion is the LAST gate before a statement is sent, and OCI
@@ -5043,13 +5181,19 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
     let executor = read_source("src/db/query/executor.rs");
 
     // One answer, and it is db-dispatched rather than hand-rolled per family.
+    //
+    // CHANGED, with its reason: the slice used to stop at the first `\n    }\n`
+    // after the entry point, which was the whole answer while the answer was
+    // one function. It is now two — the entry point SPLITS the text and the
+    // clauses are asked of each statement — so the slice runs to the end of the
+    // per-statement half, where those clauses live.
     let helper_start = execution
         .find("pub(super) fn transaction_mode_refusal_for_statement(")
         .expect("the shared transaction-mode refusal should exist");
     let helper_end = execution[helper_start..]
-        .find("\n    }\n")
+        .find("\n    /// The refusal a Read only tab gives for a statement the server's own")
         .map(|offset| helper_start + offset)
-        .expect("the shared refusal should end");
+        .expect("the shared refusal should end at the message it produces");
     let helper = &execution[helper_start..helper_end];
     assert!(
         helper.contains("transaction_mode_requires_first_statement")
@@ -5057,6 +5201,61 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
         "the shared refusal must ask the backend whether the mode is a transaction property, \
          then the statement classifier: {helper}"
     );
+    // And every clause is asked of every statement in the text, from ONE split
+    // that the ENTRY POINT owns. A unit can hold several statements (a custom
+    // MySQL `DELIMITER` makes `SELECT 1; SET GLOBAL …` one), and while the
+    // split lived inside a single clause the clause beside it — the explicit
+    // READ WRITE escape — still read the leading words, so the same leading
+    // read that hid a server change also hid the escape that disarms the pin.
+    assert!(
+        helper.contains("split_script_items_for_db_type_with_mysql_delimiter(sql")
+            && helper.contains("ScriptItem::Statement(statement) => {"),
+        "the entry point must split the text and ask about each statement: {helper}"
+    );
+    // And no single clause may split for itself again. The shared half both
+    // guards ask — a server change or a lock other sessions wait for — is a
+    // question about ONE statement, and the splitting belongs to the two entry
+    // points that own it.
+    //
+    // CHANGED, with its reason: this used to name `statement_reconfigures_the_server`,
+    // the wrapper that once did the splitting. There is no wrapper any more:
+    // both guards ask `read_only_shared_refusal`, which asks the server-change
+    // clause AND the lock clause, so a guard can no longer learn half of the
+    // shared answer — the half the tab's pin was missing.
+    let classification = read_source("src/db/sql_classification.rs");
+    let shared = classification
+        .find("fn read_only_shared_refusal_for_analysis(")
+        .map(|offset| slice_from(&classification, offset, 900))
+        .expect("one shared refusal for both read-only guards");
+    assert!(
+        shared.contains("statement_reconfigures_the_server_for_analysis(")
+            && shared.contains("statement_takes_a_lock_other_sessions_wait_for("),
+        "the shared half must ask both questions: {shared}"
+    );
+    assert!(
+        !shared.contains("split_script_items"),
+        "and it must not split for itself: {shared}"
+    );
+    // The connection's guard reaches the same answer through its own
+    // per-statement half, which is where its splitting ends.
+    for (guard, must_ask) in [
+        (
+            "pub(crate) fn read_only_block_reason(",
+            "read_only_refusal_reason(",
+        ),
+        (
+            "fn read_only_refusal_reason(",
+            "read_only_shared_refusal_for_analysis(",
+        ),
+    ] {
+        let start = classification
+            .find(guard)
+            .unwrap_or_else(|| panic!("{guard} should exist"));
+        assert!(
+            slice_from(&classification, start, 2600).contains(must_ask),
+            "the connection's guard must ask the shared answer: {guard} -> {must_ask}"
+        );
+    }
 
     // Nobody re-derives it.
     //
@@ -5091,11 +5290,41 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
         execution_production
             .matches("transaction_mode_refusal_for_statement(")
             .count(),
-        4,
-        "every batch loop and the shared answer itself, and nothing else in execution.rs: the \
-         two Oracle loops, and the MySQL family's one gate — which was NOT a caller, so the \
-         one half of the tab's mode no server enforces never reached that family at all"
+        5,
+        "the entry point itself, and every path that runs a statement: both Oracle batch \
+         loops, the Oracle thin LAZY select (the one Oracle path that runs a statement \
+         without the batch loop), and the MySQL family's session acquisition"
     );
+    // WHERE the MySQL family asks is the point, and it is not inside one of its
+    // executors. That family runs a statement down three paths — the streaming
+    // SELECT, the lazy fetch and the plain executor — and the dispatch between
+    // them reads the LEADING keyword, so a unit holding several statements took
+    // the SELECT path and the gate that lived in the plain executor was never
+    // reached: a READ ONLY tab moved a global. `acquire_mysql_pooled_session`
+    // is the one function all three pass to get the session they run on.
+    let acquisition_start = execution
+        .find("fn acquire_mysql_pooled_session(")
+        .expect("the MySQL family's session acquisition should exist");
+    let acquisition = slice_from(&execution, acquisition_start, 2600);
+    assert!(
+        acquisition.contains("statement_sql: &str")
+            && acquisition.contains("Self::transaction_mode_refusal_for_statement("),
+        "the acquisition must be told which statement it is for, and refuse it there"
+    );
+    for executor_fn in [
+        "let execute_mysql_sql = |sql: &str,",
+        "let execute_mysql_select_streaming =",
+    ] {
+        let start = execution
+            .find(executor_fn)
+            .unwrap_or_else(|| panic!("the MySQL executor {executor_fn} should exist"));
+        assert!(
+            !slice_from(&execution, start, 2000)
+                .contains("transaction_mode_refusal_for_statement("),
+            "no MySQL executor may keep a copy of the gate: one of them having it is what left \
+             the others without it ({executor_fn})"
+        );
+    }
     assert!(
         editor.contains("SqlEditorWidget::transaction_mode_refusal_for_statement("),
         "F6 Explain Plan must ask the same question before it writes to PLAN_TABLE"
@@ -5855,9 +6084,10 @@ fn nothing_the_session_carries_delays_stating_the_tabs_transaction_mode() {
             + production_flat
                 .matches("oracle_transaction_boundary.note_transaction_mode_stated(")
                 .count(),
-        5,
+        6,
         "every site that states the mode must record the server's answer: OCI pre-batch \
-         (applied / already open), OCI in-batch (applied / already open) and thin in-batch"
+         (applied / already open), OCI in-batch (applied / already open), thin in-batch, and \
+         the OCI post-CONNECT injection"
     );
 }
 
@@ -6892,4 +7122,133 @@ fn every_oracle_transaction_mode_application_records_before_it_asks() {
         body.contains("| OracleTransactionModeApplied::TransactionStillOpen => Ok(retained_state)"),
         "so the lazy fetch keeps the state it recorded rather than failing the user's SELECT"
     );
+}
+
+/// Every question about what a statement left on the session is asked of every
+/// statement in the UNIT, from ONE split.
+///
+/// One executor unit can hold several statements: a custom MySQL `DELIMITER`
+/// makes `SELECT 1; INSERT …` one statement as far as the executor is concerned,
+/// and the server runs both. Every rule that answers such a question reads the
+/// LEADING statement, so each of them answered about the first one only — the
+/// session ledger filed an open transaction, a temporary table, a prepared
+/// statement and a changed charset as nothing at all, the transaction-mode and
+/// auto-commit adoptions never fired, and a `USE` moved the session with nothing
+/// said about it. The read-only guards had the same trap and each learned it
+/// separately, which is the lesson this pins: a clause that splits for itself is
+/// a clause the next one has to remember to copy.
+#[test]
+fn every_question_about_what_a_unit_left_on_the_session_asks_every_statement() {
+    let transaction = read_source("src/db/transaction.rs");
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    // ONE split, in one place, with the executor's own splitter and no custom
+    // delimiter — the caller hands over what the executor already treats as one
+    // statement, so splitting can only find MORE statements, never fewer.
+    assert_eq!(
+        transaction
+            .matches("pub(crate) fn fold_over_unit_statements")
+            .count(),
+        1,
+        "there must be exactly one split for every question about a unit"
+    );
+    let fold = transaction
+        .find("pub(crate) fn fold_over_unit_statements")
+        .map(|offset| slice_from(&transaction, offset, 1800))
+        .expect("the shared fold should exist");
+    assert!(
+        fold.contains("split_script_items_for_db_type_with_mysql_delimiter(")
+            && fold.contains("ScriptItem::ToolCommand(_) => None"),
+        "the split is the executor's own, and a tool command reaches no server: {fold}"
+    );
+
+    // A backend answers for ONE statement; the unit answer is not its to give.
+    assert!(
+        transaction.contains("fn effects_for_single_statement(&self, sql: &str)"),
+        "each backend must answer about one statement"
+    );
+    for backend in [
+        "impl StatementSessionPostProcessor for OracleStatementSessionPostProcessor {",
+        "impl StatementSessionPostProcessor for MysqlStatementSessionPostProcessor {",
+    ] {
+        let start = transaction
+            .find(backend)
+            .unwrap_or_else(|| panic!("{backend} should exist"));
+        let body = slice_from(&transaction, start, 3000);
+        assert!(
+            body.contains("fn effects_for_single_statement(&self, sql: &str)")
+                && !body.contains("fn effects_for_sql("),
+            "a backend may not answer for a whole unit itself: {backend}"
+        );
+    }
+
+    // Nothing SUBTRACTIVE is claimed from a unit: the order inside it is not
+    // readable from a merge (`INSERT; COMMIT` and `COMMIT; INSERT` leave
+    // different sessions and merge identically), and a claim is only ever
+    // lowered by an ANSWER.
+    let then = transaction
+        .find("    fn then(self, next: Self) -> Self {")
+        .map(|offset| slice_from(&transaction, offset, 9000))
+        .expect("the sequential composition should exist");
+    for subtractive in [
+        "clears_session_state: false",
+        "clears_state: false",
+        "has_implicit_commit: false",
+        "releases_physical_session: false",
+        "clears_statement_diagnostics: false",
+        "clears_all_session_residue: false",
+        "releases_one: false",
+        "releases_all: false",
+    ] {
+        assert!(
+            then.contains(subtractive),
+            "a unit may not claim it undid something: {subtractive}"
+        );
+    }
+
+    // The one field that is NOT subtractive is folded, because consuming a
+    // pending one-shot `SET TRANSACTION` is permanent whichever statement of the
+    // unit did it — dropping it would leave the tab believing an override the
+    // server has already spent is still armed.
+    assert!(
+        then.contains("consumes_next_transaction_mode_override: self"),
+        "a consumed one-shot stays consumed: {then}"
+    );
+    // And the guess is narrow: only a unit that DROPPED an ending is one the
+    // merge could not read, or a script written under a custom `DELIMITER` would
+    // ask its tab to commit two plain reads.
+    let for_unit = transaction
+        .find("fn for_unit(db_type: DatabaseType, sql: &str")
+        .map(|offset| slice_from(&transaction, offset, 3400))
+        .expect("the unit fold should exist");
+    assert!(
+        for_unit.contains("dropped_an_ending")
+            && for_unit.contains("could_be_holding_work")
+            && for_unit.contains(
+                "!held_several_statements || !dropped_an_ending.get() || !could_be_holding_work"
+            ),
+        "the transaction is a guess only when an ending had to be dropped AND there was work for          it to have ended: {for_unit}"
+    );
+
+    // And every other question about a unit goes through the same fold.
+    for (source, question) in [
+        (
+            &transaction,
+            "pub fn session_transaction_mode_change_for_statement(",
+        ),
+        (
+            &transaction,
+            "pub(crate) fn mysql_set_autocommit_value_for_db_type(",
+        ),
+        (&execution, "fn mysql_statement_drops_current_database("),
+        (&execution, "fn mysql_unit_moves_session_database("),
+    ] {
+        let start = source
+            .find(question)
+            .unwrap_or_else(|| panic!("{question} should exist"));
+        assert!(
+            slice_from(source, start, 1400).contains("fold_over_unit_statements("),
+            "{question} must ask every statement of the unit"
+        );
+    }
 }
