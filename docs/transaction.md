@@ -210,6 +210,19 @@ reading the answer would otherwise leave an open read-only transaction that
 `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` cannot see, and every later batch would
 fail with ORA-01453.
 
+Those rules are not a call site's to keep. All three Oracle sites — the OCI
+batch, the thin batch and the thin lazy SELECT — state the mode through
+`apply_oracle_transaction_mode_statements_with`, which owns the whole shape: the
+session-default reset is the one statement it does NOT record, every other one is
+recorded before its round trip, ORA-01453 is `TransactionStillOpen`, and anything
+else is `Failed`. A **failure states nothing**: only the two ANSWERS reach
+`OracleTransactionBoundaryTracker::note_transaction_mode_stated`, because that
+call clears the guess and says a transaction no write probe can see may be open.
+The thin batch used to make it whatever came back, so a batch whose mode
+application really failed filed its session with the claim settled by an answer
+the server never gave, while the OCI twin recorded nothing — one script, two
+answers, from the code that was meant to make them one.
+
 **Nothing the session carries delays stating the mode.** A batch states the
 tab's pinned mode before its first statement whatever the session it was handed
 holds, and the two exceptions are about the batch's own STATEMENTS: a leading
@@ -267,6 +280,27 @@ same session, and while allowing the ISOLATION_LEVEL form, was an arbitrary line
 `ALTER SYSTEM` is the one exception kept out: the pin is the user saying this tab
 changes nothing, and reconfiguring the instance is a change whatever the
 transaction semantics say.
+
+That exception is not the allowlist's to remember, and it is not Oracle's alone.
+`transaction_mode_refusal_for_statement` asks
+`sql_classification::statement_reconfigures_the_server` FIRST and on every
+backend, so the answer cannot depend on a keyword being absent from a list, and
+the MySQL family — which otherwise delegates to the server — refuses `SET
+GLOBAL`, `FLUSH`, `KILL` and replication control too. No server keeps this
+promise for a read-only transaction: Oracle permits `ALTER SYSTEM` inside one,
+and the MySQL family's session characteristic constrains table writes, not server
+administration. The connection's own read-only guard asks the same function, so
+the app's two read-only guards can no longer answer differently
+(see [read-only connections](session.md#read-only-connections)).
+
+Reaching the MySQL family took one more step, and it is why that half was missing
+in the first place: **nothing on that family's execution path called the shared
+answer at all.** Its batch kept a gate of its own that asked only about the
+explicit READ WRITE escape, spelled inline. Both questions now live in
+`transaction_mode_refusal_for_statement`, and `execute_mysql_sql` — the one place
+every MySQL-family batch statement passes — asks it, in the position both Oracle
+batch loops keep theirs. Every backend's batch now asks one question, so a family
+cannot remember one half of it and forget the other.
 
 ### Unrunnable isolation/access pairs are refused at selection
 

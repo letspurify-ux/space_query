@@ -43,6 +43,11 @@
 //       auto-committed read inside the same batch.
 //   S25 (MySQL family) the combined one-statement form adopts BOTH properties,
 //       notifies the UI, and both really apply.
+//   S60 (all) a READ ONLY tab refuses a statement that reconfigures the SERVER,
+//       and the setting read back over a second connection proves it never
+//       reached it. No server keeps that half of the promise for a read-only
+//       transaction, so the client does; the control run once the pin is gone
+//       is what makes the refusal the pin's doing.
 //   S30 (MySQL family) the two per-transaction READ WRITE escape forms
 //       (one-shot SET TRANSACTION, START TRANSACTION READ WRITE) are refused
 //       on a READ ONLY tab; Oracle keeps the same promise via its client gate.
@@ -112,10 +117,11 @@
 //       Oracle probe can see, so the tab must not be filed as still holding it
 //       and every later batch must still state the pin.
 //   S58 (Oracle) the guess that block leaves does not outlive its batch. It is
-//       filed with the SESSION, and the pre-batch gate obeys it, so it unpinned
-//       every later batch on the tab. Two batches on purpose: inside one, S57's
-//       correction already covers it and the scenario would pass against the
-//       bug.
+//       filed with the SESSION, so it used to unpin every later batch on the
+//       tab (through a pre-batch gate that has since been deleted) and it still
+//       asks the user to resolve work they may never have done. Two batches on
+//       purpose: inside one, S57's correction already covers it and the
+//       scenario would pass against the bug.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -1565,10 +1571,12 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
 
         // ---- S58 (Oracle): the guess does not outlive the batch that made it.
         // The correction S57 checks reaches the statements of ONE batch. The
-        // claim is filed with the SESSION, and the pre-batch gate never states
-        // the pin over a session that may hold a transaction — so a guess that
-        // survives the batch silently unpins every LATER batch on the tab until
-        // the user commits or rolls back. Nothing in the second batch is opaque,
+        // claim is filed with the SESSION, so a guess that survives the batch
+        // used to silently unpin every LATER batch on the tab (a pre-batch gate
+        // skipped the pin over a session that may hold a transaction; it has
+        // since been deleted, and every batch now states the mode and reads the
+        // server's reply). What the guess still costs is the session's own
+        // filing. Nothing in the second batch is opaque,
         // so only the FIRST batch's closing question to the server can make this
         // pass. FAILS on both drivers before the fix.
         //
@@ -1606,8 +1614,9 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
                 pair.is_some_and(|(first, second)| first == second),
                 format!(
                     "reads in the next batch: {reads:?} (different values mean the \
-                     previous batch filed a guess the pre-batch gate then obeyed \
-                     for the life of the session)"
+                     next batch did not run under the tab's pin — either it was \
+                     never stated, or the previous batch left the session in a \
+                     state that kept it from taking)"
                 ),
             );
             h.run("ROLLBACK")?;
@@ -2493,6 +2502,100 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         "S30 no row landed through an explicit READ WRITE escape",
         leaked.trim() == "0",
         format!("COUNT(*) WHERE V = 30 = {leaked}"),
+    );
+    h.run("ROLLBACK")?;
+
+    // ---- S60: a READ ONLY tab refuses a statement that reconfigures the SERVER
+    // "This tab changes nothing" is a promise about the SERVER as much as about
+    // the data, and no server keeps that half for a read-only TRANSACTION:
+    // Oracle's own list of what one permits includes `ALTER SYSTEM`, and the
+    // MySQL family's read-only session characteristic constrains table writes,
+    // not server administration. So the client refuses it, on every backend,
+    // through the one answer the connection's read-only guard also asks
+    // (`statement_reconfigures_the_server`).
+    //
+    // The setting is read back over the harness's own second connection, which
+    // is what proves the statement never reached the server rather than merely
+    // reporting an error. And the CONTROL run — the identical statement once
+    // the pin is gone — is what makes the refusal proof of the pin's doing and
+    // not of a privilege the account lacks, the same rule
+    // `verify_read_only_live` states for its own writes. The setting is
+    // restored afterwards either way.
+    println!("  --- S60 a READ ONLY tab refuses a statement that reconfigures the server ---");
+    let (read_setting, set_setting): (&str, fn(i64) -> String) = if target.is_oracle() {
+        (
+            "SELECT VALUE FROM V$PARAMETER WHERE NAME = 'open_cursors'",
+            |value| format!("ALTER SYSTEM SET open_cursors = {value} SCOPE=MEMORY"),
+        )
+    } else {
+        ("SELECT @@GLOBAL.net_read_timeout", |value| {
+            format!("SET GLOBAL net_read_timeout = {value}")
+        })
+    };
+    let before_setting: i64 = h
+        .select_scalar(read_setting)?
+        .trim()
+        .parse()
+        .map_err(|err| format!("S60 could not read the server setting: {err}"))?;
+    h.toolbar_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    let capture = h.run(&set_setting(before_setting + 1))?;
+    let refused = capture.results.first().is_some_and(|result| {
+        !result.success
+            && result
+                .message
+                .to_ascii_lowercase()
+                .contains("reconfigures the server")
+    });
+    h.check(
+        "S60 the server-reconfiguring statement is refused on a READ ONLY tab",
+        refused,
+        format!(
+            "result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    let during = h.select_scalar(read_setting)?;
+    h.check(
+        "S60 the refused statement never reached the server",
+        during.trim().parse::<i64>().ok() == Some(before_setting),
+        format!("{read_setting} = {during:?}, was {before_setting}"),
+    );
+
+    h.editor.clear_tab_transaction_mode_override();
+    let _ = h.editor.discard_pooled_session_for_close();
+    let capture = h.run(&set_setting(before_setting + 1))?;
+    h.check(
+        "S60 the same statement runs once the pin is gone",
+        capture.results.first().is_some_and(|result| result.success),
+        format!(
+            "control result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    let after = h.select_scalar(read_setting)?;
+    h.check(
+        "S60 so the refusal was the pin's doing, not a missing privilege",
+        after.trim().parse::<i64>().ok() == Some(before_setting + 1),
+        format!(
+            "{read_setting} = {after:?}, expected {}",
+            before_setting + 1
+        ),
+    );
+    let _ = h.run(&set_setting(before_setting));
+    let restored = h.select_scalar(read_setting)?;
+    h.check(
+        "S60 the server setting is restored",
+        restored.trim().parse::<i64>().ok() == Some(before_setting),
+        format!("{read_setting} = {restored:?}, expected {before_setting}"),
     );
     h.run("ROLLBACK")?;
 

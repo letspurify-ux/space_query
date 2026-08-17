@@ -8301,14 +8301,20 @@ impl SqlEditorWidget {
                     statement_reached_server: false,
                 });
             }
-            if active_transaction_mode.get().access_mode
-                == crate::db::TransactionAccessMode::ReadOnly
-                && crate::db::transaction::mysql_statement_escapes_read_only_transaction_for_db_type(
-                    db_type, sql,
-                )
-            {
+            // The MySQL family's tab-mode gate, in the position both Oracle
+            // loops keep theirs. It used to ask only one of the two questions
+            // the tab's mode answers — the explicit READ WRITE escape — spelled
+            // out here rather than asked, so the OTHER one never reached the
+            // family's execution path at all: nothing on it called the shared
+            // answer, and a READ ONLY tab could still run `SET GLOBAL`, `FLUSH`
+            // or `KILL`, which no server refuses for a read-only transaction.
+            if let Some(message) = SqlEditorWidget::transaction_mode_refusal_for_statement(
+                db_type,
+                active_transaction_mode.get(),
+                sql,
+            ) {
                 return Err(MySqlBatchStatementError {
-                    message: SqlEditorWidget::mysql_read_only_escape_block_message(),
+                    message,
                     effects: statement_effects,
                     statement_reached_server: false,
                 });
@@ -16021,12 +16027,14 @@ impl SqlEditorWidget {
 
                 // The batch is about to file this session for the tab. A
                 // transaction claim that rests on a statement the app could not
-                // read would otherwise govern every LATER batch too: the
-                // pre-batch gate never states the tab's pinned mode over a
-                // session that may hold a transaction, and no later batch has a
-                // reason to ask. So ask once here — the same closing question
+                // read is filed WITH the session, so it outlives the batch that
+                // made it: the tab is then asked to resolve work it may never
+                // have done, at close and at every setting change the retained
+                // state guards. So ask once here — the same closing question
                 // the thin batch puts to its wire flag, and the same question
-                // the MySQL family's batch-end probe has always asked.
+                // the MySQL family's batch-end probe has always asked. What it
+                // no longer decides is whether the next batch states the tab's
+                // pinned mode: every batch does, and the server answers.
                 let claim = oracle_transaction_boundary.transaction_claim();
                 if claim.is_a_guess {
                     // An interrupted batch has no answer to settle with: the
@@ -17662,44 +17670,13 @@ impl SqlEditorWidget {
         retained_state
     }
 
-    /// Whether the app has anything to state before this Oracle statement: the
-    /// tab's pinned mode, applied so the statement runs under what the toolbar
-    /// shows.
+    /// Apply the tab's transaction mode on a thin session for a LAZY FETCH.
     ///
-    /// There is no longer a prior question. The app used to skip stating the mode
-    /// whenever the session "may have uncommitted work", because `SET TRANSACTION`
-    /// must be first in its transaction and ORA-01453 was treated as a failure.
-    /// Round 9 made that refusal an ANSWER, which leaves the skip doing harm only:
-    /// the claim it keyed on is a GUESS after any statement whose body the app
-    /// cannot read, so a `BEGIN … COMMIT; END;` in a pinned tab made every LATER
-    /// batch skip the pin as well — the tab ran at the session default for the
-    /// rest of its life while the toolbar showed Serializable or Read only, and
-    /// nothing in a later batch would ever ask again.
-    ///
-    /// So the mode is stated, always, and the server decides: it applies, or
-    /// ORA-01453 says a transaction is already open and the pin belongs to the
-    /// next one. Both Oracle drivers do this at the start of every batch, and the
-    /// MySQL family needs no equivalent because it states the mode as SESSION
-    /// state when it prepares the session, which a preserved session still
-    /// carries.
-    /// Apply the tab's transaction mode on a thin session for a LAZY FETCH,
-    /// recording each statement's effects the way both batch loops do.
-    ///
-    /// Two rules this shares with them rather than restating:
-    ///
-    /// Effects are recorded BEFORE the round trip. `SET TRANSACTION` opens a
-    /// transaction that carries no work of its own, so a cancel landing between
-    /// the server running it and the app reading the answer would otherwise
-    /// leave an open transaction nothing knows about — and every later batch on
-    /// the tab fails with ORA-01453. Recording first is true whatever the
-    /// outcome: it ran, or it was refused because a transaction was already
-    /// open, or it may have run.
-    ///
-    /// ORA-01453 is an ANSWER, not a failure. A transaction was already open,
-    /// so the pin belongs to the next one — which is what the model says
-    /// everywhere else. Failing the lazy SELECT for it made this the one Oracle
-    /// site that turned "applies from the next transaction" into an error the
-    /// user sees.
+    /// The rules it keeps are not restated here: it states the mode through
+    /// [`Self::apply_oracle_transaction_mode_statements_with`], the same
+    /// function both batch loops use. Only the last step is this site's own —
+    /// a lazy SELECT needs nothing from either ANSWER, so ORA-01453 leaves it
+    /// with the state it recorded rather than an error the user sees.
     fn apply_oracle_thin_transaction_mode_for_execution(
         conn: &mut OracleThinSession,
         prior_retained_state: RetainedSessionState,
@@ -17708,25 +17685,28 @@ impl SqlEditorWidget {
         let post_processor =
             crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
         let mut retained_state = prior_retained_state;
-        for (statement, restores_session_default) in transaction_mode.statements()? {
-            if !restores_session_default {
+        let applied = Self::apply_oracle_transaction_mode_statements_with(
+            transaction_mode,
+            |statement| {
                 retained_state = Self::oracle_retained_state_after_statement_effects(
                     retained_state,
-                    post_processor.effects_for_sql(&statement),
+                    post_processor.effects_for_sql(statement),
                     false,
                     false,
                     false,
                     false,
                 );
-            }
-            if let Err(message) = Self::execute_oracle_thin_statement(conn, &statement, false) {
-                if crate::db::oracle_error_says_transaction_still_open(&message) {
-                    break;
-                }
-                return Err(message);
-            }
+            },
+            |statement| Self::execute_oracle_thin_statement(conn, statement, false),
+        )?;
+        match applied {
+            // Both are answers, and a lazy SELECT needs nothing more from
+            // either: it applied, or a transaction was already open and the pin
+            // belongs to the next one.
+            OracleTransactionModeApplied::Yes
+            | OracleTransactionModeApplied::TransactionStillOpen => Ok(retained_state),
+            OracleTransactionModeApplied::Failed(message) => Err(message),
         }
-        Ok(retained_state)
     }
 
     fn oracle_thin_select_cells(
@@ -19967,47 +19947,14 @@ impl SqlEditorWidget {
                                 .and_then(load_mutex_transaction_mode_option),
                             default_isolation: default_transaction_isolation,
                         };
-                        // A mode this database cannot express is a batch
-                        // stopper, not something to apply nothing for. Both
-                        // Oracle loops answer the same way: applying the tab's
-                        // mode is app infrastructure, so silently running the
-                        // rest of the batch under a mode the toolbar does not
-                        // show — writes slipping through a Read only tab — is
-                        // the one outcome neither may produce. This used to be
-                        // `unwrap_or_default()`, which did exactly that while
-                        // the OCI twin stopped.
-                        let transaction_mode_statements =
-                            match transaction_mode_application.statements() {
-                                Ok(statements) => statements,
-                                Err(message) => {
-                                    had_error = true;
-                                    Self::emit_non_select_result(
-                                        sender,
-                                        session,
-                                        conn_name,
-                                        result_index,
-                                        &display_sql,
-                                        format!("Error: {message}"),
-                                        false,
-                                        false,
-                                        script_mode,
-                                    );
-                                    // Leaves the batch loop itself, like the OCI
-                                    // twin's `break` at the same point.
-                                    break;
-                                }
-                            };
-                        for (tx_sql, restores_session_default) in transaction_mode_statements {
-                            // Recorded BEFORE the round trip, exactly like the
-                            // OCI twin: `SET TRANSACTION` opens a transaction
-                            // that carries no work of its own, so a cancel
-                            // landing between the server running it and the app
-                            // reading the answer would leave an open
-                            // transaction nothing knows about. Recording first
-                            // is true whether it ran, was refused because one
-                            // was open already, or may have run.
-                            if !restores_session_default {
-                                let tx_effects = post_processor.effects_for_sql(&tx_sql);
+                        // Both drivers state the mode through one function, so
+                        // the rules it keeps — what is recorded, when, and
+                        // which replies are ANSWERS — cannot be spelled two
+                        // ways. This site used to spell them itself.
+                        let applied = Self::apply_oracle_transaction_mode_statements_with(
+                            transaction_mode_application,
+                            |tx_sql| {
+                                let tx_effects = post_processor.effects_for_sql(tx_sql);
                                 batch_may_report_transaction_work |= tx_effects
                                     .may_leave_uncommitted_work()
                                     || tx_effects.opens_or_preserves_transaction_state()
@@ -20021,19 +19968,21 @@ impl SqlEditorWidget {
                                         false,
                                         false,
                                     );
+                            },
+                            |tx_sql| Self::execute_oracle_thin_statement(conn, tx_sql, false),
+                        );
+                        match applied {
+                            // Both are the server's answer about this session's
+                            // transaction, so both reach the tracker: the mode
+                            // applied, or ORA-01453 says a transaction was
+                            // already open and the pin belongs to the next one.
+                            Ok(OracleTransactionModeApplied::Yes)
+                            | Ok(OracleTransactionModeApplied::TransactionStillOpen) => {
+                                transaction_mode_applied = true;
+                                oracle_transaction_boundary
+                                    .note_transaction_mode_stated(active_transaction_mode);
                             }
-                            if let Err(message) =
-                                Self::execute_oracle_thin_statement(conn, &tx_sql, false)
-                            {
-                                // A transaction is still running on this
-                                // session, so this was not a boundary after
-                                // all: the pin applies from the next
-                                // transaction, and the batch has no reason to
-                                // stop. The OCI twin reads the same refusal the
-                                // same way.
-                                if crate::db::oracle_error_says_transaction_still_open(&message) {
-                                    break;
-                                }
+                            Ok(OracleTransactionModeApplied::Failed(message)) => {
                                 had_error = true;
                                 let (error_message, statement_timed_out) =
                                     Self::oracle_thin_message_after_interrupt(
@@ -20054,25 +20003,55 @@ impl SqlEditorWidget {
                                     statement_timed_out,
                                     script_mode,
                                 );
-                                result_index += 1;
-                                // Applying the tab's transaction mode is app
-                                // infrastructure, not a user statement:
+                                // Leaves the batch, and deliberately not through
+                                // `stop_execution`: applying the tab's mode is
+                                // app infrastructure, not a user statement, so
                                 // continue-on-error must not let the rest of
                                 // the batch run under a mode different from
                                 // what the toolbar shows (e.g. writes slipping
-                                // through a Read only tab).
-                                stop_execution = true;
+                                // through a Read only tab). The OCI twin breaks
+                                // at the same point for the same reason.
+                                //
+                                // The tracker hears NOTHING here, which is the
+                                // other half of the twin's rule: a failure is
+                                // not an answer, and telling it the mode had
+                                // been stated let this batch file its session
+                                // with a claim settled by an answer the server
+                                // never gave.
+                                //
+                                // The tab's own mode could not be stated, so
+                                // the user's statement never ran.
+                                boundary_step.refused();
                                 break;
                             }
-                        }
-                        transaction_mode_applied = true;
-                        oracle_transaction_boundary
-                            .note_transaction_mode_stated(transaction_mode_application.mode);
-                        if stop_execution {
-                            // The tab's own mode could not be stated, so the
-                            // user's statement never ran.
-                            boundary_step.refused();
-                            break;
+                            // A mode this database cannot express is a batch
+                            // stopper, not something to apply nothing for. Both
+                            // Oracle loops answer the same way: applying the
+                            // tab's mode is app infrastructure, so silently
+                            // running the rest of the batch under a mode the
+                            // toolbar does not show — writes slipping through a
+                            // Read only tab — is the one outcome neither may
+                            // produce. This used to be `unwrap_or_default()`,
+                            // which did exactly that while the OCI twin
+                            // stopped.
+                            Err(message) => {
+                                had_error = true;
+                                Self::emit_non_select_result(
+                                    sender,
+                                    session,
+                                    conn_name,
+                                    result_index,
+                                    &display_sql,
+                                    format!("Error: {message}"),
+                                    false,
+                                    false,
+                                    script_mode,
+                                );
+                                // Leaves the batch loop itself, like the OCI
+                                // twin's `break` at the same point.
+                                boundary_step.refused();
+                                break;
+                            }
                         }
                     }
 
@@ -21872,21 +21851,6 @@ impl SqlEditorWidget {
         ]
     }
 
-    /// Record where a statement moved THIS batch's session to, and report it.
-    ///
-    /// A statement can move its own session mid-batch (`USE`,
-    /// `ALTER SESSION SET CURRENT_SCHEMA`). Everything the batch does after
-    /// that must happen where the statement landed: the per-statement session
-    /// preparation, the end-of-batch re-apply and a lazy fetch that takes the
-    /// session over all read the batch's own record of its scope. Recording
-    /// and reporting are therefore one step — when they were separate, two of
-    /// the four `USE`/`ALTER SESSION` sites reported the move without
-    /// recording it, and the rest of the same script ran in the scope the tab
-    /// had when the run started (`use db` on MySQL/MariaDB, and
-    /// `ALTER SESSION SET CURRENT_SCHEMA` on Oracle OCI).
-    ///
-    /// `record_scope` writes wherever this batch keeps that scope: a cell the
-    /// statement loop reads, or the transition context the thin batch carries.
     /// Record on the TAB's binding where this batch's session now is.
     ///
     /// The binding belongs to the tab, not to the batch, and a batch outlives
@@ -21911,13 +21875,54 @@ impl SqlEditorWidget {
         scope: &str,
     ) -> bool {
         if !session_owner.is_current() {
+            Self::log_tab_scope_left_alone(scope, "a later execution owns the tab");
             return false;
         }
-        connection_binding
+        if connection_binding
             .set_scope_if_revision(binding_revision, Some(scope.to_string()))
-            .is_ok()
+            .is_err()
+        {
+            Self::log_tab_scope_left_alone(scope, "the tab has been rebound since");
+            return false;
+        }
+        true
     }
 
+    /// Say that the tab did not follow this batch's session, and which of the
+    /// two questions above refused the write.
+    ///
+    /// Leaving the tab alone is the right answer and nothing is lost — the
+    /// batch's own record is what the rest of it asserts — but "the tab names
+    /// one schema while a live session sits in another" is the state these
+    /// rounds exist to make explicable, and it cannot be explained from a
+    /// `bool` that all three call sites drop. Every sibling door already
+    /// answers out loud (`SessionHandBack`, `WorkerSlotClear`).
+    fn log_tab_scope_left_alone(scope: &str, reason: &str) {
+        crate::utils::logging::log_warning(
+            "sql_editor::execution",
+            &format!(
+                "Leaving the tab's scope alone ({reason}); this batch's session moved to {scope}"
+            ),
+        );
+    }
+
+    /// Record where a statement moved THIS batch's session to, and report it.
+    ///
+    /// A statement can move its own session mid-batch (`USE`,
+    /// `ALTER SESSION SET CURRENT_SCHEMA`). Everything the batch does after
+    /// that must happen where the statement landed: the per-statement session
+    /// preparation, the end-of-batch re-apply and a lazy fetch that takes the
+    /// session over all read the batch's own record of its scope. Recording
+    /// and reporting are therefore one step — when they were separate, two of
+    /// the four `USE`/`ALTER SESSION` sites reported the move without
+    /// recording it, and the rest of the same script ran in the scope the tab
+    /// had when the run started (`use db` on MySQL/MariaDB, and
+    /// `ALTER SESSION SET CURRENT_SCHEMA` on Oracle OCI).
+    ///
+    /// `record_scope` writes wherever this batch keeps that scope: a cell the
+    /// statement loop reads, or the transition context the thin batch carries —
+    /// and, where the caller is a worker that may write the TAB's binding too,
+    /// through [`Self::record_batch_scope_on_tab_binding`].
     fn note_batch_scope_change(
         record_scope: impl FnOnce(&str),
         sender: &QueryProgressSender,
@@ -22666,10 +22671,16 @@ impl SqlEditorWidget {
             // CURRENT_SCHEMA` the app issues on this very session and the
             // ISOLATION_LEVEL form it already allows.
             //
-            // `ALTER SYSTEM` is deliberately NOT on this list even though
-            // Oracle permits it: the pin is the user saying "this tab changes
-            // nothing", and reconfiguring the instance is a change whatever the
-            // transaction semantics say.
+            // `ALTER SYSTEM`, which Oracle's own list permits, is refused
+            // before this allowlist is reached — the pin is the user saying
+            // "this tab changes nothing", and reconfiguring the instance is a
+            // change whatever the transaction semantics say. It is asked in
+            // `crate::db::sql_classification::statement_reconfigures_the_server`
+            // rather than left out of this list, because leaving it out is a
+            // rule this list has to remember: `ALTER SESSION` below is one
+            // keyword away from admitting it, and the connection's own
+            // read-only guard has to reach the same answer from a different
+            // shape.
             || crate::sql_text::starts_with_keyword_token(&upper, "LOCK TABLE")
             || crate::sql_text::starts_with_keyword_token(&upper, "SET ROLE")
             || crate::sql_text::starts_with_keyword_token(&upper, "ALTER SESSION")
@@ -22701,10 +22712,13 @@ impl SqlEditorWidget {
     /// `PLAN_TABLE`, which is why `classify_explain_sql_for_db_type` has always
     /// called it one. A tab pinned Read only could still write through it.
     ///
-    /// Where the SESSION carries the mode (the MySQL family) this answers None
-    /// and lets the server refuse: `SET SESSION TRANSACTION READ ONLY` survives
-    /// a commit there, and their `EXPLAIN` is a read anyway. The one hole that
-    /// leaves — an explicit READ WRITE escape statement — has its own gate.
+    /// Where the SESSION carries the mode (the MySQL family) this answers from
+    /// the server's side of the split: `SET SESSION TRANSACTION READ ONLY`
+    /// survives a commit there, and their `EXPLAIN` is a read anyway. Two holes
+    /// that leaves are closed here instead — an explicit READ WRITE escape
+    /// statement, which the server HONOURS over the session characteristic, and
+    /// a statement that reconfigures the SERVER, which is asked first and on
+    /// every backend below.
     pub(super) fn transaction_mode_refusal_for_statement(
         db_type: crate::db::DatabaseType,
         mode: crate::db::TransactionMode,
@@ -22713,10 +22727,42 @@ impl SqlEditorWidget {
         if mode.access_mode != crate::db::TransactionAccessMode::ReadOnly {
             return None;
         }
+        // "This tab changes nothing" is a promise about the SERVER as much as
+        // about the data, and no server keeps it for a read-only TRANSACTION:
+        // Oracle's own list of what one permits includes `ALTER SYSTEM`, and
+        // the MySQL family's session characteristic constrains table writes,
+        // not server administration. So this is asked on every backend, ahead
+        // of the question of who enforces the rest — and from the same place
+        // the connection's read-only guard asks it, so the two cannot answer
+        // differently again.
+        if crate::db::sql_classification::statement_reconfigures_the_server(db_type, sql) {
+            return Some(Self::read_only_server_change_block_message());
+        }
         if !db_type.transaction_mode_requires_first_statement(mode) {
-            return None;
+            // The SESSION carries the mode here and the server refuses the
+            // writes, with one exception it HONOURS instead: an explicit
+            // per-transaction `SET TRANSACTION READ WRITE` /
+            // `START TRANSACTION READ WRITE`. That refusal used to be spelled
+            // at the MySQL batch's own gate, which is why that gate answered
+            // only half the question — and why the half above never reached
+            // the family's execution path at all.
+            return crate::db::transaction::mysql_statement_escapes_read_only_transaction_for_db_type(
+                db_type, sql,
+            )
+            .then(Self::mysql_read_only_escape_block_message);
         }
         (!Self::oracle_read_only_allows_statement(sql)).then(Self::oracle_read_only_block_message)
+    }
+
+    /// The refusal a Read only tab gives for a statement that reconfigures the
+    /// server, on every backend. Worded from the shared reason so the tab's pin
+    /// and the connection's read-only flag describe the same refusal the same
+    /// way.
+    fn read_only_server_change_block_message() -> String {
+        format!(
+            "Error: Read only mode blocks {}. Switch to Read write to run this statement.",
+            crate::db::sql_classification::READ_ONLY_SERVER_CHANGE_REFUSAL
+        )
     }
 
     /// The MySQL-family twin of the Oracle read-only client gate, for the one
@@ -22724,8 +22770,14 @@ impl SqlEditorWidget {
     /// one-shot `SET TRANSACTION READ WRITE` and `START TRANSACTION READ
     /// WRITE` override READ ONLY for their transaction, so a pinned tab must
     /// refuse the escape statement itself.
+    ///
+    /// Prefixed like every other refusal the batch shows, which it was not
+    /// while it lived at a gate of its own: both answers now come from
+    /// `transaction_mode_refusal_for_statement`, so one tab can show both, and
+    /// two refusals from one gate must not read as two different kinds of
+    /// event.
     fn mysql_read_only_escape_block_message() -> String {
-        "Read only mode blocks an explicit READ WRITE transaction. Switch to Read write to run this statement."
+        "Error: Read only mode blocks an explicit READ WRITE transaction. Switch to Read write to run this statement."
             .to_string()
     }
 
@@ -23393,19 +23445,74 @@ impl SqlEditorWidget {
         }
     }
 
-    /// Applies the tab's transaction mode to an OCI session: the session-level
-    /// isolation reset (when the tab asks for the connection default) followed
-    /// by the mode statements themselves.
-    /// Apply the tab's transaction mode to an OCI session AND record each
-    /// statement's session effects as it lands, in one step.
+    /// State the tab's transaction mode on ONE Oracle session — the
+    /// session-level isolation reset (when the tab asks for the connection
+    /// default) followed by the mode statements themselves — and say what the
+    /// server answered.
     ///
-    /// Recording only after the whole list succeeded lost the effects of the
-    /// statements that DID reach the server when a later one failed or was
-    /// cancelled: `SET TRANSACTION READ ONLY` opens a read-only transaction
-    /// that `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` does not report, so the
-    /// session filed as clean and the next batch's re-application hit
-    /// ORA-01453 for the rest of the tab's life. The thin loop has always
-    /// recorded per applied statement; this is the same shape.
+    /// Both drivers and all three sites go through here (the OCI batch, the
+    /// thin batch, the thin lazy SELECT), because none of the rules below is a
+    /// call site's to get right, and the thin batch's hand-rolled copy got the
+    /// last one wrong:
+    ///
+    /// - The session-default RESET is not recorded. It restores a state the tab
+    ///   already represents, so recording it would make the next execution stop
+    ///   for a resolution decision the user does not owe.
+    /// - Every other statement is recorded BEFORE its round trip, not after it.
+    ///   `SET TRANSACTION` opens a transaction that
+    ///   `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` cannot see while it carries no
+    ///   work, so a cancel landing between the server running it and the app
+    ///   reading the answer would leave an open transaction nothing knows
+    ///   about, and every later batch would fail with ORA-01453. Recording
+    ///   first is true whatever the outcome: it ran, or it was refused because
+    ///   a transaction was open already, or it may have run.
+    /// - ORA-01453 is an ANSWER ([`OracleTransactionModeApplied::TransactionStillOpen`]),
+    ///   not a failure: a transaction is already open, so the pin belongs to
+    ///   the next one, which is what "applied from the next transaction" means
+    ///   everywhere else.
+    /// - Anything else is a FAILURE, and a failure states nothing. The thin
+    ///   batch used to tell its boundary tracker the mode had been stated on
+    ///   this path too, so a batch whose mode application really failed filed
+    ///   its session with the claim settled by an answer the server never gave,
+    ///   while the OCI twin recorded nothing — one script, two answers.
+    ///
+    /// `Failed` carries the server's own message unwrapped, because each site
+    /// says something different about it: the OCI batch names the action, and
+    /// the thin batch first asks whether a cancel or a timeout produced it.
+    ///
+    /// Nothing gates the call. The app used to skip stating the mode whenever
+    /// the session "may have uncommitted work", from the era when ORA-01453
+    /// failed the batch; once it became an answer, the skip only did harm — the
+    /// claim it keyed on is a GUESS after any statement whose body the app
+    /// cannot read, and it is filed with the session, so one `BEGIN … COMMIT;
+    /// END;` made every LATER batch of a pinned tab skip the pin too and the
+    /// tab ran at the session default while the toolbar showed Serializable or
+    /// Read only. The only things that may hold the mode back are the batch's
+    /// own STATEMENTS: a leading script `CONNECT`, and the user's own
+    /// transaction-first statement, which has to be first in its transaction
+    /// itself.
+    fn apply_oracle_transaction_mode_statements_with(
+        application: OracleTransactionModeApplication,
+        mut record_stated_statement: impl FnMut(&str),
+        mut execute: impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<OracleTransactionModeApplied, String> {
+        for (statement, restores_session_default) in application.statements()? {
+            if !restores_session_default {
+                record_stated_statement(&statement);
+            }
+            if let Err(message) = execute(&statement) {
+                if crate::db::oracle_error_says_transaction_still_open(&message) {
+                    return Ok(OracleTransactionModeApplied::TransactionStillOpen);
+                }
+                return Ok(OracleTransactionModeApplied::Failed(message));
+            }
+        }
+        Ok(OracleTransactionModeApplied::Yes)
+    }
+
+    /// The OCI half of [`Self::apply_oracle_transaction_mode_statements_with`]:
+    /// it records into the batch's cleanup guard and names the action in the
+    /// failure it reports.
     fn apply_oracle_transaction_mode_statements(
         cleanup: &mut QueryExecutionCleanupGuard,
         conn: &Connection,
@@ -23413,32 +23520,26 @@ impl SqlEditorWidget {
     ) -> Result<OracleTransactionModeApplied, String> {
         let post_processor =
             crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
-        for (statement, restores_session_default) in application.statements()? {
-            // Recorded BEFORE the round trip, not after it. `SET TRANSACTION`
-            // opens a transaction that `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID`
-            // cannot see when it carries no work, so a cancel that lands
-            // between the server running this statement and the app reading the
-            // answer would leave an open transaction nothing knows about, and
-            // every later batch would fail with ORA-01453. Recording first is
-            // true whatever the outcome: it ran (transaction open), or it was
-            // refused because one was open already, or it may have run.
-            if !restores_session_default {
+        let applied = Self::apply_oracle_transaction_mode_statements_with(
+            application,
+            |statement| {
                 Self::apply_oracle_db_statement_effects(
                     cleanup,
-                    post_processor.effects_for_sql(&statement),
+                    post_processor.effects_for_sql(statement),
                 );
-            }
-            if let Err(err) = conn.execute(&statement, &[]) {
-                let message = err.to_string();
-                if crate::db::oracle_error_says_transaction_still_open(&message) {
-                    return Ok(OracleTransactionModeApplied::TransactionStillOpen);
-                }
-                return Ok(OracleTransactionModeApplied::Failed(format!(
-                    "Failed to apply transaction mode: {message}"
-                )));
-            }
-        }
-        Ok(OracleTransactionModeApplied::Yes)
+            },
+            |statement| {
+                conn.execute(statement, &[])
+                    .map(|_| ())
+                    .map_err(|err| err.to_string())
+            },
+        )?;
+        Ok(match applied {
+            OracleTransactionModeApplied::Failed(message) => OracleTransactionModeApplied::Failed(
+                format!("Failed to apply transaction mode: {message}"),
+            ),
+            answered => answered,
+        })
     }
 
     fn record_applied_oracle_transaction_mode_effects(
@@ -31531,6 +31632,173 @@ mod query_execution_cleanup_tests {
     /// explains is a read. Asking with the user's text let F6 write on a
     /// read-only tab, which is why each backend states the statement it will
     /// send in one place.
+    /// A Read only tab promises that this tab changes nothing, and no server
+    /// keeps that promise for a read-only TRANSACTION: Oracle's own list of
+    /// what one permits includes `ALTER SYSTEM`, and the MySQL family's session
+    /// characteristic constrains table writes, not server administration. So
+    /// the pin refuses server reconfiguration itself, on every backend, from
+    /// the same place the connection's read-only guard asks.
+    #[test]
+    fn a_read_only_tab_refuses_a_statement_that_reconfigures_the_server() {
+        let read_only = crate::db::TransactionMode::new(
+            crate::db::TransactionIsolation::Default,
+            crate::db::TransactionAccessMode::ReadOnly,
+        );
+        let read_write = crate::db::TransactionMode::default();
+        let refusal = |db_type, mode, sql| {
+            SqlEditorWidget::transaction_mode_refusal_for_statement(db_type, mode, sql)
+        };
+
+        let server_changes = [
+            (
+                crate::db::DatabaseType::Oracle,
+                &[
+                    "ALTER SYSTEM FLUSH SHARED_POOL",
+                    "ALTER SYSTEM KILL SESSION '1,2'",
+                ][..],
+            ),
+            (
+                crate::db::DatabaseType::MySQL,
+                &["SET GLOBAL max_connections = 100", "FLUSH PRIVILEGES"][..],
+            ),
+            (
+                crate::db::DatabaseType::MariaDB,
+                &["SET GLOBAL max_connections = 100", "KILL QUERY 5"][..],
+            ),
+        ];
+        for (db_type, statements) in server_changes {
+            for sql in statements {
+                let message = refusal(db_type, read_only, sql)
+                    .unwrap_or_else(|| panic!("{db_type} must refuse {sql} on a Read only tab"));
+                assert!(
+                    message.contains("reconfigures the server"),
+                    "{db_type} {sql} refused for the wrong reason: {message}"
+                );
+                assert!(
+                    refusal(db_type, read_write, sql).is_none(),
+                    "{db_type} a Read write tab refuses nothing"
+                );
+            }
+        }
+
+        // Read the way the classifier reads it: past a leading comment, and
+        // past MariaDB's `SET STATEMENT ... FOR <statement>` wrapper, which
+        // hides the statement being asked about from a raw word scan.
+        assert!(
+            refusal(
+                crate::db::DatabaseType::Oracle,
+                read_only,
+                "/* just tidying up */ ALTER SYSTEM FLUSH SHARED_POOL",
+            )
+            .is_some(),
+            "a leading comment must not hide the statement"
+        );
+        assert!(
+            refusal(
+                crate::db::DatabaseType::MariaDB,
+                read_only,
+                "SET STATEMENT max_statement_time=1 FOR FLUSH PRIVILEGES",
+            )
+            .is_some(),
+            "nor must MariaDB's statement wrapper"
+        );
+        // Nor a leading read. One unit can hold several statements — a custom
+        // MySQL `DELIMITER` makes `SELECT 1; SET GLOBAL …` one statement as far
+        // as the executor is concerned — so every statement in it is asked
+        // about, not just the words at the front.
+        for (db_type, sql) in [
+            (
+                crate::db::DatabaseType::MySQL,
+                "SELECT 1; SET GLOBAL max_connections = 100",
+            ),
+            (
+                crate::db::DatabaseType::MariaDB,
+                "SELECT 1; FLUSH PRIVILEGES",
+            ),
+            (
+                crate::db::DatabaseType::Oracle,
+                "SELECT 1 FROM DUAL; ALTER SYSTEM CHECKPOINT",
+            ),
+        ] {
+            assert!(
+                refusal(db_type, read_only, sql).is_some(),
+                "{db_type} must refuse the server change behind the read in {sql}"
+            );
+        }
+        // ... and a read that only LOOKS like several still runs: a `;` inside
+        // a string or a PL/SQL block is not a statement boundary.
+        for (db_type, sql) in [
+            (crate::db::DatabaseType::MySQL, "SELECT 'a; SET GLOBAL x=1'"),
+            (
+                crate::db::DatabaseType::Oracle,
+                "SELECT 'a; ALTER SYSTEM CHECKPOINT' FROM DUAL",
+            ),
+        ] {
+            assert!(
+                refusal(db_type, read_only, sql).is_none(),
+                "{db_type} {sql} is a read"
+            );
+        }
+
+        // The Oracle allowlist is unchanged: what Oracle's own read-only
+        // transaction permits still runs, and the session-local twin of
+        // `ALTER SYSTEM` is the sharpest case — the app issues one on this very
+        // session for the tab's own scope.
+        for sql in [
+            "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY'",
+            "ALTER SESSION SET CURRENT_SCHEMA = HR",
+            "LOCK TABLE t IN EXCLUSIVE MODE",
+            "SET ROLE ALL",
+            "SELECT 1 FROM DUAL",
+            "COMMIT",
+        ] {
+            assert!(
+                refusal(crate::db::DatabaseType::Oracle, read_only, sql).is_none(),
+                "the Oracle read-only allowlist must still allow {sql}"
+            );
+        }
+
+        // The MySQL family's OTHER half is still refused, and now from the same
+        // answer: the server honours an explicit per-transaction READ WRITE
+        // over a READ ONLY session characteristic, so the escape statement
+        // itself has to be refused.
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            for sql in ["SET TRANSACTION READ WRITE", "START TRANSACTION READ WRITE"] {
+                assert!(
+                    refusal(db_type, read_only, sql).is_some(),
+                    "{db_type} must refuse the escape {sql}"
+                );
+                assert!(
+                    refusal(db_type, read_write, sql).is_none(),
+                    "{db_type} a Read write tab refuses nothing"
+                );
+            }
+        }
+
+        // And the MySQL family still delegates the rest to the server, which is
+        // what keeps this from becoming a second, divergent write gate: only
+        // the promise no server keeps is answered here.
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            for sql in [
+                "INSERT INTO t VALUES (1)",
+                "CREATE TABLE t (c INT)",
+                "SELECT 1",
+                "LOCK TABLES t WRITE",
+            ] {
+                assert!(
+                    refusal(db_type, read_only, sql).is_none(),
+                    "{db_type} {sql} is the server's answer to give"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_read_only_tab_refuses_the_explain_statement_but_not_the_query_it_explains() {
         let read_only = crate::db::TransactionMode::new(

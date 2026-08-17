@@ -81,10 +81,10 @@ pub(crate) fn read_only_block_reason(
             ScriptItem::Statement(statement) => {
                 let analysis = SqlStatementAnalysis::new_for_db_type(db_type, statement);
                 let kind = analysis.classify_for_db_type(db_type);
-                if read_only_allows(kind) {
-                    continue;
+                if let Some(reason) = read_only_refusal_reason(db_type, statement, kind, &analysis)
+                {
+                    return Some(reason);
                 }
-                return Some(describe_blocked_statement(kind, analysis.leading_keyword()));
             }
             // `@file` runs SQL this process has not read, so there is nothing
             // to classify; CONNECT would walk out of the read-only connection
@@ -104,20 +104,151 @@ pub(crate) fn read_only_block_reason(
     None
 }
 
-/// The statement kinds a read-only connection lets through.
+/// Why a read-only connection refuses this statement, if it does.
 ///
 /// Transaction control is allowed because ending a transaction that wrote
 /// nothing is harmless, and refusing COMMIT would strand a session that had one
 /// open before the connection was marked read-only.
-fn read_only_allows(kind: SqlKind) -> bool {
+///
+/// REACH is asked before the kind, because a `SqlKind` answers a different
+/// question. It says what a statement does to the TRANSACTION — which is why
+/// Oracle's `ALTER SYSTEM` is session control (it carries no implicit commit)
+/// and `SET GLOBAL TRANSACTION ...` is transaction control — and neither answer
+/// says whether the statement's effect leaves the session. Letting the kind
+/// decide alone passed both of those on a connection the user had marked
+/// read-only, while the tab's own READ ONLY pin refused the first: one app, two
+/// answers to "does read-only allow this?".
+fn read_only_refusal_reason(
+    db_type: DatabaseType,
+    sql: &str,
+    kind: SqlKind,
+    analysis: &SqlStatementAnalysis<'_>,
+) -> Option<String> {
+    if statement_reconfigures_the_server_for_analysis(db_type, analysis) {
+        return Some(READ_ONLY_SERVER_CHANGE_REFUSAL.to_string());
+    }
     match kind {
-        SqlKind::SelectLike | SqlKind::SessionControl | SqlKind::TransactionControl => true,
+        SqlKind::SelectLike | SqlKind::TransactionControl => None,
+        // The one kind that cannot be answered by the kind alone: a lock is
+        // session state, and taking one makes other sessions wait. Its RELEASE
+        // forms stay allowed for the reason COMMIT is — a connection can be
+        // marked read-only while it already holds one, and refusing the release
+        // would strand it.
+        SqlKind::SessionControl => statement_acquires_a_lock_other_sessions_wait_for(db_type, sql)
+            .then(|| "a statement that takes a lock other sessions wait for".to_string()),
         SqlKind::Dml
         | SqlKind::Ddl
         | SqlKind::PlsqlOrProcedure
         | SqlKind::Script
-        | SqlKind::Unknown => false,
+        | SqlKind::Unknown => Some(describe_blocked_statement(kind, analysis.leading_keyword())),
     }
+}
+
+/// The refusal both read-only guards give for a statement that reconfigures the
+/// server. Shared so the two cannot describe the same refusal differently.
+pub(crate) const READ_ONLY_SERVER_CHANGE_REFUSAL: &str =
+    "a statement that reconfigures the server rather than this session";
+
+/// Whether this statement reconfigures the SERVER rather than the session that
+/// runs it.
+///
+/// This is the one place that says which statements those are, because the app
+/// has two read-only guards and both have to refuse them:
+///
+/// - the CONNECTION's read-only flag, which refuses anything that is not
+///   provably a read, and
+/// - a query tab's READ ONLY transaction-mode pin, whose promise is that this
+///   tab changes nothing.
+///
+/// Neither server refuses them for a read-only TRANSACTION. Oracle's own list of
+/// what a read-only transaction permits includes `ALTER SYSTEM`, and the MySQL
+/// family's read-only session characteristic constrains table writes, not server
+/// administration — so a guard that leans on the server lets them through. The
+/// two used to disagree in both directions: the Oracle pin kept `ALTER SYSTEM`
+/// out of its allowlist by OMISSION, while the connection guard passed every
+/// session-control statement, and the MySQL pin — which delegates to the server
+/// — refused none of them at all.
+///
+/// The line it draws is the session-local twin of each rule below, and those
+/// stay allowed: `ALTER SESSION` (the app issues one on this very session for
+/// the tab's own scope), `SET SESSION`/`SET @var`, and `RESET CONNECTION`.
+///
+/// Asked of the ANALYSIS, so it reads the statement the classifier read: past a
+/// leading comment, and past MariaDB's `SET STATEMENT ... FOR <statement>`
+/// wrapper, which would otherwise hide the very statement being asked about.
+///
+/// And asked of EVERY statement in the text, not of its leading words. One unit
+/// can hold several: a custom MySQL `DELIMITER` makes `SELECT 1; SET GLOBAL …`
+/// one statement as far as the executor is concerned, and reading only the
+/// front of it let a server change ride behind a leading read on a tab pinned
+/// Read only. The connection's guard never had that gap — a text holding
+/// several statements classifies as `Script`, which it refuses outright — so
+/// this is the tab pin's half of the same answer. The splitter is the
+/// executor's own, so a `;` inside a string, a comment or a PL/SQL block is not
+/// a statement boundary.
+pub(crate) fn statement_reconfigures_the_server(db_type: DatabaseType, sql: &str) -> bool {
+    crate::db::query::QueryExecutor::split_script_items_for_db_type_with_mysql_delimiter(
+        sql,
+        Some(db_type),
+        None,
+    )
+    .iter()
+    .any(|item| match item {
+        crate::db::query::ScriptItem::Statement(statement) => {
+            statement_reconfigures_the_server_for_analysis(
+                db_type,
+                &SqlStatementAnalysis::new_for_db_type(db_type, statement),
+            )
+        }
+        // A tool command is the client's own; none of them reaches the server
+        // at all, and `read_only_block_reason` answers for the two that would
+        // leave this connection behind.
+        crate::db::query::ScriptItem::ToolCommand(_) => false,
+    })
+}
+
+fn statement_reconfigures_the_server_for_analysis(
+    db_type: DatabaseType,
+    analysis: &SqlStatementAnalysis<'_>,
+) -> bool {
+    let profile = classification_profile_for_db_type(db_type);
+    let mysql_compatible_comments = profile.mysql_compatible_comments();
+    let words = analysis.words();
+    let sql = analysis.stripped_sql.as_ref();
+    let word = |index: usize| words.get(index).map(String::as_str);
+    match profile {
+        SqlClassificationProfile::Oracle => word(0) == Some("ALTER") && word(1) == Some("SYSTEM"),
+        SqlClassificationProfile::MySqlCompatible => {
+            // `SET GLOBAL`/`SET PERSIST`/`@@global.` — including the
+            // `SET GLOBAL TRANSACTION ...` form, which classifies as
+            // transaction control and would otherwise be read as harmless.
+            set_sql_affects_only_global_or_persist_scope(sql, mysql_compatible_comments)
+                // Server-wide state: privileges, logs, hosts, table cache.
+                || word(0) == Some("FLUSH")
+                // Ends another session.
+                || word(0) == Some("KILL")
+                || (word(0) == Some("RESET")
+                    && matches!(word(1), Some("MASTER" | "REPLICA" | "SLAVE" | "PERSIST")))
+                || (word(0) == Some("PURGE") && matches!(word(1), Some("BINARY" | "MASTER")))
+                // `START`/`STOP` name a transaction as well as replication, so
+                // both words are asked.
+                || (matches!(word(0), Some("START" | "STOP"))
+                    && matches!(word(1), Some("REPLICA" | "SLAVE" | "GROUP_REPLICATION")))
+                || (word(0) == Some("CHANGE") && matches!(word(1), Some("MASTER" | "REPLICATION")))
+        }
+    }
+}
+
+/// Whether this statement takes a lock other sessions wait for.
+///
+/// Asked of the statement EFFECTS rather than re-derived here, so every backend
+/// answers from the one place that already decides what a statement does to a
+/// session — and a new lock form is covered by teaching that place, not this
+/// one.
+fn statement_acquires_a_lock_other_sessions_wait_for(db_type: DatabaseType, sql: &str) -> bool {
+    crate::db::statement_session_post_processor_for(db_type)
+        .effects_for_sql(sql)
+        .acquires_a_lock_other_sessions_wait_for()
 }
 
 fn describe_blocked_statement(kind: SqlKind, leading_keyword: Option<&str>) -> String {
@@ -2550,6 +2681,94 @@ mod tests {
     }
 
     #[test]
+    fn read_only_refuses_what_reaches_past_this_session_on_every_backend() {
+        // A `SqlKind` says what a statement does to the TRANSACTION, not how
+        // far its effect reaches, so the kind alone let two families of
+        // statement through a connection the user had marked read-only:
+        // Oracle's `ALTER SYSTEM` (session control — it carries no implicit
+        // commit), `SET GLOBAL TRANSACTION ...` (transaction control), and the
+        // MySQL family's lock acquisitions (session control). None of them is a
+        // read, and the tab's own READ ONLY pin already refused the first.
+        for sql in [
+            "ALTER SYSTEM FLUSH SHARED_POOL",
+            "ALTER SYSTEM SET open_cursors = 100",
+            "ALTER SYSTEM KILL SESSION '1,2'",
+        ] {
+            let reason = blocked(DatabaseType::Oracle, sql)
+                .unwrap_or_else(|| panic!("a read-only connection must refuse {sql}"));
+            assert!(
+                reason.contains("reconfigures the server"),
+                "{sql} refused for the wrong reason: {reason}"
+            );
+        }
+        // The session-local twin is the line this draws, and it stays allowed:
+        // the app issues one on this very session for the tab's own scope.
+        assert_eq!(
+            blocked(
+                DatabaseType::Oracle,
+                "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY'"
+            ),
+            None
+        );
+        // Read the way the classifier reads: past a leading comment, and past
+        // MariaDB's wrapper, which would otherwise hide the statement itself.
+        assert!(blocked(DatabaseType::Oracle, "/* why */ ALTER SYSTEM CHECKPOINT").is_some());
+        assert!(blocked(
+            DatabaseType::MariaDB,
+            "SET STATEMENT max_statement_time=1 FOR FLUSH PRIVILEGES"
+        )
+        .is_some());
+
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            for sql in [
+                "SET GLOBAL max_connections = 100",
+                "SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                "SET PERSIST max_connections = 100",
+                "FLUSH PRIVILEGES",
+                "KILL QUERY 5",
+                "RESET MASTER",
+                "STOP REPLICA",
+            ] {
+                let reason =
+                    blocked(db_type, sql).unwrap_or_else(|| panic!("{db_type} must refuse {sql}"));
+                assert!(
+                    !reason.is_empty(),
+                    "{db_type} {sql} refused with no reason at all"
+                );
+            }
+            // Taking a lock is not a read, and other sessions wait for it...
+            for sql in [
+                "LOCK TABLES t WRITE",
+                "LOCK TABLES t READ",
+                "LOCK INSTANCE FOR BACKUP",
+                "DO GET_LOCK('x', 10)",
+            ] {
+                let reason =
+                    blocked(db_type, sql).unwrap_or_else(|| panic!("{db_type} must refuse {sql}"));
+                assert!(
+                    reason.contains("takes a lock"),
+                    "{db_type} {sql} refused for the wrong reason: {reason}"
+                );
+            }
+            // ... but its RELEASE stays allowed, for the reason COMMIT does: a
+            // connection can be marked read-only while it already holds one,
+            // and refusing the release would strand it.
+            for sql in [
+                "UNLOCK TABLES",
+                "UNLOCK INSTANCE",
+                "DO RELEASE_LOCK('x')",
+                "DO RELEASE_ALL_LOCKS()",
+            ] {
+                assert_eq!(blocked(db_type, sql), None, "{db_type} {sql}");
+            }
+            // The session-local members of the same leading words stay allowed.
+            assert_eq!(blocked(db_type, "RESET CONNECTION"), None, "{db_type}");
+            assert_eq!(blocked(db_type, "SET ROLE ALL"), None, "{db_type}");
+            assert_eq!(blocked(db_type, "START TRANSACTION"), None, "{db_type}");
+        }
+    }
+
+    #[test]
     fn read_only_refuses_a_script_include_and_a_connect() {
         let include = blocked(DatabaseType::Oracle, "@other.sql")
             .expect("a script include must not be allowed through");
@@ -2634,6 +2853,75 @@ mod tests {
         for db_type in EVERY_DB_TYPE {
             assert_eq!(blocked(db_type, ""), None);
             assert_eq!(blocked(db_type, "   \n-- only a comment\n"), None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod round16_probe2 {
+    use super::*;
+    #[test]
+    fn probe_session_control_membership() {
+        let mysql = [
+            "LOCK TABLES t WRITE",
+            "LOCK TABLES t READ",
+            "UNLOCK TABLES",
+            "FLUSH TABLES WITH READ LOCK",
+            "FLUSH TABLES t WITH READ LOCK",
+            "LOCK INSTANCE FOR BACKUP",
+            "UNLOCK INSTANCE",
+            "USE mydb",
+            "SET autocommit = 0",
+            "SET NAMES utf8",
+            "SET @x = 1",
+            "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "PREPARE s FROM 'SELECT 1'",
+            "DEALLOCATE PREPARE s",
+            "EXECUTE s",
+            "BEGIN",
+            "START TRANSACTION",
+            "COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT a",
+            "DO SLEEP(1)",
+            "HANDLER t OPEN",
+            "ANALYZE TABLE t",
+            "CHECK TABLE t",
+            "REPAIR TABLE t",
+            "OPTIMIZE TABLE t",
+            "CHECKSUM TABLE t",
+            "SHOW TABLES",
+            "DESCRIBE t",
+            "EXPLAIN SELECT 1",
+            "CALL p()",
+        ];
+        for db in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            for sql in mysql {
+                let kind = SqlStatementAnalysis::new_for_db_type(db, sql).classify_for_db_type(db);
+                if kind == SqlKind::SessionControl {
+                    println!("{db:?} SESSIONCONTROL {sql}");
+                }
+            }
+        }
+        let oracle = [
+            "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY'",
+            "ALTER SYSTEM FLUSH SHARED_POOL",
+            "ALTER SYSTEM SET open_cursors = 100",
+            "ALTER SYSTEM KILL SESSION '1,2'",
+            "ALTER SYSTEM CHECKPOINT",
+            "SET ROLE ALL",
+            "LOCK TABLE t IN EXCLUSIVE MODE",
+            "ALTER SESSION SET CURRENT_SCHEMA = HR",
+            "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE",
+            "SET TRANSACTION READ ONLY",
+            "SAVEPOINT a",
+            "EXPLAIN PLAN FOR SELECT 1 FROM DUAL",
+        ];
+        for sql in oracle {
+            let kind = SqlStatementAnalysis::new_for_db_type(DatabaseType::Oracle, sql)
+                .classify_for_db_type(DatabaseType::Oracle);
+            println!("Oracle {kind:?} {sql}");
         }
     }
 }

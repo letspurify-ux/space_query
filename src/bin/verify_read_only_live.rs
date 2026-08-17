@@ -264,6 +264,22 @@ impl Target {
         reads
     }
 
+    /// A server setting this backend lets a privileged account change, and the
+    /// statement that changes it. Read back over the WRITABLE connection, so a
+    /// refusal that still reached the server is visible; restored afterwards.
+    fn server_setting(self) -> (&'static str, fn(i64) -> String) {
+        if self.is_oracle() {
+            (
+                "SELECT VALUE FROM V$PARAMETER WHERE NAME = 'open_cursors'",
+                |value| format!("ALTER SYSTEM SET open_cursors = {value} SCOPE=MEMORY"),
+            )
+        } else {
+            ("SELECT @@GLOBAL.net_read_timeout", |value| {
+                format!("SET GLOBAL net_read_timeout = {value}")
+            })
+        }
+    }
+
     fn schema(self) -> String {
         match self {
             Target::OracleThin | Target::OracleOci => {
@@ -438,6 +454,26 @@ fn connect(info: ConnectionInfo) -> Result<Arc<Mutex<DatabaseConnection>>, Strin
 }
 
 /// The row count as a second, writable connection sees it.
+/// The first cell of `sql`, as an integer. `row_count`'s twin, for the server
+/// settings the reconfiguration check reads back.
+fn scalar_i64(writer: &mut Harness, sql: &str) -> Result<i64, String> {
+    let events = writer.run(sql)?;
+    for event in &events {
+        let rows = match progress_inner(event) {
+            QueryProgress::Rows { rows, .. } => rows.clone(),
+            QueryProgress::StatementFinished { result, .. } => result.rows.clone(),
+            _ => continue,
+        };
+        if let Some(value) = rows.first().and_then(|row| row.last()) {
+            return value
+                .trim()
+                .parse::<i64>()
+                .map_err(|err| format!("{sql} returned {value:?}: {err}"));
+        }
+    }
+    Err(format!("{sql} returned nothing"))
+}
+
 fn row_count(writer: &mut Harness) -> Result<i64, String> {
     let events = writer.run(&format!("SELECT COUNT(*) AS N FROM {TABLE}"))?;
     for event in &events {
@@ -573,6 +609,50 @@ fn verify(target: Target) -> Result<(), String> {
         return Err("the refused ALTER TABLE was executed after all".into());
     }
     println!("PASS: nothing was created, renamed, altered or dropped");
+
+    // A statement that reconfigures the SERVER is the one a `SqlKind` cannot
+    // answer about: Oracle's `ALTER SYSTEM` is session control (it carries no
+    // implicit commit) and `SET GLOBAL TRANSACTION ...` is transaction control,
+    // and neither answer says whether the effect leaves the session. The guard
+    // used to read the kind alone and let them through — on a connection the
+    // user had marked read-only, and while the app's OTHER read-only guard, a
+    // tab's READ ONLY pin, refused the first of them.
+    //
+    // A row count cannot see this, so the setting itself is read back over the
+    // writable connection, and the control run afterwards is what makes the
+    // refusal proof of the guard rather than of a privilege the account lacks.
+    println!("\n-- a statement that reconfigures the server --");
+    let (read_setting, set_setting) = target.server_setting();
+    let before_setting = scalar_i64(&mut writer, read_setting)?;
+    if guarded.attempt(&set_setting(before_setting + 1), false) {
+        return Err(format!(
+            "a read-only connection was allowed to run {}",
+            set_setting(before_setting + 1)
+        ));
+    }
+    let during_setting = scalar_i64(&mut writer, read_setting)?;
+    if during_setting != before_setting {
+        return Err(format!(
+            "the refused statement reached the server after all: {read_setting} went from \
+             {before_setting} to {during_setting}"
+        ));
+    }
+    println!("PASS: the server reconfiguration was refused and the setting is unchanged");
+    writer
+        .run(&set_setting(before_setting + 1))
+        .map_err(|err| format!("the writable connection could not change the setting: {err}"))?;
+    let control_setting = scalar_i64(&mut writer, read_setting)?;
+    let _ = writer.run(&set_setting(before_setting));
+    if control_setting != before_setting + 1 {
+        return Err(format!(
+            "the control run did not change the setting either, so the refusal proves nothing: \
+             {read_setting} = {control_setting}"
+        ));
+    }
+    if scalar_i64(&mut writer, read_setting)? != before_setting {
+        return Err("the server setting was not restored".into());
+    }
+    println!("PASS: the same statement runs on a writable connection, so the guard refused it");
 
     println!("\n-- reads must still run on the read-only connection --");
     for (what, sql) in target.reads() {

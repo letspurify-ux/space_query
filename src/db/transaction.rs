@@ -536,12 +536,18 @@ impl RetainedSessionState {
     /// it did not do. It is wrong for a claim that was never knowledge: a
     /// PL/SQL block or `CALL` that commits internally ends the transaction with
     /// nothing else to notice, and the batch then files "may have uncommitted
-    /// work" over a session that has none. That guess outlives the batch —
-    /// Oracle's pre-batch gate never states the tab's pinned mode over a
-    /// session that may hold a transaction, and no later batch asks — so the
-    /// tab silently runs at the session default while the toolbar keeps
-    /// claiming the pin, until the user commits or rolls back. Asking the
-    /// server once, here, is what keeps a guess from governing the tab.
+    /// work" over a session that has none. That guess outlives the batch, and a
+    /// session filed as holding a transaction it does not hold asks the user to
+    /// resolve work they never did — at tab close, and at every setting change
+    /// the retained state guards. Asking the server once, here, is what keeps a
+    /// guess from being filed as knowledge.
+    ///
+    /// What it is NOT for any more: the pinned MODE reaching the next batch. A
+    /// gate used to skip stating the pin over a session that "may have
+    /// uncommitted work", so a guess left standing here governed the tab for
+    /// the rest of its life. That gate is gone — every batch states the tab's
+    /// mode and reads the server's reply — so a claim this cannot settle costs
+    /// one round trip and is corrected rather than obeyed.
     ///
     /// Deliberately narrow:
     /// - a claim the app READ is never lowered (`claim.is_a_guess == false`),
@@ -1268,6 +1274,24 @@ impl StatementSessionEffects {
 
     fn releases_all_named_locks(self) -> bool {
         self.named_lock.releases_all
+    }
+
+    /// Whether this statement takes a lock other sessions wait for.
+    ///
+    /// The CONNECTION's read-only guard asks it
+    /// (`sql_classification::read_only_refusal_reason`): taking a lock is not a
+    /// read, and it is the one thing a session-control statement can do that
+    /// the rest of the session cannot undo for the sessions now waiting. A
+    /// tab's READ ONLY pin deliberately does NOT ask — it follows Oracle's own
+    /// list of what a read-only transaction permits, and that list includes
+    /// `LOCK TABLE`. The RELEASE forms are not here either: a connection can be
+    /// marked read-only while it already holds a lock, and refusing the release
+    /// would strand it.
+    pub(crate) fn acquires_a_lock_other_sessions_wait_for(self) -> bool {
+        self.acquires_table_lock()
+            || self.acquires_flush_table_lock()
+            || self.acquires_backup_lock()
+            || self.acquires_named_lock()
     }
 
     pub(crate) fn starts_transaction_state(self) -> bool {

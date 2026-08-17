@@ -207,11 +207,15 @@ the one the tab is on (`SessionHandBackOwner::is_current`), and is the tab still
 bound to what this batch resolved (`TabConnectionBinding::set_scope_if_revision`
 — the worker's door; the bare `set_scope` belongs to the UI thread, which owns
 the tab). Neither question implies the other: a rebind does not move the
-operation id, and a new execution does not move the revision. The MySQL family
-records only its own batch cell and leaves the binding to the window. The batch's
-own record of the scope is never gated on either question — the session really
-did move, so the rest of that batch must assert the new scope whatever the tab
-has since done.
+operation id, and a new execution does not move the revision. Three sites write
+it from a worker and no other may: the MySQL family's `USE` command, the OCI
+`ALTER SESSION SET CURRENT_SCHEMA`, and its thin twin. (An in-SCRIPT `USE` moves
+only the tab's pooled session, records only its own batch cell, and leaves the
+binding to the window.) A refused write says which of the two questions refused
+it, because a tab naming one schema while a live session sits in another is the
+state this whole rule exists to keep explicable. The batch's own record of the
+scope is never gated on either question — the session really did move, so the
+rest of that batch must assert the new scope whatever the tab has since done.
 
 The window applies the report unless a LATER execution already owns the tab: an
 abandoned operation's notice is still a FACT about the tab's session and must
@@ -292,10 +296,44 @@ on a read-only connection, which also means F6 Explain Plan is unavailable there
 on Oracle. `sql_classification::read_only_block_reason` splits the text with the same
 splitter and MySQL delimiter the executor will use, classifies each statement on
 its own, and refuses anything that is not provably a read — including a
-statement it cannot classify. `SelectLike`, `SessionControl`, and
-`TransactionControl` pass; everything else does not. `ToolCommand::RunScript`
-(`@file`) is refused because its contents cannot be checked first, and
-`ToolCommand::Connect` because it would leave the connection behind.
+statement it cannot classify. `SelectLike` and `TransactionControl` pass, and so
+does `SessionControl` once the statement's REACH has been asked about;
+everything else does not. `ToolCommand::RunScript` (`@file`) is refused because
+its contents cannot be checked first, and `ToolCommand::Connect` because it would
+leave the connection behind.
+
+A `SqlKind` cannot answer the reach question by itself, because it is about the
+TRANSACTION: Oracle's `ALTER SYSTEM` is session control (it carries no implicit
+commit) and `SET GLOBAL TRANSACTION ...` is transaction control, and neither
+answer says whether the effect leaves the session. Letting the kind decide alone
+passed both of those on a connection the user had marked read-only, while the
+tab's own READ ONLY pin refused the first — one app, two answers to "does
+read-only allow this?". Two questions are therefore asked ahead of the kind, and
+both guards ask the first from one place:
+
+- `sql_classification::statement_reconfigures_the_server` — Oracle `ALTER
+  SYSTEM`, and the MySQL family's `SET GLOBAL`/`SET PERSIST`, `FLUSH`, `KILL`,
+  `RESET MASTER|REPLICA|SLAVE|PERSIST`, `PURGE BINARY LOGS` and replication
+  control. Neither server refuses these for a read-only TRANSACTION, so a guard
+  that leans on the server lets them through: Oracle's own list of what a
+  read-only transaction permits includes `ALTER SYSTEM`, and the MySQL family's
+  read-only session characteristic constrains table writes, not server
+  administration. `SqlEditorWidget::transaction_mode_refusal_for_statement` asks
+  it first and on EVERY backend, which is what closed the same hole in the tab's
+  pin — the Oracle allowlist had kept `ALTER SYSTEM` out by omission, and the
+  MySQL family, which delegates to the server, refused none of them at all.
+  It asks about every statement in the text rather than its leading words: one
+  unit can hold several (a custom MySQL `DELIMITER` makes `SELECT 1; SET GLOBAL
+  …` one statement as far as the executor is concerned), and reading only the
+  front let a server change ride behind a leading read. This guard never had
+  that gap — several statements classify as `Script`, which is not provably a
+  read — so it is the tab pin's half of the same answer.
+- lock ACQUISITION (`StatementSessionEffects::acquires_a_lock_other_sessions_wait_for`)
+  — taking a lock is not a read, and other sessions wait for it. Only the
+  connection guard asks this one: the tab's pin follows Oracle's own list, which
+  permits `LOCK TABLE`. The RELEASE forms stay allowed for the reason `COMMIT`
+  does — a connection can be marked read-only while it already holds one, and
+  refusing the release would strand it.
 
 The check runs in `execute_sql_with_mysql_delimiter_after_lazy_cancel`, the one
 place every editor entry point funnels through, ahead of both the transaction

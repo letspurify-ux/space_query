@@ -406,17 +406,40 @@ fn oracle_states_the_tabs_transaction_mode_over_a_reused_session() {
     );
     // What makes stating it always safe: the refusal is read as an ANSWER at
     // every application site, on both drivers.
+    //
+    // CHANGED, with its reason: this used to count the OCI arms that spell the
+    // answer (2) and then ask separately that the thin loop read the same
+    // refusal "the same way" — two spellings the count could not compare. Both
+    // drivers and all three sites now produce the answer from ONE function, so
+    // what is asserted is that there is one producer and that every site which
+    // reads its result answers for `TransactionStillOpen` explicitly.
     assert_eq!(
         content
-            .matches("Ok(OracleTransactionModeApplied::TransactionStillOpen) => {")
+            .matches("return Ok(OracleTransactionModeApplied::TransactionStillOpen);")
             .count(),
-        2,
-        "both OCI application sites must read ORA-01453 as the pin belonging to the next \
-         transaction, and record that the server just answered"
+        1,
+        "ORA-01453 must be turned into the answer in exactly one place"
+    );
+    // Comments may name the variant — that is where the reason lives — so ask
+    // the CODE, the way this file's other shape counts do.
+    let content_code = content
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        content_code
+            .matches("OracleTransactionModeApplied::TransactionStillOpen")
+            .count(),
+        5,
+        "and every site that reads the answer must name it: the one producer, the two OCI \
+         application arms, the thin batch arm and the thin lazy fetch's"
     );
     assert!(
-        content.contains("if crate::db::oracle_error_says_transaction_still_open(&message) {"),
-        "and the thin loop must read the same refusal the same way"
+        !content.contains("Ok(OracleTransactionModeApplied::TransactionStillOpen) => None,"),
+        "an application site that answers ORA-01453 with nothing at all is the round-14 \
+         defect: the server said a transaction is open, and the batch end must not file the \
+         session clean over it"
     );
     // Pin that the application really sits inside that guard, without pinning
     // how rustfmt wraps the call.
@@ -2163,12 +2186,15 @@ fn mysql_plain_use_statement_updates_scope_and_refreshes_metadata() {
 fn a_worker_moves_its_tabs_scope_only_while_it_still_owns_the_tab() {
     // The binding is the TAB's and the batch is not the tab: a script `CONNECT`
     // rebinds it, and a force-cancelled batch keeps unwinding while the NEXT
-    // execution owns it. Both Oracle drivers write the scope from their worker
-    // thread (the MySQL family records only its own batch cell and leaves the
-    // binding to the UI thread), and an unguarded write there left the tab
-    // naming a schema its current session was not in — which the next
-    // statement's scope assertion then made true, carrying the user's open
-    // transaction into it.
+    // execution owns it. An unguarded write there left the tab naming a schema
+    // its current session was not in — which the next statement's scope
+    // assertion then made true, carrying the user's open transaction into it.
+    //
+    // Three sites write it from a worker, and the count below is what keeps a
+    // fourth from growing its own rule: the MySQL family's `USE` command, the
+    // OCI `ALTER SESSION SET CURRENT_SCHEMA`, and its thin twin. (The MySQL
+    // family's in-SCRIPT `USE` moves only its pooled session and records only
+    // its own batch cell; the tab's binding follows from the window.)
     let execution = read_source("src/ui/sql_editor/execution.rs");
     let runtime = read_source("src/db/runtime.rs");
 
@@ -2192,12 +2218,26 @@ fn a_worker_moves_its_tabs_scope_only_while_it_still_owns_the_tab() {
          other: a rebind does not move the operation id, and a new execution does not move \
          the revision"
     );
+    // Both refusals SAY so. Leaving the tab alone is the right answer and
+    // nothing is lost, but "the tab names one schema while a live session sits
+    // in another" is the state these rounds exist to make explicable, and it
+    // cannot be explained from a `bool` all three call sites drop. Every
+    // sibling door already answers out loud (`SessionHandBack`,
+    // `WorkerSlotClear`).
+    assert_eq!(
+        helper
+            .matches("Self::log_tab_scope_left_alone(scope, ")
+            .count(),
+        2,
+        "each of the two questions must say which one refused the write"
+    );
     assert_eq!(
         execution
             .matches("record_batch_scope_on_tab_binding(")
             .count(),
         4,
-        "the two OCI sites and the thin site must all go through it (plus its definition)"
+        "the MySQL `USE` command, the OCI schema change and its thin twin must all go through \
+         it (plus its definition)"
     );
 
     // And the door itself compares before it writes.
@@ -3510,10 +3550,27 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         application_body.contains("oracle_session_isolation_reset_statement("),
         "the shared Oracle transaction-mode application must include the session-default reset"
     );
-    let application_uses = execution.matches(".statements()").count();
+    // CHANGED, with its reason: this used to count `.statements()` calls and
+    // require at least three, one per site. All three sites now reach that list
+    // through ONE function, so the count is 1 by construction and counting it
+    // proves nothing. What the clause was protecting — that no site builds its
+    // own list, and so none can omit the session-default reset — is asserted
+    // directly.
+    let application_uses = execution
+        .matches("Self::apply_oracle_transaction_mode_statements_with(")
+        .count();
+    assert_eq!(
+        application_uses, 3,
+        "the OCI apply, the thin batch and the thin lazy fetch must all go through the shared \
+         statement list (found {application_uses})"
+    );
+    let shared_application_start = execution
+        .find("fn apply_oracle_transaction_mode_statements_with(")
+        .expect("the shared Oracle transaction-mode application should exist");
     assert!(
-        application_uses >= 3,
-        "the OCI apply, the thin batch and the thin lazy fetch must all go through the shared statement list (found {application_uses})"
+        slice_from(&execution, shared_application_start, 1200)
+            .contains("application.statements()?"),
+        "and it is the one place the list is built"
     );
 
     // (11) Isolation and access mode are independent choices, so an
@@ -3653,19 +3710,59 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     // cannot read — which is why recording a refused one was the bug.
     assert_eq!(
         execution.matches("boundary_step.refused();").count(),
-        7,
+        8,
         "each refusal path between the boundary decision and the statement must say the \
          statement never ran: the mode could not be stated, the tab's mode refuses the \
          statement, and the tab's scope could not be asserted, on both loops — plus the \
-         OCI-only statement option-change gate. A path that stops saying so is a statement \
-         recorded as having run when it never reached the server, which is the shape this \
-         whole clause exists for"
+         OCI-only statement option-change gate, and the thin loop's second mode-application \
+         exit (a mode this database cannot express), which used to DROP the token instead of \
+         spending it. A path that stops saying so is a statement recorded as having run when \
+         it never reached the server, which is the shape this whole clause exists for"
     );
     assert_eq!(
         execution.matches("boundary_step.ran(").count(),
         4,
         "and every path that really reaches the server records: the main one in each loop, \
          plus the OCI branches that run a plain COMMIT/ROLLBACK and leave the loop"
+    );
+    // The tracker hears ANSWERS only. Telling it the mode was stated is a claim
+    // about the SERVER — it clears the guess and says a transaction the write
+    // probe cannot see may be open — so it may only be made from an arm that
+    // matched one of the server's two replies. The thin batch used to make it
+    // whatever came back, including a real failure, so a batch whose mode
+    // application failed filed its session with the claim settled by an answer
+    // the server never gave, while the OCI twin recorded nothing: one script,
+    // two answers, from the code that was supposed to make them one.
+    // Production code only: the unit tests drive the tracker directly, which is
+    // their job. The test modules all sit after the last production item.
+    let production = execution
+        .split_once("\nmod session_transaction_mode_adoption_tests {")
+        .map(|(before, _)| before)
+        .unwrap_or(execution.as_str());
+    let mut answered_sites = 0usize;
+    for (offset, _) in production.match_indices(".note_transaction_mode_stated(") {
+        answered_sites += 1;
+        let mut window_start = offset.saturating_sub(700);
+        while window_start > 0 && !production.is_char_boundary(window_start) {
+            window_start -= 1;
+        }
+        let preceding = &production[window_start..offset];
+        let last_reply = preceding
+            .rfind("OracleTransactionModeApplied::")
+            .map(|at| &preceding[at..])
+            .unwrap_or_default();
+        assert!(
+            last_reply.starts_with("OracleTransactionModeApplied::Yes")
+                || last_reply.starts_with("OracleTransactionModeApplied::TransactionStillOpen"),
+            "the tracker may only be told the mode was stated inside an arm that matched the \
+             server's reply, and the site at byte {offset} is reached from `{}`",
+            last_reply.lines().next().unwrap_or("no reply at all")
+        );
+    }
+    assert_eq!(
+        answered_sites, 5,
+        "the two OCI pre-batch arms, the two OCI re-application arms, and the thin batch's \
+         one arm for both replies"
     );
     // ORDER, not just existence — the failure this clause was blind to. The
     // scope assertion is the LAST gate before a statement is sent, and OCI
@@ -4961,12 +5058,27 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
          then the statement classifier: {helper}"
     );
 
-    // Nobody re-derives it. The MySQL escape gate is a different question (an
-    // explicit READ WRITE statement), so it keeps its own comparison.
+    // Nobody re-derives it.
+    //
+    // CHANGED, with its reason: the MySQL escape gate used to be called "a
+    // different question" and kept its own comparison at the batch's gate. It
+    // is the same question — does the tab's MODE refuse this statement? — and
+    // keeping it apart is what left the family's execution path asking only
+    // half of it: nothing on that path called the shared answer, so a READ ONLY
+    // tab could still run `SET GLOBAL`, `FLUSH` or `KILL`, which no server
+    // refuses for a read-only transaction. The escape now lives inside the
+    // shared answer and the batch asks that.
     assert!(
         !execution.contains("&& !SqlEditorWidget::oracle_read_only_allows_statement(")
             && !execution.contains("&& !Self::oracle_read_only_allows_statement("),
         "the Oracle read-only gates must go through transaction_mode_refusal_for_statement"
+    );
+    assert_eq!(
+        execution
+            .matches("mysql_statement_escapes_read_only_transaction_for_db_type(")
+            .count(),
+        1,
+        "and the MySQL escape must be asked from inside the shared answer only"
     );
     // Production code only: the unit tests below call it too. The test modules
     // of this file all sit after the last production item, so the prefix before
@@ -4979,8 +5091,10 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
         execution_production
             .matches("transaction_mode_refusal_for_statement(")
             .count(),
-        3,
-        "both Oracle batch loops and the shared answer itself, and nothing else in execution.rs"
+        4,
+        "every batch loop and the shared answer itself, and nothing else in execution.rs: the \
+         two Oracle loops, and the MySQL family's one gate — which was NOT a caller, so the \
+         one half of the tab's mode no server enforces never reached that family at all"
     );
     assert!(
         editor.contains("SqlEditorWidget::transaction_mode_refusal_for_statement("),
@@ -5573,44 +5687,58 @@ fn both_oracle_drivers_record_transaction_mode_effects_before_the_round_trip() {
     // record therefore goes in BEFORE the round trip, where it is true whatever
     // comes back -- it ran (transaction open), it was refused because one was
     // open already (ORA-01453), or it may have run.
+    // CHANGED, with its reason: this used to assert the order TWICE, once in
+    // the OCI apply's body and once in the thin batch's own loop, because each
+    // driver spelled the loop for itself. They no longer do — both, and the
+    // thin lazy fetch with them, state the mode through one function — so the
+    // order is asserted where it now lives, and "all three go through it" is
+    // what makes a call site unable to get it wrong. Per-site assertions were
+    // also what let the divergence they could not see survive: the thin loop
+    // told its boundary tracker the mode had been STATED when its application
+    // failed, an answer the server never gave and one the OCI twin never
+    // recorded.
     let content = read_source("src/ui/sql_editor/execution.rs");
-    let apply = content
-        .find("fn apply_oracle_transaction_mode_statements(")
-        .expect("the OCI transaction-mode apply should exist");
-    let apply_body = &content[apply..apply + 2200];
-    assert!(
-        apply_body.contains("cleanup: &mut QueryExecutionCleanupGuard"),
-        "the OCI apply must own the recording, not leave it to its callers"
-    );
-    let record = apply_body
-        .find("Self::apply_oracle_db_statement_effects(")
-        .expect("the OCI apply should record each statement's effects");
-    let execute = apply_body
-        .find("conn.execute(&statement, &[])")
-        .expect("the OCI apply should execute each statement");
+    let shared = content
+        .find("fn apply_oracle_transaction_mode_statements_with(")
+        .expect("both Oracle drivers should state the mode through one function");
+    let shared_body = slice_from(&content, shared, 1200);
+    let record = shared_body
+        .find("record_stated_statement(&statement);")
+        .expect("the shared application should record each statement's effects");
+    let execute = shared_body
+        .find("execute(&statement)")
+        .expect("the shared application should execute each statement");
     assert!(
         record < execute,
-        "the OCI apply must record the effects BEFORE the statement is issued"
-    );
-
-    // Thin's twin keeps the same shape.
-    let thin = content
-        .find("for (tx_sql, restores_session_default) in transaction_mode_statements {")
-        .expect("the thin transaction-mode apply loop should exist");
-    let thin_body = &content[thin..thin + 2600];
-    let thin_record = thin_body
-        .find("Self::oracle_retained_state_after_statement_effects(")
-        .expect("the thin apply should record each statement's effects");
-    let thin_execute = thin_body
-        .find("Self::execute_oracle_thin_statement(conn, &tx_sql, false)")
-        .expect("the thin apply should execute each statement");
-    assert!(
-        thin_record < thin_execute,
-        "the thin apply must record the effects BEFORE the statement is issued"
+        "the shared application must record the effects BEFORE the statement is issued"
     );
     assert!(
-        thin_body.contains("oracle_error_says_transaction_still_open"),
+        shared_body.contains("if !restores_session_default {"),
+        "and the session-default RESET is the one statement it must NOT record: it restores a \
+         state the tab already represents, so recording it would stop the next execution for a \
+         resolution decision the user does not owe"
+    );
+    assert!(
+        shared_body.contains("oracle_error_says_transaction_still_open"),
         "and read an ORA-01453 as `the transaction is still open`, not as a batch stopper"
+    );
+    assert_eq!(
+        content
+            .matches("Self::apply_oracle_transaction_mode_statements_with(")
+            .count(),
+        3,
+        "the OCI apply, the thin batch and the thin lazy fetch must all state the mode through it"
+    );
+    assert_eq!(
+        content
+            .matches("oracle_error_says_transaction_still_open")
+            .count(),
+        1,
+        "and none of them may re-derive what ORA-01453 means"
+    );
+    assert!(
+        content.contains("cleanup: &mut QueryExecutionCleanupGuard"),
+        "the OCI apply must own its recording, not leave it to its callers"
     );
 }
 
@@ -6737,21 +6865,31 @@ fn every_oracle_transaction_mode_application_records_before_it_asks() {
         .expect("the next function should follow it");
     let body = &execution[lazy..lazy_end];
 
-    let record = body
-        .find("oracle_retained_state_after_statement_effects(")
-        .expect("it must record what each mode statement leaves behind");
-    let send = body
-        .find("Self::execute_oracle_thin_statement(")
-        .expect("it must send the mode statements");
+    // CHANGED, with its reason: this used to assert that the lazy fetch's own
+    // body records before it sends and reads ORA-01453 itself. It no longer has
+    // a body to get that right or wrong — it states the mode through the same
+    // function both batch loops use, which is what the assertion was protecting
+    // in the first place. `both_oracle_drivers_record_transaction_mode_effects_before_the_round_trip`
+    // owns the order now; what stays here is that this site still goes through
+    // it, and still treats BOTH replies as answers.
     assert!(
-        record < send,
-        "effects must be recorded BEFORE the round trip: `SET TRANSACTION` opens a \
-         transaction that carries no work, so a cancel landing between the server running \
-         it and the app reading the answer leaves an open transaction nothing knows about"
+        body.contains("Self::apply_oracle_transaction_mode_statements_with("),
+        "the thin lazy fetch must state the mode through the shared application, so the \
+         record-before-the-round-trip rule cannot be re-spelled here"
+    );
+    let still_open = body
+        .find("OracleTransactionModeApplied::TransactionStillOpen")
+        .expect("it must have an answer for ORA-01453");
+    let failed = body
+        .find("OracleTransactionModeApplied::Failed(message) => Err(message)")
+        .expect("and a failure is still an error the caller sees");
+    assert!(
+        still_open < failed,
+        "ORA-01453 is an ANSWER — the pin applies from the next transaction — not a \
+         failure of the SELECT that asked for it"
     );
     assert!(
-        body.contains("oracle_error_says_transaction_still_open(&message)"),
-        "and ORA-01453 is an ANSWER — the pin applies from the next transaction — not a \
-         failure of the SELECT that asked for it"
+        body.contains("| OracleTransactionModeApplied::TransactionStillOpen => Ok(retained_state)"),
+        "so the lazy fetch keeps the state it recorded rather than failing the user's SELECT"
     );
 }
