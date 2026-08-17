@@ -83,6 +83,15 @@ const APPLICATION_EXIT_POLL_SECONDS: f64 = 0.2;
 // Once the user chose Cancel and Exit, a stuck database worker must not keep
 // FLTK's event loop alive indefinitely.
 const APPLICATION_EXIT_CANCEL_GRACE: Duration = Duration::from_secs(5);
+// How long the whole exit teardown will wait for calls the exit cancel has just
+// broken to let go of their connections, so each one gets a real logoff instead
+// of the process dropping its socket. ONE budget for every connection, like the
+// cancel watchdog's own: the cancels were all dispatched at the same moment, so
+// they have all had the same grace, and a per-connection budget would make exit
+// take N times as long. It only elapses when something really is wedged — each
+// wait ends the instant the connection lock is free.
+const APPLICATION_EXIT_SESSION_TEARDOWN_GRACE: Duration = Duration::from_secs(3);
+const APPLICATION_EXIT_SESSION_TEARDOWN_POLL: Duration = Duration::from_millis(25);
 const MAX_TOP_LEVEL_WINDOWS_TO_HIDE: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10175,8 +10184,14 @@ impl MainWindow {
         let connection_generation = context.connection_generation;
         let db_type = context.connection_info.db_type;
         let activity = db_type.metadata_refresh_activity(requested_scope.as_deref());
-        let activity_guard =
-            crate::db::track_pool_db_activity_for_connection(activity, db_type, connection_id);
+        // Published through the CONTEXT, like every other pool-session activity
+        // in the app. Built by hand this entry carried the connection id but no
+        // LIFETIME, and a lifetime is what `is_stale` needs to say yes — so
+        // until the first session was acquired, this refresh was an entry the
+        // stale sweep could not retire. The context has both, which is exactly
+        // why asking it is the door.
+        let activity_guard = context.track_activity(activity);
+        activity_guard.set_connection_id(connection_id);
         let data = schema_metadata_loader_for(db_type).load(
             context.clone(),
             requested_scope.clone(),
@@ -15684,6 +15699,33 @@ impl MainWindow {
         );
     }
 
+    /// Take a connection's lock so exit can log the session off properly,
+    /// waiting out a call the exit cancel has just broken.
+    ///
+    /// A single `try_lock` was not enough for the case that matters: the cancel
+    /// is dispatched on the watchdog thread, so at the instant exit reaches
+    /// here the broken call has usually not unwound yet and still holds the
+    /// mutex. Answering "could not close" then and dropping the socket is what
+    /// left server sessions behind on the very path — the forced exit — that
+    /// exists because the work would not stop.
+    ///
+    /// `deadline` is the WHOLE teardown's, not this connection's, so exit stays
+    /// bounded no matter how many connections are open.
+    fn lock_connection_for_exit(
+        connection: &SharedConnection,
+        deadline: Instant,
+    ) -> Option<crate::db::ConnectionLockGuard<'_>> {
+        loop {
+            if let Some(guard) = crate::db::try_lock_connection(connection) {
+                return Some(guard);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(APPLICATION_EXIT_SESSION_TEARDOWN_POLL);
+        }
+    }
+
     fn finish_application_exit(state: &Arc<Mutex<AppState>>, mut window: Window) {
         // FLTK's event loop returns only after every native top-level window is
         // hidden. Establish that exit condition before any resource cleanup
@@ -15691,8 +15733,7 @@ impl MainWindow {
         window.hide();
         Self::hide_all_visible_windows();
 
-        crate::db::clear_tracked_db_activity();
-        let (popups, editor_tabs, mut result_tabs, runtimes) = {
+        let (popups, editor_tabs, mut result_tabs, runtimes, force_timeout) = {
             let mut s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -15704,8 +15745,17 @@ impl MainWindow {
                 s.editor_tabs.clone(),
                 s.result_tabs.clone(),
                 s.connection_registry.runtimes(),
+                s.configured_cancel_timeout(),
             )
         };
+        // CANCELLED, not cleared. Exit is a session-ending action like any
+        // other, so it ends its work the way the others do: the owners hear
+        // about it through their cancel hooks and both tiers are dispatched
+        // against the sessions. Emptying the registry here instead — which is
+        // what this used to do — threw away every session canceler and every
+        // hook without breaking anything, and it did so on the FORCED exit
+        // path too, the one reached only because the work would not stop.
+        crate::db::cancel_all_db_activities(force_timeout);
         {
             let mut popups = popups
                 .lock()
@@ -15721,10 +15771,13 @@ impl MainWindow {
         for mut tab in editor_tabs {
             tab.sql_editor.cleanup_for_close();
         }
+        let teardown_deadline = Instant::now() + APPLICATION_EXIT_SESSION_TEARDOWN_GRACE;
         for runtime in runtimes {
             let connection = runtime.connection();
             crate::db::clear_pool_session_context_for_shared_connection(&connection);
-            if let Some(mut db_conn) = crate::db::try_lock_connection(&connection) {
+            if let Some(mut db_conn) =
+                Self::lock_connection_for_exit(&connection, teardown_deadline)
+            {
                 db_conn.disconnect();
                 db_conn.refresh_tracked_connection();
                 runtime.set_state(ConnectionRuntimeState::Disconnected);
@@ -15765,7 +15818,12 @@ impl MainWindow {
         window.show();
         app::flush();
         let _ = app::wait();
-        crate::db::clear_tracked_db_activity();
+        // Nothing is cleared here. This runs one event iteration into startup,
+        // and emptying the process-wide activity registry at that point would
+        // silently unhook whatever the first iteration had already started —
+        // no status row, nothing for the cancel button to reach, nothing for
+        // the sweeps to retire. Work is ended by cancelling it; the registry is
+        // never emptied by the application.
         {
             let mut s = state
                 .lock()

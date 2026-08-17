@@ -38,7 +38,7 @@
 
 use fltk::{app, input::IntInput};
 use space_query::db::{
-    active_db_activity_snapshots, cancel_db_activity, clear_tracked_db_activity,
+    active_db_activity_snapshots, cancel_db_activity, reset_tracked_db_activities_for_probe,
     sweep_stale_db_activities, track_pool_db_activity, ConnectionInfo, DatabaseConnection,
     DatabaseType, DbPoolSession, OracleDriverMode,
 };
@@ -346,7 +346,7 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
     let harness = Harness::connect(target)?;
 
     // ---- A1..A3: the cancel button path -----------------------------------
-    clear_tracked_db_activity();
+    reset_tracked_db_activities_for_probe();
     {
         let activity =
             track_pool_db_activity("Live cancel probe", target.connection_info().db_type);
@@ -400,7 +400,7 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
     }
 
     // ---- A4: force tier ----------------------------------------------------
-    clear_tracked_db_activity();
+    reset_tracked_db_activities_for_probe();
     {
         let activity = track_pool_db_activity("Live force probe", target.connection_info().db_type);
         let activity_id = activity.id();
@@ -431,7 +431,7 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
     }
 
     // ---- A5: session teardown, no cancel button involved --------------------
-    clear_tracked_db_activity();
+    reset_tracked_db_activities_for_probe();
     {
         let activity = track_pool_db_activity("Live sweep probe", target.connection_info().db_type);
         let activity_id = activity.id();
@@ -480,7 +480,7 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
     }
 
     // ---- A6: a returned session must not be broken by a later cancel --------
-    clear_tracked_db_activity();
+    reset_tracked_db_activities_for_probe();
     {
         let harness = Harness::connect(target)?;
         let context = harness.pool_context()?;
@@ -515,7 +515,7 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
 
     // ---- A7/A8/A9: real editor queries, cancelled through the registry -----
     for retained in [false, true] {
-        clear_tracked_db_activity();
+        reset_tracked_db_activities_for_probe();
         let label = if retained { "A8" } else { "A7" };
         let harness = Harness::connect(target)?;
         let mut editor = EditorHarness::new(&harness);
@@ -615,7 +615,7 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
         let _ = editor.wait_done(Duration::from_secs(10));
     }
 
-    clear_tracked_db_activity();
+    reset_tracked_db_activities_for_probe();
     Ok(failures)
 }
 

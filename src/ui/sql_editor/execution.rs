@@ -25417,6 +25417,21 @@ impl SqlEditorWidget {
                 hand_back,
             );
         } else {
+            // The connection incarnation this session belongs to is gone, so
+            // there is nothing left to retain it INTO and it can only be
+            // closed. Saying so is still owed: this is the same news as every
+            // other road that closes a work-carrying session, and it is the one
+            // road that used to take it in silence. (The hand-back door refuses
+            // the same case for all four backends and reports it from there;
+            // this branch never reaches the door because it cannot name the
+            // family a disconnected connection no longer remembers.)
+            if let crate::db::RetainedSessionOutcome::Retain(retained_state) = disposition {
+                Self::report_retained_session_lost_with_work(
+                    hand_back.sender(),
+                    retained_state,
+                    db_activity,
+                );
+            }
             Self::discard_mysql_pooled_connection(conn);
         }
     }
@@ -26590,6 +26605,30 @@ impl SqlEditorWidget {
         }
     }
 
+    /// What the user is told when preparing the session for the next statement
+    /// failed.
+    ///
+    /// One place for all four backends, because the answer depends on WHY it
+    /// failed and each of them wrapped the driver's words in its own sentence.
+    /// Preparation — putting the tab's scope on the session, stating its
+    /// options — runs BEFORE the statement reaches the server, so a cancel that
+    /// lands in that window aborts the preparation call itself. Reported
+    /// verbatim that came out as "Failed to apply Oracle current schema before
+    /// execution: ORA-01013: user requested cancel of current operation": a
+    /// driver failure the user did not cause, offered instead of the cancel
+    /// they had just asked for. It is not a corner either — a registry cancel
+    /// (a disconnect, the stale sweep) reaches a query that has not got to the
+    /// server yet exactly here.
+    ///
+    /// Asked of the MESSAGE through the shared per-backend marker catalog, so
+    /// it holds however the cancel arrived and whichever driver spoke.
+    fn session_preparation_failure(context: impl std::fmt::Display, message: &str) -> String {
+        if crate::db::session_policy::message_indicates_query_cancel(message) {
+            return Self::cancel_message();
+        }
+        format!("{context}: {message}")
+    }
+
     /// Put THIS batch's Oracle Thin session in the schema the tab runs in.
     ///
     /// The thin twin of [`Self::apply_oracle_schema_before_pooled_action`].
@@ -26618,7 +26657,10 @@ impl SqlEditorWidget {
             session_schema,
         )
         .map_err(|message| {
-            format!("Failed to apply Oracle current schema before execution: {message}")
+            Self::session_preparation_failure(
+                "Failed to apply Oracle current schema before execution",
+                &message,
+            )
         })
     }
 
@@ -26678,8 +26720,9 @@ impl SqlEditorWidget {
             }
             Err(message) => {
                 clear_pool_session_context_for_shared_connection(shared_connection);
-                Err(format!(
-                    "Failed to apply Oracle current schema before execution: {message}"
+                Err(Self::session_preparation_failure(
+                    "Failed to apply Oracle current schema before execution",
+                    &message,
                 ))
             }
         }
@@ -26740,7 +26783,10 @@ impl SqlEditorWidget {
             session_scope,
         )
         .map_err(|message| {
-            format!("Failed to apply {display_name} current database before execution: {message}")
+            Self::session_preparation_failure(
+                format_args!("Failed to apply {display_name} current database before execution"),
+                &message,
+            )
         });
 
         match result {
@@ -26756,8 +26802,11 @@ impl SqlEditorWidget {
                         statement_requires_transaction_boundary,
                     ) {
                         clear_pool_session_context_for_shared_connection(shared_connection);
-                        return Err(format!(
-                            "Failed to apply {display_name} session options before execution: {message}"
+                        return Err(Self::session_preparation_failure(
+                            format_args!(
+                                "Failed to apply {display_name} session options before execution"
+                            ),
+                            &message,
                         ));
                     }
                 }
@@ -31518,6 +31567,48 @@ mod query_execution_cleanup_tests {
                 .iter()
                 .any(|msg| matches!(msg, QueryProgress::BatchFinished)),
             "BatchFinished should be emitted"
+        );
+    }
+
+    /// A cancel that lands while the session is being PREPARED is a cancel.
+    ///
+    /// Preparation runs before the statement reaches the server — putting the
+    /// tab's scope on the session, stating its options — so a cancel arriving
+    /// in that window aborts the preparation call itself. Every backend wrapped
+    /// the driver's words in its own sentence and reported them verbatim, so
+    /// what the user saw was "Failed to apply Oracle current schema before
+    /// execution: ORA-01013: user requested cancel of current operation": a
+    /// driver failure they did not cause, offered instead of the cancel they
+    /// had just asked for. Live-reproduced by `verify_activity_cancel_live`
+    /// scenario A9 (A7) on Oracle thin and OCI.
+    #[test]
+    fn a_cancel_while_the_session_is_being_prepared_is_reported_as_a_cancel() {
+        // Each backend's own words for the same thing, through one classifier.
+        for cancelled in [
+            "ORA-01013: User requested cancel of current operation.",
+            "OCI Error: ORA-01013: User requested cancel of current operation.",
+            "ERROR 1317 (70100): Query execution was interrupted",
+            crate::db::query::result_messages::QUERY_CANCELLED,
+        ] {
+            assert_eq!(
+                SqlEditorWidget::session_preparation_failure(
+                    "Failed to apply Oracle current schema before execution",
+                    cancelled
+                ),
+                SqlEditorWidget::cancel_message(),
+                "a preparation call the user cancelled must be reported as a cancel: {cancelled}"
+            );
+        }
+
+        // ...and a real preparation failure still says what went wrong, with
+        // the context that tells the user which step it was.
+        let real = SqlEditorWidget::session_preparation_failure(
+            "Failed to apply Oracle current schema before execution",
+            "ORA-01435: user does not exist",
+        );
+        assert_eq!(
+            real,
+            "Failed to apply Oracle current schema before execution: ORA-01435: user does not exist"
         );
     }
 

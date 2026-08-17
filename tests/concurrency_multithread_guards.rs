@@ -340,12 +340,24 @@ fn db_tab_session_slot_is_shared_abstraction_not_raw_arc_alias() {
     );
     assert!(
         content.contains("pub fn take_reusable_lease(")
-            && content.contains("pub fn store_if_empty_with_retained_state(")
             && content.contains("pub fn hand_back_worker_session(")
             && content.contains("pub fn clear("),
         "Oracle/MySQL/MariaDB tab sessions should share the same take/hand-back/clear lifecycle \
          API — `hand_back_worker_session` is the door a WORKER gives its session back through, \
          and it is named here so it cannot be replaced by per-caller stores again"
+    );
+    // ...and the door is the ONLY way in. `store_if_empty_with_retained_state`
+    // used to be named above as part of the shared API, but it is the very
+    // thing the door replaced: a public store that reaches the slot directly,
+    // so it names no execution (an abandoned batch could file over the newer
+    // one's session) and asks nothing about the connection (a session from an
+    // incarnation that had ended could be parked where nothing revisits it).
+    // It had no callers at all — a bypass kept in the vocabulary, one call away
+    // from being used again.
+    assert!(
+        !content.contains("pub fn store_if_empty"),
+        "filing a session into a tab's slot must go through `hand_back_worker_session`; a public \
+         store reaches the slot around every question the door asks"
     );
     assert!(
         !content.contains("pub fn store_if_empty(")
@@ -6623,6 +6635,63 @@ fn every_backend_can_cancel_work_on_its_own_main_connection() {
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,"),
         "the MySQL family's main-connection execution path must name the LOCK GUARD; taking          `&mut DatabaseConnection` reaches the accessors through `DerefMut` and skips the          shadow that attaches the activity"
     );
+
+    // ...and every backend must be ABLE to say which session it is cancelling.
+    // Only the OCI variant could: it carried a `from_pool` flag, forced on it
+    // by ODPI-C rejecting a drop-close on a non-pool connection (DPI-1011).
+    // The thin and MySQL-family variants had nowhere to say it, so the same
+    // user action — force-cancelling a scope switch, a toolbar commit, an
+    // `ALTER SESSION` — re-broke the call on one backend and destroyed the
+    // app's own primary connection on the other two, leaving the app
+    // describing a connection that was gone.
+    for arm in [
+        "PoolSessionCanceler::Oracle {
+                conn: Arc::clone(conn),
+                session: CanceledSession::Main,",
+        "handle: session.cancel_handle(),
+                        session: CanceledSession::Main,",
+        "connection_id: conn.connection_id(),
+                db_type: *db_type,
+                session: CanceledSession::Main,",
+    ] {
+        assert!(
+            target_body.contains(arm) || content.contains(arm),
+            "every backend's MAIN-connection canceler must say so: missing {arm}"
+        );
+    }
+    // And the rule itself is stated ONCE, ahead of the per-driver tear-down.
+    let force_start = content
+        .find(
+            "    fn force(&self) -> Result<(), String> {
+        // How far the force tier may go",
+        )
+        .expect("the shared force tier should exist");
+    // Bounded by the next method rather than by a byte count: these assertions
+    // are about ORDER inside this function, and a comment added to it must not
+    // be able to push the code being asserted out of the window.
+    let force_end = content[force_start..]
+        .find("\n    fn label(")
+        .map_or(content.len(), |offset| force_start + offset);
+    let force = &content[force_start..force_end];
+    let rule = force
+        .find(
+            "if self.session() == CanceledSession::Main {
+            return self.interrupt();",
+        )
+        .expect("a cancel must never destroy the connection's own session");
+    for destroys in [
+        "close_with_mode(oracle::conn::CloseMode::Drop)",
+        "force_close()",
+        "cancel_connection(",
+    ] {
+        let at = force
+            .find(destroys)
+            .unwrap_or_else(|| panic!("the pooled force tier should still {destroys}"));
+        assert!(
+            rule < at,
+            "the main-connection rule must be decided BEFORE any driver tear-down: {destroys}"
+        );
+    }
 }
 
 #[test]
@@ -6735,15 +6804,20 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         content
             .matches("Self::report_retained_session_lost_with_work(")
             .count(),
-        6,
+        7,
         "every site that loses a work-carrying session reports it: the two replace-and-reset \
          sites (MySQL family, Oracle OCI), the one door a worker clears the tab's slot through \
          on the way out of a connection, the two sites that TOOK a lease and found it was \
          not a MySQL session after all (batch finalization, scope recheck) — the take had \
          already emptied the slot there, so a bare return left the tab believing it still had \
-         a session — and `stale_take_reported`, the choke point every EXECUTION take passes \
+         a session — `stale_take_reported`, the choke point every EXECUTION take passes \
          through: a take whose session belonged to an earlier incarnation of this connection \
-         CLOSES it, and all four call sites used to read that answer as `NoSession`"
+         CLOSES it, and all four call sites used to read that answer as `NoSession` — and the \
+         MySQL-family hand-back's own pre-check, which finds the connection incarnation gone \
+         and can only close the session. That last one is the ONE loss that never reaches the \
+         hand-back door (a disconnected connection no longer remembers which family it was, so \
+         the lease cannot be built), which is exactly why it has to report for itself; the \
+         door refuses and reports the same case for all four backends"
     );
 
     // And that choke point must be on the road, not merely present: every
@@ -7458,4 +7532,187 @@ fn every_question_about_what_a_unit_left_on_the_session_asks_every_statement() {
             "{question} must ask every statement of the unit"
         );
     }
+}
+
+/// The application ends DB work by CANCELLING it. It never empties the
+/// activity registry.
+///
+/// Emptying it drops every session canceler and every cancel hook where it
+/// stands — the sessions are not broken and their owners are not told — so
+/// after it the registry can no longer show, reach, or retire work that is
+/// still running, which are the three guarantees it exists to provide.
+/// Application exit did exactly that, one statement before tearing the
+/// connections down, including on the FORCED exit path that is only reached
+/// because the work would not stop.
+///
+/// The reset stays available to the probe harnesses and to this crate's own
+/// tests, which need a clean baseline between scenarios and have no sessions to
+/// lose. This test is what keeps it out of the app.
+#[test]
+fn production_ui_ends_db_work_by_cancelling_it_not_by_emptying_the_registry() {
+    let ui_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+    for file in collect_rust_files(&ui_root) {
+        let source = fs::read_to_string(&file)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()));
+        assert!(
+            !source.contains("reset_tracked_db_activities_for_probe"),
+            "{} empties the DB activity registry. End work by cancelling it \
+             (cancel_db_activity / cancel_db_activities_for_connection / \
+             sweep_stale_db_activities / cancel_all_db_activities) so the owners are told and \
+             both cancel tiers run against the sessions.",
+            file.display()
+        );
+    }
+
+    // And the one place that used to empty it now cancels, with the app's own
+    // configured cancel timeout as the force tier's deadline.
+    let main_window = read_source("src/ui/main_window.rs");
+    let exit = main_window
+        .find("fn finish_application_exit(")
+        .map(|offset| slice_from(&main_window, offset, 3000))
+        .expect("the application exit teardown should exist");
+    assert!(
+        exit.contains("crate::db::cancel_all_db_activities(force_timeout)"),
+        "application exit must cancel every tracked activity before it tears the connections \
+         down: {exit}"
+    );
+    // A cancel is dispatched on the watchdog thread, so the broken call needs a
+    // moment to let go of its connection before exit can log the session off
+    // rather than drop its socket.
+    assert!(
+        exit.contains("Self::lock_connection_for_exit(&connection, teardown_deadline)"),
+        "application exit must wait out a cancelled call before giving up on a clean \
+         logoff: {exit}"
+    );
+}
+
+/// No backend may file a session into a tab's slot for a connection
+/// incarnation that has ENDED.
+///
+/// The reclaim sweep that a disconnect / reconnect / pool rebuild triggers runs
+/// ONCE, in the background, at the moment the incarnation ends. A worker that
+/// was still unwinding then handed its session back afterwards, into a slot the
+/// sweep had just emptied — and nothing revisits a slot. The session survived
+/// the very teardown that was supposed to end it, holding a server session, and
+/// on OCI keeping the retired pool alive with it, until the tab happened to run
+/// another statement or was closed.
+///
+/// The MySQL family escaped it only because its own hand-back asks the live
+/// connection first; both Oracle drivers filed whatever generation the batch
+/// began with. So the answer belongs at the door every backend already passes
+/// through — see
+/// `every_backend_hands_a_batch_session_back_through_the_door_that_names_its_operation`
+/// for the proof that they all do.
+#[test]
+fn the_session_slot_refuses_a_hand_back_from_a_connection_incarnation_that_ended() {
+    let connection = read_source("src/db/connection.rs");
+
+    // The refusal is a named decision beside the "the tab is gone" one, not a
+    // new arm of an `if` chain, and the connection is the stronger fact.
+    let decision = connection
+        .find("fn retained_session_filing(")
+        .map(|offset| slice_from(&connection, offset, 700))
+        .expect("the filing decision should exist");
+    assert!(
+        decision.contains("if connection_is_retired {")
+            && decision.contains("RetainedSessionFiling::RefusedConnectionRetired"),
+        "an ended connection incarnation must refuse the filing outright: {decision}"
+    );
+
+    // ...and the one filing door asks it.
+    let filing = connection
+        .find("fn file_into_slot(")
+        .map(|offset| slice_from(&connection, offset, 2000))
+        .expect("the slot filing step should exist");
+    let asks = filing
+        .find("connection_generation_is_retired(connection_generation)")
+        .expect("the filing door must ask whether this incarnation is over");
+    let takes_lock = filing
+        .find("let mut lease = self.lock_inner();")
+        .expect("the filing door takes the slot lock");
+    assert!(
+        asks < takes_lock,
+        "the ledger is a leaf lock and the question is not about the slot, so it is asked \
+         outside the slot lock: {filing}"
+    );
+    assert!(
+        filing.contains("retained_session_filing(connection_is_retired, lease.closed)"),
+        "the door must fold BOTH refusals through the one decision: {filing}"
+    );
+
+    // The retirement is recorded synchronously, before the sweep is handed to a
+    // worker — otherwise a hand-back landing in between is neither swept nor
+    // refused.
+    let reclaim = connection
+        .find("fn reclaim_retired_connection_sessions_in_background(")
+        .map(|offset| slice_from(&connection, offset, 900))
+        .expect("the reclaim entry point should exist");
+    let mark = reclaim
+        .find("lock_retired_connection_generations().insert(retired_generation)")
+        .expect("the reclaim must record the retirement");
+    let spawn = reclaim
+        .find("spawn_connection_cleanup(")
+        .expect("the reclaim sweep runs on the cleanup worker");
+    assert!(
+        mark < spawn,
+        "the retirement must be marked BEFORE the sweep is handed off: {reclaim}"
+    );
+}
+
+/// Every backend's session PREPARATION reports a cancel as a cancel.
+///
+/// Preparation runs before the statement reaches the server — putting the tab's
+/// scope on the session, stating its options — so a cancel that arrives in that
+/// window aborts the preparation call itself. Each backend wrapped the driver's
+/// words in a sentence of its own and reported them verbatim, so the user was
+/// shown "Failed to apply Oracle current schema before execution: ORA-01013:
+/// user requested cancel of current operation" — a driver failure they did not
+/// cause, offered instead of the cancel they had just asked for. It is not a
+/// corner: a registry cancel (a disconnect, the stale sweep) reaches a query
+/// that has not got to the server yet exactly here.
+#[test]
+fn every_backend_reports_a_cancel_during_session_preparation_as_a_cancel() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    // The classification is stated ONCE, of the message, through the shared
+    // per-backend marker catalog.
+    let classifier = execution
+        .find("fn session_preparation_failure(")
+        .map(|offset| slice_from(&execution, offset, 400))
+        .expect("the shared preparation-failure answer should exist");
+    assert!(
+        classifier.contains("crate::db::session_policy::message_indicates_query_cancel(message)")
+            && classifier.contains("return Self::cancel_message();"),
+        "the answer must come from the shared cancel-marker catalog, so it holds for all four \
+         backends and however the cancel arrived: {classifier}"
+    );
+
+    // ...and no preparation step may build its sentence any other way. These
+    // are the four wraps: Oracle thin, Oracle OCI, and the MySQL family's
+    // database and session-option steps. Production source only — the tests
+    // below it quote these same sentences on purpose.
+    let production = execution
+        .find("\nmod query_execution_cleanup_tests {")
+        .map_or(execution.as_str(), |offset| &execution[..offset]);
+    let mut wraps_seen = 0;
+    for wrap in [
+        "Failed to apply Oracle current schema before execution",
+        "Failed to apply {display_name} current database before execution",
+        "Failed to apply {display_name} session options before execution",
+    ] {
+        for (offset, _) in production.match_indices(wrap) {
+            wraps_seen += 1;
+            let around = slice_from(production, offset.saturating_sub(220), 260);
+            assert!(
+                around.contains("Self::session_preparation_failure("),
+                "a session-preparation failure must be classified before it is shown, or a \
+                 cancel arrives as a driver error: {wrap}"
+            );
+        }
+    }
+    assert_eq!(
+        wraps_seen, 4,
+        "all four preparation steps must still be covered: Oracle thin, Oracle OCI, and the \
+         MySQL family's database and session-option steps"
+    );
 }
