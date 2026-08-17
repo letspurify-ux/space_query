@@ -2604,6 +2604,24 @@ impl AppState {
         true
     }
 
+    /// Whether this tab still has DB work a session-ending action must not run
+    /// over.
+    ///
+    /// THREE things count, not two. Besides a running query and a live lazy
+    /// fetch there is an execution the tab has already ACCEPTED but has not
+    /// started — it is waiting for a previous lazy fetch to be cancelled. In
+    /// that window the tab reads perfectly idle (no query running, no batch
+    /// begun) yet a statement is still coming, and `has_deferred_execution`
+    /// was consulted in exactly one place: result-grid reservations. So a pool
+    /// resize, a disconnect, a Disconnect All or an exit could pass the gate
+    /// there and the statement would then start against a connection whose
+    /// generation and epoch had just moved, losing its session.
+    fn tab_has_unfinished_db_work(editor: &SqlEditorWidget) -> bool {
+        editor.is_query_running()
+            || editor.active_lazy_fetch_session().is_some()
+            || editor.has_deferred_execution()
+    }
+
     fn is_any_query_running(&self) -> bool {
         self.sql_editor.is_query_running()
             || self
@@ -2822,8 +2840,7 @@ impl AppState {
     fn has_work_for_connection(&self, connection_id: ConnectionId) -> bool {
         self.editor_tabs.iter().any(|tab| {
             tab.connection_binding.snapshot().connection_id() == Some(connection_id)
-                && (tab.sql_editor.is_query_running()
-                    || tab.sql_editor.active_lazy_fetch_session().is_some())
+                && Self::tab_has_unfinished_db_work(&tab.sql_editor)
         })
     }
 
@@ -2832,10 +2849,7 @@ impl AppState {
             .editor_tabs
             .iter()
             .find(|tab| tab.tab_id == tab_id)
-            .map(|tab| {
-                tab.sql_editor.is_query_running()
-                    || tab.sql_editor.active_lazy_fetch_session().is_some()
-            })
+            .map(|tab| Self::tab_has_unfinished_db_work(&tab.sql_editor))
             .unwrap_or(false);
         let progress_has_lazy_fetch = self
             .progress_contexts
@@ -2854,7 +2868,39 @@ impl AppState {
     }
 
     fn has_running_query_or_lazy_fetch(&self) -> bool {
-        self.is_any_query_running() || self.has_active_lazy_fetches()
+        self.is_any_query_running()
+            || self.has_active_lazy_fetches()
+            || Self::tab_has_unfinished_db_work(&self.sql_editor)
+            || self
+                .editor_tabs
+                .iter()
+                .any(|tab| Self::tab_has_unfinished_db_work(&tab.sql_editor))
+    }
+
+    /// The DB work a session-ending action would tear down, in words, or `None`
+    /// when there is none.
+    ///
+    /// Asked instead of "is a query running", because a pool rebuild, a
+    /// disconnect and an exit end EVERY session on the connection, not only the
+    /// ones a query tab knows about. Bumping the connection generation makes
+    /// the stale sweep retire — and force-cancel — anything still holding a
+    /// session: an object-browser metadata refresh, an IntelliSense column
+    /// load, a bind-parameter probe, a grid export. All of those used to walk
+    /// straight through a gate that only looked at query tabs, and then died
+    /// silently, while a running query was refused with a message. The activity
+    /// registry is the one place that knows about all of them, on every
+    /// backend, which is exactly why it exists.
+    fn db_work_blocking_session_teardown(&self) -> Option<String> {
+        if self.has_running_query_or_lazy_fetch() {
+            return Some("running queries and lazy fetches".to_string());
+        }
+        let mut labels = crate::db::active_db_activity_snapshots()
+            .into_iter()
+            .map(|activity| activity.activity)
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels.dedup();
+        (!labels.is_empty()).then(|| labels.join("; "))
     }
 
     fn lazy_fetch_session_is_active_in_editor(&self, session_id: u64) -> bool {
@@ -5144,6 +5190,15 @@ enum ConnectionResult {
     },
     PoolResize {
         settings: Box<FontSettings>,
+        /// How many connections took the new size.
+        ///
+        /// Part of the answer, not bookkeeping: the rebuild walks every
+        /// connection and can fail on some of them, and the ones that
+        /// SUCCEEDED keep the new size. Storing the preference only on a clean
+        /// sweep left the app saying one size while some of its live
+        /// connections ran another — and the next connection it opened was
+        /// built with the old one.
+        applied: usize,
         result: Result<(), String>,
     },
 }
@@ -13738,16 +13793,22 @@ impl MainWindow {
                     // sessions, matching File/Disconnect and application exit:
                     // the prompt performs a real COMMIT/ROLLBACK, so it must
                     // never run for a resize that is then refused.
+                    //
+                    // Asked of the ACTIVITY REGISTRY, not just of the query
+                    // tabs: the rebuild bumps every connection's generation,
+                    // and the stale sweep then force-cancels whatever still
+                    // holds a session on them. See
+                    // `db_work_blocking_session_teardown`.
                     let blocked = {
                         let s = state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        s.is_any_query_running() || s.has_active_lazy_fetches()
+                        s.db_work_blocking_session_teardown()
                     };
-                    if blocked {
-                        crate::ui::alert_on_main(
-                            "Finish or cancel running queries and lazy fetches before changing connection pool size.",
-                        );
+                    if let Some(blocked) = blocked {
+                        crate::ui::alert_on_main(&format!(
+                            "Finish or cancel {blocked} before changing connection pool size."
+                        ));
                         return true;
                     }
                     if !Self::resolve_pooled_sessions_before_pool_resize(state) {
@@ -13789,19 +13850,21 @@ impl MainWindow {
                     if let Err(err) = thread::Builder::new()
                         .name("space-query-pool-resize".to_string())
                         .spawn(move || {
-                            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                            let (applied, result) = panic::catch_unwind(AssertUnwindSafe(|| {
                                 let mut failures = Vec::new();
+                                let mut applied = 0usize;
                                 for runtime in transition.pending() {
-                                    if let Err(err) = resize_shared_connection_pool_with_policy(
+                                    match resize_shared_connection_pool_with_policy(
                                         &runtime.connection(),
                                         size,
                                         policy,
                                     ) {
-                                        failures.push(format!(
+                                        Ok(()) => applied += 1,
+                                        Err(err) => failures.push(format!(
                                             "{}: {}",
                                             runtime.display_name(),
                                             err
-                                        ));
+                                        )),
                                     }
                                     // Whether it succeeded or not, this
                                     // connection is out of transition: its own
@@ -13810,19 +13873,23 @@ impl MainWindow {
                                     transition.finished(&runtime);
                                 }
                                 if failures.is_empty() {
-                                    Ok(())
+                                    (applied, Ok(()))
                                 } else {
-                                    Err(failures.join("\n"))
+                                    (applied, Err(failures.join("\n")))
                                 }
                             }))
                             .unwrap_or_else(|payload| {
-                                Err(format!(
-                                    "Connection pool resize worker terminated unexpectedly: {}",
-                                    panic_payload_to_string(payload.as_ref())
-                                ))
+                                (
+                                    0,
+                                    Err(format!(
+                                        "Connection pool resize worker terminated unexpectedly: {}",
+                                        panic_payload_to_string(payload.as_ref())
+                                    )),
+                                )
                             });
                             let _ = sender.send(ConnectionResult::PoolResize {
                                 settings: Box::new(settings),
+                                applied,
                                 result,
                             });
                             app::awake();
@@ -13830,6 +13897,7 @@ impl MainWindow {
                     {
                         let _ = spawn_failure_sender.send(ConnectionResult::PoolResize {
                             settings: Box::new(spawn_failure_settings),
+                            applied: 0,
                             result: Err(format!("Could not start pool resize worker: {err}")),
                         });
                         app::awake();
@@ -15186,7 +15254,11 @@ impl MainWindow {
                                     }
                                     s.result_tabs.select_messages_errors();
                                 }
-                                ConnectionResult::PoolResize { settings, result } => match result {
+                                ConnectionResult::PoolResize {
+                                    settings,
+                                    applied,
+                                    result,
+                                } => match result {
                                     Ok(()) => {
                                         let save_result =
                                             MainWindow::persist_settings(&mut s, *settings, true);
@@ -15221,6 +15293,28 @@ impl MainWindow {
                                             ResultMessageKind::Error,
                                             &[format!("Failed to resize connection pool: {err}")],
                                         );
+                                        // The connections that DID take the new
+                                        // size keep it, so the preference has to
+                                        // record it too — otherwise the app says
+                                        // one size, some of its live connections
+                                        // run another, and the next connection it
+                                        // opens is built with the old one.
+                                        if applied > 0 {
+                                            if let Err(save_err) = MainWindow::persist_settings(
+                                                &mut s, *settings, true,
+                                            ) {
+                                                crate::utils::logging::log_error(
+                                                    "settings",
+                                                    &format!("Failed to save settings: {save_err}"),
+                                                );
+                                            }
+                                            s.result_tabs.append_message_lines(
+                                                ResultMessageKind::Info,
+                                                &[format!(
+                                                    "{applied} connection(s) were rebuilt with the new pool size; the preference was saved to match them."
+                                                )],
+                                            );
+                                        }
                                         s.result_tabs.select_messages_errors();
                                     }
                                 },

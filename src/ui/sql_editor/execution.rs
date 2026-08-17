@@ -959,6 +959,12 @@ impl<'a> BatchSessionHandBack<'a> {
         self.sender
     }
 
+    /// Which execution this value speaks for, for the takes that have to stamp
+    /// it onto the session they hand over.
+    fn owner(&self) -> &'a crate::db::SessionHandBackOwner {
+        self.owner
+    }
+
     /// Hand the session back to the tab. Answers whether it reached the slot.
     fn apply(
         &self,
@@ -1358,14 +1364,24 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 }
             };
             let pool_context_epoch = pool_context.pool_context_epoch();
-            let mut retained = pooled_db_session.take_reusable_lease(
-                connection_generation,
-                pool_context_epoch,
-                db_type,
-                &pool_context.connection_info,
-                &execution_activity,
+            // The batch runs on this session long after this frame returns, so
+            // the registration is parked with the operation's sender.
+            let retained = SqlEditorWidget::stale_take_reported(
+                pooled_db_session.take_reusable_lease(
+                    &crate::db::SessionHandBackOwner::for_operation(
+                        Some(current_operation_id),
+                        operation_id,
+                    ),
+                    connection_generation,
+                    pool_context_epoch,
+                    db_type,
+                    &pool_context.connection_info,
+                    &execution_activity,
+                    sender,
+                ),
+                Some(sender),
+                "oracle thin execution startup",
             );
-            retained.hold_cancel_registration_in(sender);
             drop(conn_guard);
 
             let (thin_conn, prior_retained_state) = match retained {
@@ -1400,7 +1416,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                     return ExecutionWorkerOutcome::Handled;
                 }
                 crate::db::RetainedSessionTakeOutcome::NoSession
-                | crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale => {
+                | crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale { .. } => {
                     match pool_context
                         .acquire_session_for_current_scope(&execution_activity)
                         .map(|(session, cancel_registration)| {
@@ -4334,14 +4350,19 @@ impl SqlEditorWidget {
             Ok(context) => context.connection_info,
             Err(message) => return (conn_guard, Err(message)),
         };
-        let mut retained = pooled_db_session.take_reusable_lease(
-            connection_generation,
-            pool_context_epoch,
-            crate::db::DatabaseType::Oracle,
-            &retained_connection_info,
-            &retained_activity,
+        let retained = Self::stale_take_reported(
+            pooled_db_session.take_reusable_lease(
+                session_owner,
+                connection_generation,
+                pool_context_epoch,
+                crate::db::DatabaseType::Oracle,
+                &retained_connection_info,
+                &retained_activity,
+                sender,
+            ),
+            Some(sender),
+            "oracle execution startup",
         );
-        retained.hold_cancel_registration_in(sender);
         match retained {
             crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => {
                 let Some((conn, prior_retained_state)) =
@@ -4393,25 +4414,27 @@ impl SqlEditorWidget {
                                 Self::oracle_error_message_allows_session_reuse(&message),
                             ) {
                                 let current_scope = execution_scope.map(str::to_string);
-                                let _ = pooled_db_session
-                                    .apply_retained_session_disposition_with_scope(
-                                        connection_generation,
-                                        pool_context_epoch,
-                                        DbSessionLease::Oracle(conn),
-                                        crate::db::RetainedSessionDisposition::Retain(
-                                            prior_retained_state,
-                                        ),
-                                        "oracle pool session",
-                                        current_scope,
-                                    );
+                                let _ = pooled_db_session.hand_back_worker_session(
+                                    session_owner,
+                                    connection_generation,
+                                    pool_context_epoch,
+                                    DbSessionLease::Oracle(conn),
+                                    crate::db::RetainedSessionDisposition::Retain(
+                                        prior_retained_state,
+                                    ),
+                                    "oracle pool session",
+                                    current_scope,
+                                );
                                 return (conn_guard, Err(message));
                             }
-                            let _ = pooled_db_session.apply_retained_session_disposition(
+                            let _ = pooled_db_session.hand_back_worker_session(
+                                session_owner,
                                 connection_generation,
                                 pool_context_epoch,
                                 DbSessionLease::Oracle(conn),
                                 crate::db::RetainedSessionDisposition::DiscardPhysical,
                                 "oracle pool session",
+                                None,
                             );
                             if Self::oracle_pool_acquire_error_should_retry_fresh(&message) {
                                 crate::utils::logging::log_warning(
@@ -4426,12 +4449,14 @@ impl SqlEditorWidget {
                         }
                     }
                 } else {
-                    let _ = pooled_db_session.apply_retained_session_disposition(
+                    let _ = pooled_db_session.hand_back_worker_session(
+                        session_owner,
                         connection_generation,
                         pool_context_epoch,
                         DbSessionLease::Oracle(conn),
                         crate::db::RetainedSessionDisposition::DiscardPhysical,
                         "oracle pool session",
+                        None,
                     );
                     Self::report_retained_session_lost_with_work(
                         Some(sender),
@@ -4449,7 +4474,7 @@ impl SqlEditorWidget {
                     )),
                 );
             }
-            crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale
+            crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale { .. }
             | crate::db::RetainedSessionTakeOutcome::NoSession => {}
         }
 
@@ -5958,7 +5983,13 @@ impl SqlEditorWidget {
                         // records -- not the connection's tracked schema, which
                         // this session may well not be in.
                         let current_scope = execution_scope.clone();
-                        pooled_db_session.apply_retained_session_disposition_with_scope(
+                        // Untracked BY DESIGN, like every other lazy-fetch
+                        // hand-back: rows keep streaming after the batch
+                        // reports finished, so this session's currency is
+                        // `lazy_fetch_can_keep_session`, not the tab's
+                        // operation id.
+                        let _ = pooled_db_session.hand_back_worker_session(
+                            &crate::db::SessionHandBackOwner::untracked(),
                             connection_generation,
                             pool_context_epoch,
                             DbSessionLease::Oracle(Arc::clone(&conn)),
@@ -6803,14 +6834,20 @@ impl SqlEditorWidget {
                             retained_state_before_select,
                             may_have_uncommitted_work.unwrap_or(false),
                         );
-                        if !pooled_db_session.apply_retained_session_disposition_with_scope(
-                            connection_generation,
-                            pool_context_epoch,
-                            DbSessionLease::OracleThin(Box::new(lease_conn)),
-                            crate::db::RetainedSessionDisposition::Retain(retained_state),
-                            "oracle thin lazy fetch cleanup",
-                            current_scope.clone(),
-                        ) {
+                        // Untracked BY DESIGN — see the OCI lazy-fetch
+                        // cleanup above.
+                        if !pooled_db_session
+                            .hand_back_worker_session(
+                                &crate::db::SessionHandBackOwner::untracked(),
+                                connection_generation,
+                                pool_context_epoch,
+                                DbSessionLease::OracleThin(Box::new(lease_conn)),
+                                crate::db::RetainedSessionDisposition::Retain(retained_state),
+                                "oracle thin lazy fetch cleanup",
+                                current_scope.clone(),
+                            )
+                            .stored()
+                        {
                             cleanup_failed = true;
                             close_cancelled = true;
                             close_error_kind = InterruptKind::UnsafeOrUnknown;
@@ -9485,6 +9522,10 @@ impl SqlEditorWidget {
                         match Self::acquire_mysql_pooled_session(
                             shared_connection,
                             pooled_db_session,
+                            // The lazy fetch worker runs on this session after
+                            // the batch reports finished, so the reach belongs
+                            // to the operation's sender, not to this frame.
+                            sender,
                             current_execution_scope().as_deref(),
                             db_activity,
                             auto_commit,
@@ -10917,51 +10958,24 @@ impl SqlEditorWidget {
             operation_id,
             connection_generation: operation_connection_generation,
         };
-        let operation_activity = binding_snapshot.runtime.as_ref().map_or_else(
-            || crate::db::track_db_activity(db_activity.clone(), Some(operation_db_type)),
-            |runtime| {
-                crate::db::track_db_activity_for_connection(
-                    db_activity.clone(),
-                    Some(operation_db_type),
-                    runtime.id(),
-                )
-            },
-        );
         // Bound to the connection generation from the start, so the stale
         // sweep can retire this work even when it never acquires a pooled
         // session. Work on the OCI main connection is exactly that: without
         // this binding its activity has no lifetime, `is_stale` can never say
         // yes, and a parked lazy fetch on a disconnected connection keeps its
         // server session forever. A later pooled acquire re-binds to the pool
-        // context epoch, which is strictly newer information.
-        operation_activity.bind_lifetime(operation_connection_lifetime);
-        // A cancel that comes from the registry — a disconnect, or the stale
-        // sweep — goes through the editor's own cancel path, so it reports and
-        // settles the session exactly like the cancel button does instead of
-        // surfacing the broken session as a driver error.
-        {
-            let registry_cancel = self.registry_cancel_flag();
-            let lazy_fetch_for_registry_cancel = self.active_lazy_fetch.clone();
-            operation_activity.on_cancel(Arc::new(move || {
-                registry_cancel.store(true, Ordering::Release);
-                // The flag above is applied on the next UI tick, but the
-                // session teardown must not depend on the UI thread: a parked
-                // lazy fetch holds its session with an OPEN cursor, and the
-                // OCI force tier cannot close such a session (ODPI refuses
-                // while statements are open). Waking the worker directly makes
-                // it close its cursor and discard the session itself — the one
-                // teardown that works on every backend.
-                let handle = lazy_fetch_for_registry_cancel
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(handle) = handle.as_ref().filter(|handle| {
-                    handle.connection_generation == operation_connection_generation
-                }) {
-                    handle.cancel_requested.store(true, Ordering::Release);
-                    let _ = handle.sender.send(LazyFetchCommand::ForceCancel);
-                }
-            }));
-        }
+        // context epoch, which is strictly newer information. The registry
+        // cancel hook rides along for the same reason, and both are stated in
+        // one place so the explain plan and the toolbar transaction actions
+        // cannot get an entry without them — see `begin_operation_activity`.
+        let operation_activity = self.begin_operation_activity(
+            &StartedTabOperation {
+                token: operation_token,
+                db_type: operation_db_type,
+                connection_lifetime: operation_connection_lifetime,
+            },
+            db_activity.clone(),
+        );
         let current_query_cancel_handle = self
             .install_operation_cancel_handle(operation_token, operation_activity.finish_handle());
         let sender = Self::operation_progress_sender(self.progress_sender.clone(), operation_token)
@@ -23993,12 +24007,22 @@ impl SqlEditorWidget {
                 finalize_connection_info.unwrap_or_default(),
             )
         };
-        let retained_session = match pooled_db_session.take_reusable_lease(
-            connection_generation,
-            pool_context_epoch,
-            db_type,
-            &finalize_connection_info,
-            &finalize_activity,
+        // Scoped to this finalization: the session is used and handed back
+        // before this function returns, so the cancel button's reach over it
+        // ends exactly here.
+        let finalize_registration = crate::db::ActionSessionCancelRegistration::new();
+        let retained_session = match Self::stale_take_reported(
+            pooled_db_session.take_reusable_lease(
+                hand_back.owner(),
+                connection_generation,
+                pool_context_epoch,
+                db_type,
+                &finalize_connection_info,
+                &finalize_activity,
+                &finalize_registration,
+            ),
+            hand_back.sender(),
+            db_activity,
         ) {
             crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => retained_session,
             crate::db::RetainedSessionTakeOutcome::BlockedContextMismatch(retained_state) => {
@@ -24011,7 +24035,7 @@ impl SqlEditorWidget {
                 );
                 return;
             }
-            crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale
+            crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale { .. }
             | crate::db::RetainedSessionTakeOutcome::NoSession => return,
         };
         // Out of the slot and not a MySQL session after all: it is gone, and a
@@ -24522,7 +24546,7 @@ impl SqlEditorWidget {
     }
 
     fn reset_mysql_timeout(
-        conn_guard: &mut crate::db::DatabaseConnection,
+        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         timeout_restore: Option<&crate::db::query::mysql_executor::MysqlSessionTimeoutRestore>,
         log_context: &str,
     ) -> bool {
@@ -24657,6 +24681,26 @@ impl SqlEditorWidget {
     /// left believing the work is still pending. Every backend reports the
     /// same text (`result_messages`), and only when there was work to lose:
     /// a clean session dying is not the user's business.
+    /// Say, once, that a take CLOSED the tab's session because it belonged to
+    /// an earlier incarnation of this connection.
+    ///
+    /// Every execution road takes the tab's session through
+    /// `take_reusable_lease`, and every one of them used to read
+    /// `DiscardedBecauseStale` as "there was nothing there" — so a session
+    /// carrying uncommitted work was destroyed with nothing on screen. Passing
+    /// the answer through here is what makes the report unforgettable: the
+    /// outcome is returned unchanged, so the caller still matches it as before.
+    fn stale_take_reported(
+        outcome: crate::db::RetainedSessionTakeOutcome,
+        sender: Option<&QueryProgressSender>,
+        log_context: &str,
+    ) -> crate::db::RetainedSessionTakeOutcome {
+        if let Some(retained_state) = outcome.discarded_retained_state() {
+            Self::report_retained_session_lost_with_work(sender, retained_state, log_context);
+        }
+        outcome
+    }
+
     fn report_retained_session_lost_with_work(
         sender: Option<&QueryProgressSender>,
         prior_retained_state: RetainedSessionState,
@@ -24700,6 +24744,11 @@ impl SqlEditorWidget {
     fn acquire_mysql_pooled_session(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
+        // Where the session's cancel registration lives once this frame
+        // returns: the caller runs on the session, so the caller owns the
+        // reach. Naming it here is what stops the registration dying with the
+        // frame that took the session.
+        registration_holder: &dyn crate::db::HoldsSessionCancelRegistration,
         execution_scope: Option<&str>,
         db_activity: &str,
         auto_commit: bool,
@@ -24743,16 +24792,19 @@ impl SqlEditorWidget {
         // same context and `preserve = false`, so the tail below must not
         // repeat that work (COM_INIT_DB + encoding round trips).
         let (mut conn, prior_retained_state, mut session_scope, scope_already_prepared) =
-            match pooled_db_session
-                .take_reusable_lease(
+            match Self::stale_take_reported(
+                pooled_db_session.take_reusable_lease(
+                    hand_back.owner(),
                     context.connection_generation,
                     context.pool_context_epoch(),
                     context.connection_info.db_type,
                     &context.connection_info,
                     &activity,
-                )
-                .held_in(session_pool_sender)
-            {
+                    registration_holder,
+                ),
+                session_pool_sender,
+                db_activity,
+            ) {
                 crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => {
                     // The database this physical session is actually in. Every
                     // scope decision below is made against it rather than against
@@ -24877,7 +24929,21 @@ impl SqlEditorWidget {
                     retained_state.label()
                 ));
                 }
-                crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale
+                crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale { retained_state }
+                    if require_existing_session =>
+                {
+                    // An action that REQUIRES the tab's own session — the
+                    // toolbar commit/rollback — and the take just closed it
+                    // because it belonged to an earlier incarnation of this
+                    // connection. Saying "no retained DB session" would
+                    // describe the slot after the loss instead of the loss, on
+                    // the very button the user pressed to keep their work.
+                    // Oracle's own commit/rollback already answers this way.
+                    return Err(SqlEditorWidget::retained_session_unreachable_message(
+                        retained_state,
+                    ));
+                }
+                crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale { .. }
                 | crate::db::RetainedSessionTakeOutcome::NoSession => {
                     if require_existing_session {
                         return Err("No retained DB session for this tab.".to_string());
@@ -25533,14 +25599,19 @@ impl SqlEditorWidget {
         };
         let mutation_activity = crate::db::track_db_activity(db_activity, Some(db_type));
         let mutation_connection_info = Self::retained_session_connection_info(shared_connection);
+        // The option change runs on the session inside this function, so its
+        // cancel reach begins and ends here.
+        let mutation_registration = crate::db::ActionSessionCancelRegistration::new();
         // A take that could not reach the tab's session CLOSED it, so this push
         // has to say so rather than answer `NoSession` about a session that was
         // there a moment ago.
         let retained_session = match pooled_db_session.take_reusable_lease_for_context_update(
+            &hand_back_owner,
             connection_generation,
             db_type,
             &mutation_connection_info,
             &mutation_activity,
+            &mutation_registration,
         ) {
             crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
             crate::db::RetainedLeaseTake::Empty => {
@@ -25668,14 +25739,19 @@ impl SqlEditorWidget {
         };
         let mutation_activity = crate::db::track_db_activity(db_activity, Some(db_type));
         let mutation_connection_info = Self::retained_session_connection_info(shared_connection);
+        // The option change runs on the session inside this function, so its
+        // cancel reach begins and ends here.
+        let mutation_registration = crate::db::ActionSessionCancelRegistration::new();
         // A take that could not reach the tab's session CLOSED it, so this push
         // has to say so rather than answer `NoSession` about a session that was
         // there a moment ago.
         let retained_session = match pooled_db_session.take_reusable_lease_for_context_update(
+            &hand_back_owner,
             connection_generation,
             db_type,
             &mutation_connection_info,
             &mutation_activity,
+            &mutation_registration,
         ) {
             crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
             crate::db::RetainedLeaseTake::Empty => {
@@ -26699,8 +26775,17 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Takes the LOCK GUARD, not the connection behind it.
+    ///
+    /// `&mut DatabaseConnection` reaches every accessor through `DerefMut`,
+    /// which is how this — the MySQL family's only main-connection execution
+    /// path — used to get a live handle without the guard ever publishing an
+    /// activity for it: no status entry, nothing the cancel button could
+    /// offer, nothing the stale sweep could retire. Naming the guard means
+    /// `ConnectionLockGuard::get_mysql_connection_mut` runs instead, and that
+    /// one attaches before it delegates.
     pub(super) fn run_mysql_action_with_timeout<T, F>(
-        conn_guard: &mut crate::db::DatabaseConnection,
+        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         scope: Option<&str>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
@@ -26864,6 +26949,17 @@ impl SqlEditorWidget {
         let hand_back_owner =
             crate::db::SessionHandBackOwner::for_operation(current_operation_id, operation_id);
         let hand_back = BatchSessionHandBack::new(&hand_back_owner, session_pool_sender);
+        // Where the session's cancel registration lives while this action runs.
+        // The operation's sender when there is one — the batch keeps using the
+        // session after this call — and otherwise a holder scoped to exactly
+        // this call, which is the whole life of the work for a toolbar
+        // commit/rollback.
+        let action_registration = crate::db::ActionSessionCancelRegistration::new();
+        let registration_holder: &dyn crate::db::HoldsSessionCancelRegistration =
+            match session_pool_sender {
+                Some(sender) => sender,
+                None => &action_registration,
+            };
         let AcquiredMySqlPooledSession {
             connection_generation,
             pool_context_epoch,
@@ -26877,6 +26973,7 @@ impl SqlEditorWidget {
         } = Self::acquire_mysql_pooled_session(
             shared_connection,
             pooled_db_session,
+            registration_holder,
             execution_scope,
             log_context,
             auto_commit,
@@ -37231,10 +37328,12 @@ mod mysql_batch_execution_regression_tests {
             let crate::db::RetainedLeaseTake::Taken(mut retained_session) = self
                 .pooled_db_session
                 .take_reusable_lease_for_context_update(
+                    &crate::db::SessionHandBackOwner::untracked(),
                     connection_generation,
                     db_type,
                     &crate::db::ConnectionInfo::default(),
                     &crate::db::track_db_activity("Retained session context update", Some(db_type)),
+                    &crate::db::ActionSessionCancelRegistration::new(),
                 )
             else {
                 return;
@@ -37251,7 +37350,7 @@ mod mysql_batch_execution_regression_tests {
                     None,
                 )
                 .expect("retained MySQL session should switch back to the initial database");
-            retained_session.restore_with_context_epoch(pool_context_epoch, retained_state);
+            let _ = retained_session.restore_with_context_epoch(pool_context_epoch, retained_state);
         }
     }
 
@@ -43308,15 +43407,19 @@ mod mysql_transaction_feedback_tests {
             .acquire()
             .expect("acquire sentinel Oracle thin session");
         assert!(
-            pooled_db_session.apply_retained_session_disposition(
-                1,
-                1,
-                crate::db::DbSessionLease::OracleThin(Box::new(sentinel_conn)),
-                crate::db::RetainedSessionDisposition::Retain(
-                    crate::db::RetainedSessionState::default(),
-                ),
-                "oracle thin lazy cleanup failure live test seed",
-            ),
+            pooled_db_session
+                .hand_back_worker_session(
+                    &crate::db::SessionHandBackOwner::untracked(),
+                    1,
+                    1,
+                    crate::db::DbSessionLease::OracleThin(Box::new(sentinel_conn)),
+                    crate::db::RetainedSessionDisposition::Retain(
+                        crate::db::RetainedSessionState::default(),
+                    ),
+                    "oracle thin lazy cleanup failure live test seed",
+                    None,
+                )
+                .stored(),
             "seed retained session should occupy the tab slot"
         );
 
@@ -43411,18 +43514,24 @@ mod mysql_transaction_feedback_tests {
             events.len()
         );
 
-        let retained_session = match pooled_db_session.take_reusable_lease(
-            1,
-            1,
-            crate::db::DatabaseType::Oracle,
-            &crate::db::ConnectionInfo::default(),
-            &crate::db::track_db_activity("test", Some(crate::db::DatabaseType::Oracle)),
+        let retained_session = match SqlEditorWidget::stale_take_reported(
+            pooled_db_session.take_reusable_lease(
+                &crate::db::SessionHandBackOwner::untracked(),
+                1,
+                1,
+                crate::db::DatabaseType::Oracle,
+                &crate::db::ConnectionInfo::default(),
+                &crate::db::track_db_activity("test", Some(crate::db::DatabaseType::Oracle)),
+                &crate::db::ActionSessionCancelRegistration::new(),
+            ),
+            None,
+            "test",
         ) {
             crate::db::RetainedSessionTakeOutcome::Reusable(session) => session,
             crate::db::RetainedSessionTakeOutcome::NoSession => {
                 panic!("same tab should still be able to take a retained session, got no session")
             }
-            crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale => {
+            crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale { .. } => {
                 panic!("same tab retained session was discarded as stale")
             }
             crate::db::RetainedSessionTakeOutcome::BlockedContextMismatch(_) => {
@@ -43516,12 +43625,14 @@ mod mysql_transaction_feedback_tests {
             crate::db::RetainedSessionDisposition::DiscardPhysical
         ));
         let pooled_db_session = SharedDbSessionLease::new();
-        pooled_db_session.apply_retained_session_disposition(
+        let _ = pooled_db_session.hand_back_worker_session(
+            &crate::db::SessionHandBackOwner::untracked(),
             1,
             1,
             crate::db::DbSessionLease::OracleThin(Box::new(conn)),
             disposition,
             "oracle thin cancel live test",
+            None,
         );
         assert!(
             pooled_db_session.snapshot().is_none(),

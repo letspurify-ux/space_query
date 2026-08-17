@@ -486,8 +486,7 @@ impl SqlEditorWidget {
                 return;
             }
         };
-        let activity_guard =
-            crate::db::track_pool_db_activity(activity, context.connection_info.db_type);
+        let activity_guard = context.track_activity(activity);
 
         if !crate::db::cached_pool_session_context_matches_shared_connection(&connection, &context)
         {

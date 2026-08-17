@@ -341,8 +341,11 @@ fn db_tab_session_slot_is_shared_abstraction_not_raw_arc_alias() {
     assert!(
         content.contains("pub fn take_reusable_lease(")
             && content.contains("pub fn store_if_empty_with_retained_state(")
+            && content.contains("pub fn hand_back_worker_session(")
             && content.contains("pub fn clear("),
-        "Oracle/MySQL/MariaDB tab sessions should share the same take/store/clear lifecycle API"
+        "Oracle/MySQL/MariaDB tab sessions should share the same take/hand-back/clear lifecycle \
+         API — `hand_back_worker_session` is the door a WORKER gives its session back through, \
+         and it is named here so it cannot be replaced by per-caller stores again"
     );
     assert!(
         !content.contains("pub fn store_if_empty(")
@@ -4706,7 +4709,7 @@ fn discarded_db_sessions_release_their_pool_slots_structurally() {
     // And the release must find them, which means the one place a session
     // becomes retained is the place that registers the slot.
     let store_start = connection
-        .find("pub fn store_if_empty_with_retained_state_and_scope(")
+        .find("fn file_into_slot(")
         .expect("the retain choke point should exist");
     let store_end = connection[store_start..]
         .find("\n    }\n")
@@ -5662,7 +5665,7 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
     // refused. File/Disconnect and application exit already order it this way.
     let content = read_source("src/ui/main_window.rs");
     let gate = content
-        .find("Finish or cancel running queries and lazy fetches before changing connection pool size.")
+        .find("s.db_work_blocking_session_teardown()")
         .expect("the pool-resize running-work refusal should exist");
     let prompt = content
         .find("Self::resolve_pooled_sessions_before_pool_resize(state)")
@@ -5673,6 +5676,60 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
          commit/rollback retained sessions; the inverted order commits user \
          transactions for a resize that is then aborted"
     );
+
+    // And it must ask the ACTIVITY REGISTRY, not just the query tabs. The
+    // rebuild bumps every connection's generation, and the stale sweep then
+    // force-cancels whatever still holds a session on them: an object-browser
+    // metadata refresh, an IntelliSense column load, a bind probe, a grid
+    // export. Those all used to walk straight through a gate that only looked
+    // at `is_any_query_running` and `has_active_lazy_fetches`, and then died
+    // silently — while a running query was refused with a message.
+    let answer = content
+        .find("fn db_work_blocking_session_teardown(")
+        .expect("the shared session-teardown gate should exist");
+    let answer_body = slice_from(&content, answer, 900);
+    assert!(
+        answer_body.contains("crate::db::active_db_activity_snapshots()"),
+        "the session-teardown gate must ask the activity registry, which is the one place \
+         that knows about DB work with no query tab behind it"
+    );
+    assert!(
+        answer_body.contains("self.has_running_query_or_lazy_fetch()"),
+        "and it must still cover the query tabs' own work"
+    );
+
+    // A tab with a DEFERRED execution reads perfectly idle — no query running,
+    // no batch begun — but a statement is still coming. Every session-ending
+    // gate has to see it, not only the result-grid reservation logic.
+    let tab_work = content
+        .find("fn tab_has_unfinished_db_work(")
+        .expect("the shared per-tab work predicate should exist");
+    let tab_work_body = slice_from(&content, tab_work, 400);
+    for expected in [
+        "editor.is_query_running()",
+        "editor.active_lazy_fetch_session().is_some()",
+        "editor.has_deferred_execution()",
+    ] {
+        assert!(
+            tab_work_body.contains(expected),
+            "a session-ending gate must count {expected} as unfinished work: {tab_work_body}"
+        );
+    }
+    for gate_fn in [
+        "fn has_work_for_connection(",
+        "fn has_running_query_or_lazy_fetch_for_tab(",
+        "fn has_running_query_or_lazy_fetch(",
+    ] {
+        let start = content
+            .find(gate_fn)
+            .unwrap_or_else(|| panic!("{gate_fn} should exist"));
+        let body = slice_from(&content, start, 700);
+        assert!(
+            body.contains("Self::tab_has_unfinished_db_work("),
+            "{gate_fn} must ask the one per-tab predicate instead of re-listing the two \
+             kinds of work it happens to remember"
+        );
+    }
 }
 
 #[test]
@@ -6502,6 +6559,136 @@ fn every_backend_hands_a_batch_session_back_through_the_door_that_names_its_oper
 }
 
 #[test]
+fn every_backend_can_cancel_work_on_its_own_main_connection() {
+    // Oracle OCI, Oracle thin, MySQL and MariaDB all run work on the MAIN
+    // connection — scope switches, commits, `ALTER SESSION`, explain plans,
+    // health checks — and all of it holds the connection mutex while it blocks.
+    // The MySQL family had NO canceler for any of it: the old
+    // `main_connection_canceler` started with `connection.get_db_connection()?`,
+    // and that accessor cannot produce the MySQL variant (the driver's `Conn`
+    // is owned inline, not behind an `Arc`), so it returned `None` before ever
+    // reaching its own MySQL arm. The status bar could not offer a cancel, and
+    // the disconnect and stale sweeps REMOVED the registry entry without
+    // breaking anything — so the call kept running behind a bar that said
+    // nothing was.
+    let content = read_source("src/db/connection.rs");
+    let canceler = content
+        .find("fn main_connection_canceler(")
+        .expect("the main-connection canceler should exist");
+    let canceler_body = slice_from(&content, canceler, 900);
+    assert!(
+        !canceler_body.contains("get_db_connection"),
+        "the main-connection canceler must not route through a PARTIAL accessor:          `get_db_connection` cannot produce the MySQL variant, so every MySQL-family main          connection came out uncancelable"
+    );
+
+    let target = content
+        .find(
+            "fn main_session_cancel_target(
+        &self,
+        session_connection_info: &ConnectionInfo,",
+        )
+        .expect("the per-backend cancel target should exist");
+    let target_body = slice_from(&content, target, 1800);
+    for arm in [
+        "DbConnection::Oracle(conn)",
+        "DbConnection::OracleThin(session)",
+        "DbConnection::MySQL { conn, db_type }",
+    ] {
+        assert!(
+            target_body.contains(arm),
+            "the cancel target must be exhaustive over backends; missing {arm}"
+        );
+    }
+    assert!(
+        target_body.contains("conn.connection_id()"),
+        "the MySQL/MariaDB arm must publish the connection id its KILL QUERY / KILL CONNECTION          needs"
+    );
+
+    // And the second half of the same hole: `ConnectionLockGuard` shadows the
+    // accessors so a live handle is never handed out untracked. The MySQL
+    // family's own accessor was not among them, so the whole family reached its
+    // live connection through `Deref` with no activity for it.
+    for shadowed in [
+        "pub fn get_mysql_connection_mut(&mut self) -> Option<&mut mysql::Conn> {",
+        "pub fn get_oracle_thin_connection(&mut self) -> Option<Arc<Mutex<OracleThinSession>>> {",
+    ] {
+        assert!(
+            content.contains(shadowed),
+            "ConnectionLockGuard must shadow every raw driver-handle accessor: missing {shadowed}"
+        );
+    }
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    assert!(
+        execution.contains("pub(super) fn run_mysql_action_with_timeout<T, F>(
+        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,"),
+        "the MySQL family's main-connection execution path must name the LOCK GUARD; taking          `&mut DatabaseConnection` reaches the accessors through `DerefMut` and skips the          shadow that attaches the activity"
+    );
+}
+
+#[test]
+fn taking_a_retained_session_names_where_its_cancel_reach_lives() {
+    // Every `into_*` converter on a taken lease consumes `self`, so a
+    // registration stored INSIDE the lease was dropped by each of them —
+    // exactly when the work that needs cancelling begins. Only the execution
+    // path survived, by remembering to move it out first; the toolbar
+    // commit/rollback, the retained option changes and the tab-close prompt did
+    // not, so their round trips ran unreachable by the cancel button and
+    // invisible to the stale sweep.
+    let content = read_source("src/db/connection.rs");
+    let taken = content
+        .find("pub struct TakenDbSessionLease {")
+        .expect("the taken-lease type should exist");
+    let taken_body = slice_from(&content, taken, 700);
+    assert!(
+        !taken_body.contains("cancel_registration"),
+        "a taken lease must not OWN the registration: the converters consume the lease, so          owning it means every one of them can drop it in silence"
+    );
+    assert!(
+        taken_body.contains("hand_back_owner: SessionHandBackOwner"),
+        "a taken lease must carry WHICH execution it belongs to, because `Drop` is one of its          hand-backs and cannot be given an argument"
+    );
+
+    for take in [
+        "pub fn take_reusable_lease(",
+        "pub fn take_reusable_lease_for_context_update(",
+        "pub fn take_reusable_lease_for_resolution(",
+    ] {
+        let start = content
+            .find(take)
+            .unwrap_or_else(|| panic!("{take} should exist"));
+        let signature = slice_from(&content, start, 500);
+        let end = signature.find(") ->").unwrap_or(signature.len());
+        let signature = &signature[..end];
+        assert!(
+            signature.contains("holder: &dyn HoldsSessionCancelRegistration"),
+            "{take} must name where the session's cancel registration lives once this frame              returns"
+        );
+        assert!(
+            signature.contains("hand_back_owner: &SessionHandBackOwner"),
+            "{take} must name which execution the session belongs to, so an abandoned one              cannot file it over a newer batch's"
+        );
+    }
+
+    // And the store side is reachable only through the one door.
+    assert!(
+        !content.contains("pub fn apply_retained_session_disposition"),
+        "filing a session must go through `hand_back_worker_session`, which is what makes every          worker state its identity; a public disposition call is the way around it"
+    );
+    for path in [
+        "src/ui/sql_editor/mod.rs",
+        "src/ui/sql_editor/execution.rs",
+        "src/ui/object_browser.rs",
+        "src/ui/main_window.rs",
+    ] {
+        let ui = read_source(path);
+        assert!(
+            !ui.contains("apply_retained_session_disposition"),
+            "{path} must hand sessions back through `hand_back_worker_session`"
+        );
+    }
+}
+
+#[test]
 fn losing_a_work_carrying_session_is_reported_not_swallowed() {
     // When the tab's retained session is found dead at the next acquisition,
     // replacing it is right — but the recorded state resets to clean, so the
@@ -6548,13 +6735,33 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         content
             .matches("Self::report_retained_session_lost_with_work(")
             .count(),
-        5,
+        6,
         "every site that loses a work-carrying session reports it: the two replace-and-reset \
          sites (MySQL family, Oracle OCI), the one door a worker clears the tab's slot through \
-         on the way out of a connection, and the two sites that TOOK a lease and found it was \
+         on the way out of a connection, the two sites that TOOK a lease and found it was \
          not a MySQL session after all (batch finalization, scope recheck) — the take had \
          already emptied the slot there, so a bare return left the tab believing it still had \
-         a session"
+         a session — and `stale_take_reported`, the choke point every EXECUTION take passes \
+         through: a take whose session belonged to an earlier incarnation of this connection \
+         CLOSES it, and all four call sites used to read that answer as `NoSession`"
+    );
+
+    // And that choke point must be on the road, not merely present: every
+    // execution take goes through it.
+    let stale_reporter = content
+        .find("fn stale_take_reported(")
+        .expect("the shared stale-take reporter should exist");
+    let stale_body = slice_from(&content, stale_reporter, 900);
+    assert!(
+        stale_body.contains("outcome.discarded_retained_state()"),
+        "the reporter must read the state the take destroyed, not guess at it"
+    );
+    assert_eq!(
+        content.matches("take_reusable_lease(").count(),
+        content.matches("stale_take_reported(").count() - 1,
+        "every `take_reusable_lease` in execution must be wrapped in `stale_take_reported` \
+         (the extra match is the reporter's own definition), so no execution road can read a \
+         closed work-carrying session as an empty slot again"
     );
     // The hand-back answer covers BOTH ways a session with work can be closed:
     // the tab moved on (abandoned) and the slot refused to keep it (the tab is

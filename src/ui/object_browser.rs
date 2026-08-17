@@ -4553,8 +4553,7 @@ impl ObjectBrowserWidget {
     ) -> Result<T, String> {
         let base_context = Self::object_action_pool_session_context(connection)?;
         let context = base_context.for_scope(selected_scope);
-        let db_type = context.connection_info.db_type;
-        let activity_guard = crate::db::track_pool_db_activity(activity, db_type);
+        let activity_guard = context.track_activity(activity);
         Self::ensure_object_action_context_current(connection, &base_context)?;
         // session.md §3 / §27 — narrow the race between scope validation and
         // session acquire. `ensure_object_action_context_current` uses a
@@ -7591,10 +7590,10 @@ impl ObjectBrowserWidget {
         }
         let db_type = context.connection_info.db_type;
         let requested_scope = self.selected_scope();
-        let activity_guard = crate::db::track_pool_db_activity(
-            Self::scope_refresh_status_message(db_type, requested_scope.as_deref()),
+        let activity_guard = context.track_activity(Self::scope_refresh_status_message(
             db_type,
-        );
+            requested_scope.as_deref(),
+        ));
         // A refresh that is already running is superseded by this one, so it is
         // cancelled rather than left to finish against the old scope.
         self.cancel_metadata_refresh();
