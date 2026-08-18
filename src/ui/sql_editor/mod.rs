@@ -21,9 +21,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::db::{
-    ColumnInfo, ConnectionAdvancedSettings, ConnectionInfo, DatabaseType, DbConnection,
-    DbSessionLease, ExecutionOrigin, QueryExecutor, QueryResult, RetainedSessionDisposition,
-    RetainedSessionMutationOutcome, RetainedSessionPreflightAction,
+    CanceledSession, ColumnInfo, ConnectionAdvancedSettings, ConnectionInfo, DatabaseType,
+    DbConnection, DbSessionLease, ExecutionOrigin, QueryExecutor, QueryResult,
+    RetainedSessionDisposition, RetainedSessionMutationOutcome, RetainedSessionPreflightAction,
     RetainedSessionPreflightDecision, RetainedSessionResolutionAction, RetainedSessionState,
     ScriptItem, SharedConnection, SharedDbSessionLease, TabConnectionBinding, TableColumnDetail,
     TransactionIsolation, TransactionMode, TransactionSessionState,
@@ -726,12 +726,22 @@ pub(crate) enum LazyFetchCommand {
     ForceCancel,
 }
 
+/// What can stop one DB call, and WHICH session it speaks for.
+///
+/// The session kind is carried, never inferred: the same slot holds a POOLED
+/// session for an ordinary execution and the connection's OWN session for an
+/// explain plan (and, on OCI, for everything after a script `CONNECT`). Only
+/// the code that publishes the handle knows which it is, so that is where it
+/// is stated -- and [`QueryCancelHandle::force_cancel_blocking`] asks the same
+/// [`CanceledSession::force_tier_may_destroy_it`] the DB layer's own canceler
+/// asks, so the app has ONE answer to how far a cancel may go.
 #[derive(Clone)]
 pub(crate) enum QueryCancelHandle {
-    Oracle(Arc<Connection>),
-    OracleThin(OracleThinCancelHandle),
-    MySql(Box<MySqlQueryCancelContext>),
-    MySqlShared(Arc<Mutex<Option<MySqlQueryCancelContext>>>),
+    Oracle(Arc<Connection>, CanceledSession),
+    OracleThin(OracleThinCancelHandle, CanceledSession),
+    MySql(Box<MySqlQueryCancelContext>, CanceledSession),
+    /// A target its owner can TAKE BACK. See [`QueryCancelTarget`].
+    Withdrawable(QueryCancelTarget),
     #[cfg(test)]
     Test(Arc<AtomicBool>),
     #[cfg(test)]
@@ -739,6 +749,82 @@ pub(crate) enum QueryCancelHandle {
         started: Arc<AtomicBool>,
         release: Arc<AtomicBool>,
     },
+}
+
+/// What a cancel is told when the work it was aimed at has given its session
+/// back. Not a failure: it is the withdraw doing exactly what it is for.
+pub(crate) const WITHDRAWN_CANCEL_TARGET_MESSAGE: &str =
+    "The session this cancel was published for has already been handed back";
+
+/// A cancel target its owner can TAKE BACK.
+///
+/// The force tier is the one that cannot be undone -- an Oracle drop-close, an
+/// Oracle thin socket close, a `KILL CONNECTION` -- so it must never land on a
+/// session that has stopped being the work's. Every liveness test the editor's
+/// watchdogs had answered that question INDIRECTLY (an operation id, a lazy
+/// fetch session id, a still-running flag) and all of them were cleared AFTER
+/// the session had already gone: on both Oracle drivers the lazy fetch filed
+/// its session into the tab's slot and only then cleared its handle, so a
+/// watchdog whose deadline expired in that window drop-closed the tab's own
+/// retained transaction -- or a session another tab had just picked up from the
+/// pool. The MySQL family escaped it only because its lazy fetch happened to
+/// null its context first.
+///
+/// This makes that ordering the TYPE's business instead of each cleanup's:
+/// [`Self::withdraw`] ends the reach with one store, and
+/// `SqlEditorWidget::release_lazy_fetch_session` is the one door that does it
+/// before handing the session back -- on all four backends, because all four
+/// now publish through this.
+#[derive(Clone, Default)]
+pub(crate) struct QueryCancelTarget {
+    published: Arc<Mutex<Option<QueryCancelHandle>>>,
+}
+
+impl QueryCancelTarget {
+    /// A target with nothing published yet. The work publishes when it has a
+    /// session, and withdraws when it gives it back.
+    pub(crate) fn empty() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn publish(&self, handle: QueryCancelHandle) {
+        *self
+            .published
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+    }
+
+    /// End the reach. After this every tier answers
+    /// [`WITHDRAWN_CANCEL_TARGET_MESSAGE`] instead of touching a session that
+    /// is no longer the work's.
+    pub(crate) fn withdraw(&self) {
+        let released = self
+            .published
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        // Dropped outside the lock, like every other caller-supplied value:
+        // a MySQL context clears its password on the way out.
+        drop(released);
+    }
+
+    /// This target as a cancel handle, for the slots that hold one.
+    pub(crate) fn as_handle(&self) -> QueryCancelHandle {
+        QueryCancelHandle::Withdrawable(self.clone())
+    }
+
+    fn published_handle(&self) -> Option<QueryCancelHandle> {
+        self.published
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Whether this target still speaks for a session, and which.
+    fn canceled_session(&self) -> Option<CanceledSession> {
+        self.published_handle()
+            .and_then(|handle| handle.canceled_session())
+    }
 }
 
 pub(crate) type LazyFetchCancelHandle = QueryCancelHandle;
@@ -1413,7 +1499,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 SqlEditorWidget::set_current_oracle_thin_cancel_context(
                     current_oracle_thin_cancel_context,
                     current_query_cancel_handle,
-                    Some(cancel_handle.clone()),
+                    Some((cancel_handle.clone(), CanceledSession::Pooled)),
                 );
                 if load_mutex_bool(cancel_flag) {
                     let _ = cancel_handle.break_execution();
@@ -1551,7 +1637,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         SqlEditorWidget::set_current_query_connection(
             current_query_connection,
             current_query_cancel_handle,
-            Some(Arc::clone(&db_conn)),
+            Some((Arc::clone(&db_conn), CanceledSession::Pooled)),
         );
         if load_mutex_bool(cancel_flag) {
             let _ = db_conn.break_execution();
@@ -1995,10 +2081,14 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
         let plan_schema = conn_guard.oracle_session_schema_for_scope(scope);
         match conn_guard.require_live_db_connection() {
             Ok(DbConnection::Oracle(db_conn)) => {
+                // The whole explain runs on the connection's OWN session, so
+                // that is what the cancel speaks for. Saying so is what keeps
+                // the force tier from destroying the connection every other
+                // tab is working on.
                 SqlEditorWidget::set_current_query_connection(
                     current_query_connection,
                     current_query_cancel_handle,
-                    Some(Arc::clone(&db_conn)),
+                    Some((Arc::clone(&db_conn), CanceledSession::Main)),
                 );
                 if load_mutex_bool(cancel_flag) {
                     let _ = db_conn.break_execution();
@@ -2034,10 +2124,11 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
                 .require_applied(crate::db::DatabaseType::Oracle)?;
                 session.reset_pending_cancel();
                 let cancel_handle = session.cancel_handle();
+                // The MAIN session, like the OCI branch above.
                 SqlEditorWidget::set_current_oracle_thin_cancel_context(
                     current_oracle_thin_cancel_context,
                     current_query_cancel_handle,
-                    Some(cancel_handle.clone()),
+                    Some((cancel_handle.clone(), CanceledSession::Main)),
                 );
                 if load_mutex_bool(cancel_flag) {
                     let _ = cancel_handle.break_execution();
@@ -2191,19 +2282,13 @@ impl QueryCancelHandle {
 
     pub(crate) fn cancel_interrupt(&self) -> Result<(), String> {
         match self {
-            QueryCancelHandle::Oracle(conn) => conn.interrupt(),
-            QueryCancelHandle::OracleThin(cancel_handle) => cancel_handle.interrupt(),
-            QueryCancelHandle::MySql(context) => context.interrupt(),
-            QueryCancelHandle::MySqlShared(context) => {
-                let cancel_context = context
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                match cancel_context {
-                    Some(cancel_context) => cancel_context.interrupt(),
-                    None => Err("MySQL cancel context is not available yet".to_string()),
-                }
-            }
+            QueryCancelHandle::Oracle(conn, _) => conn.interrupt(),
+            QueryCancelHandle::OracleThin(cancel_handle, _) => cancel_handle.interrupt(),
+            QueryCancelHandle::MySql(context, _) => context.interrupt(),
+            QueryCancelHandle::Withdrawable(target) => match target.published_handle() {
+                Some(handle) => handle.cancel_interrupt(),
+                None => Err(WITHDRAWN_CANCEL_TARGET_MESSAGE.to_string()),
+            },
             #[cfg(test)]
             QueryCancelHandle::Test(called) => {
                 called.store(true, Ordering::Relaxed);
@@ -2221,22 +2306,52 @@ impl QueryCancelHandle {
         self.force_cancel_blocking()
     }
 
-    pub(crate) fn force_cancel_blocking(self) -> Result<(), String> {
+    /// WHICH session this handle speaks for.
+    ///
+    /// `None` means there is no session behind it to reason about: a
+    /// withdrawable target whose owner has already taken it back, or a test
+    /// double.
+    fn canceled_session(&self) -> Option<CanceledSession> {
         match self {
-            QueryCancelHandle::Oracle(conn) => conn.terminate(),
-            QueryCancelHandle::OracleThin(cancel_handle) => cancel_handle.terminate(),
-            QueryCancelHandle::MySql(context) => (*context).terminate(),
-            QueryCancelHandle::MySqlShared(context) => {
-                let cancel_context = context
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                if let Some(cancel_context) = cancel_context {
-                    cancel_context.terminate()
-                } else {
-                    Err("MySQL force-cancel context is not available".to_string())
-                }
+            QueryCancelHandle::Oracle(_, session)
+            | QueryCancelHandle::OracleThin(_, session)
+            | QueryCancelHandle::MySql(_, session) => Some(*session),
+            QueryCancelHandle::Withdrawable(target) => target.canceled_session(),
+            #[cfg(test)]
+            QueryCancelHandle::Test(_) | QueryCancelHandle::TestBlockingForce { .. } => None,
+        }
+    }
+
+    /// The force tier, with the app's one rule about it asked HERE and nowhere
+    /// else on this road.
+    ///
+    /// Everything below this point tears a session down and cannot be taken
+    /// back, which is why the question is put once, before the match, instead
+    /// of per backend: a rule spelled out per driver is a rule the next driver
+    /// can be added without.
+    pub(crate) fn force_cancel_blocking(self) -> Result<(), String> {
+        if let Some(session) = self.canceled_session() {
+            if !session.force_tier_may_destroy_it() {
+                return self.cancel_interrupt();
             }
+        }
+        self.destroy_session()
+    }
+
+    /// The tear-down itself. Private, and reached only through
+    /// [`Self::force_cancel_blocking`], which is where the rule about it lives.
+    fn destroy_session(self) -> Result<(), String> {
+        match self {
+            QueryCancelHandle::Oracle(conn, _) => conn.terminate(),
+            QueryCancelHandle::OracleThin(cancel_handle, _) => cancel_handle.terminate(),
+            QueryCancelHandle::MySql(context, _) => (*context).terminate(),
+            // Read again, deliberately: the owner may have withdrawn between
+            // the rule above and here, and a withdraw that lands first must
+            // win. That is the whole point of the type.
+            QueryCancelHandle::Withdrawable(target) => match target.published_handle() {
+                Some(handle) => handle.destroy_session(),
+                None => Err(WITHDRAWN_CANCEL_TARGET_MESSAGE.to_string()),
+            },
             #[cfg(test)]
             QueryCancelHandle::Test(called) => {
                 called.store(true, Ordering::Relaxed);
@@ -2255,9 +2370,12 @@ impl QueryCancelHandle {
 
     pub(crate) fn label(&self) -> &'static str {
         match self {
-            QueryCancelHandle::Oracle(_) => "Oracle",
-            QueryCancelHandle::OracleThin(_) => "Oracle thin",
-            QueryCancelHandle::MySql(_) | QueryCancelHandle::MySqlShared(_) => "MySQL-family",
+            QueryCancelHandle::Oracle(_, _) => "Oracle",
+            QueryCancelHandle::OracleThin(_, _) => "Oracle thin",
+            QueryCancelHandle::MySql(_, _) => "MySQL-family",
+            QueryCancelHandle::Withdrawable(target) => target
+                .published_handle()
+                .map_or("query session", |handle| handle.label()),
             #[cfg(test)]
             QueryCancelHandle::Test(_) | QueryCancelHandle::TestBlockingForce { .. } => "test",
         }
@@ -4908,7 +5026,15 @@ impl SqlEditorWidget {
             app::awake();
             return;
         };
-        let tab_scope = self.connection_binding.snapshot().scope;
+        let binding_snapshot = self.connection_binding.snapshot();
+        let tab_scope = binding_snapshot.scope.clone();
+        // Read back when the explain is done, exactly as the execution worker
+        // does: the whole explain runs on the connection's OWN session, and a
+        // failure there can end the connection
+        // (`ConnectionLockGuard::disconnect_untrusted_main_session`). Without
+        // this the runtime went on saying `Connected` for a connection that was
+        // gone.
+        let explain_runtime = binding_snapshot.runtime.clone();
         // A snapshot is enough: this tab is already marked query-running, and
         // the toolbar refuses a mode change while it is.
         let tab_transaction_mode_override = self.tab_transaction_mode_override_value();
@@ -5009,6 +5135,9 @@ impl SqlEditorWidget {
                     &current_query_cancel_handle,
                     None,
                 );
+                if let Some(runtime) = explain_runtime.as_ref() {
+                    runtime.refresh_state_from_connection();
+                }
                 let cleanup_owns_operation = SqlEditorWidget::clear_current_operation_snapshot(
                     &current_operation_id,
                     &last_completed_operation_id,
@@ -5784,6 +5913,32 @@ impl SqlEditorWidget {
         true
     }
 
+    /// Drive the query tab's FORCE tier against the session this tab's cancel
+    /// currently speaks for, and answer what it did.
+    ///
+    /// `#[doc(hidden)]`, for the live verification harness. The GUI reaches
+    /// this tier through the cancel watchdog, and only when a graceful break
+    /// does not land within the cancel timeout — which no test can arrange
+    /// against a real server, because every backend's graceful break works.
+    /// So the harness drives the tier itself, through exactly the
+    /// [`QueryCancelHandle::force_cancel_blocking`] the watchdog calls: what
+    /// it proves is what the watchdog does, including the one rule about how
+    /// far the tier may go.
+    ///
+    /// `None` means no session is published for this tab right now.
+    #[doc(hidden)]
+    pub fn force_cancel_published_session_for_probe(&self) -> Option<Result<(), String>> {
+        // The OPERATION's slot, which is the one the watchdog reads.
+        let published = self
+            .current_operation_cancel_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|slot| slot.handle.clone())?;
+        Self::clone_current_query_cancel_handle(&published)
+            .map(QueryCancelHandle::force_cancel_blocking)
+    }
+
     pub fn cancel_current(&self) {
         // Snapshot the cancel target before flipping any flags so completion
         // events arriving after this point can be matched against a stable
@@ -6317,14 +6472,22 @@ impl SqlEditorWidget {
             })
     }
 
+    /// Publish (or clear) the Oracle OCI session this tab's cancel speaks for.
+    ///
+    /// The session KIND travels with the session, because this one slot holds
+    /// both: an ordinary execution publishes a pooled session, while the
+    /// explain plan and everything after a script `CONNECT` publish the
+    /// connection's own. Pairing them is what stops a caller from publishing a
+    /// main session that the force tier would then destroy.
     fn set_current_query_connection(
         current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
         current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
-        value: Option<Arc<Connection>>,
+        published: Option<(Arc<Connection>, CanceledSession)>,
     ) {
-        let cancel_handle = value
-            .as_ref()
-            .map(|connection| QueryCancelHandle::Oracle(Arc::clone(connection)));
+        let cancel_handle = published.as_ref().map(|(connection, session)| {
+            QueryCancelHandle::Oracle(Arc::clone(connection), *session)
+        });
+        let value = published.map(|(connection, _)| connection);
         match current_query_connection.lock() {
             Ok(mut guard) => {
                 *guard = value;
@@ -6337,14 +6500,18 @@ impl SqlEditorWidget {
         Self::set_current_query_cancel_handle(current_query_cancel_handle, cancel_handle);
     }
 
+    /// Publish (or clear) the MySQL-family session this tab's cancel speaks
+    /// for. See [`Self::set_current_query_connection`] for why the kind
+    /// travels with it: the explain plan publishes the MAIN connection here.
     fn set_current_mysql_cancel_context(
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
-        value: Option<MySqlQueryCancelContext>,
+        published: Option<(MySqlQueryCancelContext, CanceledSession)>,
     ) {
-        let cancel_handle = value
-            .clone()
-            .map(|context| QueryCancelHandle::MySql(Box::new(context)));
+        let cancel_handle = published.as_ref().map(|(context, session)| {
+            QueryCancelHandle::MySql(Box::new(context.clone()), *session)
+        });
+        let value = published.map(|(context, _)| context);
         match current_mysql_cancel_context.lock() {
             Ok(mut guard) => {
                 if let Some(current) = guard.as_mut() {
@@ -6364,12 +6531,18 @@ impl SqlEditorWidget {
         Self::set_current_query_cancel_handle(current_query_cancel_handle, cancel_handle);
     }
 
+    /// Publish (or clear) the Oracle thin session this tab's cancel speaks
+    /// for. See [`Self::set_current_query_connection`] for why the kind
+    /// travels with it: the explain plan publishes the MAIN session here.
     fn set_current_oracle_thin_cancel_context(
         current_oracle_thin_cancel_context: &Arc<Mutex<Option<OracleThinCancelHandle>>>,
         current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
-        value: Option<OracleThinCancelHandle>,
+        published: Option<(OracleThinCancelHandle, CanceledSession)>,
     ) {
-        let cancel_handle = value.clone().map(QueryCancelHandle::OracleThin);
+        let cancel_handle = published
+            .as_ref()
+            .map(|(handle, session)| QueryCancelHandle::OracleThin(handle.clone(), *session));
+        let value = published.map(|(handle, _)| handle);
         match current_oracle_thin_cancel_context.lock() {
             Ok(mut guard) => {
                 *guard = value;
@@ -9212,11 +9385,69 @@ mod cancel_watchdog_tests {
     }
 
     #[test]
-    fn mysql_shared_cancel_without_published_context_is_not_reported_as_success() {
-        let handle = QueryCancelHandle::MySqlShared(Arc::new(Mutex::new(None)));
+    fn withdrawn_cancel_target_is_not_reported_as_success_by_either_tier() {
+        let target = QueryCancelTarget::empty();
+        let handle = target.as_handle();
+
+        assert!(handle.cancel_interrupt().is_err());
+        assert!(handle.clone().force_cancel().is_err());
+
+        // Published, then taken back: both tiers must answer the same way they
+        // do for a target that never held anything, and neither may REACH the
+        // session — that is the whole point of the withdraw. A lazy fetch hands
+        // its session back and then clears its handle, and a watchdog whose
+        // deadline expires in between would otherwise drop-close the tab's own
+        // retained transaction, or a session another tab has since picked up.
+        let touched = Arc::new(AtomicBool::new(false));
+        target.publish(QueryCancelHandle::Test(touched.clone()));
+        assert!(handle.cancel_interrupt().is_ok());
+        assert!(
+            touched.swap(false, Ordering::Relaxed),
+            "a published target reaches its session"
+        );
+
+        target.withdraw();
 
         assert!(handle.cancel_interrupt().is_err());
         assert!(handle.force_cancel().is_err());
+        assert!(
+            !touched.load(Ordering::Relaxed),
+            "a withdrawn target must not reach the session it used to speak for"
+        );
+    }
+
+    #[test]
+    fn a_cancel_handle_says_which_session_it_speaks_for() {
+        // Carried, never inferred: the same slot holds a POOLED session for an
+        // ordinary execution and the connection's OWN session for an explain
+        // plan, and only the code that publishes it knows which.
+        let context = || {
+            Box::new(MySqlQueryCancelContext {
+                connection_info: ConnectionInfo::default(),
+                connection_id: 7,
+            })
+        };
+
+        assert_eq!(
+            QueryCancelHandle::MySql(context(), CanceledSession::Pooled).canceled_session(),
+            Some(CanceledSession::Pooled)
+        );
+        assert_eq!(
+            QueryCancelHandle::MySql(context(), CanceledSession::Main).canceled_session(),
+            Some(CanceledSession::Main)
+        );
+
+        // A withdrawable target answers for whatever it still holds, and for
+        // nothing once its owner has taken it back.
+        let target = QueryCancelTarget::empty();
+        assert_eq!(target.as_handle().canceled_session(), None);
+        target.publish(QueryCancelHandle::MySql(context(), CanceledSession::Main));
+        assert_eq!(
+            target.as_handle().canceled_session(),
+            Some(CanceledSession::Main)
+        );
+        target.withdraw();
+        assert_eq!(target.as_handle().canceled_session(), None);
     }
 
     #[test]

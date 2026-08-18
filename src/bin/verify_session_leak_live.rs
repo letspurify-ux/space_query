@@ -24,6 +24,9 @@
 //      neither
 //   T11 reconnecting (connect over a live connection, no disconnect first)
 //      with an OPEN lazy fetch closes every replaced session
+//   T12 a script DISCONNECT is TAB-LOCAL: the tab gives its own session back
+//      and its next statement says it is not connected, while every other tab
+//      on the same connection keeps its session and keeps working
 //
 // T7 and T8 drive interleavings the app's own guards normally prevent (the
 // disconnect menu refuses while a lazy fetch is open; a close of a running tab
@@ -164,6 +167,15 @@ impl Target {
         }
     }
 
+    /// A statement every backend can run without owning anything.
+    fn trivial_sql(self) -> &'static str {
+        if self.is_oracle() {
+            "SELECT 1 AS N FROM dual"
+        } else {
+            "SELECT 1 AS N"
+        }
+    }
+
     /// A row source big enough to leave a lazy fetch open, without needing a
     /// table (the Oracle probe user owns nothing).
     fn many_rows_sql(self) -> &'static str {
@@ -282,6 +294,7 @@ fn progress_inner(event: &QueryProgress) -> &QueryProgress {
 struct Tab {
     editor: SqlEditorWidget,
     done: Arc<AtomicBool>,
+    messages: Arc<Mutex<Vec<String>>>,
 }
 
 impl Tab {
@@ -289,25 +302,57 @@ impl Tab {
         let timeout_input = IntInput::default();
         let mut editor = SqlEditorWidget::new(Arc::clone(shared), timeout_input);
         let done = Arc::new(AtomicBool::new(false));
+        let messages: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         {
             let done = Arc::clone(&done);
-            editor.set_progress_callback(move |event| {
-                if matches!(progress_inner(&event), QueryProgress::BatchFinished) {
-                    done.store(true, Ordering::SeqCst);
+            let messages = Arc::clone(&messages);
+            editor.set_progress_callback(move |event| match progress_inner(&event) {
+                QueryProgress::BatchFinished => done.store(true, Ordering::SeqCst),
+                QueryProgress::StatementFinished { result, .. } => messages
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(result.message.clone()),
+                QueryProgress::Message { lines, .. }
+                | QueryProgress::ScriptOutput { lines, .. } => {
+                    messages
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend(lines.iter().cloned());
                 }
+                _ => {}
             });
         }
-        Self { editor, done }
+        Self {
+            editor,
+            done,
+            messages,
+        }
+    }
+
+    /// Everything this tab has been told since the last statement started.
+    fn transcript(&self) -> Vec<String> {
+        self.messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn run(&mut self, sql: &str) -> Result<(), String> {
         self.done.store(false, Ordering::SeqCst);
+        self.messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.editor.execute_sql_text(sql);
         self.wait_for_batch(Duration::from_secs(60))
     }
 
     fn start(&mut self, sql: &str) {
         self.done.store(false, Ordering::SeqCst);
+        self.messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.editor.execute_sql_text(sql);
     }
 
@@ -772,6 +817,72 @@ fn verify(target: Target) -> Result<bool, String> {
         connected_baseline,
     );
     tab.close();
+
+    // T12: a script DISCONNECT is TAB-LOCAL on every backend. One tab ending
+    // its own session must not end the sessions of the other tabs sharing the
+    // connection — the MySQL family used to `disconnect()` the SHARED
+    // connection here, so one tab's script tore down every other tab's session
+    // (and the connection itself) with no prompt and nothing said.
+    println!("  --- T12 a script DISCONNECT is tab-local ---");
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    let mut disconnecting_tab = Tab::open(&shared);
+    let mut neighbour_tab = Tab::open(&shared);
+    disconnecting_tab.run(target.trivial_sql())?;
+    neighbour_tab.run(target.trivial_sql())?;
+
+    let script = format!("DISCONNECT\n{};", target.trivial_sql());
+    disconnecting_tab.run(&script)?;
+    let transcript = disconnecting_tab.transcript();
+    // The tab gave its OWN session back — that is what "tab-local" means on
+    // the giving-up side.
+    report.check_flag(
+        "T12 the disconnecting tab holds no session of its own",
+        disconnecting_tab
+            .editor
+            .pooled_session_activity_snapshot()
+            .is_none(),
+    );
+    report.check_flag(
+        "T12 the disconnecting tab reports the disconnect",
+        transcript
+            .iter()
+            .any(|line| line.contains("Disconnected from database")),
+    );
+    // ...and its own next statement has nothing to run on, the same sentence
+    // on all four backends.
+    report.check_flag(
+        "T12 the disconnecting tab's next statement says it is not connected",
+        transcript
+            .iter()
+            .any(|line| line.contains(space_query::db::NOT_CONNECTED_MESSAGE)),
+    );
+
+    // The neighbour is untouched: same connection, its own session, still
+    // working.
+    let neighbour_ok = neighbour_tab.run(target.trivial_sql()).is_ok()
+        && !neighbour_tab
+            .transcript()
+            .iter()
+            .any(|line| line.contains(space_query::db::NOT_CONNECTED_MESSAGE));
+    report.check_flag(
+        "T12 the other tab on the connection keeps working",
+        neighbour_ok,
+    );
+    let connection_alive = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_connected();
+    report.check_flag(
+        "T12 the shared connection is still connected",
+        connection_alive,
+    );
+    disconnecting_tab.close();
+    neighbour_tab.close();
+    // No census check here on purpose: two tabs ran statements, so the pool may
+    // legitimately still hold an idle session of its own. What a tab-local
+    // disconnect must not leave behind is a session with an OWNER that is gone,
+    // and T1-T11 are what prove that.
+
     shared
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

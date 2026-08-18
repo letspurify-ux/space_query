@@ -33,6 +33,11 @@
 //       entirely — the path a pool-acquire-only invariant misses.
 //   A9  a cancel that comes from the registry (a disconnect, or the stale
 //       sweep) is reported to the user as a cancel, not as a driver error.
+//   A10 the FORCE tier against work that runs on the connection's OWN session
+//       (the explain plan) breaks the call but never DESTROYS the connection
+//       every other tab is on. The tier is driven directly, because a graceful
+//       break always lands against a real server and the watchdog would never
+//       escalate — which is exactly why this hole went unnoticed.
 //
 // Usage: verify_activity_cancel_live <thin|oci|mysql|mariadb|all>
 
@@ -146,6 +151,27 @@ impl Target {
                 "DROP TABLE IF EXISTS SQ_CANCEL_T",
                 "CREATE TABLE SQ_CANCEL_T (V INT)",
             ]
+        }
+    }
+
+    /// What the explain plan under A10 is asked about. The MySQL family's is
+    /// the table a second session locks; Oracle's is heavy enough that the
+    /// explain is still in flight a moment after it starts.
+    fn explain_probe_sql(self) -> &'static str {
+        if self.is_oracle() {
+            "SELECT COUNT(*) FROM all_objects a, all_objects b, all_objects c              WHERE a.object_id = b.object_id AND b.object_id = c.object_id"
+        } else {
+            "SELECT * FROM SQ_CANCEL_T"
+        }
+    }
+
+    /// A statement every backend can answer instantly, for asking whether the
+    /// connection is still there.
+    fn trivial_sql(self) -> &'static str {
+        if self.is_oracle() {
+            "SELECT 1 AS N FROM dual"
+        } else {
+            "SELECT 1 AS N"
         }
     }
 
@@ -615,8 +641,136 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
         let _ = editor.wait_done(Duration::from_secs(10));
     }
 
+    // A10: cancelling work that runs on the connection's OWN session must not
+    // DESTROY that connection. The explain plan is the app's one such
+    // operation on every backend, and the query tab's force tier used to reach
+    // `terminate()` with no question about which session it spoke for: on the
+    // MySQL family that is `KILL CONNECTION` against the app's primary
+    // connection — the one every other tab is working on — with nothing
+    // marking it disconnected.
+    //
+    // MySQL family only, and deliberately so: an explain has to be BLOCKED for
+    // the force tier to be reached at all, and a metadata lock held by a
+    // second session is the one reliable way to do that. Oracle parses an
+    // explain without taking a lock any other session can hold, so there is no
+    // honest way to stall it here; the rule itself is shared
+    // (`CanceledSession::force_tier_may_destroy_it`) and is covered by the
+    // unit test and the guard test.
+    {
+        let label = target.label();
+        println!(
+            "   A10 ({label}): the force tier must never destroy the connection's own session"
+        );
+        // A5 ended the outer harness's connection on purpose, so this scenario
+        // opens one of its own — like A7/A8 do.
+        let harness = Harness::connect(target)?;
+        let mut editor = EditorHarness::new(&harness);
+        editor.editor.set_text(target.explain_probe_sql());
+        // A new tab does metadata work of its own on the MAIN connection, and
+        // on the MySQL family that work would block on the table lock below
+        // while holding the connection — let it finish first.
+        editor.pump_until(Duration::from_secs(20), || {
+            space_query::db::try_lock_connection(&harness.connection).map(|_| ())
+        });
+
+        // Hold the explain still long enough to force it. On the MySQL family a
+        // second session's metadata lock does it; Oracle takes no lock another
+        // session can hold, so there the explain is caught in flight instead.
+        let blocker = if target.is_oracle() {
+            None
+        } else {
+            match block_mysql_table(target) {
+                Ok(blocker) => Some(blocker),
+                Err(err) => {
+                    failures.push(format!(
+                        "A10 ({label}): could not take the blocking lock: {err}"
+                    ));
+                    None
+                }
+            }
+        };
+        if target.is_oracle() || blocker.is_some() {
+            // The force tier, driven the way the cancel watchdog drives it. It
+            // cannot be reached by waiting out a cancel timeout here: every
+            // backend's graceful break DOES land, so the watchdog would never
+            // escalate — which is exactly why this hole went unnoticed.
+            let mut forced = None;
+            for _ in 0..40 {
+                editor.editor.explain_current();
+                let caught = editor.pump_until(Duration::from_secs(3), || {
+                    editor.editor.force_cancel_published_session_for_probe()
+                });
+                if let Some(outcome) = caught {
+                    forced = Some(outcome);
+                    break;
+                }
+                editor.pump_until(Duration::from_millis(200), || None::<()>);
+            }
+            match forced {
+                None => failures.push(format!(
+                    "A10 ({label}): the explain plan never published a session for the force tier"
+                )),
+                Some(outcome) => {
+                    println!("   A10 ({label}) force tier answered {outcome:?}");
+                }
+            }
+            editor.pump_until(cancel_deadline(), || {
+                (!editor.editor.is_query_running()).then_some(())
+            });
+        }
+        // Release the blocker before asking the connection anything.
+        if let Some(mut blocker) = blocker {
+            use mysql::prelude::Queryable;
+            let _ = blocker.query_drop("UNLOCK TABLES");
+        }
+        editor.pump_until(Duration::from_secs(2), || None::<()>);
+
+        // THE ASSERTION: the connection every other tab is on is still there.
+        // Before the force tier asked which session it spoke for, it had just
+        // force-closed it (Oracle thin) or `KILL CONNECTION`ed it (MySQL
+        // family).
+        //
+        // Asked with ANOTHER EXPLAIN, deliberately: an ordinary statement runs
+        // on a POOLED session and would answer happily over a main connection
+        // the app had just destroyed.
+        let mut alive = false;
+        for _ in 0..5 {
+            if editor.explain(target.trivial_sql(), Duration::from_secs(20)) {
+                alive = true;
+                break;
+            }
+            editor.pump_until(Duration::from_millis(500), || None::<()>);
+        }
+        if alive {
+            println!("   A10 ({label}) the connection survived the force tier");
+        } else {
+            failures.push(format!(
+                "A10 ({label}): the force tier destroyed the connection every other tab is on \
+                 (transcript: {:?})",
+                editor.transcript()
+            ));
+        }
+        let _ = editor.wait_done(Duration::from_secs(10));
+    }
+
     reset_tracked_db_activities_for_probe();
     Ok(failures)
+}
+
+/// A second MySQL-family session holding a metadata lock on the probe table, so
+/// an `EXPLAIN` of it blocks long enough for the force tier to be reached.
+fn block_mysql_table(target: Target) -> Result<mysql::Conn, String> {
+    use mysql::prelude::Queryable;
+
+    let info = target.connection_info();
+    let url = format!(
+        "mysql://{}:{}@{}:{}/{}",
+        info.username, info.password, info.host, info.port, info.service_name
+    );
+    let mut conn = mysql::Conn::new(url.as_str()).map_err(|err| err.to_string())?;
+    conn.query_drop("LOCK TABLES SQ_CANCEL_T WRITE")
+        .map_err(|err| err.to_string())?;
+    Ok(conn)
 }
 
 /// Drives a real `SqlEditorWidget` the way the GUI does.
@@ -624,6 +778,7 @@ struct EditorHarness {
     editor: SqlEditorWidget,
     done: Arc<AtomicBool>,
     messages: Arc<Mutex<Vec<String>>>,
+    explained: Arc<AtomicBool>,
 }
 
 impl EditorHarness {
@@ -632,10 +787,16 @@ impl EditorHarness {
         let mut editor = SqlEditorWidget::new(Arc::clone(&harness.connection), timeout_input);
         let done = Arc::new(AtomicBool::new(false));
         let messages: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let explained = Arc::new(AtomicBool::new(false));
         {
             let done = done.clone();
             let messages = messages.clone();
+            let explained = explained.clone();
             editor.set_progress_callback(move |event| match progress_inner(&event) {
+                // The explain plan's own success: it is the app's one operation
+                // that runs on the connection's OWN session, so it is also how
+                // this harness asks whether that session is still there.
+                QueryProgress::ExplainPlanOutput { .. } => explained.store(true, Ordering::Release),
                 // BatchFinished arrives wrapped in Operation/StatementOrigin.
                 QueryProgress::BatchFinished => done.store(true, Ordering::Release),
                 QueryProgress::StatementFinished { result, .. } => {
@@ -658,7 +819,25 @@ impl EditorHarness {
             editor,
             done,
             messages,
+            explained,
         }
+    }
+
+    /// Run an explain plan and wait for the server's answer. The explain is the
+    /// app's one MAIN-connection operation, so this is how the harness asks
+    /// whether that connection is still usable.
+    fn explain(&mut self, sql: &str, within: Duration) -> bool {
+        self.explained.store(false, Ordering::Release);
+        self.messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.editor.set_text(sql);
+        self.editor.explain_current();
+        self.pump_until(within, || {
+            self.explained.load(Ordering::Acquire).then_some(())
+        })
+        .is_some()
     }
 
     fn start(&mut self, sql: &str) {
@@ -686,6 +865,13 @@ impl EditorHarness {
 
     fn retained_session_state(&self) -> Option<space_query::db::PooledSessionLeaseSnapshot> {
         self.editor.pooled_session_activity_snapshot()
+    }
+
+    fn transcript(&self) -> Vec<String> {
+        self.messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn last_message(&self) -> String {

@@ -38,9 +38,10 @@ use crate::db::{
     cache_pool_session_context_for_shared_connection,
     clear_pool_session_context_for_shared_connection, connect_shared_connection_with_policy,
     lock_connection_with_activity, result_messages, BindDataType, BindValue, BindVar, ColumnInfo,
-    ConnectionAttemptPolicy, CursorResult, DbPoolSession, DbSessionLease, ObjectBrowser, QueryCell,
-    QueryExecutor, QueryResult, ResolvedBind, RetainedSessionState, ScriptItem, SessionState,
-    SharedDbSessionLease, SqlValueKind, ToolCommand, TransactionSessionState,
+    ConnectionAttemptPolicy, CursorResult, DbPoolSession, DbSessionLease, MainSessionTeardown,
+    ObjectBrowser, QueryCell, QueryExecutor, QueryResult, ResolvedBind, RetainedSessionState,
+    ScriptItem, SessionState, SharedDbSessionLease, SqlValueKind, ToolCommand,
+    TransactionSessionState,
 };
 use crate::sql_text;
 use crate::utils::arithmetic::{safe_div, safe_rem};
@@ -1614,7 +1615,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
         SqlEditorWidget::set_current_oracle_thin_cancel_context(
             current_oracle_thin_cancel_context,
             current_query_cancel_handle,
-            Some(cancel_handle.clone()),
+            Some((cancel_handle.clone(), CanceledSession::Pooled)),
         );
         if preconnected_info.is_none()
             && !SqlEditorWidget::operation_snapshot_is_current(current_operation_id, operation_id)
@@ -1926,6 +1927,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
         let ExecutionWorkerContext {
             shared_connection,
             connection_binding,
+            binding_revision,
             sender,
             sql_text,
             result_edit_request,
@@ -2023,6 +2025,8 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
         }
         SqlEditorWidget::execute_mysql_batch(
             shared_connection,
+            connection_binding,
+            binding_revision,
             sender,
             db_type,
             sql_text,
@@ -5245,6 +5249,33 @@ impl SqlEditorWidget {
         )
     }
 
+    /// Give a lazy fetch's session back, and give up the force tier's reach
+    /// FIRST.
+    ///
+    /// The ONE door every lazy-fetch session release goes through, on all four
+    /// backends, and the order is the whole reason it exists. The lazy-fetch
+    /// cancel watchdog decides whether it may tear a session down from the
+    /// tab's `active_lazy_fetch` handle — an INDIRECT answer, cleared several
+    /// statements after the session has already been filed into the tab's slot
+    /// or returned to the pool. A watchdog whose deadline expired in that
+    /// window drop-closed (OCI) or force-closed (thin) the tab's own retained
+    /// transaction, or a session another tab had just picked up. The MySQL
+    /// family escaped it on the ordinary path only because it happened to null
+    /// its context first — and NOT on its panic path, which discarded the
+    /// session before nulling it.
+    ///
+    /// Withdrawing the target is one store and cannot fail, so putting it here
+    /// makes "the reach ends before the session does" a property of the door
+    /// rather than of each cleanup remembering the order. Same separation as
+    /// `DbSessionCancelRegistration::release_reach` in the DB layer.
+    fn release_lazy_fetch_session<T>(
+        force_target: &QueryCancelTarget,
+        give_the_session_back: impl FnOnce() -> T,
+    ) -> T {
+        force_target.withdraw();
+        give_the_session_back()
+    }
+
     fn discard_oracle_lazy_fetch_session(
         pooled_db_session: &SharedDbSessionLease,
         connection_generation: u64,
@@ -5585,7 +5616,13 @@ impl SqlEditorWidget {
         // The cancel handle is a clone of the session handle, taken before the
         // owner below has it: the fetch has to be cancellable from the moment
         // it is registered.
-        let cancel_conn = Arc::clone(&conn);
+        // Withdrawable, like every other lazy fetch's: the reach ends the
+        // moment `release_lazy_fetch_session` gives the session back.
+        let lazy_force_target = QueryCancelTarget::empty();
+        lazy_force_target.publish(QueryCancelHandle::Oracle(
+            Arc::clone(&conn),
+            CanceledSession::Pooled,
+        ));
         // The tab's session is out of its slot from here until the fetch worker
         // takes it INSIDE its own thread; a worker that never starts must not
         // let it fall into the pool, where `reset_before_reuse` rolls back
@@ -5608,7 +5645,7 @@ impl SqlEditorWidget {
             connection_generation,
             crate::db::DatabaseType::Oracle,
             command_sender,
-            Some(LazyFetchCancelHandle::Oracle(cancel_conn)),
+            Some(lazy_force_target.as_handle()),
             sender.status_finish_handle(),
         );
         let _ = sender.send(QueryProgress::LazyFetchSession {
@@ -5988,22 +6025,26 @@ impl SqlEditorWidget {
                         // reports finished, so this session's currency is
                         // `lazy_fetch_can_keep_session`, not the tab's
                         // operation id.
-                        let _ = pooled_db_session.hand_back_worker_session(
-                            &crate::db::SessionHandBackOwner::untracked(),
-                            connection_generation,
-                            pool_context_epoch,
-                            DbSessionLease::Oracle(Arc::clone(&conn)),
-                            crate::db::RetainedSessionDisposition::Retain(retained_state),
-                            "oracle lazy fetch cleanup",
-                            current_scope,
-                        );
+                        Self::release_lazy_fetch_session(&lazy_force_target, || {
+                            let _ = pooled_db_session.hand_back_worker_session(
+                                &crate::db::SessionHandBackOwner::untracked(),
+                                connection_generation,
+                                pool_context_epoch,
+                                DbSessionLease::Oracle(Arc::clone(&conn)),
+                                crate::db::RetainedSessionDisposition::Retain(retained_state),
+                                "oracle lazy fetch cleanup",
+                                current_scope,
+                            );
+                        });
                     } else {
-                        Self::discard_oracle_lazy_fetch_session(
-                            &pooled_db_session,
-                            connection_generation,
-                            &conn,
-                            "oracle lazy fetch cleanup",
-                        );
+                        Self::release_lazy_fetch_session(&lazy_force_target, || {
+                            Self::discard_oracle_lazy_fetch_session(
+                                &pooled_db_session,
+                                connection_generation,
+                                &conn,
+                                "oracle lazy fetch cleanup",
+                            );
+                        });
                     }
                     if error_result.is_none()
                         && Self::oracle_lazy_fetch_success_loses_required_session(
@@ -6050,12 +6091,14 @@ impl SqlEditorWidget {
                 }));
                 if let Err(payload) = worker_result {
                     let _ = conn.set_call_timeout(previous_timeout);
-                    Self::discard_oracle_lazy_fetch_session(
-                        &pooled_db_session,
-                        connection_generation,
-                        &conn,
-                        "oracle lazy fetch panic",
-                    );
+                    Self::release_lazy_fetch_session(&lazy_force_target, || {
+                        Self::discard_oracle_lazy_fetch_session(
+                            &pooled_db_session,
+                            connection_generation,
+                            &conn,
+                            "oracle lazy fetch panic",
+                        );
+                    });
                     Self::clear_lazy_fetch_after_worker_panic(
                         &sender,
                         &active_lazy_fetch,
@@ -6131,6 +6174,13 @@ impl SqlEditorWidget {
         };
         lazy_conn.reset_pending_cancel();
         let cancel_handle = lazy_conn.cancel_handle();
+        // Withdrawable, like every other lazy fetch's: the reach ends the
+        // moment `release_lazy_fetch_session` gives the session back.
+        let lazy_force_target = QueryCancelTarget::empty();
+        lazy_force_target.publish(QueryCancelHandle::OracleThin(
+            cancel_handle,
+            CanceledSession::Pooled,
+        ));
         Self::register_lazy_fetch_handle(
             &active_lazy_fetch,
             index,
@@ -6138,7 +6188,7 @@ impl SqlEditorWidget {
             connection_generation,
             crate::db::DatabaseType::Oracle,
             command_sender,
-            Some(LazyFetchCancelHandle::OracleThin(cancel_handle)),
+            Some(lazy_force_target.as_handle()),
             sender.status_finish_handle(),
         );
         let _ = sender.send(QueryProgress::LazyFetchSession {
@@ -6810,6 +6860,9 @@ impl SqlEditorWidget {
                         None
                     };
                     let Some(lease_conn) = conn_slot.take() else {
+                        // The session is already gone, so the reach over it has
+                        // to go too — same door, nothing left to hand back.
+                        Self::release_lazy_fetch_session(&lazy_force_target, || {});
                         crate::utils::logging::log_error(
                             "oracle thin lazy fetch cleanup",
                             "Oracle thin lazy connection was missing during cleanup",
@@ -6836,25 +6889,29 @@ impl SqlEditorWidget {
                         );
                         // Untracked BY DESIGN — see the OCI lazy-fetch
                         // cleanup above.
-                        if !pooled_db_session
-                            .hand_back_worker_session(
-                                &crate::db::SessionHandBackOwner::untracked(),
-                                connection_generation,
-                                pool_context_epoch,
-                                DbSessionLease::OracleThin(Box::new(lease_conn)),
-                                crate::db::RetainedSessionDisposition::Retain(retained_state),
-                                "oracle thin lazy fetch cleanup",
-                                current_scope.clone(),
-                            )
-                            .stored()
-                        {
+                        let stored = Self::release_lazy_fetch_session(&lazy_force_target, || {
+                            pooled_db_session
+                                .hand_back_worker_session(
+                                    &crate::db::SessionHandBackOwner::untracked(),
+                                    connection_generation,
+                                    pool_context_epoch,
+                                    DbSessionLease::OracleThin(Box::new(lease_conn)),
+                                    crate::db::RetainedSessionDisposition::Retain(retained_state),
+                                    "oracle thin lazy fetch cleanup",
+                                    current_scope.clone(),
+                                )
+                                .stored()
+                        });
+                        if !stored {
                             cleanup_failed = true;
                             close_cancelled = true;
                             close_error_kind = InterruptKind::UnsafeOrUnknown;
                         }
                     } else {
-                        DbSessionLease::OracleThin(Box::new(lease_conn))
-                            .discard_physical("oracle thin lazy fetch cleanup");
+                        Self::release_lazy_fetch_session(&lazy_force_target, || {
+                            DbSessionLease::OracleThin(Box::new(lease_conn))
+                                .discard_physical("oracle thin lazy fetch cleanup");
+                        });
                     }
                     if error_result.is_none()
                         && Self::oracle_lazy_fetch_success_loses_required_session(
@@ -6905,8 +6962,10 @@ impl SqlEditorWidget {
                 }));
                 if let Err(payload) = worker_result {
                     if let Some(conn) = conn_slot.take() {
-                        DbSessionLease::OracleThin(Box::new(conn))
-                            .discard_physical("oracle thin lazy fetch panic");
+                        Self::release_lazy_fetch_session(&lazy_force_target, || {
+                            DbSessionLease::OracleThin(Box::new(conn))
+                                .discard_physical("oracle thin lazy fetch panic");
+                        });
                     }
                     Self::clear_lazy_fetch_after_worker_panic(
                         &sender,
@@ -6974,8 +7033,9 @@ impl SqlEditorWidget {
         let lazy_fetch_hand_back_owner = crate::db::SessionHandBackOwner::untracked();
         let db_display_name = connection_info.db_type.display_name();
         let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
-        let lazy_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
-            Arc::new(Mutex::new(None));
+        // Withdrawable, like every other lazy fetch's: the reach ends the
+        // moment `release_lazy_fetch_session` gives the session back.
+        let lazy_force_target = QueryCancelTarget::empty();
         // The tab's session is out of its slot from here until the fetch worker
         // takes it INSIDE its own thread; a worker that never starts must not
         // let it fall into the pool, where the connection reset rolls back
@@ -6998,9 +7058,7 @@ impl SqlEditorWidget {
             connection_generation,
             connection_info.db_type,
             command_sender,
-            Some(LazyFetchCancelHandle::MySqlShared(
-                lazy_cancel_context.clone(),
-            )),
+            Some(lazy_force_target.as_handle()),
             sender.status_finish_handle(),
         );
         let _ = sender.send(QueryProgress::LazyFetchSession {
@@ -7045,13 +7103,13 @@ impl SqlEditorWidget {
                     let mut keep_session = false;
                     let mut pending_commands = VecDeque::new();
                     let lazy_fetch_timeout = Self::lazy_fetch_query_timeout(query_timeout);
-                    *lazy_cancel_context
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                        Some(MySqlQueryCancelContext {
+                    lazy_force_target.publish(QueryCancelHandle::MySql(
+                        Box::new(MySqlQueryCancelContext {
                             connection_info: connection_info.clone(),
                             connection_id: conn.connection_id(),
-                        });
+                        }),
+                        CanceledSession::Pooled,
+                    ));
                     let result = (|| -> Result<LazyFetchWorkerOutcome, String> {
                         if !prior_retained_state.requires_physical_session_preservation() {
                             conn.query_drop(if auto_commit {
@@ -7086,7 +7144,7 @@ impl SqlEditorWidget {
                         ) {
                             if matches!(command, LazyFetchCommand::CancelFetch) {
                                 Self::cancel_mysql_lazy_fetch_query(
-                                    &lazy_cancel_context,
+                                    &lazy_force_target,
                                     "mysql lazy fetch cancel",
                                 );
                             }
@@ -7180,7 +7238,7 @@ impl SqlEditorWidget {
                         ) {
                             if matches!(command, LazyFetchCommand::CancelFetch) {
                                 Self::cancel_mysql_lazy_fetch_query(
-                                    &lazy_cancel_context,
+                                    &lazy_force_target,
                                     "mysql lazy fetch cancel",
                                 );
                             }
@@ -7243,7 +7301,7 @@ impl SqlEditorWidget {
                         ) {
                             if matches!(command, LazyFetchCommand::CancelFetch) {
                                 Self::cancel_mysql_lazy_fetch_query(
-                                    &lazy_cancel_context,
+                                    &lazy_force_target,
                                     "mysql lazy fetch cancel",
                                 );
                             }
@@ -7309,7 +7367,7 @@ impl SqlEditorWidget {
                                     ) {
                                         if matches!(command, LazyFetchCommand::CancelFetch) {
                                             Self::cancel_mysql_lazy_fetch_query(
-                                                &lazy_cancel_context,
+                                                &lazy_force_target,
                                                 "mysql lazy fetch cancel",
                                             );
                                         }
@@ -7367,7 +7425,7 @@ impl SqlEditorWidget {
                                         ) {
                                             if matches!(command, LazyFetchCommand::CancelFetch) {
                                                 Self::cancel_mysql_lazy_fetch_query(
-                                                    &lazy_cancel_context,
+                                                    &lazy_force_target,
                                                     "mysql lazy fetch cancel",
                                                 );
                                             }
@@ -7409,7 +7467,7 @@ impl SqlEditorWidget {
                                 }
                                 Ok(LazyFetchCommand::CancelFetch) => {
                                     Self::cancel_mysql_lazy_fetch_query(
-                                        &lazy_cancel_context,
+                                        &lazy_force_target,
                                         "mysql lazy fetch cancel",
                                     );
                                     return Ok(LazyFetchWorkerOutcome::Interrupted(
@@ -7636,9 +7694,6 @@ impl SqlEditorWidget {
                                 statement_start.elapsed(),
                             ));
                     }
-                    *lazy_cancel_context
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 }));
                 match worker_result {
                     Ok(()) => {
@@ -7646,23 +7701,31 @@ impl SqlEditorWidget {
                             if should_retain_session
                                 && Self::lazy_fetch_can_keep_session(&active_lazy_fetch, session_id)
                             {
-                                Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
-                                    &shared_connection,
-                                    &pooled_db_session,
-                                    connection_generation,
-                                    pool_context_epoch,
-                                    conn,
-                                    retained_state,
-                                    "mysql lazy fetch cleanup",
-                                    execution_scope.clone(),
-                                    BatchSessionHandBack::new(
-                                        &lazy_fetch_hand_back_owner,
-                                        Some(&sender),
-                                    ),
-                                );
+                                Self::release_lazy_fetch_session(&lazy_force_target, || {
+                                    Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
+                                        &shared_connection,
+                                        &pooled_db_session,
+                                        connection_generation,
+                                        pool_context_epoch,
+                                        conn,
+                                        retained_state,
+                                        "mysql lazy fetch cleanup",
+                                        execution_scope.clone(),
+                                        BatchSessionHandBack::new(
+                                            &lazy_fetch_hand_back_owner,
+                                            Some(&sender),
+                                        ),
+                                    );
+                                });
                             } else {
-                                Self::discard_mysql_pooled_connection(conn);
+                                Self::release_lazy_fetch_session(&lazy_force_target, || {
+                                    Self::discard_mysql_pooled_connection(conn);
+                                });
                             }
+                        } else {
+                            // Nothing left to hand back, so the reach over it
+                            // goes anyway — same door.
+                            Self::release_lazy_fetch_session(&lazy_force_target, || {});
                         }
                         if let Some(error_result) = error_result {
                             let _ = sender.send(error_result);
@@ -7689,15 +7752,14 @@ impl SqlEditorWidget {
                         );
                     }
                     Err(payload) => {
-                        if let Some(conn) = conn.take() {
-                            // Panic cleanup discards the physical connection;
-                            // do not run the old generic timeout reset here,
-                            // because it does not restore lock-wait variables.
-                            Self::discard_mysql_pooled_connection(conn);
-                        }
-                        *lazy_cancel_context
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                        Self::release_lazy_fetch_session(&lazy_force_target, || {
+                            if let Some(conn) = conn.take() {
+                                // Panic cleanup discards the physical connection;
+                                // do not run the old generic timeout reset here,
+                                // because it does not restore lock-wait variables.
+                                Self::discard_mysql_pooled_connection(conn);
+                            }
+                        });
                         Self::clear_lazy_fetch_after_worker_panic(
                             &sender,
                             &active_lazy_fetch,
@@ -7731,25 +7793,17 @@ impl SqlEditorWidget {
         }
     }
 
-    fn cancel_mysql_lazy_fetch_query(
-        cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-        log_context: &str,
-    ) {
-        let context = cancel_context
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(context) = context {
-            let display_name = context.connection_info.db_type.display_name();
-            if let Err(err) = crate::db::query::mysql_executor::MysqlExecutor::cancel_running_query(
-                &context.connection_info,
-                context.connection_id,
-            ) {
-                crate::utils::logging::log_error(
-                    log_context,
-                    &format!("Failed to cancel {display_name} lazy fetch query: {err}"),
-                );
-            }
+    /// Ask the server to abort this lazy fetch's current call.
+    ///
+    /// Asked THROUGH the withdrawable target, so a graceful cancel that races
+    /// with the fetch giving its session back reaches nothing instead of
+    /// `KILL QUERY`-ing whoever holds that session now.
+    fn cancel_mysql_lazy_fetch_query(force_target: &QueryCancelTarget, log_context: &str) {
+        if let Err(err) = force_target.as_handle().cancel_interrupt() {
+            crate::utils::logging::log_error(
+                log_context,
+                &format!("Failed to cancel MySQL-family lazy fetch query: {err}"),
+            );
         }
     }
 
@@ -8279,8 +8333,11 @@ impl SqlEditorWidget {
         error_message
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_mysql_batch(
         shared_connection: &crate::db::SharedConnection,
+        connection_binding: &TabConnectionBinding,
+        binding_revision: u64,
         sender: &QueryProgressSender,
         db_type: crate::db::DatabaseType,
         sql_text: &str,
@@ -8338,6 +8395,17 @@ impl SqlEditorWidget {
         app::awake();
 
         let mut conn_name = conn_name.to_string();
+        // Which incarnation of the tab's binding this batch speaks for. A
+        // script `DISCONNECT` detaches with it, and keeps the STALE revision
+        // when the detach is refused, so a superseded batch cannot unbind a tab
+        // that has moved on. Same value, same rule, as both Oracle drivers.
+        let mut binding_revision = binding_revision;
+        // Whether this TAB is still on its connection. A script `DISCONNECT`
+        // is tab-local on all four backends -- other tabs sharing the runtime
+        // and its pool keep working -- so the statements after it have no
+        // session of their own to run on and say so, instead of reaching for a
+        // connection this tab has left.
+        let batch_connected = std::cell::Cell::new(true);
         let mut result_index = 0usize;
         let mut auto_commit = initial_auto_commit;
         // Cell instead of a mut local so the statement-executing closures can
@@ -8395,19 +8463,30 @@ impl SqlEditorWidget {
             statement_reached_server: bool,
         }
 
-        let execute_mysql_sql = |sql: &str,
-                                 auto_commit: bool,
-                                 batch_effects: &crate::db::MySqlBatchSessionEffects|
+        // What every statement of this batch is asked before it reaches a
+        // session, whichever of the three paths runs it: the streaming SELECT,
+        // the general statement path, and (through them) the lazily fetched
+        // SELECT. One unit can hold several statements and the dispatch picks
+        // its path from the leading keyword, so a question asked in only one of
+        // them is a question a statement can walk around.
+        let begin_mysql_batch_statement = |sql: &str,
+                                           batch_effects: &crate::db::MySqlBatchSessionEffects|
          -> Result<
-            MySqlBatchStatementSuccess,
+            crate::db::StatementSessionEffects,
             MySqlBatchStatementError,
         > {
-            // A `USE` anywhere in the unit moved the session, so the encoding
-            // has to be read again — not only a unit that STARTS with one.
-            let refresh_encoding_after =
-                SqlEditorWidget::mysql_unit_moves_session_database(db_type, sql).is_some();
             let statement_effects =
                 SqlEditorWidget::mysql_statement_session_effects_for_sql_for_db_type(db_type, sql);
+            // The tab has left this connection (a script DISCONNECT), so it has
+            // no session of its own to run on — the same answer both Oracle
+            // drivers give, in the same words.
+            if !batch_connected.get() {
+                return Err(MySqlBatchStatementError {
+                    message: crate::db::NOT_CONNECTED_MESSAGE.to_string(),
+                    effects: statement_effects,
+                    statement_reached_server: false,
+                });
+            }
             if let Err(message) =
                 SqlEditorWidget::ensure_mysql_batch_transaction_option_change_allowed(
                     batch_effects,
@@ -8420,6 +8499,21 @@ impl SqlEditorWidget {
                     statement_reached_server: false,
                 });
             }
+            Ok(statement_effects)
+        };
+
+        let execute_mysql_sql = |sql: &str,
+                                 auto_commit: bool,
+                                 batch_effects: &crate::db::MySqlBatchSessionEffects|
+         -> Result<
+            MySqlBatchStatementSuccess,
+            MySqlBatchStatementError,
+        > {
+            // A `USE` anywhere in the unit moved the session, so the encoding
+            // has to be read again — not only a unit that STARTS with one.
+            let refresh_encoding_after =
+                SqlEditorWidget::mysql_unit_moves_session_database(db_type, sql).is_some();
+            let statement_effects = begin_mysql_batch_statement(sql, batch_effects)?;
             // The tab-mode gate is NOT here. It lives where the session is
             // handed to a statement (`acquire_mysql_pooled_session`), because
             // this closure is only one of the family's execution paths and the
@@ -8490,22 +8584,7 @@ impl SqlEditorWidget {
              index: usize,
              emit_statement_start_event: bool|
              -> Result<MySqlSelectStreamOutcome, MySqlBatchStatementError> {
-                let statement_effects =
-                    SqlEditorWidget::mysql_statement_session_effects_for_sql_for_db_type(
-                        db_type, sql,
-                    );
-                if let Err(message) =
-                    SqlEditorWidget::ensure_mysql_batch_transaction_option_change_allowed(
-                        batch_effects,
-                        statement_effects,
-                    )
-                {
-                    return Err(MySqlBatchStatementError {
-                        message,
-                        effects: statement_effects,
-                        statement_reached_server: false,
-                    });
-                }
+                let statement_effects = begin_mysql_batch_statement(sql, batch_effects)?;
                 let sql_to_execute = crate::db::query::mysql_executor::MysqlExecutor::statement_sql_preserving_found_rows_for_db_type(
                     db_type,
                     sql,
@@ -9106,20 +9185,43 @@ impl SqlEditorWidget {
                                 );
                                 command_error = true;
                             } else {
-                                let had_connection = {
-                                    let mut conn_guard = lock_connection_with_activity(
-                                        shared_connection,
-                                        db_activity.to_string(),
-                                    );
-                                    let had_connection = conn_guard.is_connected()
-                                        || conn_guard.has_connection_handle();
-                                    clear_pool_session_context_for_shared_connection(
-                                        shared_connection,
-                                    );
-                                    conn_guard.disconnect();
-                                    had_connection
-                                };
+                                let had_connection = batch_connected.get();
+                                // TAB-LOCAL, exactly as it is on both Oracle
+                                // drivers. This used to `disconnect()` the
+                                // SHARED connection: one tab's script ended
+                                // every other tab's sessions on it, bumping the
+                                // connection generation and the pool epoch,
+                                // with none of the things File > Disconnect
+                                // does — no check for work on the other tabs,
+                                // no per-tab commit/rollback prompt (so their
+                                // uncommitted work went with it, in silence),
+                                // no `cancel_db_activities_for_connection`, and
+                                // no runtime state change, so the app went on
+                                // describing a connection that was gone.
                                 hand_back.clear(pooled_db_session, db_activity);
+                                Self::set_current_mysql_cancel_context(
+                                    current_mysql_cancel_context,
+                                    current_query_cancel_handle,
+                                    None,
+                                );
+                                // Keeps the STALE revision when the detach is
+                                // refused, so a superseded batch cannot unbind
+                                // a tab that has moved on.
+                                binding_revision = connection_binding
+                                    .detach_if_revision(binding_revision)
+                                    .unwrap_or(binding_revision);
+                                batch_connected.set(false);
+                                // A new session is what the tab would come back
+                                // on, so what this batch learned about the old
+                                // one is not a claim about anything any more.
+                                mysql_batch_effects =
+                                    crate::db::MySqlBatchSessionEffects::for_db_type(db_type);
+                                // The detach resets the tab's script session,
+                                // so the batch re-reads what it drives from.
+                                continue_on_error = match session.lock() {
+                                    Ok(guard) => guard.continue_on_error,
+                                    Err(poisoned) => poisoned.into_inner().continue_on_error,
+                                };
                                 conn_name.clear();
                                 let _ =
                                     sender.send(QueryProgress::ConnectionChanged { info: None });
@@ -9515,7 +9617,8 @@ impl SqlEditorWidget {
                         crate::db::query::mysql_executor::MysqlExecutor::is_displayable_select_statement_for_db_type(
                             db_type, &sql_text,
                         );
-                    if lazy_fetch_single_statement
+                    if batch_connected.get()
+                        && lazy_fetch_single_statement
                         && displayable_result_statement
                         && SqlEditorWidget::mysql_select_can_use_lazy_fetch(statement_effects)
                     {
@@ -11306,7 +11409,7 @@ impl SqlEditorWidget {
                     SqlEditorWidget::set_current_query_connection(
                         &current_query_connection,
                         &current_query_cancel_handle,
-                        Some(Arc::clone(conn)),
+                        Some((Arc::clone(conn), CanceledSession::Pooled)),
                     );
                     if !Self::operation_snapshot_is_current(&current_operation_id, operation_id) {
                         SqlEditorWidget::set_current_query_connection(
@@ -13345,11 +13448,16 @@ impl SqlEditorWidget {
                                                     &current_operation_autocommit,
                                                     auto_commit,
                                                 );
-                                                // Update cancel connection so break_execution() uses the new connection
+                                                // Update cancel connection so break_execution() uses the new connection.
+                                                // Unlike the pooled session the batch started on,
+                                                // this is the candidate CONNECTION's own session —
+                                                // the rest of the batch runs on it and the app
+                                                // tracks its schema and auto-commit there — so a
+                                                // cancel may break it but never destroy it.
                                                 SqlEditorWidget::set_current_query_connection(
                                                     &current_query_connection,
                                                     &current_query_cancel_handle,
-                                                    Some(prepared_conn),
+                                                    Some((prepared_conn, CanceledSession::Main)),
                                                 );
                                                 SqlEditorWidget::emit_script_message(
                                                     &sender,
@@ -19710,7 +19818,7 @@ impl SqlEditorWidget {
                                     Self::set_current_oracle_thin_cancel_context(
                                         context.current_oracle_thin_cancel_context,
                                         context.current_query_cancel_handle,
-                                        Some(cancel_handle),
+                                        Some((cancel_handle, CanceledSession::Pooled)),
                                     );
                                     Self::emit_script_message(
                                         sender,
@@ -26824,6 +26932,15 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Why the connection's own session can no longer be described: its
+    /// timeout variables were changed for this call and could not be put back.
+    ///
+    /// Unlike a pooled session, which is simply discarded, the main session is
+    /// the connection — so the only way to be rid of an undescribable one is to
+    /// replace the connection.
+    const MAIN_SESSION_TIMEOUT_SETTINGS_UNKNOWN: &'static str =
+        "its session timeout settings could not be restored";
+
     /// Takes the LOCK GUARD, not the connection behind it.
     ///
     /// `&mut DatabaseConnection` reaches every accessor through `DerefMut`,
@@ -26859,13 +26976,20 @@ impl SqlEditorWidget {
             None => return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
         };
 
+        // The connection's OWN session — this is the MySQL family's one
+        // main-connection execution path. A cancel may `KILL QUERY` it; it may
+        // never `KILL CONNECTION` it, or one tab's explain would take down the
+        // connection every other tab is working on.
         Self::set_current_mysql_cancel_context(
             current_mysql_cancel_context,
             current_query_cancel_handle,
-            Some(MySqlQueryCancelContext {
-                connection_info,
-                connection_id,
-            }),
+            Some((
+                MySqlQueryCancelContext {
+                    connection_info,
+                    connection_id,
+                },
+                CanceledSession::Main,
+            )),
         );
 
         let timeout_restore;
@@ -26885,18 +27009,23 @@ impl SqlEditorWidget {
                 ) {
                 Ok(timeout_restore) => timeout_restore,
                 Err(err) => {
-                    if err.restore_failed() {
-                        conn_guard.disconnect();
-                    }
+                    let teardown = err.restore_failed().then(|| {
+                        conn_guard.disconnect_untrusted_main_session(
+                            Self::MAIN_SESSION_TIMEOUT_SETTINGS_UNKNOWN,
+                        )
+                    });
                     Self::set_current_mysql_cancel_context(
                         current_mysql_cancel_context,
                         current_query_cancel_handle,
                         None,
                     );
-                    return Err(SqlEditorWidget::mysql_timeout_apply_error_message(
-                        &err,
-                        db_type,
-                        query_timeout,
+                    return Err(Self::with_main_session_teardown(
+                        SqlEditorWidget::mysql_timeout_apply_error_message(
+                            &err,
+                            db_type,
+                            query_timeout,
+                        ),
+                        teardown,
                     ));
                 }
             };
@@ -26912,10 +27041,12 @@ impl SqlEditorWidget {
                     current_query_cancel_handle,
                     None,
                 );
-                if !timeout_restore_ok {
-                    conn_guard.disconnect();
-                }
-                return Err(cancelled);
+                let teardown = (!timeout_restore_ok).then(|| {
+                    conn_guard.disconnect_untrusted_main_session(
+                        Self::MAIN_SESSION_TIMEOUT_SETTINGS_UNKNOWN,
+                    )
+                });
+                return Err(Self::with_main_session_teardown(cancelled, teardown));
             }
         }
 
@@ -26927,18 +27058,48 @@ impl SqlEditorWidget {
             }
         }));
 
-        if !Self::reset_mysql_timeout(conn_guard, timeout_restore.as_ref(), log_context) {
-            conn_guard.disconnect();
-        }
+        let teardown =
+            (!Self::reset_mysql_timeout(conn_guard, timeout_restore.as_ref(), log_context)).then(
+                || {
+                    conn_guard.disconnect_untrusted_main_session(
+                        Self::MAIN_SESSION_TIMEOUT_SETTINGS_UNKNOWN,
+                    )
+                },
+            );
         Self::set_current_mysql_cancel_context(
             current_mysql_cancel_context,
             current_query_cancel_handle,
             None,
         );
         match result {
-            Ok(Err(_)) if load_mutex_bool(cancel_flag) => Err(Self::cancel_message()),
-            Ok(result) => result,
+            Ok(Err(_)) if load_mutex_bool(cancel_flag) => Err(Self::with_main_session_teardown(
+                Self::cancel_message(),
+                teardown,
+            )),
+            Ok(Ok(value)) => match teardown.as_ref().and_then(MainSessionTeardown::message) {
+                // The action itself succeeded, but the connection it ran on is
+                // gone: reporting only the success would leave every other tab
+                // describing a connection that no longer exists.
+                Some(message) => Err(message),
+                None => Ok(value),
+            },
+            Ok(Err(message)) => Err(Self::with_main_session_teardown(message, teardown)),
             Err(payload) => panic::resume_unwind(payload),
+        }
+    }
+
+    /// A failure message that also says the connection went with it.
+    ///
+    /// One place, so no caller of `disconnect_untrusted_main_session` can drop
+    /// the connection-wide half of what happened while reporting the local
+    /// half.
+    fn with_main_session_teardown(
+        message: String,
+        teardown: Option<MainSessionTeardown>,
+    ) -> String {
+        match teardown.as_ref().and_then(MainSessionTeardown::message) {
+            Some(teardown_message) => format!("{message}; {teardown_message}"),
+            None => message,
         }
     }
 
@@ -27124,10 +27285,13 @@ impl SqlEditorWidget {
         Self::set_current_mysql_cancel_context(
             current_mysql_cancel_context,
             current_query_cancel_handle,
-            Some(MySqlQueryCancelContext {
-                connection_info,
-                connection_id: conn.connection_id(),
-            }),
+            Some((
+                MySqlQueryCancelContext {
+                    connection_info,
+                    connection_id: conn.connection_id(),
+                },
+                CanceledSession::Pooled,
+            )),
         );
         if current_operation_id.is_some_and(|current_operation_id| {
             !Self::operation_snapshot_is_current(current_operation_id, operation_id)
@@ -28008,8 +28172,8 @@ mod query_execution_cleanup_tests {
         lazy_fetch_all_timeout_for_fetch_all, InterruptKind, LazyFetchAllTimeout,
         LazyFetchCancelBeforeExecutionDecision, LazyFetchCancelHandle, LazyFetchCloseOutcome,
         LazyFetchCommand, LazyFetchHandle, MySqlQueryCancelContext, OracleThinQueryResult,
-        QueryCancelHandle, QueryExecutionCleanupGuard, QueryProgress, QueryProgressSender,
-        ScriptExecutionFrame, SqlEditorWidget, LAZY_FETCH_CANCEL_RETRY_LIMIT,
+        QueryCancelHandle, QueryCancelTarget, QueryExecutionCleanupGuard, QueryProgress,
+        QueryProgressSender, ScriptExecutionFrame, SqlEditorWidget, LAZY_FETCH_CANCEL_RETRY_LIMIT,
         ORACLE_THIN_LAZY_CLEANUP_FALLBACK_TIMEOUT,
     };
     use crate::db::{
@@ -31865,14 +32029,17 @@ mod query_execution_cleanup_tests {
 
     #[test]
     fn mysql_lazy_fetch_cancel_helper_ignores_missing_context() {
-        let context = Arc::new(Mutex::new(None));
+        // Nothing published — either not yet, or already withdrawn because the
+        // session went back. Either way the cancel must reach nothing rather
+        // than KILL QUERY whoever holds that session now.
+        let force_target = QueryCancelTarget::empty();
 
-        SqlEditorWidget::cancel_mysql_lazy_fetch_query(&context, "test mysql lazy fetch cancel");
+        SqlEditorWidget::cancel_mysql_lazy_fetch_query(
+            &force_target,
+            "test mysql lazy fetch cancel",
+        );
 
-        assert!(context
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_none());
+        assert!(force_target.as_handle().cancel_interrupt().is_err());
     }
 
     #[test]
@@ -33396,9 +33563,7 @@ mod query_execution_cleanup_tests {
             connection_generation: 7,
             db_type: crate::db::DatabaseType::MySQL,
             sender: command_sender,
-            cancel_handle: Some(LazyFetchCancelHandle::MySqlShared(Arc::new(Mutex::new(
-                None,
-            )))),
+            cancel_handle: Some(QueryCancelTarget::empty().as_handle()),
             cancel_requested: Arc::new(AtomicBool::new(true)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
@@ -36920,8 +37085,8 @@ mod mysql_batch_execution_regression_tests {
     };
     use crate::db::{
         connection::{ConnectionInfo, DatabaseType},
-        DatabaseConnection, DbPoolSession, SessionState, TransactionAccessMode,
-        TransactionIsolation, TransactionMode,
+        DatabaseConnection, DbPoolSession, SessionState, TabConnectionBinding,
+        TransactionAccessMode, TransactionIsolation, TransactionMode,
     };
     use crate::ui::main_window::{
         result_pane_routes_for_progress, result_pane_routes_for_progress_with_script_context,
@@ -37368,6 +37533,8 @@ mod mysql_batch_execution_regression_tests {
             };
             SqlEditorWidget::execute_mysql_batch(
                 &self.shared_connection,
+                &TabConnectionBinding::unbound(),
+                0,
                 &sender,
                 self.db_type,
                 script,
@@ -37474,6 +37641,8 @@ mod mysql_batch_execution_regression_tests {
 
         SqlEditorWidget::execute_mysql_batch(
             shared_connection,
+            &TabConnectionBinding::unbound(),
+            0,
             &sender,
             db_type,
             script,
@@ -38000,6 +38169,8 @@ mod mysql_batch_execution_regression_tests {
 
         SqlEditorWidget::execute_mysql_batch(
             &shared_connection,
+            &TabConnectionBinding::unbound(),
+            0,
             &sender,
             db_type,
             script,
@@ -38126,6 +38297,8 @@ mod mysql_batch_execution_regression_tests {
 
         SqlEditorWidget::execute_mysql_batch(
             &shared_connection,
+            &TabConnectionBinding::unbound(),
+            0,
             &sender,
             DatabaseType::MySQL,
             script,
@@ -38420,6 +38593,8 @@ mod mysql_batch_execution_regression_tests {
             let (sender, receiver) = super::test_query_progress_channel();
             SqlEditorWidget::execute_mysql_batch(
                 &shared_connection,
+                &TabConnectionBinding::unbound(),
+                0,
                 &sender,
                 db_type,
                 "SHOW VARIABLES WHERE Variable_name IN ('transaction_isolation', 'tx_isolation', 'transaction_read_only', 'tx_read_only'); SELECT 1 AS done",
@@ -38509,6 +38684,8 @@ mod mysql_batch_execution_regression_tests {
             let (sender, receiver) = super::test_query_progress_channel();
             SqlEditorWidget::execute_mysql_batch(
                 &shared_connection,
+                &TabConnectionBinding::unbound(),
+                0,
                 &sender,
                 db_type,
                 single_select,
@@ -39066,6 +39243,8 @@ SELECT 'FINAL_STATUS' AS section_name,
 
         SqlEditorWidget::execute_mysql_batch(
             &shared_connection,
+            &TabConnectionBinding::unbound(),
+            0,
             &sender,
             DatabaseType::MariaDB,
             &sql,

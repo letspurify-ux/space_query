@@ -119,6 +119,21 @@ pub mod result_messages {
         "This read ran on a separate DB session, so it does not include this tab's uncommitted \
          changes. Commit them first to include them.";
 
+    /// The connection's OWN session was left in a state the app cannot
+    /// describe, so the connection was replaced.
+    ///
+    /// Connection-wide, and that is the whole reason it is said out loud: it is
+    /// not this tab's session that ended but every tab's, and the app used to
+    /// do it in silence while reporting only the immediate failure. Same text
+    /// on all four backends, because the situation is the same on all four.
+    pub fn main_session_teardown(reason: &str) -> String {
+        format!(
+            "The connection was closed because {reason}. Every query tab on it lost its DB \
+             session, and any uncommitted work those sessions held is gone. Reconnect to \
+             continue."
+        )
+    }
+
     /// The tab's scope could not be put on the session its statements run on,
     /// because the server does not have it any more.
     ///

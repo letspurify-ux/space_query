@@ -2033,7 +2033,7 @@ pub fn oracle_force_close_already_completed(error: &OracleError) -> bool {
 /// commit, an `ALTER SESSION`) tore the app's own primary connection down on
 /// two backends and re-broke the call on the third, for the same user action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CanceledSession {
+pub enum CanceledSession {
     /// One session checked out of the pool. Tearing it down costs exactly that
     /// session and the pool opens another, so the force tier destroys it.
     Pooled,
@@ -2043,6 +2043,34 @@ enum CanceledSession {
     /// that is gone — nothing marks it disconnected — and OCI cannot destroy it
     /// at all, so no caller could ever rely on the force tier having done it.
     Main,
+}
+
+impl CanceledSession {
+    /// Whether the force tier may DESTROY this session, or may only ask again.
+    ///
+    /// The app's one answer to "how far may a cancel go", asked by EVERY force
+    /// tier there is. It used to be an `if` inside the DB layer's own canceler,
+    /// so the rule held only for the road that went through it: the query
+    /// tab's cancel watchdog carries a handle of its own
+    /// (`ui::sql_editor::QueryCancelHandle`) and reached `terminate()` with no
+    /// such question, and the explain plan publishes the MAIN connection's
+    /// handle there on all four backends. Cancelling one therefore force-closed
+    /// the app's own primary connection on Oracle thin and `KILL CONNECTION`ed
+    /// it on the MySQL family -- the connection every other tab is working on,
+    /// with nothing marking it disconnected -- while on OCI it reported a
+    /// "force close failed: DPI-1011" for a tear-down that cannot happen there
+    /// at all.
+    ///
+    /// Ending the connection itself is a deliberate action with its own
+    /// bookkeeping (File > Disconnect), never a side effect of cancelling one
+    /// call. Re-breaking is the strongest tier available for a main session,
+    /// and it is not a failure to report.
+    pub fn force_tier_may_destroy_it(self) -> bool {
+        match self {
+            Self::Pooled => true,
+            Self::Main => false,
+        }
+    }
 }
 
 /// Cancels whatever call a pooled session is currently blocked in.
@@ -2271,15 +2299,9 @@ impl DbActivityCanceler for PoolSessionCanceler {
     fn force(&self) -> Result<(), String> {
         // How far the force tier may go is a question about WHICH session this
         // is, not about which driver it is, so it is answered once for all four
-        // backends. A cancel never destroys the connection's own session: the
-        // app tracks its schema, transaction mode and auto-commit there and
-        // nothing would mark it disconnected, and OCI cannot destroy it at all
-        // (DPI-1011), so no caller could ever have relied on it happening.
-        // Re-breaking is the strongest tier available there, and it is not a
-        // failure to report. Ending the connection itself is a deliberate
-        // action with its own bookkeeping — File > Disconnect — not a side
-        // effect of cancelling one call.
-        if self.session() == CanceledSession::Main {
+        // backends — and in ONE place for every force tier in the app, not just
+        // this one. See [`CanceledSession::force_tier_may_destroy_it`].
+        if !self.session().force_tier_may_destroy_it() {
             return self.interrupt();
         }
         match self {
@@ -8977,6 +8999,40 @@ pub fn reset_tracked_db_activities_for_probe() {
     drop(cleared);
 }
 
+/// What ending a connection from a worker cost, so it can be reported.
+///
+/// A `#[must_use]` ANSWER rather than a silent state reset, because the reset
+/// is connection-WIDE: every other tab bound to this connection loses its
+/// retained session with it, whatever work those sessions were carrying goes
+/// with them, and the tracked work still running on them is left for the status
+/// tick's stale sweep to force-cancel. `DatabaseConnection::disconnect` says
+/// none of that, so a worker that reached for it directly — the MySQL family's
+/// main-connection action, when a session-variable restore failed — ended every
+/// other tab's sessions while the runtime still said `Connected` and the user
+/// was told only that a timeout could not be reset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct MainSessionTeardown {
+    connection_id: Option<ConnectionId>,
+    reason: String,
+    had_connection: bool,
+}
+
+impl MainSessionTeardown {
+    /// What the user has to be told, or `None` when nothing was connected and
+    /// so nothing was ended.
+    pub fn message(&self) -> Option<String> {
+        self.had_connection
+            .then(|| crate::db::query::result_messages::main_session_teardown(&self.reason))
+    }
+
+    /// The connection whose tracked work this ended, for a caller that can
+    /// retire it deliberately rather than leaving it to the stale sweep.
+    pub fn connection_id(&self) -> Option<ConnectionId> {
+        self.connection_id
+    }
+}
+
 pub struct ConnectionLockGuard<'a> {
     guard: DatabaseConnectionGuard<'a>,
     activity_guard: Option<DbActivityGuard>,
@@ -9063,6 +9119,33 @@ impl<'a> ConnectionLockGuard<'a> {
     pub fn get_mysql_connection_mut(&mut self) -> Option<&mut mysql::Conn> {
         let _ = self.activity();
         self.guard.get_mysql_connection_mut()
+    }
+
+    /// End this connection because its OWN session state can no longer be
+    /// trusted, and answer what that cost.
+    ///
+    /// The one door a worker ends a connection through. `disconnect()` is the
+    /// raw state reset — it replaces the connection's identity, bumps its
+    /// generation and retires its pool — and it tells nobody; see
+    /// [`MainSessionTeardown`] for what that hid. Nothing about the tear-down
+    /// itself changes here: when the connection's own session is in a state the
+    /// app cannot describe, replacing it is the only answer there is, because
+    /// unlike a pooled session it cannot simply be discarded.
+    ///
+    /// The activity registry is deliberately NOT touched from here: this runs
+    /// under the connection mutex, and `connection_lock_releases_database_mutex_before_activity_mutex`
+    /// is the rule that the registry is never waited on while that mutex is
+    /// held. The answer carries the connection id so a caller that is off the
+    /// mutex can retire the work deliberately.
+    pub fn disconnect_untrusted_main_session(&mut self, reason: &str) -> MainSessionTeardown {
+        let had_connection = self.guard.is_connected() || self.guard.has_connection_handle();
+        let connection_id = self.guard.connection_id();
+        self.guard.disconnect();
+        MainSessionTeardown {
+            connection_id,
+            reason: reason.to_string(),
+            had_connection,
+        }
     }
 
     /// The activity this lock is tracked under, creating one if the lock was
@@ -9353,6 +9436,21 @@ pub fn try_lock_connection_with_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app's one answer to how far a cancel may go, so both force tiers —
+    /// the DB layer's canceler and the query tab's own watchdog — get the same
+    /// one.
+    #[test]
+    fn a_cancel_may_destroy_a_pooled_session_and_never_the_connections_own() {
+        assert!(
+            CanceledSession::Pooled.force_tier_may_destroy_it(),
+            "tearing a pooled session down costs exactly that session"
+        );
+        assert!(
+            !CanceledSession::Main.force_tier_may_destroy_it(),
+            "destroying the connection's own session leaves the app describing a connection              that is gone, and OCI cannot do it at all; ending a connection is File >              Disconnect, which has its own bookkeeping"
+        );
+    }
 
     /// A scope the server no longer has is tolerated, and the toleration is an
     /// ANSWER — the caller decides what to do with it, and cannot drop it by

@@ -623,7 +623,7 @@ fn pooled_query_execution_rechecks_scope_immediately_before_action() {
     );
 
     let lazy_start = content
-        .find("if lazy_fetch_single_statement\n                        && displayable_result_statement")
+        .find("&& lazy_fetch_single_statement\n                        && displayable_result_statement")
         .expect("MySQL lazy displayable SELECT branch should exist");
     let lazy_end = content[lazy_start..]
         .find("SqlEditorWidget::start_mysql_lazy_select")
@@ -5677,7 +5677,7 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
     // refused. File/Disconnect and application exit already order it this way.
     let content = read_source("src/ui/main_window.rs");
     let gate = content
-        .find("s.db_work_blocking_session_teardown()")
+        .find("s.db_work_blocking_session_teardown(")
         .expect("the pool-resize running-work refusal should exist");
     let prompt = content
         .find("Self::resolve_pooled_sessions_before_pool_resize(state)")
@@ -5699,15 +5699,39 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
     let answer = content
         .find("fn db_work_blocking_session_teardown(")
         .expect("the shared session-teardown gate should exist");
-    let answer_body = slice_from(&content, answer, 900);
+    let answer_body = compact_for_pattern(slice_from(&content, answer, 500));
     assert!(
-        answer_body.contains("crate::db::active_db_activity_snapshots()"),
-        "the session-teardown gate must ask the activity registry, which is the one place \
-         that knows about DB work with no query tab behind it"
+        answer_body.contains("self.tab_work_blocking_session_teardown(scope)")
+            && answer_body.contains("self.background_work_blocking_session_teardown(scope)"),
+        "the pool-resize gate must ask BOTH halves — a preference change may destroy \
+         neither the query tabs' work nor the background work holding sessions: {answer_body}"
     );
+
+    // The background half is the one that knows about DB work with no query
+    // tab behind it, and it can only come from the activity registry.
+    let background = content
+        .find("fn background_work_blocking_session_teardown(")
+        .expect("the background half of the session-teardown gate should exist");
+    let background_body = compact_for_pattern(slice_from(&content, background, 700));
     assert!(
-        answer_body.contains("self.has_running_query_or_lazy_fetch()"),
-        "and it must still cover the query tabs' own work"
+        background_body.contains("crate::db::active_db_activity_snapshots()")
+            && background_body.contains("scope.covers(activity.connection_id)"),
+        "the background half must ask the activity registry, scoped to the connections \
+         whose sessions are about to end: {background_body}"
+    );
+
+    // The tab half must still cover the query tabs' own work, for both scopes.
+    let tab_half = content
+        .find("fn tab_work_blocking_session_teardown(")
+        .expect("the tab half of the session-teardown gate should exist");
+    let tab_half_body = compact_for_pattern(slice_from(&content, tab_half, 900));
+    assert!(
+        tab_half_body.contains("self.has_running_query_or_lazy_fetch()")
+            && tab_half_body.contains("self.has_running_query_or_lazy_fetch_for_tab(tab.tab_id)")
+            && tab_half_body.contains("self.lazy_fetch_sessions_for_connection(connection_id)"),
+        "the tab half must cover a tab's running work, its deferred execution and its \
+         result-grid lazy fetches, for one connection as well as for all of them: \
+         {tab_half_body}"
     );
 
     // A tab with a DEFERRED execution reads perfectly idle — no query running,
@@ -5728,7 +5752,6 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
         );
     }
     for gate_fn in [
-        "fn has_work_for_connection(",
         "fn has_running_query_or_lazy_fetch_for_tab(",
         "fn has_running_query_or_lazy_fetch(",
     ] {
@@ -5866,7 +5889,13 @@ fn disconnect_all_asks_each_tab_the_same_question_a_single_disconnect_does() {
     let handler = content
         .find("\"File/Disconnect All\"")
         .expect("the Disconnect All handler should exist");
-    let handler_body = slice_from(&content, handler, 4000);
+    // Bounded by the next menu arm rather than by a byte count, so a step added
+    // to the handler cannot push the code being asserted out of the window.
+    let handler_body = content[handler..]
+        .find("\n            \"File/Exit\"")
+        .map_or(slice_from(&content, handler, 8000), |end| {
+            &content[handler..handler + end]
+        });
     assert!(
         handler_body.contains("RetainedSessionPreflightAction::ConnectionTransition")
             && handler_body.contains("\"Commit and Disconnect\""),
@@ -6192,7 +6221,7 @@ fn a_session_ending_action_asks_every_tab_before_it_resolves_any() {
     let disconnect_all = main_window
         .find("\"File/Disconnect All\" => {")
         .expect("Disconnect All should exist");
-    let disconnect_all_body = &main_window[disconnect_all..disconnect_all + 4000];
+    let disconnect_all_body = &main_window[disconnect_all..disconnect_all + 8000];
     assert!(
         disconnect_all_body.contains("Self::resolve_pooled_sessions_for_tabs("),
         "Disconnect All must ask every connection's tabs in one plan"
@@ -6675,7 +6704,7 @@ fn every_backend_can_cancel_work_on_its_own_main_connection() {
     let force = &content[force_start..force_end];
     let rule = force
         .find(
-            "if self.session() == CanceledSession::Main {
+            "if !self.session().force_tier_may_destroy_it() {
             return self.interrupt();",
         )
         .expect("a cancel must never destroy the connection's own session");
@@ -7715,4 +7744,349 @@ fn every_backend_reports_a_cancel_during_session_preparation_as_a_cancel() {
         "all four preparation steps must still be covered: Oracle thin, Oracle OCI, and the \
          MySQL family's database and session-option steps"
     );
+}
+
+#[test]
+fn every_force_tier_asks_one_rule_before_it_destroys_a_session() {
+    // The force tier is the one that cannot be taken back: an Oracle
+    // drop-close, an Oracle thin socket close, a `KILL CONNECTION`. How far it
+    // may go is a question about WHICH session it speaks for, and the app had
+    // TWO answers to it. The DB layer's canceler asked `CanceledSession`; the
+    // query tab's own watchdog carried a handle of its own and reached
+    // `terminate()` with no such question — and the explain plan publishes the
+    // MAIN connection's handle there on all four backends, so cancelling one
+    // force-closed the app's primary connection on Oracle thin, `KILL
+    // CONNECTION`ed it on the MySQL family, and reported a bogus DPI-1011
+    // failure on OCI.
+    let connection = read_source("src/db/connection.rs");
+    let rule = connection
+        .find("pub fn force_tier_may_destroy_it(")
+        .expect("the one force-tier rule should exist");
+    let rule_body = slice_from(&connection, rule, 220);
+    assert!(
+        rule_body.contains("Self::Pooled => true") && rule_body.contains("Self::Main => false"),
+        "a cancel may destroy a pooled session and may never destroy the connection's own: \
+         {rule_body}"
+    );
+
+    let pool_force = connection
+        .find("impl DbActivityCanceler for PoolSessionCanceler")
+        .and_then(|start| connection[start..].find("fn force(").map(|at| start + at))
+        .expect("the DB layer's force tier should exist");
+    let pool_force_body = slice_from(&connection, pool_force, 700);
+    assert!(
+        pool_force_body.contains("self.session().force_tier_may_destroy_it()"),
+        "the DB layer's force tier must ask the shared rule: {pool_force_body}"
+    );
+
+    // The query tab's own force tier asks the SAME rule, once, before the
+    // match — a rule spelled out per backend is a rule the next backend can be
+    // added without.
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let editor_force = editor
+        .find("pub(crate) fn force_cancel_blocking(")
+        .expect("the query tab's force tier should exist");
+    let editor_force_body = slice_from(&editor, editor_force, 400);
+    assert!(
+        editor_force_body.contains("session.force_tier_may_destroy_it()")
+            && editor_force_body.contains("return self.cancel_interrupt();")
+            && editor_force_body.contains("self.destroy_session()"),
+        "the query tab's force tier must ask the shared rule before tearing anything down, \
+         and re-break instead when it may not: {editor_force_body}"
+    );
+    assert_eq!(
+        editor.matches("fn destroy_session(").count(),
+        1,
+        "the tear-down itself must have exactly one home, reached only through the tier \
+         that asks the rule"
+    );
+    assert!(
+        !editor.contains("pub(crate) fn destroy_session(")
+            && !editor.contains("pub fn destroy_session("),
+        "the tear-down must not be reachable around the rule"
+    );
+
+    // And the MAIN-connection publishers must say so. All three explain-plan
+    // branches run on the connection's own session.
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    for (source, marker) in [
+        (&editor, "Ok(DbConnection::Oracle(db_conn)) => {"),
+        (&editor, "session.reset_pending_cancel();\n                let cancel_handle = session.cancel_handle();"),
+        (&execution, "let connection_info = match conn_guard.runtime_connection_info() {"),
+    ] {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("an explain-plan main-session publisher should exist: {marker}"));
+        let window = slice_from(source, start, 1000);
+        assert!(
+            window.contains("CanceledSession::Main"),
+            "an explain plan runs on the connection's OWN session and has to publish it as \
+             such: {window}"
+        );
+    }
+}
+
+#[test]
+fn a_lazy_fetch_gives_up_its_force_target_before_it_gives_back_its_session() {
+    // The lazy-fetch cancel watchdog decided whether it could tear a session
+    // down from the tab's `active_lazy_fetch` handle — an INDIRECT answer,
+    // cleared several statements AFTER the session had already been filed into
+    // the tab's slot or returned to the pool. On both Oracle drivers a watchdog
+    // whose deadline expired in that window drop-closed the tab's own retained
+    // transaction, or a session another tab had just picked up. The MySQL
+    // family escaped it on the ordinary path only by nulling its context first
+    // — and not on its panic path, which discarded the session before nulling.
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let door = execution
+        .find("fn release_lazy_fetch_session<T>(")
+        .expect("the one lazy-fetch session release door should exist");
+    let door_body = slice_from(&execution, door, 300);
+    assert!(
+        door_body.contains("force_target.withdraw();")
+            && door_body.find("force_target.withdraw();").unwrap()
+                < door_body.find("give_the_session_back()").unwrap(),
+        "the door must end the reach BEFORE the session goes back: {door_body}"
+    );
+
+    // Every backend's lazy fetch publishes a WITHDRAWABLE target, so the reach
+    // is something its owner can take back at all.
+    assert_eq!(
+        execution
+            .matches("Some(lazy_force_target.as_handle())")
+            .count(),
+        3,
+        "Oracle OCI, Oracle thin and the MySQL family must all register a withdrawable \
+         lazy-fetch cancel target"
+    );
+
+    // And inside every backend's lazy-fetch worker, NO way of giving the
+    // session back is reached except through the door.
+    for (worker, releases) in [
+        (
+            "fn start_oracle_lazy_select(",
+            &[
+                "pooled_db_session.hand_back_worker_session(",
+                "Self::discard_oracle_lazy_fetch_session(",
+            ][..],
+        ),
+        (
+            "fn start_oracle_thin_lazy_select(",
+            &[
+                "hand_back_worker_session(",
+                ".discard_physical(\"oracle thin lazy fetch",
+            ][..],
+        ),
+        (
+            "fn start_mysql_lazy_select(",
+            &[
+                "Self::retain_mysql_pooled_session_if_current_with_state_and_scope(",
+                "Self::discard_mysql_pooled_connection(",
+            ][..],
+        ),
+    ] {
+        let start = execution
+            .find(worker)
+            .unwrap_or_else(|| panic!("{worker} should exist"));
+        let end = execution[start + worker.len()..]
+            .find("\n    fn ")
+            .map_or(execution.len(), |offset| start + worker.len() + offset);
+        let body = &execution[start..end];
+        for release in releases {
+            for (offset, _) in body.match_indices(release) {
+                let before = &body[..offset];
+                let door = before
+                    .rfind("Self::release_lazy_fetch_session(&lazy_force_target")
+                    .unwrap_or(0);
+                let opened = before[door..].matches('{').count();
+                let closed = before[door..].matches('}').count();
+                assert!(
+                    door > 0 && opened > closed,
+                    "a lazy fetch's session may only be released INSIDE the door that gives \
+                     up the force tier's reach first: {worker} / {release}"
+                );
+            }
+        }
+    }
+    assert!(
+        !execution.contains("*lazy_cancel_context"),
+        "the MySQL family's hand-rolled cancel-context slot must be gone: the withdraw is \
+         the door's business now, not each cleanup's"
+    );
+}
+
+#[test]
+fn a_script_disconnect_is_tab_local_on_every_backend() {
+    // `DISCONNECT` ends the TAB's session. Both Oracle drivers did that; the
+    // MySQL family disconnected the SHARED connection instead, so one tab's
+    // script ended every other tab's sessions on it — bumping the connection
+    // generation and pool epoch with none of the things File > Disconnect does:
+    // no check for work on the other tabs, no per-tab commit/rollback prompt
+    // (so their uncommitted work went with it, in silence), no runtime state
+    // change, so the app went on describing a connection that was gone.
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let batch = execution
+        .find("fn execute_mysql_batch(")
+        .expect("the MySQL-family batch should exist");
+    let disconnect = execution[batch..]
+        .find("ToolCommand::Disconnect => {")
+        .map(|at| batch + at)
+        .expect("the MySQL-family script DISCONNECT should exist");
+    // Bounded by the next tool-command arm rather than by a byte count.
+    let arm_end = execution[disconnect..]
+        .find("ToolCommand::RunScript {")
+        .map_or(execution.len(), |offset| disconnect + offset);
+    let arm = &execution[disconnect..arm_end];
+    assert!(
+        !arm.contains("conn_guard.disconnect()"),
+        "a script DISCONNECT must not tear down the connection every other tab is on: {arm}"
+    );
+    assert!(
+        arm.contains("hand_back.clear(pooled_db_session, db_activity);")
+            && arm.contains(".detach_if_revision(binding_revision)")
+            && arm.contains("batch_connected.set(false);"),
+        "a script DISCONNECT gives the tab's session back, unbinds the tab, and leaves the \
+         batch with nothing to run on — the same three steps as both Oracle drivers: {arm}"
+    );
+
+    // ...and the statements after it say so instead of reaching for the
+    // connection this tab has left — asked ONCE, where every statement of the
+    // batch passes. The family runs statements down three paths and the
+    // dispatch picks one from the leading keyword, so a question asked in only
+    // one of them is a question a statement can walk around.
+    let precheck = execution
+        .find("let begin_mysql_batch_statement =")
+        .expect("the MySQL-family batch must have one per-statement precheck");
+    let precheck_body = slice_from(&execution, precheck, 1400);
+    assert!(
+        precheck_body.contains("if !batch_connected.get() {")
+            && precheck_body.contains("crate::db::NOT_CONNECTED_MESSAGE"),
+        "the precheck must refuse statements once its tab is unbound, in the words every \
+         other backend uses: {precheck_body}"
+    );
+    assert_eq!(
+        execution.matches("batch_connected.get()").count(),
+        3,
+        "exactly three readers: the precheck every statement passes, the lazy-SELECT branch \
+         that would otherwise acquire a session before reaching it, and DISCONNECT's own \
+         report of whether there was a connection to end"
+    );
+    assert_eq!(
+        execution
+            .matches("begin_mysql_batch_statement(sql, batch_effects)?")
+            .count(),
+        2,
+        "both statement-running closures must ask the precheck"
+    );
+}
+
+#[test]
+fn a_worker_ends_a_connection_only_through_the_door_that_reports_it() {
+    // `DatabaseConnection::disconnect` is the raw state reset: it replaces the
+    // connection's identity, bumps its generation and retires its pool, and
+    // tells nobody. The MySQL family's main-connection action reached for it
+    // when a session-variable restore failed, so one tab's explain plan ended
+    // every other tab's sessions on that connection while the runtime still
+    // said `Connected` and the user was told only that a timeout could not be
+    // reset.
+    let connection = read_source("src/db/connection.rs");
+    let door = connection
+        .find("pub fn disconnect_untrusted_main_session(")
+        .expect("the worker's connection-teardown door should exist");
+    let door_body = slice_from(&connection, door, 400);
+    assert!(
+        door_body.contains("MainSessionTeardown {"),
+        "the door must ANSWER what it cost, so the caller cannot drop it: {door_body}"
+    );
+    assert!(
+        connection.contains("#[must_use]\npub struct MainSessionTeardown {"),
+        "and that answer must be `#[must_use]`"
+    );
+
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let action = execution
+        .find("pub(super) fn run_mysql_action_with_timeout<T, F>(")
+        .expect("the MySQL family's main-connection action should exist");
+    let action_body = compact_for_pattern(slice_from(&execution, action, 5200));
+    assert!(
+        !action_body.contains("conn_guard.disconnect();"),
+        "the main-connection action must not reach the raw state reset: {action_body}"
+    );
+    assert_eq!(
+        action_body
+            .matches("disconnect_untrusted_main_session(Self::MAIN_SESSION_TIMEOUT_SETTINGS_UNKNOWN,)")
+            .count()
+            + action_body
+                .matches("disconnect_untrusted_main_session(Self::MAIN_SESSION_TIMEOUT_SETTINGS_UNKNOWN)")
+                .count(),
+        3,
+        "all three of its untrusted-session paths must go through the door: {action_body}"
+    );
+    assert!(
+        execution.contains("fn with_main_session_teardown("),
+        "and the connection-wide half of what happened must be folded into the report in \
+         one place, so no caller can report only the local half"
+    );
+}
+
+#[test]
+fn every_session_ending_action_asks_the_one_preflight() {
+    // Four actions end sessions — a pool rebuild, a disconnect, a Disconnect
+    // All, a reconnect — and they used to ask three different questions about
+    // the work standing in their way. Only the pool rebuild asked the activity
+    // registry; the other three asked a tabs-only question, so background work
+    // holding a session on the connection walked through their gate and was
+    // then force-cancelled by the stale sweep. Two of them had no busy probe at
+    // all and went straight to a WAITING lock on the UI thread.
+    let content = read_source("src/ui/main_window.rs");
+    let preflight = content
+        .find("fn prepare_session_teardown(")
+        .expect("the disconnect family's shared preflight should exist");
+    let body = slice_from(&content, preflight, 1600);
+    let refuse = body
+        .find("s.tab_work_blocking_session_teardown(")
+        .expect("the preflight must refuse a query tab's own work");
+    let cancel = body
+        .find(".cancel_background_db_work(force_timeout)")
+        .expect("the preflight must end the background work deliberately");
+    let probe = body
+        .find("try_lock_connection_with_activity(connection")
+        .expect("the preflight must probe the connection before anything waits on it");
+    assert!(
+        refuse < cancel && cancel < probe,
+        "refuse the tab's work, then end the background work while its sessions are still \
+         reachable, then probe: {body}"
+    );
+
+    // All three of the disconnect family ask it, and BEFORE the prompts — a
+    // prompt performs a real COMMIT/ROLLBACK, so refusing after one leaves the
+    // user's transaction committed for an action that never happened.
+    for (action, prompt) in [
+        (
+            "\"File/Disconnect\" | \"File/Disconnect Active Connection\" => {",
+            "Self::resolve_pooled_sessions_before_runtime_disconnect(state, connection_id)",
+        ),
+        (
+            "\"File/Disconnect All\" => {",
+            "let plan = Self::resolve_pooled_sessions_for_tabs(",
+        ),
+        (
+            "\"File/Reconnect Active Connection\" => {",
+            "Self::resolve_pooled_sessions_before_runtime_disconnect(state, runtime.id())",
+        ),
+    ] {
+        let start = content
+            .find(action)
+            .unwrap_or_else(|| panic!("{action} should exist"));
+        let window = &content[start..];
+        let asked = window
+            .find("Self::prepare_session_teardown(")
+            .unwrap_or_else(|| panic!("{action} must ask the shared preflight"));
+        let prompted = window
+            .find(prompt)
+            .unwrap_or_else(|| panic!("{action} should still prompt for retained sessions"));
+        assert!(
+            asked < prompted,
+            "{action} must clear the way BEFORE it prompts to commit/rollback"
+        );
+    }
 }
