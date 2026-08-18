@@ -501,13 +501,25 @@ fn oracle_reused_tab_session_applies_tab_scope_before_execution() {
         !helper.contains("retained_session.oracle_connection()"),
         "Reusable Oracle execution must not clone the Arc while leaving TakenDbSessionLease to drop and close the physical session"
     );
+    // The RECEIVER spelling is incidental -- the fresh path holds its session in
+    // a `HeldSession` so the acquire window cannot drop it back into the pool
+    // with its cancel reach still published -- but the SCOPE is not: both the
+    // reusable and the fresh path must put the owning tab's explicit scope on
+    // the session before a statement runs on it.
     assert!(
         helper.contains("execution_scope: Option<&str>")
             && helper
-                .matches("apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope)")
+                .matches("apply_oracle_current_schema_for_scope(")
                 .count()
                 >= 2
-            && helper.contains("execution_scope"),
+            && helper
+                .matches("apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope)")
+                .count()
+                >= 1
+            && helper
+                .matches("apply_oracle_current_schema_for_scope(held.as_ref(), execution_scope)")
+                .count()
+                >= 1,
         "Reusable and fresh Oracle execution sessions must apply the owning tab's explicit scope before execution"
     );
     assert!(
@@ -6435,7 +6447,7 @@ fn every_backend_hands_a_batch_session_back_through_the_door_that_names_its_oper
         let start = execution
             .find(starter)
             .unwrap_or_else(|| panic!("{starter} should exist"));
-        let body = slice_from(&execution, start, 4000);
+        let body = slice_from(&execution, start, 5000);
         let wrap = body
             .find("WorkerSessionOwner::for_lazy_fetch(")
             .unwrap_or_else(|| panic!("{starter} must own its session before spawning"));
@@ -7840,12 +7852,27 @@ fn a_lazy_fetch_gives_up_its_force_target_before_it_gives_back_its_session() {
     let door = execution
         .find("fn release_lazy_fetch_session<T>(")
         .expect("the one lazy-fetch session release door should exist");
-    let door_body = slice_from(&execution, door, 300);
+    let door_body = slice_from(&execution, door, 400);
     assert!(
-        door_body.contains("force_target.withdraw();")
-            && door_body.find("force_target.withdraw();").unwrap()
+        door_body.contains("cancel_reach: &crate::db::SessionCancelReach,"),
+        "the door must take the WHOLE reach, not just the tab's own force target: a lazy fetch \
+         publishes two things over its session -- the withdrawable target its watchdog reads AND \
+         the DB layer's registration parked in the operation's sender -- and the discard roads \
+         ended only the first, leaving a canceler in the registry still speaking for a session \
+         that had been closed: {door_body}"
+    );
+    assert!(
+        door_body.contains("cancel_reach.end_before_release();")
+            && door_body
+                .find("cancel_reach.end_before_release();")
+                .unwrap()
                 < door_body.find("give_the_session_back()").unwrap(),
         "the door must end the reach BEFORE the session goes back: {door_body}"
+    );
+    assert!(
+        !execution.contains("release_lazy_fetch_session(&lazy_force_target"),
+        "no release may pass the half-reach any more; every one names the value that covers \
+         both halves"
     );
 
     // Every backend's lazy fetch publishes a WITHDRAWABLE target, so the reach
@@ -7895,7 +7922,7 @@ fn a_lazy_fetch_gives_up_its_force_target_before_it_gives_back_its_session() {
             for (offset, _) in body.match_indices(release) {
                 let before = &body[..offset];
                 let door = before
-                    .rfind("Self::release_lazy_fetch_session(&lazy_force_target")
+                    .rfind("Self::release_lazy_fetch_session(&lazy_cancel_reach")
                     .unwrap_or(0);
                 let opened = before[door..].matches('{').count();
                 let closed = before[door..].matches('}').count();
@@ -8212,6 +8239,256 @@ fn every_session_ending_action_asks_the_one_preflight() {
         assert!(
             asked < prompted,
             "{action} must clear the way BEFORE it prompts to commit/rollback"
+        );
+    }
+}
+
+/// A pooled session and the cancel reach published over it are ONE value.
+///
+/// The acquire choke point used to hand back a `(DbPoolSession,
+/// DbSessionCancelRegistration)` tuple, and a tuple can be split in either
+/// direction. The registration could go FIRST — the connection metadata
+/// refresh, the app's longest-running background read, dropped it inside a
+/// `.map(|(session, _registration)| session)` before the session was used at
+/// all, so on all four backends that work was neither offerable by the cancel
+/// button (its row reported `cancelable: false`) nor breakable by a
+/// disconnect, which retired the row and left the query running. And the
+/// session could go first — an error path dropping a `mysql::PooledConn` or an
+/// `Arc<Connection>` returns it to the pool ALIVE while the registration, by
+/// then parked in the operation's sender, still names it.
+#[test]
+fn a_pooled_session_is_never_held_apart_from_its_cancel_reach() {
+    let connection = read_source("src/db/connection.rs");
+
+    // The acquire choke point answers with the pair, never with a tuple.
+    for acquire in [
+        "pub fn acquire_session(",
+        "pub fn acquire_session_for_current_scope(",
+        "pub fn acquire_session_for_scope(",
+        "fn acquire_session_with_scope_context(",
+    ] {
+        let start = connection
+            .find(acquire)
+            .unwrap_or_else(|| panic!("{acquire} should exist"));
+        let signature = slice_from(&connection, start, 420);
+        let arrow = signature
+            .find("->")
+            .unwrap_or_else(|| panic!("{acquire} should have a return type"));
+        let returns = slice_from(signature, arrow, 80);
+        assert!(
+            returns.contains("AcquiredPoolSession"),
+            "{acquire} must answer with the pair, not with a tuple a caller can split: {returns}"
+        );
+    }
+    assert!(
+        !connection.contains("(DbPoolSession, DbSessionCancelRegistration)"),
+        "no signature may name the two halves separately again"
+    );
+
+    // The reach is not something a caller can quietly drop: the only ways out
+    // of the pair name where the reach goes.
+    assert!(
+        connection.contains("pub fn take_for(")
+            && connection.contains("holder: &dyn HoldsSessionCancelRegistration")
+            && connection.contains("pub fn take_ending_reach(")
+            && connection.contains("pub fn discard_with("),
+        "every way of giving the session up must state what happens to the reach"
+    );
+
+    // And the ORDER is the value's business. `HeldSession` says it as a field
+    // order, which is what lets it be taken apart without an unreachable panic
+    // in the middle of the DB core; `AcquiredPoolSession` says it in its drop.
+    let held = connection
+        .find("pub struct HeldSession<H> {")
+        .expect("the driver-handle half of the pair should exist");
+    let held_fields = slice_from(&connection, held, 200);
+    let reach_field = held_fields
+        .find("reach: SessionReachGuard,")
+        .expect("HeldSession must own the reach");
+    let handle_field = held_fields
+        .find("handle: H,")
+        .expect("HeldSession must own the handle");
+    assert!(
+        reach_field < handle_field,
+        "struct fields drop in declaration order, so the reach must be declared FIRST: \
+         {held_fields}"
+    );
+    assert!(
+        !connection.contains("impl<H> Drop for HeldSession<H>"),
+        "and it must NOT own a drop: a value with one cannot be taken apart, and taking this \
+         one apart is how a session is handed on without a panic on an unreachable state"
+    );
+}
+
+/// Both of the query tab's cancel tiers read the operation slot AGAIN at the
+/// moment they act on it.
+///
+/// The tab road used to clone the handle out of the slot and then make a
+/// network call on the clone. A hand-back landing in between sets the slot to
+/// `Withdrawn` before the session moves — but a raw `Arc<Connection>`, thin
+/// handle or MySQL context has nowhere to look, so neither tier could see it.
+/// The lazy-fetch road has always read through a withdrawable target; this
+/// makes the operation road do it with the same implementation rather than a
+/// second one.
+#[test]
+fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+
+    assert!(
+        editor.contains("OperationSlot(Arc<Mutex<OperationCancelTarget>>)"),
+        "the tiers need a handle that can look at the slot again"
+    );
+    for tier in [
+        "fn cancel_interrupt(&self) -> Result<(), String> {",
+        "fn destroy_session(self) -> Result<(), String> {",
+    ] {
+        let start = editor
+            .find(tier)
+            .unwrap_or_else(|| panic!("{tier} should exist"));
+        let body = slice_from(&editor, start, 2000);
+        assert!(
+            body.contains("QueryCancelHandle::OperationSlot(slot)"),
+            "{tier} must have an answer for the operation slot"
+        );
+        assert!(
+            body.contains("WITHDRAWN_CANCEL_TARGET_MESSAGE"),
+            "{tier} must say so when the slot has been withdrawn instead of acting: {body}"
+        );
+    }
+
+    // The watchdog holds the SLOT, not the handle inside it.
+    let watchdog = editor
+        .find("fn start_query_cancel_watchdog(")
+        .expect("the tab's force tier should exist");
+    let watchdog_body = slice_from(&editor, watchdog, 6000);
+    assert!(
+        watchdog_body.contains("let handle = QueryCancelHandle::OperationSlot(Arc::clone("),
+        "the force tier must hold the slot while it acts: {watchdog_body}"
+    );
+    assert!(
+        !watchdog_body.contains("target.published().cloned()"),
+        "and it must not clone the inner handle out first, which is what left it unable to \
+         see a withdraw: {watchdog_body}"
+    );
+    assert!(
+        watchdog_body.contains("if message == WITHDRAWN_CANCEL_TARGET_MESSAGE {"),
+        "a withdraw that lands mid-tear-down is not a force that FAILED, and must not invite \
+         the user to retry one: {watchdog_body}"
+    );
+
+    // The graceful tier reads through the slot as well, and answers a withdraw
+    // the way it answers a session that has not arrived: keep waiting.
+    let graceful = editor
+        .find("let cancel_handle =\n                    QueryCancelHandle::OperationSlot(Arc::clone(&current_query_cancel_handle));")
+        .expect("the graceful tier must read through the slot too");
+    let graceful_body = slice_from(&editor, graceful, 2400);
+    assert!(
+        graceful_body.contains("Err(message) if message == WITHDRAWN_CANCEL_TARGET_MESSAGE =>")
+            && graceful_body.contains("QueryCancelOutcome::PendingInitialization"),
+        "a withdraw during the break keeps the cancel requested: {graceful_body}"
+    );
+}
+
+/// Every road a pooled session leaves a frame by ends the reach FIRST — the
+/// two hand-back doors, and the roads that reach no door at all.
+///
+/// `hand_back_worker_session` and `clear_worker_session` withdraw for
+/// themselves, so the roads that go back to a SLOT were covered. The third way
+/// a session leaves a worker is that it is CLOSED, or simply dropped back into
+/// the pool by an early return, and that road had no door: on OCI the acquire
+/// loop dropped a session whose connection incarnation had ENDED straight back
+/// into the pool, and on the MySQL family a `?` in session preparation returned
+/// a live session to the pool with its registration still parked in the
+/// operation's sender — where a cancel or a disconnect on THIS tab then issued
+/// `KILL QUERY`/`KILL CONNECTION` against whichever tab picked it up.
+#[test]
+fn every_road_a_pooled_session_leaves_a_frame_ends_the_reach_first() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    // Oracle OCI: the acquire window holds the session in the pair for its
+    // whole life, and the roads that must CLOSE it say so.
+    let oracle = execution
+        .find("fn acquire_oracle_pool_session_for_execution(")
+        .or_else(|| execution.find("let mut held = match pool_session_result {"))
+        .expect("the Oracle acquire window should exist");
+    let oracle_body = slice_from(&execution, oracle, 6000);
+    assert!(
+        oracle_body.contains("let mut held = match pool_session_result {")
+            && oracle_body.contains("let conn = held.take_for(sender);"),
+        "the Oracle acquire window must hold the pair until the batch takes it: {oracle_body}"
+    );
+    assert!(
+        !oracle_body.contains("drop(session);") && !oracle_body.contains("drop(conn);"),
+        "and no road out of it may drop the session while the reach is still published: \
+         {oracle_body}"
+    );
+    assert_eq!(
+        oracle_body
+            .matches("Self::discard_oracle_pool_session(held, \"oracle pool session\");")
+            .count(),
+        3,
+        "a retired connection incarnation and a session the driver called stale are both \
+         CLOSED, never returned to the pool for the next tab"
+    );
+
+    // MySQL family: preparation takes and returns the pair, so a `?` inside it
+    // ends the reach before the session goes back to the pool.
+    let prepare = execution
+        .find("fn prepare_mysql_pooled_session_or_retry_once(")
+        .expect("the MySQL-family session preparation should exist");
+    let prepare_body = slice_from(&execution, prepare, 2600);
+    assert!(
+        prepare_body.contains("mut held: crate::db::HeldSession<mysql::PooledConn>,")
+            && prepare_body.contains(
+                "Result<(crate::db::HeldSession<mysql::PooledConn>, Option<String>), String>"
+            ),
+        "MySQL-family preparation must carry the pair, not a bare connection: {prepare_body}"
+    );
+    assert!(
+        prepare_body.contains("Self::discard_mysql_pool_session(held);"),
+        "and close it through the door that ends the reach first: {prepare_body}"
+    );
+
+    // The MySQL family's fresh acquire parks the reach in the holder the caller
+    // NAMED, which for a toolbar commit/rollback is not the progress sender —
+    // there isn't one, and the registration used to be dropped where it stood.
+    let take = execution
+        .find("fn take_mysql_pool_session_for(")
+        .expect("the MySQL-family hand-over should exist");
+    let take_body = slice_from(&execution, take, 400);
+    assert!(
+        take_body.contains("registration_holder: &dyn crate::db::HoldsSessionCancelRegistration")
+            && take_body.contains("held.take_for(registration_holder)"),
+        "the fresh MySQL-family acquire must park its reach in the named holder: {take_body}"
+    );
+
+    // And the cleanup decision that CLOSES an Oracle session states the same
+    // order, because it is the one arm of that applier which reaches no door.
+    let applier = execution
+        .find("fn discard_physical_session(&mut self) {")
+        .expect("the Oracle cleanup discard should exist");
+    let applier_body = slice_from(&execution, applier, 900);
+    let reach = applier_body
+        .find("self.hand_back.end_reach_before_release();")
+        .expect("the discard arm must end the reach");
+    let discard = applier_body
+        .find("discard_oracle_if_current_connection(")
+        .expect("the discard arm must close the session");
+    assert!(
+        reach < discard,
+        "reach first, session second, on the arm that reaches no door: {applier_body}"
+    );
+
+    // Every MySQL-family close that runs inside a statement's own frame does
+    // the same. `hand_back` is the value that knows what this execution
+    // published, so a close beside one must say so.
+    for (offset, _) in execution.match_indices("Self::discard_mysql_pooled_connection(conn);") {
+        let before = &execution[offset.saturating_sub(600)..offset];
+        assert!(
+            before.contains("hand_back.end_reach_before_release();")
+                || before.contains("Self::release_lazy_fetch_session(&lazy_cancel_reach,"),
+            "a MySQL-family session closed inside a statement's frame must end what that \
+             execution published over it first: ...{before}"
         );
     }
 }

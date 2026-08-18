@@ -4975,9 +4975,14 @@ fn check_recycled_session_isolation(
             format!("{scenario} seeding a pooled session"),
             Some(DatabaseType::Oracle),
         );
-        let (session, _registration) = context
+        let mut acquired = context
             .acquire_session_for_current_scope(&activity)
             .map_err(|e| format!("{scenario} acquire: {e}"))?;
+        let Some(session) = acquired.session_mut() else {
+            return Err(format!(
+                "{scenario} acquire: the session was already given up"
+            ));
+        };
         match session {
             space_query::db::DbPoolSession::Oracle(conn) => {
                 conn.execute("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE", &[])
@@ -4987,12 +4992,12 @@ fn check_recycled_session_isolation(
                     .map_err(|e| format!("{scenario} read sid (oci): {e}"))?;
                 seeded_sid = row.trim().to_string();
             }
-            space_query::db::DbPoolSession::OracleThin(mut conn) => {
+            space_query::db::DbPoolSession::OracleThin(conn) => {
                 conn.query_drop("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE")
                     .map_err(|e| format!("{scenario} alter session (thin): {e}"))?;
                 seeded_sid =
                     space_query::db::DatabaseConnection::oracle_thin_select_one_text_for_test(
-                        &mut conn, sid_sql,
+                        conn, sid_sql,
                     )
                     .map_err(|e| format!("{scenario} read sid (thin): {e}"))?
                     .unwrap_or_default();

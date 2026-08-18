@@ -563,11 +563,23 @@ impl SchemaMetadataLoader for OracleSchemaMetadataLoader {
         activity: &crate::db::DbActivityGuard,
     ) -> Option<IntellisenseData> {
         context.ensure_current().ok()?;
-        let (current_schema, mut owners, schema_objects, relation_members) = match context
-            .acquire_session_for_current_scope(activity)
-            .map(|(session, _cancel_registration)| session)
+        // The session and the cancel reach published over it travel as ONE
+        // value from here: this used to be a `(session, registration)` tuple
+        // whose registration was dropped inside a `.map()` before the session
+        // was used at all, so the longest-running background read in the app
+        // was neither offerable by the cancel button nor breakable by a
+        // disconnect. See `AcquiredPoolSession`.
+        let acquired = match context.acquire_session_for_current_scope(activity) {
+            Ok(acquired) => acquired,
+            Err(err) => {
+                eprintln!("Warning: failed to acquire Oracle metadata session: {err}");
+                return None;
+            }
+        };
+        let (current_schema, mut owners, schema_objects, relation_members) = match acquired
+            .into_oracle()
         {
-            Ok(crate::db::DbPoolSession::Oracle(conn)) => {
+            Ok(conn) => {
                 let current_schema = context
                     .oracle_current_schema
                     .clone()
@@ -612,79 +624,77 @@ impl SchemaMetadataLoader for OracleSchemaMetadataLoader {
                 };
                 (current_schema, owners, schema_objects, relation_members)
             }
-            Ok(crate::db::DbPoolSession::OracleThin(mut conn)) => {
-                let current_schema = context
-                    .oracle_current_schema
-                    .clone()
-                    .or_else(|| {
-                        ObjectBrowser::get_thin_current_schema(&mut conn)
-                            .ok()
-                            .map(|schema| schema.trim().to_string())
-                            .filter(|schema| !schema.is_empty())
-                    })
-                    .or_else(|| {
-                        let username = context.connection_info.username.trim();
-                        (!username.is_empty()).then(|| username.to_ascii_uppercase())
-                    });
-                let owners = match ObjectBrowser::get_thin_users(&mut conn) {
-                    Ok(owners) => owners,
-                    Err(err) => {
-                        eprintln!("Warning: failed to load Oracle Thin owner list: {err}");
-                        Vec::new()
-                    }
-                };
-                context.ensure_current().ok()?;
-                let selected_owner = requested_scope
-                    .clone()
-                    .filter(|scope| !scope.trim().is_empty())
-                    .or_else(|| current_schema.clone())
-                    .or_else(|| owners.first().cloned());
-                let (schema_objects, relation_members) = if let Some(ref selected_owner) =
-                    selected_owner
-                {
-                    let schema_objects = match ObjectBrowser::get_thin_schema_objects_for_owner(
-                        &mut conn,
-                        selected_owner,
-                    ) {
-                        Ok(objects) => objects,
+            Err(acquired) => match acquired.into_oracle_thin() {
+                Ok(mut conn) => {
+                    let current_schema = context
+                        .oracle_current_schema
+                        .clone()
+                        .or_else(|| {
+                            ObjectBrowser::get_thin_current_schema(&mut conn)
+                                .ok()
+                                .map(|schema| schema.trim().to_string())
+                                .filter(|schema| !schema.is_empty())
+                        })
+                        .or_else(|| {
+                            let username = context.connection_info.username.trim();
+                            (!username.is_empty()).then(|| username.to_ascii_uppercase())
+                        });
+                    let owners = match ObjectBrowser::get_thin_users(&mut conn) {
+                        Ok(owners) => owners,
                         Err(err) => {
-                            eprintln!(
-                                    "Warning: failed to load Oracle Thin schema objects, keeping previous metadata: {err}"
-                                );
-                            return None;
+                            eprintln!("Warning: failed to load Oracle Thin owner list: {err}");
+                            Vec::new()
                         }
                     };
                     context.ensure_current().ok()?;
-                    let relation_members =
-                        match ObjectBrowser::get_thin_schema_relation_members_for_owner(
+                    let selected_owner = requested_scope
+                        .clone()
+                        .filter(|scope| !scope.trim().is_empty())
+                        .or_else(|| current_schema.clone())
+                        .or_else(|| owners.first().cloned());
+                    let (schema_objects, relation_members) = if let Some(ref selected_owner) =
+                        selected_owner
+                    {
+                        let schema_objects = match ObjectBrowser::get_thin_schema_objects_for_owner(
                             &mut conn,
                             selected_owner,
                         ) {
-                            Ok(members) => members,
+                            Ok(objects) => objects,
                             Err(err) => {
                                 eprintln!(
-                                        "Warning: failed to load Oracle Thin relation members, keeping previous metadata: {err}"
-                                    );
+                                    "Warning: failed to load Oracle Thin schema objects, keeping previous metadata: {err}"
+                                );
                                 return None;
                             }
                         };
-                    (schema_objects, relation_members)
-                } else {
-                    (HashMap::new(), HashMap::new())
-                };
-                (current_schema, owners, schema_objects, relation_members)
-            }
-            Ok(other) => {
-                eprintln!(
-                    "Warning: expected Oracle metadata session but acquired {}",
-                    other.db_type()
-                );
-                return None;
-            }
-            Err(err) => {
-                eprintln!("Warning: failed to acquire Oracle metadata session: {err}");
-                return None;
-            }
+                        context.ensure_current().ok()?;
+                        let relation_members =
+                            match ObjectBrowser::get_thin_schema_relation_members_for_owner(
+                                &mut conn,
+                                selected_owner,
+                            ) {
+                                Ok(members) => members,
+                                Err(err) => {
+                                    eprintln!(
+                                        "Warning: failed to load Oracle Thin relation members, keeping previous metadata: {err}"
+                                    );
+                                    return None;
+                                }
+                            };
+                        (schema_objects, relation_members)
+                    } else {
+                        (HashMap::new(), HashMap::new())
+                    };
+                    (current_schema, owners, schema_objects, relation_members)
+                }
+                Err(other) => {
+                    eprintln!(
+                        "Warning: expected Oracle metadata session but acquired {}",
+                        other.describe_session()
+                    );
+                    return None;
+                }
+            },
         };
         if let Some(ref current_schema) = current_schema {
             if !owners.iter().any(|owner| owner == current_schema) {
@@ -726,24 +736,22 @@ impl SchemaMetadataLoader for MysqlSchemaMetadataLoader {
         let expected_db_type = context.connection_info.db_type;
         let display_name = expected_db_type.display_name();
         context.ensure_current().ok()?;
-        let mut mysql_conn = match context
-            .acquire_session_for_current_scope(activity)
-            .map(|(session, _cancel_registration)| session)
-        {
-            Ok(crate::db::DbPoolSession::MySQL { conn, db_type })
-                if db_type.is_same_type_as(expected_db_type) =>
-            {
-                conn
-            }
-            Ok(other) => {
-                eprintln!(
-                    "Warning: expected {display_name} metadata session but acquired {}",
-                    other.db_type()
-                );
-                return None;
-            }
+        // One value, session and cancel reach together -- see the Oracle
+        // loader above and `AcquiredPoolSession`.
+        let acquired = match context.acquire_session_for_current_scope(activity) {
+            Ok(acquired) => acquired,
             Err(err) => {
                 eprintln!("Warning: failed to acquire {display_name} metadata session: {err}");
+                return None;
+            }
+        };
+        let mut mysql_conn = match acquired.into_mysql(expected_db_type) {
+            Ok(conn) => conn,
+            Err(other) => {
+                eprintln!(
+                    "Warning: expected {display_name} metadata session but acquired {}",
+                    other.describe_session()
+                );
                 return None;
             }
         };
@@ -10406,6 +10414,30 @@ impl MainWindow {
             db_type,
             requested_scope,
         })
+    }
+
+    /// Drive the app's real schema-metadata load, for the live cancel harness.
+    ///
+    /// `#[doc(hidden)]`, and it exists because the defect it covers cannot be
+    /// reached from outside: the loader acquires a POOLED session and the
+    /// guarantee is that the cancel button can reach it for as long as it holds
+    /// one. That guarantee was silently absent — the loader dropped the
+    /// session's cancel registration inside a `.map()` before the session was
+    /// used at all — and nothing about the load's RESULT changes when it is, so
+    /// only a probe watching the registry while the load runs can tell.
+    ///
+    /// Answers whether the load produced metadata, which is what a caller
+    /// asserting "and it still works" needs.
+    #[doc(hidden)]
+    pub fn load_schema_metadata_for_probe(
+        context: crate::db::DbPoolSessionContext,
+        requested_scope: Option<String>,
+    ) -> bool {
+        let Some(connection_id) = context.connection_id else {
+            return false;
+        };
+        Self::load_schema_update_from_pool_context(context, requested_scope, 0, connection_id, 0, 0)
+            .is_some()
     }
 
     fn start_connection_metadata_refresh(

@@ -112,9 +112,15 @@ fn non_empty(args: Vec<ProcedureArgument>) -> Option<Vec<ProcedureArgument>> {
 }
 
 trait SignatureBackend: Sync {
+    /// `usability` is the session OWNER's flag: a backend that leaves the
+    /// session in an unknown state sets it, and the owner closes the session
+    /// instead of returning it to the pool. It is passed alongside the borrow
+    /// rather than taken from the session, because a borrower cannot hold both
+    /// at once -- see `PoolSessionUsability`.
     fn resolve(
         &self,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
+        usability: &crate::db::PoolSessionUsability,
         name: &str,
         qualifier: Option<&str>,
     ) -> Result<Option<Vec<ProcedureArgument>>, String>;
@@ -250,14 +256,22 @@ impl SqlEditorWidget {
         }
     }
 
+    /// `usability` is how this borrower says the session must be CLOSED rather
+    /// than returned to the pool: applying the signature timeout and failing to
+    /// restore it leaves the session carrying settings nobody has accounted
+    /// for. It used to take the session by value to do that, which is what made
+    /// the whole signature backend own a session it only reads -- and an owned
+    /// session is one whose cancel registration a caller has to remember to
+    /// carry alongside it. See `PoolSessionUsability`.
     fn resolve_mysql_signature_with_timeout(
-        mut conn: mysql::PooledConn,
+        conn: &mut mysql::PooledConn,
+        usability: &crate::db::PoolSessionUsability,
         db_type: crate::db::DatabaseType,
         name: &str,
         qualifier: Option<&str>,
     ) -> Result<Option<Vec<ProcedureArgument>>, String> {
         let timeout_restore = match crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout_with_restore_for_db(
-            &mut conn,
+            conn,
             Some(SIGNATURE_METADATA_TIMEOUT),
             db_type,
         ) {
@@ -270,18 +284,18 @@ impl SqlEditorWidget {
                     Some(SIGNATURE_METADATA_TIMEOUT),
                 );
                 if restore_failed {
-                    crate::db::discard_mysql_pooled_connection(conn);
+                    usability.mark_unusable();
                 }
                 return Err(message);
             }
         };
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            resolve_mysql_signature_arguments(&mut conn, name, qualifier).map_err(|err| {
+            resolve_mysql_signature_arguments(conn, name, qualifier).map_err(|err| {
                 Self::mysql_error_message(&err, Some(SIGNATURE_METADATA_TIMEOUT))
             })
         }));
         let reset_result = timeout_restore.map_or(Ok(()), |restore| {
-            restore.restore_for_db(&mut conn, db_type).map_err(|err| {
+            restore.restore_for_db(conn, db_type).map_err(|err| {
                 format!("Failed to restore {} signature timeout: {err}", db_type.display_name())
             })
         });
@@ -289,21 +303,23 @@ impl SqlEditorWidget {
             Ok(Ok(args)) => match reset_result {
                 Ok(()) => Ok(args),
                 Err(message) => {
-                    crate::db::discard_mysql_pooled_connection(conn);
+                    usability.mark_unusable();
                     Err(message)
                 }
             },
             Ok(Err(message)) => match reset_result {
                 Ok(()) => Err(message),
                 Err(reset_message) => {
-                    crate::db::discard_mysql_pooled_connection(conn);
+                    usability.mark_unusable();
                     Err(format!("{message}; {reset_message}"))
                 }
             },
             Err(payload) => {
                 if let Err(message) = reset_result {
                     crate::utils::logging::log_error("signature hint", &message);
-                    crate::db::discard_mysql_pooled_connection(conn);
+                    // Read by the session owner's own drop, so this still
+                    // closes the session while the panic unwinds past here.
+                    usability.mark_unusable();
                 }
                 panic::resume_unwind(payload);
             }
@@ -314,17 +330,18 @@ impl SqlEditorWidget {
 impl SignatureBackend for OracleSignatureBackend {
     fn resolve(
         &self,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
+        _usability: &crate::db::PoolSessionUsability,
         name: &str,
         qualifier: Option<&str>,
     ) -> Result<Option<Vec<ProcedureArgument>>, String> {
         match session {
             crate::db::DbPoolSession::Oracle(conn) => {
-                SqlEditorWidget::resolve_oracle_signature_with_timeout(&conn, name, qualifier)
+                SqlEditorWidget::resolve_oracle_signature_with_timeout(conn, name, qualifier)
             }
-            crate::db::DbPoolSession::OracleThin(mut conn) => {
+            crate::db::DbPoolSession::OracleThin(conn) => {
                 SqlEditorWidget::resolve_oracle_thin_signature_with_timeout(
-                    &mut conn, name, qualifier,
+                    conn, name, qualifier,
                 )
             }
             crate::db::DbPoolSession::MySQL { db_type, .. } => Err(format!(
@@ -338,14 +355,15 @@ impl SignatureBackend for OracleSignatureBackend {
 impl SignatureBackend for MysqlSignatureBackend {
     fn resolve(
         &self,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
+        usability: &crate::db::PoolSessionUsability,
         name: &str,
         qualifier: Option<&str>,
     ) -> Result<Option<Vec<ProcedureArgument>>, String> {
         match session {
             crate::db::DbPoolSession::MySQL { conn, db_type } => {
                 SqlEditorWidget::resolve_mysql_signature_with_timeout(
-                    conn, db_type, name, qualifier,
+                    conn, usability, *db_type, name, qualifier,
                 )
             }
             crate::db::DbPoolSession::Oracle(_) | crate::db::DbPoolSession::OracleThin(_) => {
@@ -363,7 +381,7 @@ impl SqlEditorWidget {
 
     fn resolve_signature_label(
         db_type: crate::db::DatabaseType,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::AcquiredPoolSession,
         name: &str,
         qualifier: Option<&str>,
         display_name: &str,
@@ -376,11 +394,18 @@ impl SqlEditorWidget {
     /// rather than a label to draw — the bind parameter prompt.
     pub(crate) fn resolve_routine_arguments(
         db_type: crate::db::DatabaseType,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::AcquiredPoolSession,
         name: &str,
         qualifier: Option<&str>,
     ) -> Result<Option<Vec<ProcedureArgument>>, String> {
-        signature_backend_for(db_type).resolve(session, name, qualifier)
+        // Cloned BEFORE the borrow, because the borrow is exclusive: this is
+        // the whole reason the flag is a shared value rather than a method on
+        // the session.
+        let usability = session.usability();
+        let Some(session) = session.session_mut() else {
+            return Err("The signature metadata session was already given up".to_string());
+        };
+        signature_backend_for(db_type).resolve(session, &usability, name, qualifier)
     }
 
     pub(crate) fn hide_signature_popup(&self) {
@@ -909,7 +934,9 @@ impl SqlEditorWidget {
                 ) {
                     return Err("Signature metadata connection changed before acquire".to_string());
                 }
-                let (session, _cancel_registration) =
+                // Session and cancel reach as one value -- see
+                // `AcquiredPoolSession`.
+                let mut acquired =
                     context.acquire_session_for_scope(tab_scope.as_deref(), &activity_guard)?;
                 if !crate::db::cached_pool_session_context_matches_shared_connection(
                     &connection,
@@ -919,7 +946,7 @@ impl SqlEditorWidget {
                 }
                 let label = Self::resolve_signature_label(
                     context.connection_info.db_type,
-                    session,
+                    &mut acquired,
                     &lookup_name,
                     qualifier.as_deref(),
                     &display_name,

@@ -1196,6 +1196,14 @@ impl DatabaseType {
         backend_for(self).metadata_refresh_activity(requested_scope)
     }
 
+    /// The label the schema metadata refresh publishes to the activity
+    /// registry, for the live harness that has to FIND that row while the load
+    /// is running. `#[doc(hidden)]`: the app itself never needs to predict it.
+    #[doc(hidden)]
+    pub fn metadata_refresh_activity_for_probe(self, requested_scope: Option<&str>) -> String {
+        self.metadata_refresh_activity(requested_scope)
+    }
+
     pub(crate) fn metadata_refresh_activity_with_base(
         self,
         base_activity: &str,
@@ -1721,9 +1729,29 @@ impl SessionCancelReach {
         }
     }
 
+    /// End every reach over a session that is being RELEASED outside a
+    /// hand-back door.
+    ///
+    /// The doors ([`SharedDbSessionLease::hand_back_worker_session`] and
+    /// [`SharedDbSessionLease::clear_worker_session`]) are the two ways a
+    /// session goes back to a SLOT, and they withdraw for themselves. The THIRD
+    /// way a session leaves a worker is that it is closed outright, and that
+    /// road had no door: the lazy fetch's discard branches ended only the tab's
+    /// own force target and left the DB layer's registration still saying the
+    /// session was this work's. A cancel dispatched in that window ran its
+    /// graceful break — and, while the operation's activity row was still
+    /// alive, its force — against a session that no longer existed, and gave
+    /// the driver's complaint back to the user as a cancel that failed.
+    ///
+    /// Public so a release can state it. It is idempotent, so a road that ends
+    /// up at a door after all withdraws twice and nothing changes.
+    pub fn end_before_release(&self) {
+        self.withdraw();
+    }
+
     /// Drive the withdraw directly. Only for tests that assert what one
     /// execution's reach covers; production always goes through a hand-back
-    /// door, which is the point of the value.
+    /// door or [`Self::end_before_release`], which is the point of the value.
     #[cfg(test)]
     pub(crate) fn withdraw_for_test(&self) {
         self.withdraw();
@@ -2012,7 +2040,7 @@ impl DbPoolSessionContext {
     pub fn acquire_session_for_current_scope(
         &self,
         activity: &DbActivityGuard,
-    ) -> Result<(DbPoolSession, DbSessionCancelRegistration), String> {
+    ) -> Result<AcquiredPoolSession, String> {
         self.acquire_session_with_scope_context(self, activity)
     }
 
@@ -2020,7 +2048,7 @@ impl DbPoolSessionContext {
         &self,
         scope: Option<&str>,
         activity: &DbActivityGuard,
-    ) -> Result<(DbPoolSession, DbSessionCancelRegistration), String> {
+    ) -> Result<AcquiredPoolSession, String> {
         let scoped = self.for_scope(scope);
         self.acquire_session_with_scope_context(&scoped, activity)
     }
@@ -2073,34 +2101,32 @@ impl DbPoolSessionContext {
         &self,
         scope_context: &DbPoolSessionContext,
         activity: &DbActivityGuard,
-    ) -> Result<(DbPoolSession, DbSessionCancelRegistration), String> {
+    ) -> Result<AcquiredPoolSession, String> {
         self.ensure_current()?;
         // Tie the activity to this connection before the session exists, so a
         // teardown that lands mid-acquire still retires this work.
         activity.bind_lifetime(self.activity_lifetime());
-        let (mut session, mut registration) =
-            self.pool.acquire_session(&self.connection_info, activity)?;
-        // Same order as every hand-back door: the reach ends BEFORE the session
-        // does. Nothing here can hand the session on, so a cancel that lands
-        // between the discard and this frame returning would be aimed at a
-        // session that is already gone.
-        let discard = |session, registration: &mut DbSessionCancelRegistration| {
-            registration.release_reach();
-            Self::discard_stale_session(session);
+        let mut acquired = self.pool.acquire_session(&self.connection_info, activity)?;
+        // Every failure below closes the session, and `AcquiredPoolSession::
+        // discard` is what keeps the order right: the reach ends BEFORE the
+        // session does, so a cancel that lands between the discard and this
+        // frame returning is never aimed at a session that has already gone.
+        if let Err(err) = self.ensure_current() {
+            acquired.discard();
+            return Err(err);
+        }
+        let Some(session) = acquired.session_mut() else {
+            return Err(STALE_POOL_CONTEXT_MESSAGE.to_string());
         };
-        if let Err(err) = self.ensure_current() {
-            discard(session, &mut registration);
-            return Err(err);
-        }
-        if let Err(err) = scope_context.apply_current_scope_to_session(&mut session) {
-            discard(session, &mut registration);
+        if let Err(err) = scope_context.apply_current_scope_to_session(session) {
+            acquired.discard();
             return Err(err);
         }
         if let Err(err) = self.ensure_current() {
-            discard(session, &mut registration);
+            acquired.discard();
             return Err(err);
         }
-        Ok((session, registration))
+        Ok(acquired)
     }
 
     pub fn apply_current_scope_to_session(
@@ -2460,10 +2486,12 @@ impl DbConnectionPool {
         &self,
         connection_info: &ConnectionInfo,
         activity: &DbActivityGuard,
-    ) -> Result<(DbPoolSession, DbSessionCancelRegistration), String> {
+    ) -> Result<AcquiredPoolSession, String> {
         let session = self.acquire_session_untracked()?;
         match activity.attach_canceler(pool_session_canceler(&session, connection_info)) {
-            SessionCancelAttachment::Attached(registration) => Ok((session, registration)),
+            SessionCancelAttachment::Attached(registration) => {
+                Ok(AcquiredPoolSession::new(session, registration))
+            }
             // The activity was retired while this session was being acquired —
             // the user cancelled, or a teardown swept it. Handing the session
             // over now would run work nothing can stop, under a status bar that
@@ -2645,6 +2673,329 @@ impl DbPoolSession {
             DbPoolSession::OracleThin(conn) => DbSessionLease::OracleThin(conn),
             DbPoolSession::MySQL { conn, db_type } => DbSessionLease::MySQL { conn, db_type },
         }
+    }
+}
+
+/// Ends a session's cancel reach when it drops, or hands it to whoever will
+/// keep it.
+///
+/// Small on purpose: it is what lets [`AcquiredPoolSession`] and
+/// [`HeldSession`] state "reach first, session second" as a FIELD ORDER rather
+/// than as a `Drop` impl. A `Drop` impl would stop those values being taken
+/// apart, and taking them apart is how a session is handed on without a
+/// panic-on-unreachable in the middle.
+struct SessionReachGuard {
+    /// `None` once the reach has been handed on. Never observed by anything
+    /// but this value's own drop.
+    registration: Option<DbSessionCancelRegistration>,
+}
+
+impl SessionReachGuard {
+    fn new(registration: Option<DbSessionCancelRegistration>) -> Self {
+        Self { registration }
+    }
+
+    /// `holder` keeps the reach from here; this guard has nothing left to end.
+    fn hand_to(mut self, holder: &dyn HoldsSessionCancelRegistration) {
+        if let Some(registration) = self.registration.take() {
+            holder.hold_session_registration(registration);
+        }
+    }
+}
+
+impl Drop for SessionReachGuard {
+    fn drop(&mut self) {
+        let Some(mut registration) = self.registration.take() else {
+            return;
+        };
+        // The reach itself ends with NO lock at all; the registry detach in the
+        // registration's own drop follows immediately after.
+        registration.release_reach();
+        drop(registration);
+    }
+}
+
+/// A BORROWER's way to say that a session must not go back to the pool.
+///
+/// Code that only borrows a session ([`AcquiredPoolSession::session_mut`]) can
+/// still discover that what the session carries is unknown — a session timeout
+/// that was applied and could not be restored is the standing example. It used
+/// to need OWNERSHIP to say so, which is why such borrowers took the session by
+/// value, and a session taken by value is one whose cancel registration the
+/// caller then has to remember to carry alongside it.
+///
+/// Shared rather than borrowed on purpose: the flag is read by
+/// [`AcquiredPoolSession`]'s own drop, so a borrower that sets it and then
+/// PANICS still gets the session closed — which is what taking it by value and
+/// discarding before `resume_unwind` was doing by hand.
+#[derive(Clone, Default)]
+pub struct PoolSessionUsability(Arc<AtomicBool>);
+
+impl PoolSessionUsability {
+    /// This session must be closed instead of returned to the pool.
+    pub fn mark_unusable(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_unusable(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// A pooled session and the cancel reach published over it, as ONE value.
+///
+/// The rule is [`SessionCancelReach`]'s: **the reach ends before the session
+/// stops being the work's.** Between the acquire and the code that will run on
+/// the session there is a whole frame — scope checks, driver type checks,
+/// session preparation, retries — and every way out of it that is not "the
+/// next owner took it" used to be spelled by hand: an early `?`, a `drop`, a
+/// `return None`, a panic.
+///
+/// It went wrong in both directions. A tuple could be split so the
+/// REGISTRATION went first — `.map(|(session, _registration)| session)` dropped
+/// it before the session was used at all, leaving a live server call the cancel
+/// button could not offer and a disconnect could not break. And it could be
+/// split so the SESSION went first — an error path dropping a
+/// `mysql::PooledConn` or an `Arc<Connection>` returns it to the pool ALIVE,
+/// where another tab picks it up while the first tab's canceler still names it.
+///
+/// So the pair is one value. There is no way to hold the session without the
+/// reach, and every way of giving it up states the order: [`Self::take_for`]
+/// names the holder that keeps the reach past this frame, and everything else —
+/// drop, [`Self::discard`], a panic — ends the reach first.
+#[must_use = "a pooled session that is dropped immediately is acquired for nothing"]
+pub struct AcquiredPoolSession {
+    /// `None` once the reach has been handed on or ended.
+    reach: Option<DbSessionCancelRegistration>,
+    usability: PoolSessionUsability,
+    /// `None` only after an exit that CONSUMES this value has taken it, so
+    /// nothing but this value's own drop can observe it.
+    session: Option<DbPoolSession>,
+}
+
+impl AcquiredPoolSession {
+    fn new(session: DbPoolSession, reach: DbSessionCancelRegistration) -> Self {
+        Self {
+            reach: Some(reach),
+            usability: PoolSessionUsability::default(),
+            session: Some(session),
+        }
+    }
+
+    /// The family of session this is.
+    pub fn db_type(&self) -> Option<DatabaseType> {
+        self.session.as_ref().map(DbPoolSession::db_type)
+    }
+
+    /// What this value is holding, in words, for the message a caller writes
+    /// when the family was not the one it expected. Total, because a message
+    /// must not be the thing that has no answer.
+    pub fn describe_session(&self) -> String {
+        match self.session.as_ref() {
+            Some(session) => session.db_type().to_string(),
+            None => "no pool session".to_string(),
+        }
+    }
+
+    /// The flag a borrower of this session sets when the session must not go
+    /// back to the pool. Cloned out BEFORE the borrow, because the borrow is
+    /// exclusive — which is the whole reason the flag is a shared value rather
+    /// than a method on the session.
+    pub fn usability(&self) -> PoolSessionUsability {
+        self.usability.clone()
+    }
+
+    /// The session, for the calls this frame makes on it.
+    ///
+    /// `Option` for the same reason [`TakenDbSessionLease::lease_mut`] is: the
+    /// value can be consumed by an exit, and answering that with a panic would
+    /// put one in the DB core for a state no caller can reach.
+    pub fn session_mut(&mut self) -> Option<&mut DbPoolSession> {
+        self.session.as_mut()
+    }
+
+    /// Hand ownership on: `holder` keeps the reach from here, and the caller
+    /// owns the session.
+    ///
+    /// The ONE way to separate the two, and it exists because the execution
+    /// road needs it: a batch parks its registration in the operation's
+    /// progress sender so the reach outlives the frame that acquired the
+    /// session, and the hand-back doors withdraw it from there. Naming the
+    /// holder is the point — "nothing holds this" is then
+    /// [`UncancelableSessionAction`], a decision in the source rather than an
+    /// omission.
+    pub fn take_for(
+        mut self,
+        holder: &dyn HoldsSessionCancelRegistration,
+    ) -> Option<DbPoolSession> {
+        let session = self.session.take()?;
+        SessionReachGuard::new(self.reach.take()).hand_to(holder);
+        Some(session)
+    }
+
+    /// This session cannot be handed over: close it.
+    ///
+    /// Either the connection it came from is gone, or preparing it failed part
+    /// way, so what it carries is unknown. Returning it to the pool by simply
+    /// dropping it would hand the next tab state nobody has accounted for.
+    pub fn discard(mut self) {
+        self.end_reach();
+        if let Some(session) = self.session.take() {
+            DbPoolSessionContext::discard_stale_session(session);
+        }
+    }
+
+    /// The Oracle OCI session behind this value, still paired with its reach.
+    /// `Err` gives the value back so the caller can say what it really got.
+    ///
+    /// The refusing arm names every other variant rather than using `_`: a new
+    /// physical session kind must not be able to join the app by falling into
+    /// somebody's fallback.
+    pub fn into_oracle(mut self) -> Result<HeldSession<Arc<Connection>>, Self> {
+        match self.session.take() {
+            Some(DbPoolSession::Oracle(conn)) => Ok(HeldSession::new(conn, self.reach.take())),
+            session @ (Some(DbPoolSession::OracleThin(_))
+            | Some(DbPoolSession::MySQL { .. })
+            | None) => {
+                self.session = session;
+                Err(self)
+            }
+        }
+    }
+
+    /// The Oracle Thin session behind this value, still paired with its reach.
+    pub fn into_oracle_thin(
+        mut self,
+    ) -> Result<HeldSession<PooledThinConnection<OracleThinSession>>, Self> {
+        match self.session.take() {
+            Some(DbPoolSession::OracleThin(conn)) => Ok(HeldSession::new(*conn, self.reach.take())),
+            session @ (Some(DbPoolSession::Oracle(_))
+            | Some(DbPoolSession::MySQL { .. })
+            | None) => {
+                self.session = session;
+                Err(self)
+            }
+        }
+    }
+
+    /// The MySQL-family session behind this value, still paired with its
+    /// reach. Refuses a session of the wrong family for the same reason
+    /// [`DbPoolSession::ensure_db_type`] does.
+    pub fn into_mysql(
+        mut self,
+        expected: DatabaseType,
+    ) -> Result<HeldSession<mysql::PooledConn>, Self> {
+        match self.session.take() {
+            Some(DbPoolSession::MySQL { conn, db_type }) if db_type.is_same_type_as(expected) => {
+                Ok(HeldSession::new(conn, self.reach.take()))
+            }
+            session @ (Some(DbPoolSession::MySQL { .. })
+            | Some(DbPoolSession::Oracle(_))
+            | Some(DbPoolSession::OracleThin(_))
+            | None) => {
+                self.session = session;
+                Err(self)
+            }
+        }
+    }
+
+    /// End the reach without touching the session. Always first.
+    fn end_reach(&mut self) {
+        drop(SessionReachGuard::new(self.reach.take()));
+    }
+}
+
+impl Drop for AcquiredPoolSession {
+    fn drop(&mut self) {
+        // Reach first, session second — the one order, made a property of the
+        // value instead of of each exit remembering it. A session that reaches
+        // here is healthy as far as this frame knows, so it goes back to the
+        // pool the ordinary way; an exit that knows better says so with
+        // [`Self::discard`], and a BORROWER says so with
+        // [`PoolSessionUsability::mark_unusable`].
+        self.end_reach();
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        if self.usability.is_unusable() {
+            DbPoolSessionContext::discard_stale_session(session);
+        } else {
+            drop(session);
+        }
+    }
+}
+
+/// One driver's session handle, still paired with the cancel reach published
+/// over it.
+///
+/// What [`AcquiredPoolSession`] becomes once the caller has said which backend
+/// it expected. It derefs to the handle, so the driver calls read exactly as
+/// they did when this was a `(handle, registration)` tuple — but the pair
+/// cannot be split, and the reach ends before the handle goes.
+///
+/// That order is the FIELD ORDER and nothing else: struct fields drop in
+/// declaration order, so `reach` goes first. Deliberately no `Drop` impl —
+/// a value with one cannot be taken apart, and taking this one apart is how
+/// [`Self::take_for`] hands the session on without an unreachable panic in the
+/// middle of the DB core.
+#[must_use = "a session that is dropped immediately is acquired for nothing"]
+pub struct HeldSession<H> {
+    reach: SessionReachGuard,
+    handle: H,
+}
+
+impl<H> HeldSession<H> {
+    fn new(handle: H, reach: Option<DbSessionCancelRegistration>) -> Self {
+        Self {
+            reach: SessionReachGuard::new(reach),
+            handle,
+        }
+    }
+
+    /// Hand ownership on, exactly like [`AcquiredPoolSession::take_for`].
+    pub fn take_for(self, holder: &dyn HoldsSessionCancelRegistration) -> H {
+        let Self { reach, handle } = self;
+        reach.hand_to(holder);
+        handle
+    }
+
+    /// End the reach and hand the handle on, because this session stops being
+    /// POOLED work here.
+    ///
+    /// The one case that is neither [`Self::take_for`] nor a release: a script
+    /// `CONNECT` promotes its candidate session to a connection's OWN, where
+    /// the pool canceler no longer speaks for it (`CanceledSession::Main`
+    /// does). Named rather than left to a `_registration` binding, so the order
+    /// is stated instead of depending on which local the compiler drops first.
+    pub fn take_ending_reach(self) -> H {
+        let Self { reach, handle } = self;
+        drop(reach);
+        handle
+    }
+
+    /// This session cannot be handed over: close it, reach first.
+    ///
+    /// `close` says how, because only the caller knows the family — a
+    /// `mysql::PooledConn` goes through `discard_mysql_pooled_connection`,
+    /// which also keeps the pool's slot accounting straight.
+    pub fn discard_with(self, close: impl FnOnce(H)) {
+        let Self { reach, handle } = self;
+        drop(reach);
+        close(handle);
+    }
+}
+
+impl<H> std::ops::Deref for HeldSession<H> {
+    type Target = H;
+
+    fn deref(&self) -> &H {
+        &self.handle
+    }
+}
+
+impl<H> std::ops::DerefMut for HeldSession<H> {
+    fn deref_mut(&mut self) -> &mut H {
+        &mut self.handle
     }
 }
 
@@ -3143,6 +3494,15 @@ impl SessionHandBackOwner {
     /// door's property rather than each caller's.
     fn withdraw_cancel_reach(&self) {
         self.cancel_reach.withdraw();
+    }
+
+    /// What this owner published, for the RELEASE roads that never reach a
+    /// door: a session that is closed outright is not filed anywhere, so
+    /// nothing else would end its reach.
+    ///
+    /// See [`SessionCancelReach::end_before_release`].
+    pub fn cancel_reach(&self) -> &SessionCancelReach {
+        &self.cancel_reach
     }
 
     /// The tab's live operation counter, for a caller that has to pass the
@@ -9909,6 +10269,169 @@ mod tests {
         );
     }
 
+    /// A session handle whose drop RECORDS what the registry said about its
+    /// session at that exact moment.
+    ///
+    /// The order this proves is the whole point of pairing the two: a session
+    /// that goes back to the pool while a canceler still names it is one the
+    /// next tab can pick up and this tab's cancel can then break.
+    struct RecordsTheReachWhenItIsReleased {
+        activity_id: u64,
+        reach_at_release: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl Drop for RecordsTheReachWhenItIsReleased {
+        fn drop(&mut self) {
+            *self
+                .reach_at_release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(activity_is_cancelable(self.activity_id));
+        }
+    }
+
+    fn held_session_recording_its_release() -> (
+        HeldSession<RecordsTheReachWhenItIsReleased>,
+        u64,
+        Arc<Mutex<Option<bool>>>,
+    ) {
+        let activity = track_db_activity("held session", None);
+        let activity_id = activity.id();
+        let registration = activity
+            .attach_canceler(Arc::new(TestCanceler::default()))
+            .attached()
+            .expect("a fresh activity should take a canceler");
+        let reach_at_release = Arc::new(Mutex::new(None));
+        let held = HeldSession::new(
+            RecordsTheReachWhenItIsReleased {
+                activity_id,
+                reach_at_release: Arc::clone(&reach_at_release),
+            },
+            Some(registration),
+        );
+        // The activity guard is deliberately leaked into the returned tuple's
+        // lifetime by keeping the ROW alive: the row is what `cancelable` is
+        // read from, and dropping the guard would remove it and make every
+        // answer below `false` for the wrong reason.
+        std::mem::forget(activity);
+        (held, activity_id, reach_at_release)
+    }
+
+    /// Dropping the pair ends the reach BEFORE the session goes.
+    #[test]
+    fn a_held_session_ends_its_reach_before_the_session_is_released() {
+        let _test_guard = db_activity_test_lock();
+        let (held, activity_id, reach_at_release) = held_session_recording_its_release();
+        assert!(
+            activity_is_cancelable(activity_id),
+            "the session is reachable while the work holds it"
+        );
+        drop(held);
+        assert_eq!(
+            *reach_at_release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Some(false),
+            "the cancel's reach had already ended when the session went back to the pool"
+        );
+        remove_db_activity(activity_id);
+    }
+
+    /// And so does closing it, which is the road the lazy fetch's discard
+    /// branches and the acquire retries take.
+    #[test]
+    fn closing_a_held_session_ends_its_reach_first_too() {
+        let _test_guard = db_activity_test_lock();
+        let (held, activity_id, reach_at_release) = held_session_recording_its_release();
+        held.discard_with(drop);
+        assert_eq!(
+            *reach_at_release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Some(false),
+            "a session that is CLOSED gives its reach up first as well"
+        );
+        remove_db_activity(activity_id);
+    }
+
+    /// Handing the session on keeps the reach, in the holder that outlives this
+    /// frame. That is the one road that does NOT end it, and it has to name
+    /// where it went.
+    #[test]
+    fn handing_a_held_session_on_moves_its_reach_to_the_named_holder() {
+        let _test_guard = db_activity_test_lock();
+        let (held, activity_id, reach_at_release) = held_session_recording_its_release();
+        let holder = ActionSessionCancelRegistration::new();
+        let handle = held.take_for(&holder);
+        assert!(
+            activity_is_cancelable(activity_id),
+            "the session is still reachable: the holder keeps the reach"
+        );
+        drop(handle);
+        assert_eq!(
+            *reach_at_release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Some(true),
+            "the handle went while the holder still had the reach -- which is what the holder \
+             is FOR: the work runs on this session past the frame that acquired it"
+        );
+        drop(holder);
+        assert!(
+            !activity_is_cancelable(activity_id),
+            "and the reach ends when the holder does"
+        );
+        remove_db_activity(activity_id);
+    }
+
+    /// A promotion out of the pool ends the reach without closing anything: the
+    /// session becomes a connection's OWN, which the pool canceler must not
+    /// speak for.
+    #[test]
+    fn promoting_a_held_session_out_of_the_pool_ends_its_reach() {
+        let _test_guard = db_activity_test_lock();
+        let (held, activity_id, _reach_at_release) = held_session_recording_its_release();
+        let handle = held.take_ending_reach();
+        assert!(
+            !activity_is_cancelable(activity_id),
+            "a session that has stopped being pooled work is no longer reachable as pooled work"
+        );
+        drop(handle);
+        remove_db_activity(activity_id);
+    }
+
+    /// A BORROWER can say the pool must not have this session back, and the
+    /// owner is what acts on it — including while a panic unwinds past the
+    /// borrower, which is why the flag is shared rather than returned.
+    #[test]
+    fn a_borrower_can_say_a_pooled_session_must_not_go_back_to_the_pool() {
+        let usability = PoolSessionUsability::default();
+        assert!(
+            !usability.is_unusable(),
+            "a session is usable until a borrower says otherwise"
+        );
+        let borrowed = usability.clone();
+        borrowed.mark_unusable();
+        assert!(
+            usability.is_unusable(),
+            "the owner reads what the borrower said, through its own copy"
+        );
+
+        let source = include_str!("connection.rs");
+        let dropped_at = source
+            .find("impl Drop for AcquiredPoolSession {")
+            .expect("the value must own its drop");
+        let dropped = &source[dropped_at
+            ..source[dropped_at..]
+                .find("\n}\n")
+                .map_or(source.len(), |offset| dropped_at + offset)];
+        assert!(
+            dropped.contains("if self.usability.is_unusable()")
+                && dropped.contains("DbPoolSessionContext::discard_stale_session(session)"),
+            "and the owner CLOSES such a session instead of returning it to the pool: {dropped}"
+        );
+    }
+
     /// A session the pool could not finish preparing goes through the ONE
     /// discard door, never back into the pool by falling out of scope.
     #[test]
@@ -9920,16 +10443,50 @@ mod tests {
             "a half-configured session must be discarded through the choke point, not dropped \
              back into the pool for the next tab to inherit: {body}"
         );
+        // Every failure between the acquire and the hand-over closes the
+        // session, and it does it through the ONE value that owns both halves.
         let scoped = source_of_fn(source, "fn acquire_session_with_scope_context(");
-        let release = scoped
-            .find("registration.release_reach();")
+        assert_eq!(
+            scoped.matches("acquired.discard();").count(),
+            3,
+            "each of the three checks after the acquire must close the session through the \
+             value that owns its reach as well: {scoped}"
+        );
+        assert!(
+            !scoped.contains("Self::discard_stale_session("),
+            "and none of them may reach past that value to the raw discard, which cannot end \
+             the reach: {scoped}"
+        );
+        // The order itself is now the VALUE's property rather than each exit's,
+        // which is what makes it hold for the exits that are not written yet:
+        // a `?`, a `drop`, a panic.
+        let discard = source_of_fn(source, "pub fn discard(mut self) {");
+        let reach = discard
+            .find("self.end_reach();")
             .expect("the discard path must end the cancel's reach");
-        let discard = scoped
-            .find("Self::discard_stale_session(session);")
+        let close = discard
+            .find("DbPoolSessionContext::discard_stale_session(session);")
             .expect("the discard path must destroy the session");
         assert!(
-            release < discard,
-            "same order as every hand-back: the reach ends before the session does"
+            reach < close,
+            "same order as every hand-back: the reach ends before the session does: {discard}"
+        );
+        let dropped_at = source
+            .find("impl Drop for AcquiredPoolSession {")
+            .expect("the value must own its drop");
+        let dropped = &source[dropped_at
+            ..source[dropped_at..]
+                .find("\n}\n")
+                .map_or(source.len(), |offset| dropped_at + offset)];
+        let reach = dropped
+            .find("self.end_reach();")
+            .expect("dropping the value must end the cancel's reach");
+        let release = dropped
+            .find("self.session.take()")
+            .expect("dropping the value must release the session");
+        assert!(
+            reach < release,
+            "a session that falls out of scope gives its reach up first too: {dropped}"
         );
     }
 
@@ -10654,13 +11211,13 @@ mod tests {
         resize_shared_connection_pool_with_policy(&shared, 1, policy)
             .expect("rebuild the connection pool");
 
-        let read_one = |session: DbPoolSession, sql: &str| -> String {
+        let read_one = |session: &mut DbPoolSession, sql: &str| -> String {
             match session {
                 DbPoolSession::Oracle(conn) => conn
                     .query_row_as::<String>(sql, &[])
                     .expect("read from the Oracle OCI pool session"),
-                DbPoolSession::OracleThin(mut conn) => {
-                    DatabaseConnection::oracle_thin_select_one_text(&mut conn, sql)
+                DbPoolSession::OracleThin(conn) => {
+                    DatabaseConnection::oracle_thin_select_one_text(conn, sql)
                         .expect("read from the Oracle thin pool session")
                         .unwrap_or_default()
                 }
@@ -10674,18 +11231,23 @@ mod tests {
         // OCI the cancel registration keeps a clone of the session handle, so
         // a lingering one exhausts a pool of one and the next acquire times
         // out with ORA-24496 instead of handing back the recycled session.
-        let with_session = |label: &str, use_session: &dyn Fn(DbPoolSession) -> String| -> String {
-            let context = pool_session_context_for_shared_connection(&shared, Some(label))
-                .expect("pool session context");
-            let activity = track_pool_db_activity(label.to_string(), DatabaseType::Oracle);
-            let (session, registration) = context
-                .acquire_session_for_current_scope(&activity)
-                .expect("acquire a pooled session");
-            let answer = use_session(session);
-            drop(registration);
-            drop(activity);
-            answer
-        };
+        let with_session =
+            |label: &str, use_session: &dyn Fn(&mut DbPoolSession) -> String| -> String {
+                let context = pool_session_context_for_shared_connection(&shared, Some(label))
+                    .expect("pool session context");
+                let activity = track_pool_db_activity(label.to_string(), DatabaseType::Oracle);
+                let mut acquired = context
+                    .acquire_session_for_current_scope(&activity)
+                    .expect("acquire a pooled session");
+                let answer = use_session(
+                    acquired
+                        .session_mut()
+                        .expect("the acquired session is still held"),
+                );
+                drop(acquired);
+                drop(activity);
+                answer
+            };
 
         // Leave the session the way a previous tab would leave it, then let it
         // go back into the one-session pool alive.
@@ -10698,10 +11260,10 @@ mod tests {
                     .trim()
                     .to_string()
             }
-            DbPoolSession::OracleThin(mut conn) => {
+            DbPoolSession::OracleThin(conn) => {
                 conn.query_drop("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE")
                     .expect("set the thin session isolation");
-                DatabaseConnection::oracle_thin_select_one_text(&mut conn, SID_SQL)
+                DatabaseConnection::oracle_thin_select_one_text(conn, SID_SQL)
                     .expect("read the thin session sid")
                     .unwrap_or_default()
                     .trim()
@@ -11107,7 +11669,10 @@ mod tests {
             context
                 .acquire_session_for_current_scope(&activity)
                 .expect("acquire a pooled session")
-                .0
+                // The census holds the LEASE and counts server sessions; there
+                // is no call to break, so the reach ends with the take.
+                .take_for(&UncancelableSessionAction)
+                .expect("the acquired session is still held")
                 .into_lease()
         };
 
@@ -11643,11 +12208,24 @@ mod tests {
         /// Conversions and accessors on a handle that is already tracked, plus
         /// the `DatabaseConnection` accessors that `ConnectionLockGuard`
         /// shadows to attach before delegating.
-        const ALREADY_TRACKED: [&str; 12] = [
+        ///
+        /// `AcquiredPoolSession`/`HeldSession` are in here for the same reason
+        /// as the rest: the only way to GET one is the acquire choke point,
+        /// which requires an activity, and neither value can be split into a
+        /// session without a reach — `take_for` names the holder that keeps it,
+        /// and every other road out ends it. Exempting the accessors is
+        /// therefore exempting reads of a value that is already tracked, not
+        /// opening a second door to a session.
+        const ALREADY_TRACKED: [&str; 17] = [
             "fn into_lease",
             "fn into_oracle_connection",
             "fn into_oracle_thin_connection",
             "fn into_mysql_connection",
+            "fn into_oracle",
+            "fn into_mysql",
+            "fn session_mut",
+            "fn take_for",
+            "fn take_ending_reach",
             "fn lease_mut",
             "fn acquire_session_untracked",
             "fn require_live_connection",
@@ -13066,10 +13644,10 @@ mod tests {
             db_type: info.db_type,
         };
         let pool_activity = track_pool_db_activity("MySQL pool session test", info.db_type);
-        let (mut session, _cancel_registration) = db_pool
+        let mut acquired = db_pool
             .acquire_session(&info, &pool_activity)
             .expect("acquire MySQL pool session");
-        let DbPoolSession::MySQL { conn, .. } = &mut session else {
+        let Some(DbPoolSession::MySQL { conn, .. }) = acquired.session_mut() else {
             panic!("expected MySQL pool session");
         };
         conn.as_mut()
@@ -13099,10 +13677,15 @@ mod tests {
             connection_generation_token: Arc::new(AtomicU64::new(1)),
         };
         backend_for(DatabaseType::MySQL)
-            .apply_current_scope_to_session(&context, &mut session)
+            .apply_current_scope_to_session(
+                &context,
+                acquired
+                    .session_mut()
+                    .expect("the acquired session is still held"),
+            )
             .expect("empty MySQL current scope should reset stale database state");
 
-        let DbPoolSession::MySQL { conn, .. } = &mut session else {
+        let Some(DbPoolSession::MySQL { conn, .. }) = acquired.session_mut() else {
             panic!("expected MySQL pool session");
         };
         let current_database = conn

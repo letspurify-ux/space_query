@@ -52,10 +52,12 @@
 
 use fltk::{app, input::IntInput};
 use space_query::db::{
-    active_db_activity_snapshots, cancel_db_activity, reset_tracked_db_activities_for_probe,
-    sweep_stale_db_activities, track_pool_db_activity, ConnectionInfo, DatabaseConnection,
-    DatabaseType, DbPoolSession, OracleDriverMode,
+    active_db_activity_snapshots, active_pool_db_activity_snapshots, cancel_db_activity,
+    reset_tracked_db_activities_for_probe, sweep_stale_db_activities, track_pool_db_activity,
+    ConnectionInfo, ConnectionRegistry, DatabaseConnection, DatabaseType, DbPoolSession,
+    OracleDriverMode,
 };
+use space_query::ui::main_window::MainWindow;
 use space_query::ui::sql_editor::{HandBackForceProbe, QueryProgress, SqlEditorWidget};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -269,9 +271,13 @@ impl SlowStatement {
         let acquired_in_worker = acquired.clone();
         let handle = thread::spawn(move || {
             let outcome = (|| -> Result<(), String> {
-                let (session, _cancel_registration) =
-                    context.acquire_session_for_current_scope(&activity)?;
+                // Session and cancel reach as ONE value: the reach lasts
+                // exactly as long as the statement runs on the session.
+                let mut acquired = context.acquire_session_for_current_scope(&activity)?;
                 acquired_in_worker.store(true, Ordering::Release);
+                let Some(session) = acquired.session_mut() else {
+                    return Err("the acquired session was already given up".to_string());
+                };
                 run_slow_statement(session, target.slow_sql())
             })();
             *outcome_in_worker
@@ -332,17 +338,14 @@ impl Drop for SlowStatement {
     }
 }
 
-fn run_slow_statement(session: DbPoolSession, sql: &str) -> Result<(), String> {
+fn run_slow_statement(session: &mut DbPoolSession, sql: &str) -> Result<(), String> {
     match session {
         DbPoolSession::Oracle(conn) => conn
             .query_row(sql, &[])
             .map(|_| ())
             .map_err(|err| err.to_string()),
-        DbPoolSession::OracleThin(conn) => {
-            let mut conn = *conn;
-            conn.query_drop(sql).map_err(|err| err.to_string())
-        }
-        DbPoolSession::MySQL { mut conn, .. } => {
+        DbPoolSession::OracleThin(conn) => conn.query_drop(sql).map_err(|err| err.to_string()),
+        DbPoolSession::MySQL { conn, .. } => {
             use mysql::prelude::Queryable;
             conn.as_mut().query_drop(sql).map_err(|err| err.to_string())
         }
@@ -521,8 +524,7 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
         let context = harness.pool_context()?;
         let first = track_pool_db_activity("Live detach probe", target.connection_info().db_type);
         {
-            let (_session, _cancel_registration) =
-                context.acquire_session_for_current_scope(&first)?;
+            let _acquired = context.acquire_session_for_current_scope(&first)?;
         }
         // The session went back to the pool; the activity must no longer claim
         // it can cancel anything.
@@ -823,6 +825,162 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
             }
         }
         let _ = editor.wait_done(Duration::from_secs(10));
+    }
+
+    // A12: the app's own schema metadata load must stay reachable by the cancel
+    // button for as long as it holds a pooled session.
+    //
+    // This is the longest-running background read the app does, and on every
+    // backend it was neither offerable by the cancel button nor breakable by a
+    // disconnect: the loader acquired `(session, registration)` and dropped the
+    // registration inside a `.map()` before the session was used at all, so the
+    // registry entry carried NO canceler while a real server call ran under it.
+    // Cancelling it retired the row -- the screen said the work had ended --
+    // and broke nothing, so the query ran on holding a pooled session that a
+    // disconnect was meanwhile tearing the pool out from under.
+    //
+    // Two things are asked, because neither alone can see the defect. The
+    // registry has to say the load is cancelable for essentially the whole time
+    // it holds a session (the defect left it cancelable for the ACQUIRE alone,
+    // which is a window a poll can still land in), and a cancel fired inside
+    // that window has to actually STOP the load, which is the user-visible
+    // half.
+    reset_tracked_db_activities_for_probe();
+    {
+        let label = target.label();
+        println!("   A12 ({label}): a schema metadata load must be cancelable while it runs");
+        let harness = Harness::connect(target)?;
+        // The loader tags its activity with the connection it belongs to, which
+        // is what a disconnect matches on, so the probe registers the
+        // connection exactly as the app does.
+        let registry = ConnectionRegistry::new();
+        let _runtime = registry.register_unmanaged(Arc::clone(&harness.connection));
+        let expected_activity = harness
+            .pool_context()?
+            .connection_info
+            .db_type
+            .metadata_refresh_activity_for_probe(None);
+
+        // Pass 1: watch a load all the way through and measure how much of the
+        // row's life it was cancelable for.
+        let context = harness.pool_context()?;
+        let done = Arc::new(AtomicBool::new(false));
+        let loaded = Arc::new(AtomicBool::new(false));
+        let done_in_worker = Arc::clone(&done);
+        let loaded_in_worker = Arc::clone(&loaded);
+        let worker = thread::spawn(move || {
+            loaded_in_worker.store(
+                MainWindow::load_schema_metadata_for_probe(context, None),
+                Ordering::Release,
+            );
+            done_in_worker.store(true, Ordering::Release);
+        });
+        let mut row_polls = 0usize;
+        let mut cancelable_polls = 0usize;
+        let mut cancelable_run = 0usize;
+        let mut longest_cancelable_run = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while Instant::now() < deadline && !done.load(Ordering::Acquire) {
+            if let Some(row) = active_pool_db_activity_snapshots()
+                .into_iter()
+                .find(|snapshot| snapshot.activity == expected_activity)
+            {
+                row_polls += 1;
+                if row.cancelable {
+                    cancelable_polls += 1;
+                    cancelable_run += 1;
+                    longest_cancelable_run = longest_cancelable_run.max(cancelable_run);
+                } else {
+                    cancelable_run = 0;
+                }
+            }
+        }
+        let _ = worker.join();
+        println!(
+            "   A12 ({label}) metadata load: cancelable on {cancelable_polls} of {row_polls} \
+             observations (longest unbroken run {longest_cancelable_run}), produced metadata: {}",
+            loaded.load(Ordering::Acquire)
+        );
+        if row_polls == 0 {
+            failures.push(format!(
+                "A12 ({label}): the schema metadata load never published an activity row, so \
+                 the probe could not observe it (expected {expected_activity:?})"
+            ));
+        } else if cancelable_polls * 2 < row_polls {
+            // The load's tail -- rebuilding indices and highlight data -- runs
+            // after the session has gone back to the pool, so the row is
+            // legitimately not cancelable for part of its life. What the defect
+            // produced is the opposite shape: cancelable for the acquire alone
+            // and not for any of the querying.
+            failures.push(format!(
+                "A12 ({label}): the schema metadata load held a pooled session the cancel \
+                 button could not offer and a disconnect could not break (cancelable on \
+                 {cancelable_polls} of {row_polls} observations)"
+            ));
+        }
+        if !loaded.load(Ordering::Acquire) {
+            failures.push(format!(
+                "A12 ({label}): the schema metadata load produced nothing, so the scenario \
+                 proved nothing about a load that works"
+            ));
+        }
+
+        // Pass 2: and the reach is real -- a cancel fired while the load holds
+        // its session stops it, rather than only clearing the status bar.
+        //
+        // Reported, not required. Both tiers run on the watchdog thread and the
+        // MySQL family's graceful break opens a SECOND connection to issue
+        // `KILL QUERY`, so on a small test database the load can simply finish
+        // first. That says nothing about the defect -- pass 1 is what sees it
+        // -- so a load that outran its own cancel is a note, not a failure.
+        let mut stopped = false;
+        let mut cancelled_a_row = false;
+        for _ in 0..4 {
+            let context = harness.pool_context()?;
+            let done = Arc::new(AtomicBool::new(false));
+            let loaded = Arc::new(AtomicBool::new(false));
+            let done_in_worker = Arc::clone(&done);
+            let loaded_in_worker = Arc::clone(&loaded);
+            let worker = thread::spawn(move || {
+                loaded_in_worker.store(
+                    MainWindow::load_schema_metadata_for_probe(context, None),
+                    Ordering::Release,
+                );
+                done_in_worker.store(true, Ordering::Release);
+            });
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while Instant::now() < deadline && !done.load(Ordering::Acquire) {
+                // Cancel only what the registry says is REACHABLE. A cancel
+                // that lands before the canceler is attached is refused by the
+                // acquire itself, which stops the load whether or not the
+                // session it goes on to hold is reachable.
+                if let Some(row) = active_pool_db_activity_snapshots()
+                    .into_iter()
+                    .find(|snapshot| snapshot.activity == expected_activity && snapshot.cancelable)
+                {
+                    cancelled_a_row |= cancel_db_activity(row.id, PROBE_CANCEL_TIMEOUT);
+                    break;
+                }
+            }
+            let _ = worker.join();
+            if cancelled_a_row && !loaded.load(Ordering::Acquire) {
+                stopped = true;
+                break;
+            }
+        }
+        if !cancelled_a_row {
+            failures.push(format!(
+                "A12 ({label}): the schema metadata load never offered a cancelable row, so the \
+                 cancel button had nothing to reach"
+            ));
+        } else if stopped {
+            println!("   A12 ({label}) and cancelling it actually stopped the load");
+        } else {
+            println!(
+                "   A12 ({label}) note: every load finished before its own cancel could land \
+                 (the break runs on the watchdog thread), so only the reach was checked"
+            );
+        }
     }
 
     reset_tracked_db_activities_for_probe();

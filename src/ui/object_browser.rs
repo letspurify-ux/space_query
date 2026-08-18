@@ -509,7 +509,7 @@ trait ObjectBrowserDbBehavior: Sync {
     fn load_routine_script(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         object_name: &str,
         routine_type: &str,
@@ -517,7 +517,7 @@ trait ObjectBrowserDbBehavior: Sync {
     fn load_table_structure(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<TableColumnDetail>, String>;
@@ -528,28 +528,28 @@ trait ObjectBrowserDbBehavior: Sync {
     fn load_table_rows(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<crate::db::QueryResult, String>;
     fn load_table_indexes(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<IndexInfo>, String>;
     fn load_table_constraints(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<ConstraintInfo>, String>;
     fn load_object_info(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         object_type: &str,
         object_name: &str,
@@ -557,7 +557,7 @@ trait ObjectBrowserDbBehavior: Sync {
     fn generate_object_ddl(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         object_type: &str,
         object_name: &str,
@@ -619,11 +619,11 @@ fn object_browser_behavior_for(
 }
 
 impl MysqlObjectBrowserBehavior {
-    fn take_object_action_session(
+    fn take_object_action_session<'a>(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
-    ) -> Result<mysql::PooledConn, String> {
+        session: &'a mut crate::db::DbPoolSession,
+    ) -> Result<&'a mut mysql::PooledConn, String> {
         let expected_db_type = context.connection_info.db_type;
         let actual_db_type = session.db_type();
         let crate::db::DbPoolSession::MySQL { conn, db_type } = session else {
@@ -4548,7 +4548,7 @@ impl ObjectBrowserWidget {
         activity: String,
         action: impl FnOnce(
             &crate::db::DbPoolSessionContext,
-            crate::db::DbPoolSession,
+            &mut crate::db::DbPoolSession,
         ) -> Result<T, String>,
     ) -> Result<T, String> {
         let base_context = Self::object_action_pool_session_context(connection)?;
@@ -4569,10 +4569,11 @@ impl ObjectBrowserWidget {
                     .to_string(),
             );
         }
-        // The registration rides along to the end of the action, so the cancel
-        // button and the stale sweep can reach this session for as long as it
-        // is in use.
-        let (session, _cancel_registration) =
+        // Session and cancel reach as ONE value, so the reach lasts exactly as
+        // long as the action's use of the session and ends BEFORE it goes back
+        // to the pool -- `AcquiredPoolSession`'s own drop, which runs after
+        // this frame's borrow of the session ends.
+        let mut acquired =
             base_context.acquire_session_for_scope(selected_scope, &activity_guard)?;
         if !crate::db::cached_pool_session_context_matches_shared_connection(
             connection,
@@ -4584,6 +4585,12 @@ impl ObjectBrowserWidget {
             );
         }
         Self::ensure_object_action_context_current(connection, &base_context)?;
+        let Some(session) = acquired.session_mut() else {
+            return Err(
+                "Object metadata session was taken before the action started. Retry the action."
+                    .to_string(),
+            );
+        };
         action(&context, session)
     }
 
@@ -4609,25 +4616,22 @@ impl ObjectBrowserWidget {
     fn acquire_oracle_metadata_session(
         context: &crate::db::DbPoolSessionContext,
         activity: &crate::db::DbActivityGuard,
-    ) -> Option<(
-        Arc<oracle::Connection>,
-        crate::db::DbSessionCancelRegistration,
-    )> {
+    ) -> Option<crate::db::HeldSession<Arc<oracle::Connection>>> {
         if activity.is_finished() {
             return None;
         }
         context.ensure_current().ok()?;
         match context.acquire_session_for_current_scope(activity) {
-            Ok((crate::db::DbPoolSession::Oracle(conn), registration)) => {
-                Some((conn, registration))
-            }
-            Ok((other, _registration)) => {
-                eprintln!(
-                    "Warning: expected Oracle object-browser metadata session but acquired {}",
-                    other.db_type()
-                );
-                None
-            }
+            Ok(acquired) => match acquired.into_oracle() {
+                Ok(conn) => Some(conn),
+                Err(other) => {
+                    eprintln!(
+                        "Warning: expected Oracle object-browser metadata session but acquired {}",
+                        other.describe_session()
+                    );
+                    None
+                }
+            },
             Err(err) => {
                 eprintln!(
                     "Warning: failed to acquire Oracle object-browser metadata session: {err}"
@@ -4640,25 +4644,24 @@ impl ObjectBrowserWidget {
     fn acquire_oracle_thin_metadata_session(
         context: &crate::db::DbPoolSessionContext,
         activity: &crate::db::DbActivityGuard,
-    ) -> Option<(
-        tns_thin::pool::PooledThinConnection<tns_thin::OracleThinSession>,
-        crate::db::DbSessionCancelRegistration,
-    )> {
+    ) -> Option<
+        crate::db::HeldSession<tns_thin::pool::PooledThinConnection<tns_thin::OracleThinSession>>,
+    > {
         if activity.is_finished() {
             return None;
         }
         context.ensure_current().ok()?;
         match context.acquire_session_for_current_scope(activity) {
-            Ok((crate::db::DbPoolSession::OracleThin(conn), registration)) => {
-                Some((*conn, registration))
-            }
-            Ok((other, _registration)) => {
-                eprintln!(
-                    "Warning: expected Oracle Thin object-browser metadata session but acquired {}",
-                    other.db_type()
-                );
-                None
-            }
+            Ok(acquired) => match acquired.into_oracle_thin() {
+                Ok(conn) => Some(conn),
+                Err(other) => {
+                    eprintln!(
+                        "Warning: expected Oracle Thin object-browser metadata session but acquired {}",
+                        other.describe_session()
+                    );
+                    None
+                }
+            },
             Err(err) => {
                 eprintln!(
                     "Warning: failed to acquire Oracle Thin object-browser metadata session: {err}"
@@ -4672,28 +4675,24 @@ impl ObjectBrowserWidget {
         context: &crate::db::DbPoolSessionContext,
         selected_scope: &str,
         activity: &crate::db::DbActivityGuard,
-    ) -> Option<(mysql::PooledConn, crate::db::DbSessionCancelRegistration)> {
+    ) -> Option<crate::db::HeldSession<mysql::PooledConn>> {
         if activity.is_finished() {
             return None;
         }
         context.ensure_current().ok()?;
         let expected_db_type = context.connection_info.db_type;
         let display_name = expected_db_type.display_name();
-        let (mut mysql_conn, registration) = match context
-            .acquire_session_for_current_scope(activity)
-        {
-            Ok((crate::db::DbPoolSession::MySQL { conn, db_type }, registration))
-                if db_type.is_same_type_as(expected_db_type) =>
-            {
-                (conn, registration)
-            }
-            Ok((other, _registration)) => {
-                eprintln!(
-                    "Warning: expected {display_name} object-browser metadata session but acquired {}",
-                    other.db_type()
-                );
-                return None;
-            }
+        let mut mysql_conn = match context.acquire_session_for_current_scope(activity) {
+            Ok(acquired) => match acquired.into_mysql(expected_db_type) {
+                Ok(conn) => conn,
+                Err(other) => {
+                    eprintln!(
+                        "Warning: expected {display_name} object-browser metadata session but acquired {}",
+                        other.describe_session()
+                    );
+                    return None;
+                }
+            },
             Err(err) => {
                 eprintln!(
                     "Warning: failed to acquire {display_name} object-browser metadata session: {err}"
@@ -4711,7 +4710,7 @@ impl ObjectBrowserWidget {
 
         if let Err(err) =
             crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type(
-                &mut mysql_conn,
+                &mut *mysql_conn,
                 &context.connection_info.advanced,
                 expected_db_type,
             )
@@ -4722,7 +4721,7 @@ impl ObjectBrowserWidget {
             return None;
         }
 
-        Some((mysql_conn, registration))
+        Some(mysql_conn)
     }
 
     fn object_metadata_worker_limit(context: &crate::db::DbPoolSessionContext) -> usize {
@@ -8180,7 +8179,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn load_routine_script(
         &self,
         _context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         object_name: &str,
         routine_type: &str,
@@ -8188,11 +8187,11 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         let qualified_name = self.qualify_object_name(selected_scope, object_name);
         let arguments = match session {
             crate::db::DbPoolSession::Oracle(conn) => {
-                ObjectBrowser::get_procedure_arguments(&conn, &qualified_name)
+                ObjectBrowser::get_procedure_arguments(conn, &qualified_name)
                     .map_err(|err| err.to_string())?
             }
-            crate::db::DbPoolSession::OracleThin(mut conn) => {
-                ObjectBrowser::get_thin_procedure_arguments(&mut conn, &qualified_name)?
+            crate::db::DbPoolSession::OracleThin(conn) => {
+                ObjectBrowser::get_thin_procedure_arguments(conn, &qualified_name)?
             }
             unexpected @ crate::db::DbPoolSession::MySQL { .. } => {
                 return Err(format!(
@@ -8211,18 +8210,18 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn load_table_structure(
         &self,
         _context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<TableColumnDetail>, String> {
         let qualified_name = self.qualify_object_name(selected_scope, table_name);
         match session {
             crate::db::DbPoolSession::Oracle(conn) => {
-                ObjectBrowser::get_table_structure(&conn, &qualified_name)
+                ObjectBrowser::get_table_structure(conn, &qualified_name)
                     .map_err(|err| err.to_string())
             }
-            crate::db::DbPoolSession::OracleThin(mut conn) => {
-                ObjectBrowser::get_thin_table_structure(&mut conn, &qualified_name)
+            crate::db::DbPoolSession::OracleThin(conn) => {
+                ObjectBrowser::get_thin_table_structure(conn, &qualified_name)
             }
             unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                 "Expected Oracle object action session but acquired {}",
@@ -8234,17 +8233,17 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn load_table_rows(
         &self,
         _context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<crate::db::QueryResult, String> {
         let sql = self.export_select_sql(selected_scope, table_name);
         match session {
             crate::db::DbPoolSession::Oracle(conn) => {
-                ObjectBrowser::execute_oci_query(&conn, &sql).map_err(|err| err.to_string())
+                ObjectBrowser::execute_oci_query(conn, &sql).map_err(|err| err.to_string())
             }
-            crate::db::DbPoolSession::OracleThin(mut conn) => {
-                ObjectBrowser::execute_thin_query(&mut conn, &sql)
+            crate::db::DbPoolSession::OracleThin(conn) => {
+                ObjectBrowser::execute_thin_query(conn, &sql)
             }
             unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                 "Expected Oracle object action session but acquired {}",
@@ -8256,18 +8255,18 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn load_table_indexes(
         &self,
         _context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<IndexInfo>, String> {
         let qualified_name = self.qualify_object_name(selected_scope, table_name);
         match session {
             crate::db::DbPoolSession::Oracle(conn) => {
-                ObjectBrowser::get_table_indexes(&conn, &qualified_name)
+                ObjectBrowser::get_table_indexes(conn, &qualified_name)
                     .map_err(|err| err.to_string())
             }
-            crate::db::DbPoolSession::OracleThin(mut conn) => {
-                ObjectBrowser::get_thin_table_indexes(&mut conn, &qualified_name)
+            crate::db::DbPoolSession::OracleThin(conn) => {
+                ObjectBrowser::get_thin_table_indexes(conn, &qualified_name)
             }
             unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                 "Expected Oracle object action session but acquired {}",
@@ -8279,18 +8278,18 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn load_table_constraints(
         &self,
         _context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<ConstraintInfo>, String> {
         let qualified_name = self.qualify_object_name(selected_scope, table_name);
         match session {
             crate::db::DbPoolSession::Oracle(conn) => {
-                ObjectBrowser::get_table_constraints(&conn, &qualified_name)
+                ObjectBrowser::get_table_constraints(conn, &qualified_name)
                     .map_err(|err| err.to_string())
             }
-            crate::db::DbPoolSession::OracleThin(mut conn) => {
-                ObjectBrowser::get_thin_table_constraints(&mut conn, &qualified_name)
+            crate::db::DbPoolSession::OracleThin(conn) => {
+                ObjectBrowser::get_thin_table_constraints(conn, &qualified_name)
             }
             unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                 "Expected Oracle object action session but acquired {}",
@@ -8302,7 +8301,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn load_object_info(
         &self,
         _context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         object_type: &str,
         object_name: &str,
@@ -8310,18 +8309,18 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         let qualified_name = self.qualify_object_name(selected_scope, object_name);
         match session {
             crate::db::DbPoolSession::Oracle(conn) => match object_type {
-                "SYNONYMS" => ObjectBrowser::get_synonym_info(&conn, &qualified_name)
+                "SYNONYMS" => ObjectBrowser::get_synonym_info(conn, &qualified_name)
                     .map(ObjectInfoPayload::Synonym)
                     .map_err(|err| err.to_string()),
-                "SEQUENCES" => ObjectBrowser::get_sequence_info(&conn, &qualified_name)
+                "SEQUENCES" => ObjectBrowser::get_sequence_info(conn, &qualified_name)
                     .map(ObjectInfoPayload::Sequence)
                     .map_err(|err| err.to_string()),
                 other => Err(format!("Unexpected object type for View Info: {other}")),
             },
-            crate::db::DbPoolSession::OracleThin(mut conn) => match object_type {
-                "SYNONYMS" => ObjectBrowser::get_thin_synonym_info(&mut conn, &qualified_name)
+            crate::db::DbPoolSession::OracleThin(conn) => match object_type {
+                "SYNONYMS" => ObjectBrowser::get_thin_synonym_info(conn, &qualified_name)
                     .map(ObjectInfoPayload::Synonym),
-                "SEQUENCES" => ObjectBrowser::get_thin_sequence_info(&mut conn, &qualified_name)
+                "SEQUENCES" => ObjectBrowser::get_thin_sequence_info(conn, &qualified_name)
                     .map(ObjectInfoPayload::Sequence),
                 other => Err(format!("Unexpected object type for View Info: {other}")),
             },
@@ -8335,7 +8334,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn generate_object_ddl(
         &self,
         _context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         object_type: &str,
         object_name: &str,
@@ -8343,19 +8342,19 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         let qualified_name = self.qualify_object_name(selected_scope, object_name);
         match session {
             crate::db::DbPoolSession::Oracle(conn) => match object_type {
-                "TABLE" => ObjectBrowser::get_table_ddl(&conn, &qualified_name),
-                "VIEW" => ObjectBrowser::get_view_ddl(&conn, &qualified_name),
+                "TABLE" => ObjectBrowser::get_table_ddl(conn, &qualified_name),
+                "VIEW" => ObjectBrowser::get_view_ddl(conn, &qualified_name),
                 "MATERIALIZED_VIEW" => {
-                    ObjectBrowser::get_object_ddl(&conn, "MATERIALIZED_VIEW", &qualified_name)
+                    ObjectBrowser::get_object_ddl(conn, "MATERIALIZED_VIEW", &qualified_name)
                 }
-                "PROCEDURE" => ObjectBrowser::get_procedure_ddl(&conn, &qualified_name),
-                "FUNCTION" => ObjectBrowser::get_function_ddl(&conn, &qualified_name),
-                "SEQUENCE" => ObjectBrowser::get_sequence_ddl(&conn, &qualified_name),
-                "TRIGGER" => ObjectBrowser::get_object_ddl(&conn, "TRIGGER", &qualified_name),
-                "TYPE" => ObjectBrowser::get_object_ddl(&conn, "TYPE", &qualified_name),
-                "INDEX" => ObjectBrowser::get_object_ddl(&conn, "INDEX", &qualified_name),
-                "SYNONYM" => ObjectBrowser::get_synonym_ddl(&conn, &qualified_name),
-                "PACKAGE" => ObjectBrowser::get_package_ddl(&conn, &qualified_name),
+                "PROCEDURE" => ObjectBrowser::get_procedure_ddl(conn, &qualified_name),
+                "FUNCTION" => ObjectBrowser::get_function_ddl(conn, &qualified_name),
+                "SEQUENCE" => ObjectBrowser::get_sequence_ddl(conn, &qualified_name),
+                "TRIGGER" => ObjectBrowser::get_object_ddl(conn, "TRIGGER", &qualified_name),
+                "TYPE" => ObjectBrowser::get_object_ddl(conn, "TYPE", &qualified_name),
+                "INDEX" => ObjectBrowser::get_object_ddl(conn, "INDEX", &qualified_name),
+                "SYNONYM" => ObjectBrowser::get_synonym_ddl(conn, &qualified_name),
+                "PACKAGE" => ObjectBrowser::get_package_ddl(conn, &qualified_name),
                 other => {
                     return Err(format!(
                         "{other} DDL is not supported for Oracle connections"
@@ -8363,32 +8362,22 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                 }
             }
             .map_err(|err| err.to_string()),
-            crate::db::DbPoolSession::OracleThin(mut conn) => match object_type {
-                "TABLE" => ObjectBrowser::get_thin_object_ddl(&mut conn, "TABLE", &qualified_name),
-                "VIEW" => ObjectBrowser::get_thin_object_ddl(&mut conn, "VIEW", &qualified_name),
-                "MATERIALIZED_VIEW" => ObjectBrowser::get_thin_object_ddl(
-                    &mut conn,
-                    "MATERIALIZED_VIEW",
-                    &qualified_name,
-                ),
+            crate::db::DbPoolSession::OracleThin(conn) => match object_type {
+                "TABLE" => ObjectBrowser::get_thin_object_ddl(conn, "TABLE", &qualified_name),
+                "VIEW" => ObjectBrowser::get_thin_object_ddl(conn, "VIEW", &qualified_name),
+                "MATERIALIZED_VIEW" => {
+                    ObjectBrowser::get_thin_object_ddl(conn, "MATERIALIZED_VIEW", &qualified_name)
+                }
                 "PROCEDURE" => {
-                    ObjectBrowser::get_thin_object_ddl(&mut conn, "PROCEDURE", &qualified_name)
+                    ObjectBrowser::get_thin_object_ddl(conn, "PROCEDURE", &qualified_name)
                 }
-                "FUNCTION" => {
-                    ObjectBrowser::get_thin_object_ddl(&mut conn, "FUNCTION", &qualified_name)
-                }
-                "SEQUENCE" => {
-                    ObjectBrowser::get_thin_object_ddl(&mut conn, "SEQUENCE", &qualified_name)
-                }
-                "TRIGGER" => {
-                    ObjectBrowser::get_thin_object_ddl(&mut conn, "TRIGGER", &qualified_name)
-                }
-                "TYPE" => ObjectBrowser::get_thin_object_ddl(&mut conn, "TYPE", &qualified_name),
-                "INDEX" => ObjectBrowser::get_thin_object_ddl(&mut conn, "INDEX", &qualified_name),
-                "SYNONYM" => {
-                    ObjectBrowser::get_thin_object_ddl(&mut conn, "SYNONYM", &qualified_name)
-                }
-                "PACKAGE" => ObjectBrowser::get_thin_package_ddl(&mut conn, &qualified_name),
+                "FUNCTION" => ObjectBrowser::get_thin_object_ddl(conn, "FUNCTION", &qualified_name),
+                "SEQUENCE" => ObjectBrowser::get_thin_object_ddl(conn, "SEQUENCE", &qualified_name),
+                "TRIGGER" => ObjectBrowser::get_thin_object_ddl(conn, "TRIGGER", &qualified_name),
+                "TYPE" => ObjectBrowser::get_thin_object_ddl(conn, "TYPE", &qualified_name),
+                "INDEX" => ObjectBrowser::get_thin_object_ddl(conn, "INDEX", &qualified_name),
+                "SYNONYM" => ObjectBrowser::get_thin_object_ddl(conn, "SYNONYM", &qualified_name),
+                "PACKAGE" => ObjectBrowser::get_thin_package_ddl(conn, &qualified_name),
                 other => Err(format!(
                     "{other} DDL is not supported for Oracle connections"
                 )),
@@ -8418,11 +8407,11 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             activity,
             |_context, session| match session {
                 crate::db::DbPoolSession::Oracle(conn) => {
-                    ObjectBrowser::get_package_routines(&conn, &qualified_package)
+                    ObjectBrowser::get_package_routines(conn, &qualified_package)
                         .map_err(|err| err.to_string())
                 }
-                crate::db::DbPoolSession::OracleThin(mut conn) => {
-                    ObjectBrowser::get_thin_package_routines(&mut conn, &qualified_package)
+                crate::db::DbPoolSession::OracleThin(conn) => {
+                    ObjectBrowser::get_thin_package_routines(conn, &qualified_package)
                 }
                 unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                     "Expected Oracle object action session but acquired {}",
@@ -8452,7 +8441,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                 crate::db::DbPoolSession::Oracle(conn) => {
                     let resolved_type = if routine_type == "UNKNOWN" {
                         let routines =
-                            ObjectBrowser::get_package_routines(&conn, &package_qualified_name)
+                            ObjectBrowser::get_package_routines(conn, &package_qualified_name)
                                 .map_err(|err| err.to_string())?;
                         routines
                             .iter()
@@ -8473,7 +8462,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     }?;
 
                     let arguments = ObjectBrowser::get_package_procedure_arguments(
-                        &conn,
+                        conn,
                         &package_qualified_name,
                         routine_name,
                     )
@@ -8484,10 +8473,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                         sql: self.build_routine_script(&qualified_name, &resolved_type, &arguments),
                     })
                 }
-                crate::db::DbPoolSession::OracleThin(mut conn) => {
+                crate::db::DbPoolSession::OracleThin(conn) => {
                     let resolved_type = if routine_type == "UNKNOWN" {
                         let routines = ObjectBrowser::get_thin_package_routines(
-                            &mut conn,
+                            conn,
                             &package_qualified_name,
                         )?;
                         routines
@@ -8509,7 +8498,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     }?;
 
                     let arguments = ObjectBrowser::get_thin_package_procedure_arguments(
-                        &mut conn,
+                        conn,
                         &package_qualified_name,
                         routine_name,
                     )?;
@@ -8544,23 +8533,23 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                 let (status, body_status, errors) = match session {
                     crate::db::DbPoolSession::Oracle(conn) => {
                         let status =
-                            ObjectBrowser::get_object_status(&conn, &qualified_name, object_type)
+                            ObjectBrowser::get_object_status(conn, &qualified_name, object_type)
                                 .unwrap_or_else(|_| "UNKNOWN".to_string());
                         let body_status = if object_type == "PACKAGE" {
-                            ObjectBrowser::get_object_status(&conn, &qualified_name, "PACKAGE BODY")
+                            ObjectBrowser::get_object_status(conn, &qualified_name, "PACKAGE BODY")
                                 .ok()
                         } else {
                             None
                         };
                         let mut errors = ObjectBrowser::get_compilation_errors(
-                            &conn,
+                            conn,
                             &qualified_name,
                             object_type,
                         )
                         .unwrap_or_default();
                         if object_type == "PACKAGE" {
                             if let Ok(body_errors) = ObjectBrowser::get_compilation_errors(
-                                &conn,
+                                conn,
                                 &qualified_name,
                                 "PACKAGE BODY",
                             ) {
@@ -8569,16 +8558,16 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                         }
                         (status, body_status, errors)
                     }
-                    crate::db::DbPoolSession::OracleThin(mut conn) => {
+                    crate::db::DbPoolSession::OracleThin(conn) => {
                         let status = ObjectBrowser::get_thin_object_status(
-                            &mut conn,
+                            conn,
                             &qualified_name,
                             object_type,
                         )
                         .unwrap_or_else(|_| "UNKNOWN".to_string());
                         let body_status = if object_type == "PACKAGE" {
                             ObjectBrowser::get_thin_object_status(
-                                &mut conn,
+                                conn,
                                 &qualified_name,
                                 "PACKAGE BODY",
                             )
@@ -8587,14 +8576,14 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                             None
                         };
                         let mut errors = ObjectBrowser::get_thin_compilation_errors(
-                            &mut conn,
+                            conn,
                             &qualified_name,
                             object_type,
                         )
                         .unwrap_or_default();
                         if object_type == "PACKAGE" {
                             if let Ok(body_errors) = ObjectBrowser::get_thin_compilation_errors(
-                                &mut conn,
+                                conn,
                                 &qualified_name,
                                 "PACKAGE BODY",
                             ) {
@@ -8694,10 +8683,18 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     )> {
         let db_type = context.connection_info.db_type;
         context.ensure_current().ok()?;
-        let (current_schema, mut available_scopes, use_thin_metadata) = match context
-            .acquire_session_for_current_scope(activity)
+        let acquired = match context.acquire_session_for_current_scope(activity) {
+            Ok(acquired) => acquired,
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to acquire Oracle object-browser metadata session: {err}"
+                );
+                return None;
+            }
+        };
+        let (current_schema, mut available_scopes, use_thin_metadata) = match acquired.into_oracle()
         {
-            Ok((crate::db::DbPoolSession::Oracle(conn), _cancel_registration)) => {
+            Ok(conn) => {
                 let current_schema = context
                     .oracle_current_schema
                     .clone()
@@ -8714,36 +8711,33 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                 let available_scopes = ObjectBrowser::get_users(&conn).unwrap_or_default();
                 (current_schema, available_scopes, false)
             }
-            Ok((crate::db::DbPoolSession::OracleThin(mut conn), _cancel_registration)) => {
-                let current_schema = context
-                    .oracle_current_schema
-                    .clone()
-                    .or_else(|| {
-                        ObjectBrowser::get_thin_current_schema(&mut conn)
-                            .ok()
-                            .map(|schema| schema.trim().to_string())
-                            .filter(|schema| !schema.is_empty())
-                    })
-                    .or_else(|| {
-                        let username = context.connection_info.username.trim();
-                        (!username.is_empty()).then(|| username.to_ascii_uppercase())
-                    });
-                let available_scopes = ObjectBrowser::get_thin_users(&mut conn).unwrap_or_default();
-                (current_schema, available_scopes, true)
-            }
-            Ok((other, _cancel_registration)) => {
-                eprintln!(
-                    "Warning: expected Oracle object-browser metadata session but acquired {}",
-                    other.db_type()
-                );
-                return None;
-            }
-            Err(err) => {
-                eprintln!(
-                    "Warning: failed to acquire Oracle object-browser metadata session: {err}"
-                );
-                return None;
-            }
+            Err(acquired) => match acquired.into_oracle_thin() {
+                Ok(mut conn) => {
+                    let current_schema = context
+                        .oracle_current_schema
+                        .clone()
+                        .or_else(|| {
+                            ObjectBrowser::get_thin_current_schema(&mut conn)
+                                .ok()
+                                .map(|schema| schema.trim().to_string())
+                                .filter(|schema| !schema.is_empty())
+                        })
+                        .or_else(|| {
+                            let username = context.connection_info.username.trim();
+                            (!username.is_empty()).then(|| username.to_ascii_uppercase())
+                        });
+                    let available_scopes =
+                        ObjectBrowser::get_thin_users(&mut conn).unwrap_or_default();
+                    (current_schema, available_scopes, true)
+                }
+                Err(other) => {
+                    eprintln!(
+                        "Warning: expected Oracle object-browser metadata session but acquired {}",
+                        other.describe_session()
+                    );
+                    return None;
+                }
+            },
         };
         context.ensure_current().ok()?;
         if let Some(ref current_schema) = current_schema {
@@ -8769,7 +8763,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.tables = if use_thin_metadata {
-                    let Some((mut db_conn, _cancel_registration)) =
+                    let Some(mut db_conn) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_tables,
                             &activity_for_tables,
@@ -8780,12 +8774,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_tables_by_owner(&mut db_conn, &scope_for_tables)
                         .unwrap_or_default()
                 } else {
-                    let Some((db_conn, _cancel_registration)) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(
-                            &context_for_tables,
-                            &activity_for_tables,
-                        )
-                    else {
+                    let Some(db_conn) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                        &context_for_tables,
+                        &activity_for_tables,
+                    ) else {
                         return cache;
                     };
                     ObjectBrowser::get_tables_by_owner(&db_conn, &scope_for_tables)
@@ -8800,7 +8792,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.views = if use_thin_metadata {
-                    let Some((mut db_conn, _cancel_registration)) =
+                    let Some(mut db_conn) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_views,
                             &activity_for_views,
@@ -8811,12 +8803,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_views_by_owner(&mut db_conn, &scope_for_views)
                         .unwrap_or_default()
                 } else {
-                    let Some((db_conn, _cancel_registration)) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(
-                            &context_for_views,
-                            &activity_for_views,
-                        )
-                    else {
+                    let Some(db_conn) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                        &context_for_views,
+                        &activity_for_views,
+                    ) else {
                         return cache;
                     };
                     ObjectBrowser::get_views_by_owner(&db_conn, &scope_for_views)
@@ -8831,7 +8821,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.procedures = if use_thin_metadata {
-                    let Some((mut db_conn, _cancel_registration)) =
+                    let Some(mut db_conn) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_procedures,
                             &activity_for_procedures,
@@ -8842,12 +8832,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_procedures_by_owner(&mut db_conn, &scope_for_procedures)
                         .unwrap_or_default()
                 } else {
-                    let Some((db_conn, _cancel_registration)) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(
-                            &context_for_procedures,
-                            &activity_for_procedures,
-                        )
-                    else {
+                    let Some(db_conn) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                        &context_for_procedures,
+                        &activity_for_procedures,
+                    ) else {
                         return cache;
                     };
                     ObjectBrowser::get_procedures_by_owner(&db_conn, &scope_for_procedures)
@@ -8862,7 +8850,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.functions = if use_thin_metadata {
-                    let Some((mut db_conn, _cancel_registration)) =
+                    let Some(mut db_conn) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_functions,
                             &activity_for_functions,
@@ -8873,12 +8861,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_functions_by_owner(&mut db_conn, &scope_for_functions)
                         .unwrap_or_default()
                 } else {
-                    let Some((db_conn, _cancel_registration)) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(
-                            &context_for_functions,
-                            &activity_for_functions,
-                        )
-                    else {
+                    let Some(db_conn) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                        &context_for_functions,
+                        &activity_for_functions,
+                    ) else {
                         return cache;
                     };
                     ObjectBrowser::get_functions_by_owner(&db_conn, &scope_for_functions)
@@ -8893,7 +8879,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.sequences = if use_thin_metadata {
-                    let Some((mut db_conn, _cancel_registration)) =
+                    let Some(mut db_conn) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_sequences,
                             &activity_for_sequences,
@@ -8904,12 +8890,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_sequences_by_owner(&mut db_conn, &scope_for_sequences)
                         .unwrap_or_default()
                 } else {
-                    let Some((db_conn, _cancel_registration)) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(
-                            &context_for_sequences,
-                            &activity_for_sequences,
-                        )
-                    else {
+                    let Some(db_conn) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                        &context_for_sequences,
+                        &activity_for_sequences,
+                    ) else {
                         return cache;
                     };
                     ObjectBrowser::get_sequences_by_owner(&db_conn, &scope_for_sequences)
@@ -8924,7 +8908,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.triggers = if use_thin_metadata {
-                    let Some((mut db_conn, _cancel_registration)) =
+                    let Some(mut db_conn) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_triggers,
                             &activity_for_triggers,
@@ -8935,12 +8919,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_triggers_by_owner(&mut db_conn, &scope_for_triggers)
                         .unwrap_or_default()
                 } else {
-                    let Some((db_conn, _cancel_registration)) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(
-                            &context_for_triggers,
-                            &activity_for_triggers,
-                        )
-                    else {
+                    let Some(db_conn) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                        &context_for_triggers,
+                        &activity_for_triggers,
+                    ) else {
                         return cache;
                     };
                     ObjectBrowser::get_triggers_by_owner(&db_conn, &scope_for_triggers)
@@ -8955,7 +8937,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.synonyms = if use_thin_metadata {
-                    let Some((mut db_conn, _cancel_registration)) =
+                    let Some(mut db_conn) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_synonyms,
                             &activity_for_synonyms,
@@ -8966,12 +8948,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_synonyms_by_owner(&mut db_conn, &scope_for_synonyms)
                         .unwrap_or_default()
                 } else {
-                    let Some((db_conn, _cancel_registration)) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(
-                            &context_for_synonyms,
-                            &activity_for_synonyms,
-                        )
-                    else {
+                    let Some(db_conn) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                        &context_for_synonyms,
+                        &activity_for_synonyms,
+                    ) else {
                         return cache;
                     };
                     ObjectBrowser::get_synonyms_by_owner(&db_conn, &scope_for_synonyms)
@@ -8986,7 +8966,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.packages = if use_thin_metadata {
-                    let Some((mut db_conn, _cancel_registration)) =
+                    let Some(mut db_conn) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_packages,
                             &activity_for_packages,
@@ -8997,12 +8977,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_packages_by_owner(&mut db_conn, &scope_for_packages)
                         .unwrap_or_default()
                 } else {
-                    let Some((db_conn, _cancel_registration)) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(
-                            &context_for_packages,
-                            &activity_for_packages,
-                        )
-                    else {
+                    let Some(db_conn) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                        &context_for_packages,
+                        &activity_for_packages,
+                    ) else {
                         return cache;
                     };
                     ObjectBrowser::get_packages_by_owner(&db_conn, &scope_for_packages)
@@ -9135,12 +9113,12 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     fn load_routine_script(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         object_name: &str,
         routine_type: &str,
     ) -> Result<RoutineScriptData, String> {
-        let mut conn = self.take_object_action_session(context, session)?;
+        let conn = self.take_object_action_session(context, session)?;
         let action_scope = self.action_scope(selected_scope, context);
         let qualified_name = self.qualify_object_name(action_scope, object_name);
         crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_arguments_in_schema(
@@ -9159,11 +9137,11 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     fn load_table_structure(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<TableColumnDetail>, String> {
-        let mut conn = self.take_object_action_session(context, session)?;
+        let conn = self.take_object_action_session(context, session)?;
         crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_structure_in_schema(
             conn.as_mut(),
             self.action_scope(selected_scope, context),
@@ -9175,7 +9153,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     fn load_table_rows(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<crate::db::QueryResult, String> {
@@ -9184,7 +9162,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         // statements differently, and defaulting to MySQL would quietly give a
         // MariaDB connection MySQL's answer.
         let db_type = context.connection_info.db_type;
-        let mut conn = self.take_object_action_session(context, session)?;
+        let conn = self.take_object_action_session(context, session)?;
         let results = crate::db::query::mysql_executor::MysqlExecutor::execute_for_db_type(
             conn.as_mut(),
             &sql,
@@ -9200,11 +9178,11 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     fn load_table_indexes(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<IndexInfo>, String> {
-        let mut conn = self.take_object_action_session(context, session)?;
+        let conn = self.take_object_action_session(context, session)?;
         crate::db::query::mysql_executor::MysqlObjectBrowser::get_index_details_in_schema(
             conn.as_mut(),
             self.action_scope(selected_scope, context),
@@ -9216,11 +9194,11 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     fn load_table_constraints(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<ConstraintInfo>, String> {
-        let mut conn = self.take_object_action_session(context, session)?;
+        let conn = self.take_object_action_session(context, session)?;
         crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_constraints_in_schema(
             conn.as_mut(),
             self.action_scope(selected_scope, context),
@@ -9232,7 +9210,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     fn load_object_info(
         &self,
         _context: &crate::db::DbPoolSessionContext,
-        _session: crate::db::DbPoolSession,
+        _session: &mut crate::db::DbPoolSession,
         _selected_scope: Option<&str>,
         object_type: &str,
         _object_name: &str,
@@ -9246,12 +9224,12 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     fn generate_object_ddl(
         &self,
         context: &crate::db::DbPoolSessionContext,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         object_type: &str,
         object_name: &str,
     ) -> Result<String, String> {
-        let mut conn = self.take_object_action_session(context, session)?;
+        let conn = self.take_object_action_session(context, session)?;
         match object_type {
             "MATERIALIZED_VIEW" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "TYPE" | "INDEX" => {
                 Err(format!(
@@ -9392,23 +9370,17 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         let requested_scope = requested_scope
             .map(|scope| scope.trim().to_string())
             .filter(|scope| !scope.is_empty());
-        let (mut mysql_conn, _cancel_registration) = match context
-            .acquire_session_for_current_scope(activity)
-        {
-            Ok((
-                crate::db::DbPoolSession::MySQL {
-                    conn,
-                    db_type: session_db_type,
-                },
-                registration,
-            )) if session_db_type.is_same_type_as(db_type) => (conn, registration),
-            Ok((other, _registration)) => {
-                eprintln!(
-                    "Warning: expected {display_name} object-browser metadata session but acquired {}",
-                    other.db_type()
-                );
-                return None;
-            }
+        let mut mysql_conn = match context.acquire_session_for_current_scope(activity) {
+            Ok(acquired) => match acquired.into_mysql(db_type) {
+                Ok(conn) => conn,
+                Err(other) => {
+                    eprintln!(
+                        "Warning: expected {display_name} object-browser metadata session but acquired {}",
+                        other.describe_session()
+                    );
+                    return None;
+                }
+            },
             Err(err) => {
                 eprintln!(
                     "Warning: failed to acquire {display_name} object-browser metadata session: {err}"
@@ -9453,7 +9425,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
 
             if let Err(err) =
                 crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type(
-                    &mut mysql_conn,
+                    &mut *mysql_conn,
                     &context.connection_info.advanced,
                     db_type,
                 )
@@ -9477,13 +9449,11 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_tables = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) =
-                    ObjectBrowserWidget::acquire_mysql_metadata_session(
-                        &context_for_tables,
-                        &scope_for_tables,
-                        &activity_for_tables,
-                    )
-                else {
+                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                    &context_for_tables,
+                    &scope_for_tables,
+                    &activity_for_tables,
+                ) else {
                     return cache;
                 };
                 cache.tables =
@@ -9496,13 +9466,11 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_views = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) =
-                    ObjectBrowserWidget::acquire_mysql_metadata_session(
-                        &context_for_views,
-                        &scope_for_views,
-                        &activity_for_views,
-                    )
-                else {
+                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                    &context_for_views,
+                    &scope_for_views,
+                    &activity_for_views,
+                ) else {
                     return cache;
                 };
                 cache.views =
@@ -9515,13 +9483,11 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_procedures = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) =
-                    ObjectBrowserWidget::acquire_mysql_metadata_session(
-                        &context_for_procedures,
-                        &scope_for_procedures,
-                        &activity_for_procedures,
-                    )
-                else {
+                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                    &context_for_procedures,
+                    &scope_for_procedures,
+                    &activity_for_procedures,
+                ) else {
                     return cache;
                 };
                 cache.procedures =
@@ -9534,13 +9500,11 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_functions = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) =
-                    ObjectBrowserWidget::acquire_mysql_metadata_session(
-                        &context_for_functions,
-                        &scope_for_functions,
-                        &activity_for_functions,
-                    )
-                else {
+                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                    &context_for_functions,
+                    &scope_for_functions,
+                    &activity_for_functions,
+                ) else {
                     return cache;
                 };
                 cache.functions =
@@ -9553,13 +9517,11 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_sequences = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) =
-                    ObjectBrowserWidget::acquire_mysql_metadata_session(
-                        &context_for_sequences,
-                        &scope_for_sequences,
-                        &activity_for_sequences,
-                    )
-                else {
+                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                    &context_for_sequences,
+                    &scope_for_sequences,
+                    &activity_for_sequences,
+                ) else {
                     return cache;
                 };
                 cache.sequences =
@@ -9572,13 +9534,11 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_triggers = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) =
-                    ObjectBrowserWidget::acquire_mysql_metadata_session(
-                        &context_for_triggers,
-                        &scope_for_triggers,
-                        &activity_for_triggers,
-                    )
-                else {
+                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                    &context_for_triggers,
+                    &scope_for_triggers,
+                    &activity_for_triggers,
+                ) else {
                     return cache;
                 };
                 cache.triggers =
@@ -9591,13 +9551,11 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_events = selected_scope;
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) =
-                    ObjectBrowserWidget::acquire_mysql_metadata_session(
-                        &context_for_events,
-                        &scope_for_events,
-                        &activity_for_events,
-                    )
-                else {
+                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                    &context_for_events,
+                    &scope_for_events,
+                    &activity_for_events,
+                ) else {
                     return cache;
                 };
                 cache.events =

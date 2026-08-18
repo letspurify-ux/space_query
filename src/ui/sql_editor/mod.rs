@@ -762,6 +762,21 @@ pub(crate) enum QueryCancelHandle {
     MySql(Box<MySqlQueryCancelContext>, CanceledSession),
     /// A target its owner can TAKE BACK. See [`QueryCancelTarget`].
     Withdrawable(QueryCancelTarget),
+    /// The tab's per-operation slot ITSELF, read again at the moment a tier
+    /// acts on it.
+    ///
+    /// The lazy-fetch road has always had this through [`QueryCancelTarget`];
+    /// the operation road did not. Its watchdog cloned the inner handle out of
+    /// the slot and then made a network call on the clone, so a hand-back that
+    /// landed in between -- withdraw, then the session into the tab's slot or
+    /// back into the pool -- could not be seen: a raw `Arc<Connection>`, thin
+    /// handle or MySQL context has nowhere to look. Reading the slot again is
+    /// what makes "a withdraw that lands first wins" true on BOTH roads, and
+    /// with one implementation rather than two.
+    ///
+    /// Never PUBLISHED into a slot -- it is what a tier holds while it acts,
+    /// and `SqlEditorWidget::set_current_query_cancel_handle` refuses it.
+    OperationSlot(Arc<Mutex<OperationCancelTarget>>),
     #[cfg(test)]
     Test(Arc<AtomicBool>),
     #[cfg(test)]
@@ -2434,12 +2449,25 @@ impl QueryCancelHandle {
         }
     }
 
+    /// What an operation slot has published RIGHT NOW.
+    fn operation_slot_published(
+        slot: &Arc<Mutex<OperationCancelTarget>>,
+    ) -> Option<QueryCancelHandle> {
+        SqlEditorWidget::clone_current_query_cancel_handle(slot)
+            .published()
+            .cloned()
+    }
+
     pub(crate) fn cancel_interrupt(&self) -> Result<(), String> {
         match self {
             QueryCancelHandle::Oracle(conn, _) => conn.interrupt(),
             QueryCancelHandle::OracleThin(cancel_handle, _) => cancel_handle.interrupt(),
             QueryCancelHandle::MySql(context, _) => context.interrupt(),
             QueryCancelHandle::Withdrawable(target) => match target.published_handle() {
+                Some(handle) => handle.cancel_interrupt(),
+                None => Err(WITHDRAWN_CANCEL_TARGET_MESSAGE.to_string()),
+            },
+            QueryCancelHandle::OperationSlot(slot) => match Self::operation_slot_published(slot) {
                 Some(handle) => handle.cancel_interrupt(),
                 None => Err(WITHDRAWN_CANCEL_TARGET_MESSAGE.to_string()),
             },
@@ -2471,6 +2499,9 @@ impl QueryCancelHandle {
             | QueryCancelHandle::OracleThin(_, session)
             | QueryCancelHandle::MySql(_, session) => Some(*session),
             QueryCancelHandle::Withdrawable(target) => target.canceled_session(),
+            QueryCancelHandle::OperationSlot(slot) => {
+                Self::operation_slot_published(slot).and_then(|handle| handle.canceled_session())
+            }
             #[cfg(test)]
             QueryCancelHandle::Test(_) | QueryCancelHandle::TestBlockingForce { .. } => None,
         }
@@ -2506,6 +2537,13 @@ impl QueryCancelHandle {
                 Some(handle) => handle.destroy_session(),
                 None => Err(WITHDRAWN_CANCEL_TARGET_MESSAGE.to_string()),
             },
+            // Same, for the operation road: the hand-back doors set the slot to
+            // `Withdrawn` before the session moves, so a target that is not
+            // published at THIS instant is one no tier may touch.
+            QueryCancelHandle::OperationSlot(slot) => match Self::operation_slot_published(&slot) {
+                Some(handle) => handle.destroy_session(),
+                None => Err(WITHDRAWN_CANCEL_TARGET_MESSAGE.to_string()),
+            },
             #[cfg(test)]
             QueryCancelHandle::Test(called) => {
                 called.store(true, Ordering::Relaxed);
@@ -2529,6 +2567,8 @@ impl QueryCancelHandle {
             QueryCancelHandle::MySql(_, _) => "MySQL-family",
             QueryCancelHandle::Withdrawable(target) => target
                 .published_handle()
+                .map_or("query session", |handle| handle.label()),
+            QueryCancelHandle::OperationSlot(slot) => Self::operation_slot_published(slot)
                 .map_or("query session", |handle| handle.label()),
             #[cfg(test)]
             QueryCancelHandle::Test(_) | QueryCancelHandle::TestBlockingForce { .. } => "test",
@@ -6483,7 +6523,7 @@ impl SqlEditorWidget {
                     return;
                 }
 
-                let Some(cancel_handle) = cancel_target.published().cloned() else {
+                if cancel_target.published().is_none() {
                     // The worker has no break-able session published — it has not
                     // reached one yet, or it has just given one back between
                     // statements. Keep cancel requested so execution stops at the
@@ -6491,7 +6531,13 @@ impl SqlEditorWidget {
                     // instead of pretending the DB-level break already happened.
                     send_outcome(QueryCancelOutcome::PendingInitialization);
                     return;
-                };
+                }
+                // Read through the SLOT for the same reason the force tier does:
+                // a hand-back landing between the check above and the break
+                // below withdraws first, and the break must see that rather than
+                // act on a handle cloned a moment earlier.
+                let cancel_handle =
+                    QueryCancelHandle::OperationSlot(Arc::clone(&current_query_cancel_handle));
 
                 let interrupt_result =
                     panic::catch_unwind(AssertUnwindSafe(|| cancel_handle.cancel_interrupt()))
@@ -6515,10 +6561,21 @@ impl SqlEditorWidget {
                     send_outcome(QueryCancelOutcome::AlreadyFinished);
                     return;
                 }
-                let outcome = interrupt_result
-                    .map_or_else(QueryCancelOutcome::InterruptFailed, |()| {
-                        QueryCancelOutcome::InterruptSent
-                    });
+                let outcome = match interrupt_result {
+                    Ok(()) => QueryCancelOutcome::InterruptSent,
+                    // The work gave the session back between the check above
+                    // and the break. The graceful tier treats that exactly like
+                    // a session that has not arrived yet -- it keeps the cancel
+                    // requested and waits -- because on the MySQL family the
+                    // tab's session is re-acquired PER STATEMENT and a script
+                    // `CONNECT` replaces it mid-batch. Reporting it as a failed
+                    // interrupt would invite a retry for something that did not
+                    // fail.
+                    Err(message) if message == WITHDRAWN_CANCEL_TARGET_MESSAGE => {
+                        QueryCancelOutcome::PendingInitialization
+                    }
+                    Err(message) => QueryCancelOutcome::InterruptFailed(message),
+                };
                 send_outcome(outcome);
             });
         if let Err(err) = spawn_result {
@@ -6662,7 +6719,18 @@ impl SqlEditorWidget {
 
                     let target =
                         Self::clone_current_query_cancel_handle(&current_query_cancel_handle);
-                    if let Some(handle) = target.published().cloned() {
+                    if target.published().is_some() {
+                        // The SLOT, not the handle inside it. Between this read
+                        // and the tear-down below there is a channel send and a
+                        // network call, and a hand-back landing in that window
+                        // sets the slot to `Withdrawn` BEFORE the session moves
+                        // -- so the tier that cannot be undone asks again at the
+                        // moment it acts. The lazy-fetch road has always worked
+                        // this way (`QueryCancelTarget`); cloning the inner
+                        // handle out is what left this one unable to look.
+                        let handle = QueryCancelHandle::OperationSlot(Arc::clone(
+                            &current_query_cancel_handle,
+                        ));
                         let _ = progress_sender.send(QueryProgress::CancelOutcome {
                             token: operation_token,
                             outcome: QueryCancelOutcome::ForceStarted,
@@ -6677,6 +6745,20 @@ impl SqlEditorWidget {
                             ))
                         });
                         if let Err(message) = force_result {
+                            if message == WITHDRAWN_CANCEL_TARGET_MESSAGE {
+                                // The session was handed back between the read
+                                // above and the tear-down: it is the tab's
+                                // retained session now, or the pool's, or
+                                // another tab's. Nothing failed, and nothing
+                                // must be retried -- the same answer the
+                                // `may_still_publish` branch below gives.
+                                crate::utils::logging::log_info(
+                                    "sql_editor::cancel",
+                                    "Cancel target was withdrawn while the force tier was \
+                                     acting; the session is no longer this operation's",
+                                );
+                                return;
+                            }
                             if !load_mutex_bool(&cancel_flag)
                                 || !Self::is_query_running_flag(&query_running)
                                 || !Self::cancel_snapshot_matches_for_watchdog(
@@ -6890,6 +6972,12 @@ impl SqlEditorWidget {
         current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         value: Option<QueryCancelHandle>,
     ) {
+        debug_assert!(
+            !matches!(value, Some(QueryCancelHandle::OperationSlot(_))),
+            "an operation slot is what a cancel tier HOLDS while it acts, never what an \
+             execution publishes: storing one in the slot it reads would make every tier \
+             recurse"
+        );
         let value = value.map_or(OperationCancelTarget::Withdrawn, |handle| {
             OperationCancelTarget::Published(handle)
         });
@@ -9955,7 +10043,7 @@ mod cancel_watchdog_tests {
         // requested, for both of the not-published answers.
         let source = include_str!("mod.rs");
         let start = source
-            .find("let Some(cancel_handle) = cancel_target.published().cloned() else {")
+            .find("if cancel_target.published().is_none() {\n                    // The worker has no break-able session published")
             .expect("the graceful tier must gate on a published session");
         let fallback = &source[start..start + 700];
         assert!(
@@ -9967,6 +10055,24 @@ mod cancel_watchdog_tests {
             !fallback.contains("QueryCancelOutcome::AlreadyFinished"),
             "and it must never report the operation finished on the strength of the target \
              alone: {fallback}"
+        );
+        // The same answer when the withdraw lands MID-BREAK. The graceful tier
+        // now reads the slot again at the moment it acts (see
+        // `QueryCancelHandle::OperationSlot`), so it can be told the session was
+        // handed back while it was breaking it -- and that is still not a
+        // failure and still not the end of the operation.
+        let mid_break = source
+            .find("Err(message) if message == WITHDRAWN_CANCEL_TARGET_MESSAGE =>")
+            .expect("the graceful tier must have an answer for a withdraw that lands mid-break");
+        let mid_break = &source[mid_break..mid_break + 200];
+        assert!(
+            mid_break.contains("QueryCancelOutcome::PendingInitialization"),
+            "a withdraw during the break keeps the cancel requested, exactly like a session \
+             that has not arrived: {mid_break}"
+        );
+        assert!(
+            !mid_break.contains("QueryCancelOutcome::InterruptFailed"),
+            "and it is never reported as an interrupt that failed: {mid_break}"
         );
     }
 

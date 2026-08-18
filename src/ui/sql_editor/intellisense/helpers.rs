@@ -53,7 +53,7 @@ trait ColumnLoadBackend: Sync {
     fn load_columns(
         &self,
         expected_db_type: crate::db::DatabaseType,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         table_key: &str,
         schema_and_table: Option<(&str, &str)>,
     ) -> LoadedColumns;
@@ -63,7 +63,7 @@ trait ColumnLoadBackend: Sync {
     fn load_foreign_keys(
         &self,
         expected_db_type: crate::db::DatabaseType,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         table_key: &str,
         schema_and_table: Option<(&str, &str)>,
     ) -> Result<Vec<ForeignKeyMeta>, ()>;
@@ -87,19 +87,19 @@ impl ColumnLoadBackend for OracleColumnLoadBackend {
     fn load_columns(
         &self,
         _expected_db_type: crate::db::DatabaseType,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         table_key: &str,
         _schema_and_table: Option<(&str, &str)>,
     ) -> LoadedColumns {
         match session {
             crate::db::DbPoolSession::Oracle(conn) => {
-                match crate::db::ObjectBrowser::get_table_structure(&conn, table_key) {
+                match crate::db::ObjectBrowser::get_table_structure(conn, table_key) {
                     Ok(details) => LoadedColumns::from_details(details),
                     Err(_) => LoadedColumns::failed(),
                 }
             }
-            crate::db::DbPoolSession::OracleThin(mut conn) => {
-                match crate::db::ObjectBrowser::get_thin_table_structure(&mut conn, table_key) {
+            crate::db::DbPoolSession::OracleThin(conn) => {
+                match crate::db::ObjectBrowser::get_thin_table_structure(conn, table_key) {
                     Ok(details) => LoadedColumns::from_details(details),
                     Err(_) => LoadedColumns::failed(),
                 }
@@ -117,18 +117,18 @@ impl ColumnLoadBackend for OracleColumnLoadBackend {
     fn load_foreign_keys(
         &self,
         _expected_db_type: crate::db::DatabaseType,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         table_key: &str,
         _schema_and_table: Option<(&str, &str)>,
     ) -> Result<Vec<ForeignKeyMeta>, ()> {
         match session {
             crate::db::DbPoolSession::Oracle(conn) => {
-                crate::db::ObjectBrowser::get_table_foreign_keys(&conn, table_key)
+                crate::db::ObjectBrowser::get_table_foreign_keys(conn, table_key)
                     .map(foreign_keys_to_meta)
                     .map_err(|_| ())
             }
-            crate::db::DbPoolSession::OracleThin(mut conn) => {
-                crate::db::ObjectBrowser::get_thin_table_foreign_keys(&mut conn, table_key)
+            crate::db::DbPoolSession::OracleThin(conn) => {
+                crate::db::ObjectBrowser::get_thin_table_foreign_keys(conn, table_key)
                     .map(foreign_keys_to_meta)
                     .map_err(|_| ())
             }
@@ -147,13 +147,13 @@ impl ColumnLoadBackend for MysqlColumnLoadBackend {
     fn load_columns(
         &self,
         expected_db_type: crate::db::DatabaseType,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         table_key: &str,
         schema_and_table: Option<(&str, &str)>,
     ) -> LoadedColumns {
         match session {
             crate::db::DbPoolSession::MySQL {
-                conn: mut mysql_conn,
+                conn: mysql_conn,
                 db_type,
             } => {
                 if !db_type.is_same_type_as(expected_db_type) {
@@ -201,13 +201,13 @@ impl ColumnLoadBackend for MysqlColumnLoadBackend {
     fn load_foreign_keys(
         &self,
         expected_db_type: crate::db::DatabaseType,
-        session: crate::db::DbPoolSession,
+        session: &mut crate::db::DbPoolSession,
         table_key: &str,
         schema_and_table: Option<(&str, &str)>,
     ) -> Result<Vec<ForeignKeyMeta>, ()> {
         match session {
             crate::db::DbPoolSession::MySQL {
-                conn: mut mysql_conn,
+                conn: mysql_conn,
                 db_type,
             } => {
                 if !db_type.is_same_type_as(expected_db_type) {
@@ -494,13 +494,14 @@ impl SqlEditorWidget {
             return;
         }
 
-        // `_cancel_registration` keeps this column load reachable by the cancel
-        // button for as long as it holds the session.
+        // The session and the cancel reach published over it travel as ONE
+        // value (`AcquiredPoolSession`), so this column load stays reachable by
+        // the cancel button for exactly as long as it holds the session.
         // The requesting TAB's scope, never the connection's: an unqualified
         // table name must resolve where that tab's statements would. The two
         // sibling metadata lookups (signature hints, bind-prompt routine
         // arguments) already acquire this way.
-        let (pool_session, _cancel_registration) = match context
+        let mut pool_session = match context
             .acquire_session_for_scope(scope.as_deref(), &activity_guard)
         {
             Ok(session) => session,
@@ -516,6 +517,11 @@ impl SqlEditorWidget {
             return;
         }
 
+        let Some(session) = pool_session.session_mut() else {
+            Self::send_empty_column_load_update(&sender, &table_key, foreign_keys);
+            return;
+        };
+
         let schema_and_table = Self::column_load_schema_and_table(&table_key);
         let schema_and_table_ref = schema_and_table
             .as_ref()
@@ -525,7 +531,7 @@ impl SqlEditorWidget {
         let update = if foreign_keys {
             match backend.load_foreign_keys(
                 context.connection_info.db_type,
-                pool_session,
+                session,
                 table_key.as_str(),
                 schema_and_table_ref,
             ) {
@@ -549,7 +555,7 @@ impl SqlEditorWidget {
                 cache: cache_columns,
             } = backend.load_columns(
                 context.connection_info.db_type,
-                pool_session,
+                session,
                 table_key.as_str(),
                 schema_and_table_ref,
             );

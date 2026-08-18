@@ -2525,7 +2525,7 @@ fn object_browser_mysql_family_actions_keep_concrete_db_type() {
     };
     let body = rust_function_body_by_signature(
         &content,
-        "fn take_object_action_session(",
+        "fn take_object_action_session<'a>(",
         "src/ui/object_browser.rs",
     );
     let metadata_session_body = rust_function_body_by_signature(
@@ -2550,11 +2550,32 @@ fn object_browser_mysql_family_actions_keep_concrete_db_type() {
         "MySQL/MariaDB object-browser actions must validate the concrete pool session DB type \
          against the active object-browser context and use the concrete display name"
     );
+    // The family check itself lives in `AcquiredPoolSession::into_mysql`, which
+    // takes the expected family as an argument -- the pool session and the
+    // cancel reach published over it are ONE value now, so the caller cannot
+    // pattern-match the session out of a tuple without also deciding what
+    // happens to the reach. What these two must still do is pass the ACTIVE
+    // context's concrete type and report with its concrete display name.
+    let connection_path = manifest_dir.join("src").join("db").join("connection.rs");
+    let connection = match fs::read_to_string(&connection_path) {
+        Ok(content) => content,
+        Err(err) => panic!(
+            "failed to read source file {}: {err}",
+            connection_path.display()
+        ),
+    };
+    let into_mysql =
+        rust_function_body_by_signature(&connection, "pub fn into_mysql(", "src/db/connection.rs");
+    assert!(
+        into_mysql.contains("db_type.is_same_type_as(expected)"),
+        "the one family check must compare the session's concrete type with the expected one: \
+         {into_mysql}"
+    );
     assert!(
         metadata_session_body.contains("context.connection_info.db_type")
-            && metadata_session_body.contains("db_type.is_same_type_as(expected_db_type)")
+            && metadata_session_body.contains("acquired.into_mysql(expected_db_type)")
             && metadata_session_body.contains("expected_db_type.display_name()")
-            && metadata_cache_body.contains("session_db_type.is_same_type_as(db_type)")
+            && metadata_cache_body.contains("acquired.into_mysql(db_type)")
             && metadata_cache_body.contains("db_type.display_name()"),
         "MySQL/MariaDB object-browser metadata loading must validate concrete pool session DB \
          types and use the active context display name"
