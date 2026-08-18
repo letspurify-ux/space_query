@@ -13081,7 +13081,12 @@ impl MainWindow {
                     return true;
                 }
 
-                runtime.set_state(ConnectionRuntimeState::Transitioning);
+                // Announced and taken back as ONE value, like the pool rebuild
+                // and Disconnect All: a worker that never starts or dies partway
+                // would otherwise leave this connection claiming it is
+                // transitioning for the life of the process, with reconnect,
+                // Disconnect All and preferences all refusing it.
+                let transition = ConnectionRuntime::announce_transition(vec![runtime.clone()]);
                 {
                     let mut s = state
                         .lock()
@@ -13113,6 +13118,10 @@ impl MainWindow {
                         // worker panics or never starts, because the hold drops
                         // with the closure either way.
                         let _handout_hold = handout_hold;
+                        // Moved in for the same reason: whatever this worker
+                        // does not reach is read back from the connection when
+                        // the transition drops with the closure.
+                        let mut transition = transition;
                         let result = panic::catch_unwind(AssertUnwindSafe(|| {
                             connect_shared_connection_with_policy(
                                 &connection,
@@ -13127,9 +13136,12 @@ impl MainWindow {
                                 panic_payload_to_string(payload.as_ref())
                             ))
                         });
+                        // Out of transition either way, and its state read back
+                        // from the connection it belongs to. The result handler
+                        // still applies its own answer on the UI thread.
+                        transition.finished(&runtime_for_worker);
                         match result {
                             Ok(_) => {
-                                runtime_for_worker.refresh_state_from_connection();
                                 info.clear_password();
                                 let _ = sender.send(ConnectionResult::Success {
                                     connection_id,
@@ -13362,9 +13374,17 @@ impl MainWindow {
                     return true;
                 }
 
-                for runtime in &runtimes {
-                    runtime.set_state(ConnectionRuntimeState::Transitioning);
-                }
+                // Announced and taken back as ONE value, exactly like the pool
+                // rebuild's. Setting the state by hand is a promise nothing
+                // keeps: a disconnect that unwinds partway would leave the
+                // connections it never reached claiming they are transitioning
+                // for the life of the process -- every tab labelled
+                // "(transitioning)", reconnect refused as already in progress,
+                // Disconnect All and preferences refused, and no way back but a
+                // restart. `ConnectionTransition` reads each connection's state
+                // back from the connection itself, which is the only place the
+                // truth was ever kept.
+                let mut transition = ConnectionRuntime::announce_transition(runtimes.clone());
                 {
                     let mut s = state
                         .lock()
@@ -13396,9 +13416,14 @@ impl MainWindow {
                     db_conn.disconnect();
                     db_conn.refresh_tracked_connection();
                     drop(db_conn);
-                    runtime.set_state(ConnectionRuntimeState::Disconnected);
+                    // This connection is out of transition: its state is read
+                    // back from the connection it belongs to, and its pool
+                    // re-opens one connection at a time rather than all of them
+                    // at the end.
+                    transition.finished(&runtime);
                     disconnected.push(runtime.id());
                 }
+                drop(transition);
 
                 let mut s = state
                     .lock()

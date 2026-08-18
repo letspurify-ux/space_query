@@ -181,7 +181,20 @@ fn release_retained_sessions_for_retired_connection(retired_generation: u64) -> 
     released
 }
 
-fn lock_retired_connection_generations() -> MutexGuard<'static, std::collections::HashSet<u64>> {
+fn lock_retired_connection_generations() -> TrackedGuard<'static, std::collections::HashSet<u64>> {
+    // Tracked like every other shared lock in this file: it is taken from under
+    // both the connection mutex (a generation bump) and the session-lease mutex
+    // (the filing door), so leaving it out was leaving those two orders
+    // invisible to the detector.
+    let _order = crate::db::lock_order::LockOrderScope::enter(
+        crate::db::lock_order::names::RETIRED_GENERATIONS,
+    );
+    let guard = lock_retired_connection_generations_raw();
+    TrackedGuard { guard, _order }
+}
+
+fn lock_retired_connection_generations_raw() -> MutexGuard<'static, std::collections::HashSet<u64>>
+{
     RETIRED_CONNECTION_GENERATIONS
         .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
         .lock()
@@ -228,7 +241,15 @@ pub(crate) fn connection_generation_is_retired(connection_generation: u64) -> bo
 /// first.
 static POOL_SESSION_HANDOUT_HOLDS: OnceLock<Mutex<HashMap<ConnectionId, usize>>> = OnceLock::new();
 
-fn lock_pool_session_handout_holds() -> MutexGuard<'static, HashMap<ConnectionId, usize>> {
+fn lock_pool_session_handout_holds() -> TrackedGuard<'static, HashMap<ConnectionId, usize>> {
+    let _order = crate::db::lock_order::LockOrderScope::enter(
+        crate::db::lock_order::names::POOL_HANDOUT_HOLDS,
+    );
+    let guard = lock_pool_session_handout_holds_raw();
+    TrackedGuard { guard, _order }
+}
+
+fn lock_pool_session_handout_holds_raw() -> MutexGuard<'static, HashMap<ConnectionId, usize>> {
     POOL_SESSION_HANDOUT_HOLDS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -2356,6 +2377,126 @@ impl CanceledSession {
     }
 }
 
+/// Whether the session a cancel was published for is STILL the work's, asked
+/// at the moment the cancel REACHES the server rather than only before it was
+/// dispatched.
+///
+/// Rounds 1-5 made "the reach ends before the session stops being the work's"
+/// a property of the hand-back doors ([`SessionCancelReach`]), and both cancel
+/// tiers ask it before they act. What none of that covers is the DISTANCE
+/// between the question and the effect. On both Oracle drivers a cancel acts
+/// on a handle the app already owns, so the two are microseconds apart. On the
+/// MySQL family a cancel has to OPEN A SECOND CONNECTION first — TCP connect,
+/// handshake, auth, each bounded only by the cancel I/O timeout — and only
+/// then issue `KILL QUERY` / `KILL CONNECTION`. A query that finishes inside
+/// that window hands its session back, the pool gives the same physical
+/// connection to another tab, and the `KILL` lands on THAT tab's statement —
+/// or, at the force tier, destroys the session it is running on.
+///
+/// So the question travels WITH the cancel and is put again on the far side of
+/// the slow half. [`Self::deliver`] is the one shape that does it, which is
+/// what makes "asked at the moment it acts" a property of this value instead
+/// of something each driver's arm has to remember.
+#[derive(Clone)]
+pub struct SessionCancelClaim {
+    /// `None` means nothing can take this session away under the cancel, which
+    /// is a different fact from "the answer is yes right now".
+    still_ours: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl SessionCancelClaim {
+    /// Nothing can take this session away while the cancel is being delivered:
+    /// the caller owns it outright for the whole call.
+    ///
+    /// Named so that "there is nothing to ask again" is a decision in the
+    /// source rather than an omission — the same reason
+    /// [`UncancelableSessionAction`] exists.
+    pub fn owned_outright() -> Self {
+        Self { still_ours: None }
+    }
+
+    /// This cancel speaks for the session only while `still_ours` answers yes.
+    pub fn published(still_ours: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        Self {
+            still_ours: Some(still_ours),
+        }
+    }
+
+    /// This claim AND one more. Used by the handles that are reached through an
+    /// outer claim and add their own withdrawable target, so a nested handle
+    /// never widens what the outer one allows.
+    pub fn and(&self, still_ours: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        match self.still_ours.clone() {
+            None => Self::published(still_ours),
+            Some(outer) => Self::published(Arc::new(move || outer() && still_ours())),
+        }
+    }
+
+    /// Whether the session is still this cancel's to act on.
+    pub fn holds(&self) -> bool {
+        self.still_ours
+            .as_ref()
+            .is_none_or(|still_ours| still_ours())
+    }
+
+    /// Prepare whatever the cancel needs, ask again, and only then let it reach
+    /// the server.
+    ///
+    /// The ONE shape every backend's cancel goes through. `prepare` is the half
+    /// that can take arbitrarily long — on the MySQL family it is the control
+    /// connection; on Oracle there is nothing to do — and the question is put
+    /// between the two halves, where the answer can still change the outcome.
+    pub fn deliver<P, E>(
+        &self,
+        prepare: impl FnOnce() -> Result<P, E>,
+        send: impl FnOnce(P) -> Result<(), E>,
+    ) -> Result<SessionCancelDelivery, E> {
+        if !self.holds() {
+            return Ok(SessionCancelDelivery::Withdrawn);
+        }
+        let prepared = prepare()?;
+        // The far side of the slow half. Everything below reaches the server.
+        if !self.holds() {
+            return Ok(SessionCancelDelivery::Withdrawn);
+        }
+        send(prepared)?;
+        Ok(SessionCancelDelivery::Delivered)
+    }
+}
+
+impl fmt::Debug for SessionCancelClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionCancelClaim")
+            .field("holds", &self.holds())
+            .finish()
+    }
+}
+
+/// What a cancel did when it got to the point of acting.
+///
+/// A stated answer rather than a `Result<(), String>` whose error text has to
+/// be compared against a sentinel: "the session was handed back before this
+/// could land" is not a failure, and telling it apart from one used to be a
+/// rule each road had to remember. Three roads had to — the query tab's two
+/// tiers and the lazy fetch's — and the lazy fetch's did not, so a withdraw
+/// reached the user as a cancel that failed and invited a retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum SessionCancelDelivery {
+    /// It reached the server.
+    Delivered,
+    /// The session stopped being this work's before the cancel could land, so
+    /// nothing was sent. Nothing failed, and nothing must be retried.
+    Withdrawn,
+}
+
+impl SessionCancelDelivery {
+    pub fn reached_the_server(self) -> bool {
+        matches!(self, Self::Delivered)
+    }
+}
+
 /// Cancels whatever call a pooled session is currently blocked in.
 ///
 /// Lives in the DB layer so session acquisition can build one without the UI:
@@ -2559,14 +2700,14 @@ fn pool_session_canceler(
 }
 
 impl DbActivityCanceler for PoolSessionCanceler {
-    fn interrupt(&self) -> Result<(), String> {
+    fn interrupt(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
         match self {
-            PoolSessionCanceler::Oracle { conn, .. } => {
-                conn.break_execution().map_err(|err| err.to_string())
-            }
-            PoolSessionCanceler::OracleThin { handle, .. } => {
-                handle.break_execution().map_err(|err| err.to_string())
-            }
+            PoolSessionCanceler::Oracle { conn, .. } => claim
+                .deliver(|| Ok(()), |()| conn.break_execution())
+                .map_err(|err: OracleError| err.to_string()),
+            PoolSessionCanceler::OracleThin { handle, .. } => claim
+                .deliver(|| Ok(()), |()| handle.break_execution())
+                .map_err(|err: tns_thin::OracleThinError| err.to_string()),
             PoolSessionCanceler::MySql {
                 connection_info,
                 connection_id,
@@ -2574,30 +2715,37 @@ impl DbActivityCanceler for PoolSessionCanceler {
             } => crate::db::query::mysql_executor::MysqlExecutor::cancel_running_query(
                 connection_info,
                 *connection_id,
+                claim,
             )
             .map_err(|err| err.to_string()),
         }
     }
 
-    fn force(&self) -> Result<(), String> {
+    fn force(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
         // How far the force tier may go is a question about WHICH session this
         // is, not about which driver it is, so it is answered once for all four
         // backends — and in ONE place for every force tier in the app, not just
         // this one. See [`CanceledSession::force_tier_may_destroy_it`].
         if !self.session().force_tier_may_destroy_it() {
-            return self.interrupt();
+            return self.interrupt(claim);
         }
         match self {
-            PoolSessionCanceler::Oracle { conn, .. } => {
-                match conn.close_with_mode(oracle::conn::CloseMode::Drop) {
+            PoolSessionCanceler::Oracle { conn, .. } => claim.deliver(
+                || Ok(()),
+                |()| match conn.close_with_mode(oracle::conn::CloseMode::Drop) {
                     Ok(()) => Ok(()),
                     Err(error) if oracle_force_close_already_completed(&error) => Ok(()),
                     Err(error) => Err(format!("Oracle force close failed: {error}")),
-                }
-            }
-            PoolSessionCanceler::OracleThin { handle, .. } => handle
-                .force_close()
-                .map_err(|err| format!("Oracle thin force close failed: {err}")),
+                },
+            ),
+            PoolSessionCanceler::OracleThin { handle, .. } => claim.deliver(
+                || Ok(()),
+                |()| {
+                    handle
+                        .force_close()
+                        .map_err(|err| format!("Oracle thin force close failed: {err}"))
+                },
+            ),
             PoolSessionCanceler::MySql {
                 connection_info,
                 connection_id,
@@ -2605,6 +2753,7 @@ impl DbActivityCanceler for PoolSessionCanceler {
             } => crate::db::query::mysql_executor::MysqlExecutor::cancel_connection(
                 connection_info,
                 *connection_id,
+                claim,
             )
             .map_err(|err| format!("MySQL KILL CONNECTION {connection_id} failed: {err}")),
         }
@@ -2649,7 +2798,45 @@ impl DbConnectionPool {
         }
     }
 
+    /// Get a prepared session, retrying ONCE if the one the pool handed out was
+    /// still carrying somebody else's cancel.
+    ///
+    /// A cancel names a session, and it can arrive after that session stopped
+    /// being the work it was aimed at — the window is a scheduler slice on both
+    /// Oracle drivers and a control connection on the MySQL family (see
+    /// [`SessionCancelClaim`], which closes the wide half of it). What is left
+    /// lands on whoever holds the session next, and the first thing that
+    /// happens to a freshly acquired session is [`Self::apply_pool_session_settings`].
+    ///
+    /// Oracle thin CLEARS such residue for itself (`reset_before_reuse` and
+    /// `pool_session_canceler` both call `reset_pending_cancel`); OCI and the
+    /// MySQL family have no way to. So the app RECOGNISES it instead, at the
+    /// one door every pooled session comes through, and none of the four hands
+    /// a user a cancel they did not ask for.
+    ///
+    /// A cancel this caller asked for cannot be what this sees: the session has
+    /// no canceler published for it until `acquire_session` attaches one, which
+    /// is after this returns. A cancel the caller asked for EARLIER is answered
+    /// by `SessionCancelAttachment::ActivityRetired` there instead.
+    ///
+    /// Once, not in a loop: a second failure is the pool's answer, not a race.
     fn acquire_session_untracked(&self) -> Result<DbPoolSession, String> {
+        match self.acquire_prepared_session_once() {
+            Err(message) if crate::db::session_policy::message_indicates_query_cancel(&message) => {
+                logging::log_warning(
+                    "db::connection",
+                    &format!(
+                        "A pooled session was still carrying a cancel aimed at its previous \
+                         holder ({message}); it was closed and another was taken"
+                    ),
+                );
+                self.acquire_prepared_session_once()
+            }
+            other => other,
+        }
+    }
+
+    fn acquire_prepared_session_once(&self) -> Result<DbPoolSession, String> {
         let mut session = match self {
             DbConnectionPool::Oracle { pool, .. } => DbPoolSession::Oracle(Arc::new(
                 pool.get()
@@ -8761,9 +8948,17 @@ impl DbActivityProgress {
 ///
 /// Same shape the query cancel button uses: ask the server to abort the call,
 /// then tear the session down if it does not let go within the cancel timeout.
+///
+/// Both tiers are handed a [`SessionCancelClaim`] and must reach the server
+/// only through [`SessionCancelClaim::deliver`]. Asking "is this still our
+/// session?" before DISPATCHING a cancel is not enough on every backend: the
+/// MySQL family opens a control connection before it can say anything at all,
+/// and a session handed back inside that window belongs to another tab by the
+/// time the `KILL` arrives. Taking the claim as an ARGUMENT is what stops a
+/// backend from joining the app without answering that.
 pub trait DbActivityCanceler: Send + Sync {
-    fn interrupt(&self) -> Result<(), String>;
-    fn force(&self) -> Result<(), String>;
+    fn interrupt(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String>;
+    fn force(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String>;
     fn label(&self) -> &'static str;
 }
 
@@ -9454,6 +9649,42 @@ impl DispatchedCancel {
         self.still_registered.strong_count() > 0
     }
 
+    /// The same question, in the form that travels WITH the cancel so it is
+    /// put again at the instant the cancel reaches the server.
+    ///
+    /// Asking it here and nowhere else was enough while every backend acted on
+    /// a handle the app already owned. The MySQL family does not: it opens a
+    /// control connection first, and a session handed back in that window is
+    /// another tab's by the time the `KILL` lands. See [`SessionCancelClaim`].
+    fn session_claim(&self) -> SessionCancelClaim {
+        let still_registered = self.still_registered.clone();
+        SessionCancelClaim::published(Arc::new(move || still_registered.strong_count() > 0))
+    }
+
+    /// [`Self::still_running_on_its_session`] as a claim, for the tier that
+    /// destroys: it must also still be true that the work never let go.
+    fn running_claim(&self) -> SessionCancelClaim {
+        let still_registered = self.still_registered.clone();
+        let guard = self.guard.clone();
+        SessionCancelClaim::published(Arc::new(move || {
+            still_registered.strong_count() > 0 && guard.upgrade().is_some()
+        }))
+    }
+
+    /// Report what a tier did, so a withdraw is never logged as a failure.
+    fn note_delivery(&self, what: &str, delivery: SessionCancelDelivery) {
+        if delivery.reached_the_server() {
+            return;
+        }
+        logging::log_info(
+            "db::connection",
+            &format!(
+                "{what} was not sent for '{}': the session stopped being this work's before it                  could land",
+                self.activity
+            ),
+        );
+    }
+
     /// Whether the work this cancel was dispatched for is still running on
     /// this session.
     ///
@@ -9471,12 +9702,16 @@ impl DispatchedCancel {
     /// Ask the server to abort the call, unless the session has already been
     /// handed back.
     fn interrupt(&self) {
-        if !self.owns_its_session() {
+        let claim = self.session_claim();
+        if !claim.holds() {
             return;
         }
         let label = self.canceler.label();
-        run_guarded(&format!("{label} cancel"), &self.activity, || {
-            self.canceler.interrupt()
+        let what = format!("{label} cancel");
+        run_guarded(&what, &self.activity, || {
+            self.canceler
+                .interrupt(&claim)
+                .map(|delivery| self.note_delivery(&what, delivery))
         });
     }
 
@@ -9490,12 +9725,16 @@ impl DispatchedCancel {
     /// taken back: an Oracle drop-close or a `KILL CONNECTION` on a session
     /// that has gone back to the pool lands on whichever tab picked it up.
     fn force(&self) {
-        if !self.still_running_on_its_session() {
+        let claim = self.running_claim();
+        if !claim.holds() {
             return;
         }
         let label = self.canceler.label();
-        run_guarded(&format!("{label} force cancel"), &self.activity, || {
-            self.canceler.force()
+        let what = format!("{label} force cancel");
+        run_guarded(&what, &self.activity, || {
+            self.canceler
+                .force(&claim)
+                .map(|delivery| self.note_delivery(&what, delivery))
         });
     }
 }
@@ -9740,12 +9979,68 @@ impl MainSessionTeardown {
     }
 }
 
+/// What publishing this connection lock to the activity registry answered.
+///
+/// `DbActivityGuard::attach_canceler` can simply not land: the registry retires
+/// an activity the moment it is cancelled, and [`lock_connection_with_activity`]
+/// creates its row BEFORE it waits for the connection mutex — a wait that is as
+/// long as whatever holds the mutex. A teardown landing in that window
+/// (`cancel_all_db_activities`, which application exit reaches for) retires the
+/// row, and reading that back as "there was no canceler" is how the work then
+/// went on to run with no entry in the registry, nothing able to break it, and
+/// a session-ending action that had already been told there was none of it.
+///
+/// `DbConnectionPool::acquire_session` has refused exactly this since the first
+/// round; the connection lock answered it with `.attached()`, which throws the
+/// two cases together. This is that same refusal for the other door.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionLockReach {
+    /// Published — or there was nothing to publish, which is the whole truth
+    /// when nothing is connected.
+    Held,
+    /// The activity this lock was created under is gone, so work started under
+    /// it would be invisible and unstoppable.
+    ActivityRetired,
+}
+
+/// Publish the main session to `activity_guard`, and say whether it landed.
+///
+/// One place, so both the blocking and the non-blocking lock helpers — and the
+/// lazy `ConnectionLockGuard::activity` — get the same answer rather than each
+/// deciding what a failed attach means.
+fn publish_connection_lock_canceler(
+    connection: &DatabaseConnection,
+    activity_guard: &DbActivityGuard,
+) -> (Option<DbSessionCancelRegistration>, ConnectionLockReach) {
+    let Some(canceler) = main_connection_canceler(connection) else {
+        return (None, ConnectionLockReach::Held);
+    };
+    connection_lock_reach_for(activity_guard.attach_canceler(canceler))
+}
+
+/// What an attach answer means for a connection lock. Split out from
+/// [`publish_connection_lock_canceler`] because the mapping is the decision and
+/// the connection is not: a test can reach a retired activity, but not a live
+/// main session.
+fn connection_lock_reach_for(
+    attachment: SessionCancelAttachment,
+) -> (Option<DbSessionCancelRegistration>, ConnectionLockReach) {
+    match attachment {
+        SessionCancelAttachment::Attached(registration) => {
+            (Some(registration), ConnectionLockReach::Held)
+        }
+        SessionCancelAttachment::ActivityRetired => (None, ConnectionLockReach::ActivityRetired),
+    }
+}
+
 pub struct ConnectionLockGuard<'a> {
     guard: DatabaseConnectionGuard<'a>,
     activity_guard: Option<DbActivityGuard>,
     /// Detaches when the lock is released, so a cancel cannot land on the
     /// connection after this operation stopped using it.
     cancel_registration: Option<DbSessionCancelRegistration>,
+    /// Whether this lock's work may still start. See [`ConnectionLockReach`].
+    reach: ConnectionLockReach,
 }
 
 /// The cancel's REACH over this connection ends before the mutex does; the
@@ -9784,35 +10079,61 @@ impl Drop for ConnectionLockGuard<'_> {
 impl<'a> ConnectionLockGuard<'a> {
     pub fn refresh_tracked_connection(&self) {}
 
+    /// Whether work may still start under this lock.
+    ///
+    /// Asked by every accessor that hands out a live handle, which is the same
+    /// choke point that publishes them — so a lock whose activity was retired
+    /// while it waited for the mutex cannot be used, on any backend, without a
+    /// call site having to know about it.
+    fn reach_still_holds(&self) -> Result<(), String> {
+        match self.reach {
+            ConnectionLockReach::Held => Ok(()),
+            ConnectionLockReach::ActivityRetired => {
+                Err(CANCELLED_BEFORE_SESSION_MESSAGE.to_string())
+            }
+        }
+    }
+
     /// Publish the live connection to the registry before it is handed out.
     ///
-    /// These four shadow the `DatabaseConnection` accessors reached through
-    /// `Deref`, and inherent methods win over `Deref`, so every guard-based
-    /// caller goes through them whether it knows about them or not. That is
-    /// what makes "a connection handle is never handed out untracked" hold
-    /// without auditing call sites.
+    /// These shadow the `DatabaseConnection` accessors reached through `Deref`,
+    /// and inherent methods win over `Deref`, so every guard-based caller goes
+    /// through them whether it knows about them or not. That is what makes "a
+    /// connection handle is never handed out untracked" hold without auditing
+    /// call sites — and, with [`Self::reach_still_holds`], "never handed out
+    /// under an activity that has already been retired" as well.
+    ///
+    /// The `Option`-returning four can only say NO; a caller reads that as "not
+    /// connected", which is the wrong noun for a retired activity but the right
+    /// answer — the work must not start. The two that return a `Result` say
+    /// what really happened.
     pub fn require_live_connection(&mut self) -> Result<Arc<Connection>, String> {
+        self.reach_still_holds()?;
         let _ = self.activity();
         self.guard.require_live_connection()
     }
 
     pub fn require_live_db_connection(&mut self) -> Result<DbConnection, String> {
+        self.reach_still_holds()?;
         let _ = self.activity();
         self.guard.require_live_db_connection()
     }
 
     pub fn get_connection(&mut self) -> Option<Arc<Connection>> {
+        self.reach_still_holds().ok()?;
         let _ = self.activity();
         self.guard.get_connection()
     }
 
     pub fn get_db_connection(&mut self) -> Option<DbConnection> {
+        self.reach_still_holds().ok()?;
         let _ = self.activity();
         self.guard.get_db_connection()
     }
 
     /// The Oracle thin main session, tracked.
     pub fn get_oracle_thin_connection(&mut self) -> Option<Arc<Mutex<OracleThinSession>>> {
+        self.reach_still_holds().ok()?;
         let _ = self.activity();
         self.guard.get_oracle_thin_connection()
     }
@@ -9824,6 +10145,7 @@ impl<'a> ConnectionLockGuard<'a> {
     /// activity for it — no status entry, nothing for the cancel button to
     /// offer, and nothing for the stale sweep to retire.
     pub fn get_mysql_connection_mut(&mut self) -> Option<&mut mysql::Conn> {
+        self.reach_still_holds().ok()?;
         let _ = self.activity();
         self.guard.get_mysql_connection_mut()
     }
@@ -9875,8 +10197,10 @@ impl<'a> ConnectionLockGuard<'a> {
             if let Some(connection_id) = self.guard.connection_id() {
                 activity_guard.set_connection_id(connection_id);
             }
-            self.cancel_registration = main_connection_canceler(&self.guard)
-                .and_then(|canceler| activity_guard.attach_canceler(canceler).attached());
+            let (registration, reach) =
+                publish_connection_lock_canceler(&self.guard, &activity_guard);
+            self.cancel_registration = registration;
+            self.reach = reach;
             self.activity_guard = Some(activity_guard);
         }
         self.activity_guard
@@ -10026,6 +10350,7 @@ pub fn lock_connection(connection: &SharedConnection) -> ConnectionLockGuard<'_>
             guard,
             activity_guard: None,
             cancel_registration: None,
+            reach: ConnectionLockReach::Held,
         };
     }
 }
@@ -10045,8 +10370,12 @@ pub fn lock_connection_with_activity(
     if let Some(connection_id) = connection_guard.connection_id() {
         activity_guard.set_connection_id(connection_id);
     }
-    connection_guard.cancel_registration = main_connection_canceler(&connection_guard)
-        .and_then(|canceler| activity_guard.attach_canceler(canceler).attached());
+    // The row above was created BEFORE the wait for the mutex, so this is the
+    // one lock helper whose activity can be gone by the time it gets here.
+    let (registration, reach) =
+        publish_connection_lock_canceler(&connection_guard, &activity_guard);
+    connection_guard.cancel_registration = registration;
+    connection_guard.reach = reach;
     connection_guard.activity_guard = Some(activity_guard);
     connection_guard
 }
@@ -10082,6 +10411,7 @@ pub fn try_lock_connection(connection: &SharedConnection) -> Option<ConnectionLo
         guard,
         activity_guard: None,
         cancel_registration: None,
+        reach: ConnectionLockReach::Held,
     })
 }
 
@@ -10112,8 +10442,12 @@ pub fn try_lock_connection_for_activity<'a>(
     if let Some(connection_id) = guard.connection_id() {
         activity.set_connection_id(connection_id);
     }
-    guard.cancel_registration = main_connection_canceler(&guard)
-        .and_then(|canceler| activity.attach_canceler(canceler).attached());
+    // The activity here is the OPERATION's, not one this helper made, so it can
+    // have been retired by a cancel or a teardown before this lock was taken —
+    // and that is the case this must not read as "there was no canceler".
+    let (registration, reach) = publish_connection_lock_canceler(&guard, activity);
+    guard.cancel_registration = registration;
+    guard.reach = reach;
     guard.activity_guard = Some(activity.clone());
     Some(guard)
 }
@@ -10134,8 +10468,9 @@ pub fn try_lock_connection_with_activity(
     if let Some(connection_id) = guard.connection_id() {
         activity_guard.set_connection_id(connection_id);
     }
-    guard.cancel_registration = main_connection_canceler(&guard)
-        .and_then(|canceler| activity_guard.attach_canceler(canceler).attached());
+    let (registration, reach) = publish_connection_lock_canceler(&guard, &activity_guard);
+    guard.cancel_registration = registration;
+    guard.reach = reach;
     guard.activity_guard = Some(activity_guard);
     Some(guard)
 }
@@ -10156,6 +10491,153 @@ mod tests {
         assert!(
             !CanceledSession::Main.force_tier_may_destroy_it(),
             "destroying the connection's own session leaves the app describing a connection              that is gone, and OCI cannot do it at all; ending a connection is File >              Disconnect, which has its own bookkeeping"
+        );
+    }
+
+    /// A cancel that is STILL TRAVELLING when its session stops being the
+    /// work's must not land.
+    ///
+    /// Every liveness question the app asks is asked before a cancel is
+    /// dispatched. That is nearly the same instant on both Oracle drivers, and
+    /// a whole control connection away on the MySQL family — TCP connect,
+    /// handshake, auth — and a `KILL` names a server THREAD, so one that
+    /// arrives late lands on whatever that thread is doing by then: another
+    /// tab's statement, or (at the force tier) the session it is running on.
+    #[test]
+    fn a_cancel_that_is_still_travelling_when_its_session_moves_never_reaches_the_server() {
+        let still_ours = Arc::new(AtomicBool::new(true));
+        let flag = still_ours.clone();
+        let claim = SessionCancelClaim::published(Arc::new(move || flag.load(Ordering::Acquire)));
+        let canceler = TestCanceler::default();
+
+        // Nothing has changed: the cancel reaches the server.
+        assert_eq!(
+            canceler.interrupt(&claim).expect("interrupt"),
+            SessionCancelDelivery::Delivered
+        );
+        assert!(canceler.interrupted.swap(false, Ordering::AcqRel));
+
+        // The session goes back DURING the slow half — which is what `deliver`
+        // models, and where the second question is put.
+        let moved = still_ours.clone();
+        let delivery = claim
+            .deliver(
+                || {
+                    moved.store(false, Ordering::Release);
+                    Ok::<(), String>(())
+                },
+                |()| {
+                    panic!("a cancel must not reach the server after its session moved on");
+                },
+            )
+            .expect("a withdraw is not a failure");
+        assert_eq!(delivery, SessionCancelDelivery::Withdrawn);
+
+        // And both tiers answer the same way from then on, with nothing sent.
+        assert_eq!(
+            canceler.interrupt(&claim).expect("interrupt"),
+            SessionCancelDelivery::Withdrawn
+        );
+        assert_eq!(
+            canceler.force(&claim).expect("force"),
+            SessionCancelDelivery::Withdrawn
+        );
+        assert!(!canceler.interrupted.load(Ordering::Acquire));
+        assert!(!canceler.forced.load(Ordering::Acquire));
+    }
+
+    /// A claim that is narrowed cannot allow more than the one it came from.
+    ///
+    /// The withdrawable target and the operation slot each add their own half
+    /// on the way down to the driver; a nested handle must never widen what the
+    /// outer claim said.
+    #[test]
+    fn a_narrowed_claim_answers_no_as_soon_as_either_question_does() {
+        let outer = Arc::new(AtomicBool::new(true));
+        let inner = Arc::new(AtomicBool::new(true));
+        let outer_flag = outer.clone();
+        let inner_flag = inner.clone();
+        let claim =
+            SessionCancelClaim::published(Arc::new(move || outer_flag.load(Ordering::Acquire)))
+                .and(Arc::new(move || inner_flag.load(Ordering::Acquire)));
+
+        assert!(claim.holds());
+        inner.store(false, Ordering::Release);
+        assert!(
+            !claim.holds(),
+            "the inner question alone must be able to stop it"
+        );
+        inner.store(true, Ordering::Release);
+        outer.store(false, Ordering::Release);
+        assert!(!claim.holds(), "and so must the outer one");
+
+        // "Nothing can take this away" narrows to exactly the added question,
+        // rather than staying unconditional.
+        let owned = SessionCancelClaim::owned_outright();
+        assert!(owned.holds());
+        assert!(!owned.and(Arc::new(|| false)).holds());
+    }
+
+    /// A connection lock whose activity was retired while it waited for the
+    /// mutex must not hand out a connection.
+    ///
+    /// `lock_connection_with_activity` creates its registry row BEFORE it waits
+    /// — the wait is as long as whatever holds the mutex — so a teardown can
+    /// retire that row before the lock is taken. Reading the failed attach back
+    /// as "no canceler" is how the work then ran with no row in the registry,
+    /// nothing able to break it, and a session-ending action that had already
+    /// been told there was none of it.
+    #[test]
+    fn a_connection_lock_whose_activity_was_retired_may_not_start_work() {
+        let _test_guard = db_activity_test_lock();
+
+        let activity = track_db_activity("waiting for the connection", None);
+        let live =
+            connection_lock_reach_for(activity.attach_canceler(Arc::new(TestCanceler::default())));
+        assert_eq!(live.1, ConnectionLockReach::Held);
+        assert!(live.0.is_some(), "a live activity keeps the cancel's reach");
+        drop(live);
+
+        // The teardown lands while the lock is still queued.
+        assert!(cancel_db_activity(activity.id(), Duration::from_millis(10)));
+        let retired =
+            connection_lock_reach_for(activity.attach_canceler(Arc::new(TestCanceler::default())));
+        assert_eq!(
+            retired.1,
+            ConnectionLockReach::ActivityRetired,
+            "a lock whose activity is gone must say so rather than look like an idle connection"
+        );
+        assert!(retired.0.is_none());
+    }
+
+    /// A pooled session still carrying a cancel aimed at whoever held it BEFORE
+    /// is recognised on every backend.
+    ///
+    /// Oracle thin clears such residue for itself — `reset_before_reuse` and
+    /// `pool_session_canceler` both call `reset_pending_cancel` — and OCI and
+    /// the MySQL family have no way to. So the app recognises it at the one
+    /// acquire door instead, and none of the four hands a user a cancel they
+    /// did not ask for.
+    #[test]
+    fn a_pooled_session_carrying_a_foreign_cancel_is_recognised_on_every_backend() {
+        for message in [
+            "Failed to apply Oracle session setting `ALTER SESSION SET NLS_DATE_FORMAT = \'x\'`: \
+             ORA-01013: user requested cancel of current operation",
+            "Failed to apply Oracle thin session setting `ALTER SESSION SET TIME_ZONE = \'x\'`: \
+             ORA-01013: user requested cancel of current operation",
+            "Query execution was interrupted",
+        ] {
+            assert!(
+                crate::db::session_policy::message_indicates_query_cancel(message),
+                "the acquire door must be able to tell a foreign cancel from a real failure: \
+                 {message}"
+            );
+        }
+        assert!(
+            !crate::db::session_policy::message_indicates_query_cancel(
+                "ORA-01017: invalid username/password"
+            ),
+            "and it must not retry what is not one"
         );
     }
 
@@ -10682,7 +11164,10 @@ mod tests {
     #[test]
     fn a_pool_session_whose_settings_could_not_be_applied_is_not_returned_to_the_pool() {
         let source = include_str!("connection.rs");
-        let body = source_of_fn(source, "fn acquire_session_untracked(");
+        // The preparation itself lives in `acquire_prepared_session_once`; the
+        // door around it only decides whether to take another session when the
+        // one it got was still carrying somebody else's cancel.
+        let body = source_of_fn(source, "fn acquire_prepared_session_once(");
         assert!(
             body.contains("DbPoolSessionContext::discard_stale_session(session);"),
             "a half-configured session must be discarded through the choke point, not dropped \
@@ -12559,14 +13044,26 @@ mod tests {
     }
 
     impl DbActivityCanceler for TestCanceler {
-        fn interrupt(&self) -> Result<(), String> {
-            self.interrupted.store(true, Ordering::Release);
-            Ok(())
+        // Through `deliver`, like every production canceler, so a claim that
+        // stops holding stops this double reaching its "server" too.
+        fn interrupt(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
+            claim.deliver(
+                || Ok(()),
+                |()| {
+                    self.interrupted.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
         }
 
-        fn force(&self) -> Result<(), String> {
-            self.forced.store(true, Ordering::Release);
-            Ok(())
+        fn force(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
+            claim.deliver(
+                || Ok(()),
+                |()| {
+                    self.forced.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
         }
 
         fn label(&self) -> &'static str {
@@ -13077,11 +13574,11 @@ mod tests {
     struct PanickingCanceler;
 
     impl DbActivityCanceler for PanickingCanceler {
-        fn interrupt(&self) -> Result<(), String> {
+        fn interrupt(&self, _claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
             panic!("driver exploded during interrupt");
         }
 
-        fn force(&self) -> Result<(), String> {
+        fn force(&self, _claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
             panic!("driver exploded during force");
         }
 
@@ -13185,12 +13682,12 @@ mod tests {
     }
 
     impl DbActivityCanceler for ReentrantDropCanceler {
-        fn interrupt(&self) -> Result<(), String> {
-            Ok(())
+        fn interrupt(&self, _claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
+            Ok(SessionCancelDelivery::Delivered)
         }
 
-        fn force(&self) -> Result<(), String> {
-            Ok(())
+        fn force(&self, _claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
+            Ok(SessionCancelDelivery::Delivered)
         }
 
         fn label(&self) -> &'static str {

@@ -60,23 +60,40 @@ mod tracking {
     impl LockOrderScope {
         pub fn enter(name: &'static str) -> Self {
             let outer: Vec<&'static str> = HELD.with(|held| held.borrow().clone());
+            // Nothing held means there is no ORDERED PAIR to record and nothing
+            // this acquisition can invert, so the whole global-mutex section is
+            // skipped. That matters because the tracker runs in every debug
+            // build, including the live harnesses: the leaf ledgers are taken
+            // on the pooled-session acquire path, and paying a global lock plus
+            // a `Location::caller().to_string()` there measurably slowed the
+            // very phase `verify_activity_cancel_live`'s A12 measures.
+            if outer.is_empty() {
+                HELD.with(|held| held.borrow_mut().push(name));
+                return Self { tracked: true };
+            }
             // Re-entering the same lock is a deadlock on a non-reentrant mutex,
             // so it is recorded as an inversion of itself rather than ignored.
-            let site = std::panic::Location::caller().to_string();
+            //
+            // The location is only turned into a String when it is actually
+            // stored or reported: a pair the tracker has already seen -- which
+            // is nearly all of them once the app is warm -- costs nothing.
+            let location = std::panic::Location::caller();
             {
                 let mut observed = observed()
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let mut inverted = Vec::new();
                 for held in &outer {
-                    observed.entry((held, name)).or_insert_with(|| site.clone());
+                    observed
+                        .entry((held, name))
+                        .or_insert_with(|| location.to_string());
                     if held == &name {
                         inverted.push(format!(
-                            "re-entrant acquire of {name} (already held) at {site}"
+                            "re-entrant acquire of {name} (already held) at {location}"
                         ));
                     } else if let Some(first) = observed.get(&(name, *held)) {
                         inverted.push(format!(
-                            "{held} -> {name} at {site} inverts {name} -> {held} first seen at {first}"
+                            "{held} -> {name} at {location} inverts {name} -> {held} first seen at {first}"
                         ));
                     }
                 }
@@ -255,14 +272,21 @@ pub mod names {
     pub const SESSION_LEASE: &str = "SESSION_LEASE";
     pub const CONNECTION_REGISTRY: &str = "CONNECTION_REGISTRY";
     pub const SENDER_REGISTRATIONS: &str = "SENDER_REGISTRATIONS";
+    /// The ledger that says which connection incarnations are over.
+    pub const RETIRED_GENERATIONS: &str = "RETIRED_GENERATIONS";
+    /// The ledger that says which connections a decided session-ending action
+    /// is holding shut.
+    pub const POOL_HANDOUT_HOLDS: &str = "POOL_HANDOUT_HOLDS";
 
-    pub const ALL: [&str; 6] = [
+    pub const ALL: [&str; 8] = [
         ACTIVITY_REGISTRY,
         DB_CONNECTION,
         POOL_CONTEXT_CACHE,
         SESSION_LEASE,
         CONNECTION_REGISTRY,
         SENDER_REGISTRATIONS,
+        RETIRED_GENERATIONS,
+        POOL_HANDOUT_HOLDS,
     ];
 }
 

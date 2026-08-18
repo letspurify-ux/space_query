@@ -20,6 +20,25 @@ pub struct MysqlObjectBrowser;
 
 const MYSQL_CANCEL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Which `KILL` a cancel sends. Named so the two tiers cannot be told apart
+/// only by a formatted string at the call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MysqlKillTier {
+    /// Graceful: abort the statement, leave the session.
+    Query,
+    /// Force: end the server thread.
+    Connection,
+}
+
+impl MysqlKillTier {
+    fn statement(self) -> &'static str {
+        match self {
+            Self::Query => "KILL QUERY",
+            Self::Connection => "KILL CONNECTION",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct MysqlSessionTimeoutApplyError {
     apply_error: Box<MysqlError>,
@@ -1150,21 +1169,52 @@ impl MysqlExecutor {
         }
     }
 
+    /// Break the statement this server thread is running.
     pub fn cancel_running_query(
         info: &ConnectionInfo,
         connection_id: u32,
-    ) -> Result<(), MysqlError> {
-        let opts = Self::build_cancel_opts(info);
-        let mut cancel_conn = mysql::Conn::new(opts)?;
-        let kill_sql = format!("KILL QUERY {connection_id}");
-        Self::normalize_cancel_result(cancel_conn.query_drop(kill_sql.as_str()))
+        claim: &crate::db::SessionCancelClaim,
+    ) -> Result<crate::db::SessionCancelDelivery, MysqlError> {
+        Self::kill_over_control_connection(info, connection_id, MysqlKillTier::Query, claim)
     }
 
-    pub fn cancel_connection(info: &ConnectionInfo, connection_id: u32) -> Result<(), MysqlError> {
+    /// Tear the server thread down. The force tier, and the one that cannot be
+    /// taken back.
+    pub fn cancel_connection(
+        info: &ConnectionInfo,
+        connection_id: u32,
+        claim: &crate::db::SessionCancelClaim,
+    ) -> Result<crate::db::SessionCancelDelivery, MysqlError> {
+        Self::kill_over_control_connection(info, connection_id, MysqlKillTier::Connection, claim)
+    }
+
+    /// The ONE way a `KILL` reaches this family's server, both tiers, both
+    /// roads (the activity registry's canceler and the query tab's own).
+    ///
+    /// A `KILL` names a server THREAD, not a statement, so it lands on
+    /// whatever that thread is doing when it arrives — and getting it there
+    /// means opening a control connection first, which is TCP connect,
+    /// handshake and auth. Everything the app does to keep a cancel aimed at
+    /// its own session happens before that connect; the pooled session behind
+    /// `connection_id` can be handed back and picked up by another tab while it
+    /// is in progress. So the claim is asked again on the far side of the
+    /// connect, immediately before the `KILL` — see
+    /// [`crate::db::SessionCancelClaim::deliver`], which is what puts the
+    /// question there rather than leaving it to this function to remember.
+    fn kill_over_control_connection(
+        info: &ConnectionInfo,
+        connection_id: u32,
+        tier: MysqlKillTier,
+        claim: &crate::db::SessionCancelClaim,
+    ) -> Result<crate::db::SessionCancelDelivery, MysqlError> {
         let opts = Self::build_cancel_opts(info);
-        let mut cancel_conn = mysql::Conn::new(opts)?;
-        let kill_sql = format!("KILL CONNECTION {connection_id}");
-        Self::normalize_cancel_result(cancel_conn.query_drop(kill_sql.as_str()))
+        claim.deliver(
+            || mysql::Conn::new(opts),
+            |mut cancel_conn| {
+                let kill_sql = format!("{} {connection_id}", tier.statement());
+                Self::normalize_cancel_result(cancel_conn.query_drop(kill_sql.as_str()))
+            },
+        )
     }
 
     fn current_database_changed_message(database: &str) -> String {
@@ -3651,7 +3701,14 @@ mod tests {
         let cancel_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(300));
             cancel_requested_for_thread.store(true, Ordering::SeqCst);
-            MysqlExecutor::cancel_running_query(&info, connection_id)
+            // The session is this test's for the whole call, so the claim has
+            // nothing to take back -- which is exactly what
+            // `owned_outright` says.
+            MysqlExecutor::cancel_running_query(
+                &info,
+                connection_id,
+                &crate::db::SessionCancelClaim::owned_outright(),
+            )
         });
 
         let started = Instant::now();
@@ -3664,7 +3721,11 @@ mod tests {
         let cancel_result = cancel_thread
             .join()
             .expect("cancel thread should not panic");
-        cancel_result.expect("KILL QUERY should be accepted by the server");
+        assert_eq!(
+            cancel_result.expect("KILL QUERY should be accepted by the server"),
+            crate::db::SessionCancelDelivery::Delivered,
+            "a claim nothing can withdraw must let the KILL reach the server"
+        );
 
         match result {
             Ok(results) => {

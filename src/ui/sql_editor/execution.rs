@@ -7969,11 +7969,22 @@ impl SqlEditorWidget {
     /// with the fetch giving its session back reaches nothing instead of
     /// `KILL QUERY`-ing whoever holds that session now.
     fn cancel_mysql_lazy_fetch_query(force_target: &QueryCancelTarget, log_context: &str) {
-        if let Err(err) = force_target.as_handle().cancel_interrupt() {
-            crate::utils::logging::log_error(
+        match force_target
+            .as_handle()
+            .cancel_interrupt(&crate::db::SessionCancelClaim::owned_outright())
+        {
+            Ok(crate::db::SessionCancelDelivery::Delivered) => {}
+            // The fetch gave its session back while the `KILL QUERY` was on its
+            // way. Nothing was sent, and that is the withdraw working.
+            Ok(crate::db::SessionCancelDelivery::Withdrawn) => crate::utils::logging::log_info(
+                log_context,
+                "MySQL-family lazy fetch cancel was not sent: the session is no longer this \
+                 fetch's",
+            ),
+            Err(err) => crate::utils::logging::log_error(
                 log_context,
                 &format!("Failed to cancel MySQL-family lazy fetch query: {err}"),
-            );
+            ),
         }
     }
 
@@ -32288,7 +32299,13 @@ mod query_execution_cleanup_tests {
             "test mysql lazy fetch cancel",
         );
 
-        assert!(force_target.as_handle().cancel_interrupt().is_err());
+        assert_eq!(
+            force_target
+                .as_handle()
+                .cancel_interrupt(&crate::db::SessionCancelClaim::owned_outright())
+                .expect("an empty target is not a failure"),
+            crate::db::SessionCancelDelivery::Withdrawn
+        );
     }
 
     #[test]
@@ -33812,7 +33829,12 @@ mod query_execution_cleanup_tests {
             connection_generation: 7,
             db_type: crate::db::DatabaseType::MySQL,
             sender: command_sender,
-            cancel_handle: Some(QueryCancelTarget::empty().as_handle()),
+            // A GENUINE failure: the fetch has no force-cancel handle at all
+            // and does not stop. An empty `QueryCancelTarget` used to stand in
+            // for one, but a target with nothing published is the WITHDRAW
+            // answering, not a cancel that failed -- see
+            // `lazy_fetch_force_on_a_withdrawn_target_is_not_a_failure`.
+            cancel_handle: None,
             cancel_requested: Arc::new(AtomicBool::new(true)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
@@ -33834,13 +33856,67 @@ mod query_execution_cleanup_tests {
             Ok(LazyFetchCommand::ForceCancel)
         ));
         assert!(matches!(
-            progress_receiver.recv_timeout(Duration::from_secs(2)),
+            progress_receiver.recv_timeout(Duration::from_secs(3)),
             Ok(QueryProgress::LazyFetchCancelFailed { session_id: 42, .. })
         ));
         assert!(SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
         assert!(
             !watchdog_started.load(Ordering::Acquire),
             "a retry must be able to claim a new lazy-fetch watchdog before failure is published"
+        );
+    }
+
+    /// A lazy fetch that gave its session back before the force tier could land
+    /// is not a cancel that FAILED.
+    ///
+    /// This road is the reason the answer is a type. The operation road
+    /// recognised a withdraw by comparing an error STRING and returned quietly;
+    /// this one never learned the rule, so the user was told "Cancel failed:
+    /// the session this cancel was published for has already been handed back"
+    /// and invited to retry a tear-down that must never happen.
+    #[test]
+    fn lazy_fetch_force_on_a_withdrawn_target_is_not_a_failure() {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = progress_channel();
+        let watchdog_started = Arc::new(AtomicBool::new(false));
+        let target = QueryCancelTarget::empty();
+        target.publish(QueryCancelHandle::Test(Arc::new(AtomicBool::new(false))));
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            index: 3,
+            session_id: 42,
+            operation_id: 42,
+            connection_generation: 7,
+            db_type: crate::db::DatabaseType::MySQL,
+            sender: command_sender,
+            cancel_handle: Some(target.as_handle()),
+            cancel_requested: Arc::new(AtomicBool::new(true)),
+            retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
+            db_cancel_requested: Arc::new(AtomicBool::new(true)),
+            fetch_in_progress: Arc::new(AtomicBool::new(true)),
+            cancel_watchdog_started: watchdog_started.clone(),
+            status_activity: None,
+        })));
+        // The release door withdraws BEFORE the session moves; here that lands
+        // while the watchdog is on its way to the force tier.
+        target.withdraw();
+
+        SqlEditorWidget::start_lazy_fetch_cancel_watchdog_with(
+            active.clone(),
+            progress_sender,
+            42,
+            Duration::from_millis(1),
+        )
+        .expect("lazy fetch cancel watchdog should start");
+
+        assert!(matches!(
+            command_receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(LazyFetchCommand::ForceCancel)
+        ));
+        assert!(
+            progress_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .is_err(),
+            "a withdrawn target must not be reported to the user as a cancel that failed"
         );
     }
 

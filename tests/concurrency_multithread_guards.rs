@@ -6703,7 +6703,7 @@ fn every_backend_can_cancel_work_on_its_own_main_connection() {
     // And the rule itself is stated ONCE, ahead of the per-driver tear-down.
     let force_start = content
         .find(
-            "    fn force(&self) -> Result<(), String> {
+            "    fn force(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
         // How far the force tier may go",
         )
         .expect("the shared force tier should exist");
@@ -6717,7 +6717,7 @@ fn every_backend_can_cancel_work_on_its_own_main_connection() {
     let rule = force
         .find(
             "if !self.session().force_tier_may_destroy_it() {
-            return self.interrupt();",
+            return self.interrupt(claim);",
         )
         .expect("a cancel must never destroy the connection's own session");
     for destroys in [
@@ -7801,8 +7801,8 @@ fn every_force_tier_asks_one_rule_before_it_destroys_a_session() {
     let editor_force_body = slice_from(&editor, editor_force, 400);
     assert!(
         editor_force_body.contains("session.force_tier_may_destroy_it()")
-            && editor_force_body.contains("return self.cancel_interrupt();")
-            && editor_force_body.contains("self.destroy_session()"),
+            && editor_force_body.contains("return self.cancel_interrupt(claim);")
+            && editor_force_body.contains("self.destroy_session(claim)"),
         "the query tab's force tier must ask the shared rule before tearing anything down, \
          and re-break instead when it may not: {editor_force_body}"
     );
@@ -8339,20 +8339,27 @@ fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
         "the tiers need a handle that can look at the slot again"
     );
     for tier in [
-        "fn cancel_interrupt(&self) -> Result<(), String> {",
-        "fn destroy_session(self) -> Result<(), String> {",
+        "pub(crate) fn cancel_interrupt(",
+        "fn destroy_session(self, claim: &SessionCancelClaim)",
     ] {
         let start = editor
             .find(tier)
             .unwrap_or_else(|| panic!("{tier} should exist"));
-        let body = slice_from(&editor, start, 2000);
+        let body = slice_from(&editor, start, 2600);
         assert!(
             body.contains("QueryCancelHandle::OperationSlot(slot)"),
             "{tier} must have an answer for the operation slot"
         );
         assert!(
-            body.contains("WITHDRAWN_CANCEL_TARGET_MESSAGE"),
+            body.contains("Ok(SessionCancelDelivery::Withdrawn)"),
             "{tier} must say so when the slot has been withdrawn instead of acting: {body}"
+        );
+        assert!(
+            body.contains("claim.and(Self::operation_slot_still_published(")
+                && body.contains("claim.and(target.still_published())"),
+            "{tier} must carry the slot's own question ON into the driver, because reading the \
+             slot here is still a control connection away from the server on the MySQL \
+             family: {body}"
         );
     }
 
@@ -8371,7 +8378,7 @@ fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
          see a withdraw: {watchdog_body}"
     );
     assert!(
-        watchdog_body.contains("if message == WITHDRAWN_CANCEL_TARGET_MESSAGE {"),
+        watchdog_body.contains("if let Ok(SessionCancelDelivery::Withdrawn) = force_result {"),
         "a withdraw that lands mid-tear-down is not a force that FAILED, and must not invite \
          the user to retry one: {watchdog_body}"
     );
@@ -8383,9 +8390,295 @@ fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
         .expect("the graceful tier must read through the slot too");
     let graceful_body = slice_from(&editor, graceful, 2400);
     assert!(
-        graceful_body.contains("Err(message) if message == WITHDRAWN_CANCEL_TARGET_MESSAGE =>")
+        graceful_body.contains("Ok(SessionCancelDelivery::Withdrawn) => {")
             && graceful_body.contains("QueryCancelOutcome::PendingInitialization"),
         "a withdraw during the break keeps the cancel requested: {graceful_body}"
+    );
+}
+
+/// Every cancel asks whether the session is still the work's AT THE MOMENT it
+/// reaches the server, not only before it is dispatched.
+///
+/// Rounds 1-5 put that question before every dispatch, and on both Oracle
+/// drivers that is nearly the same instant: the cancel acts on a handle the app
+/// already owns. The MySQL family has no such handle. It has to OPEN A CONTROL
+/// CONNECTION first — TCP connect, handshake, auth — and only then send
+/// `KILL QUERY` / `KILL CONNECTION`, which name a server THREAD and land on
+/// whatever that thread is doing when they arrive. A query that finishes inside
+/// that window hands its session back, the pool gives the same physical
+/// connection to another tab, and the `KILL` aborts THAT tab's statement — or,
+/// at the force tier, destroys the session it is running on.
+///
+/// So the question travels with the cancel as a `SessionCancelClaim` and is put
+/// again on the far side of the slow half. `SessionCancelClaim::deliver` is the
+/// one shape that does it, and taking the claim as an ARGUMENT is what stops a
+/// backend from joining the app without answering.
+#[test]
+fn every_cancel_asks_again_at_the_moment_it_reaches_the_server() {
+    let connection = read_source("src/db/connection.rs");
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let mysql = read_source("src/db/query/mysql_executor.rs");
+
+    // The contract: both tiers take the claim and answer what they DID.
+    for tier in [
+        "fn interrupt(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String>;",
+        "fn force(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String>;",
+    ] {
+        assert!(
+            connection.contains(tier),
+            "the activity registry's cancel contract must carry the claim and answer a \
+             delivery: {tier}"
+        );
+    }
+
+    // The question is asked on BOTH sides of the slow half, in one place.
+    let deliver = connection
+        .find("    pub fn deliver<P, E>(")
+        .expect("the one delivery shape should exist");
+    let deliver_body = slice_from(&connection, deliver, 700);
+    assert_eq!(
+        deliver_body.matches("if !self.holds() {").count(),
+        2,
+        "deliver must ask before the slow half AND again immediately before the cancel \
+         reaches the server: {deliver_body}"
+    );
+
+    // Every driver arm reaches its server through it. Four backends, two
+    // layers: the registry's canceler and the query tab's own.
+    //
+    // Both Oracle arms go through `deliver` directly; the MySQL arm goes
+    // through the executor's one KILL door, which does the same on the far side
+    // of its control connection. So each tier body must show exactly two
+    // `deliver` calls and must hand the claim to the MySQL door.
+    for (label, marker, span) in [
+        (
+            "the registry's graceful tier",
+            "impl DbActivityCanceler for PoolSessionCanceler {",
+            1000,
+        ),
+        (
+            "the registry's force tier",
+            "        // How far the force tier may go is a question about WHICH session this",
+            1900,
+        ),
+    ] {
+        let start = connection
+            .find(marker)
+            .unwrap_or_else(|| panic!("{label} should exist"));
+        let body = slice_from(&connection, start, span);
+        assert_eq!(
+            body.matches(".deliver(").count(),
+            2,
+            "{label}: both Oracle arms must reach the driver only through the shape that \
+             re-asks: {body}"
+        );
+        assert!(
+            body.contains("MysqlExecutor::cancel_") && body.contains("\n                claim,\n"),
+            "{label}: the MySQL arm must hand the claim on rather than drop it: {body}"
+        );
+    }
+
+    // The query tab's own canceler, all three drivers.
+    for driver in [
+        "impl QueryCanceler for Arc<Connection> {",
+        "impl QueryCanceler for OracleThinCancelHandle {",
+        "impl QueryCanceler for MySqlQueryCancelContext {",
+    ] {
+        let start = editor
+            .find(driver)
+            .unwrap_or_else(|| panic!("{driver} should exist"));
+        let body = slice_from(&editor, start, 1100);
+        assert!(
+            body.contains("claim") && !body.contains("_claim"),
+            "{driver} must use the claim rather than ignore it: {body}"
+        );
+        let reaches_server = body.contains("claim.deliver(")
+            || body.contains("claim\n            .deliver(")
+            || body.contains("MysqlExecutor::cancel_");
+        assert!(
+            reaches_server,
+            "{driver} must reach its server only through the shape that re-asks: {body}"
+        );
+    }
+
+    // The MySQL family's one door, and the split that makes the re-ask land in
+    // the right place: the control connection is the PREPARE, the `KILL` is the
+    // SEND, and `deliver` asks between them.
+    assert_eq!(
+        mysql.matches("mysql::Conn::new(opts)").count(),
+        1,
+        "a cancel control connection must be opened in exactly one place"
+    );
+    let door = mysql
+        .find("    fn kill_over_control_connection(")
+        .expect("the one KILL door should exist");
+    let door_body = slice_from(&mysql, door, 700);
+    let deliver_at = door_body
+        .find("claim.deliver(")
+        .expect("the door must go through the shape that re-asks");
+    let connect_at = door_body
+        .find("mysql::Conn::new(opts)")
+        .expect("the door opens the control connection");
+    let kill_at = door_body
+        .find("cancel_conn.query_drop(kill_sql.as_str())")
+        .expect("the door issues the KILL");
+    assert!(
+        deliver_at < connect_at && connect_at < kill_at,
+        "the connect must be INSIDE deliver, as its prepare, and the KILL its send -- a \
+         connect opened before deliver puts the whole handshake on the wrong side of the \
+         question: {door_body}"
+    );
+    for tier in ["pub fn cancel_running_query(", "pub fn cancel_connection("] {
+        let start = mysql
+            .find(tier)
+            .unwrap_or_else(|| panic!("{tier} should exist"));
+        let body = slice_from(&mysql, start, 420);
+        assert!(
+            body.contains("Self::kill_over_control_connection("),
+            "{tier} must go through the one door: {body}"
+        );
+    }
+}
+
+/// Every connection-wide state change is announced and taken back as ONE
+/// value.
+///
+/// `Transitioning` is what the screen reads and what refuses reconnect,
+/// Disconnect All and the preferences dialog, and `ConnectionTransition` also
+/// holds the connection's pool shut while it is set. Setting the state by hand
+/// is a promise nothing keeps: an action that unwinds partway leaves the
+/// connections it never reached claiming they are transitioning for the life of
+/// the process — every tab labelled "(transitioning)" and no way back but a
+/// restart. Disconnect All did exactly that, and the reconnect relied on an
+/// event it might never deliver.
+#[test]
+fn every_connection_wide_state_change_is_announced_and_taken_back_as_one_value() {
+    let window = read_source("src/ui/main_window.rs");
+    assert!(
+        !window.contains("set_state(ConnectionRuntimeState::Transitioning)"),
+        "no action may announce a transition by hand; the announcement and its promise to \
+         end are one value (`ConnectionRuntime::announce_transition`)"
+    );
+    assert_eq!(
+        window
+            .matches("ConnectionRuntime::announce_transition(")
+            .count(),
+        3,
+        "the three connection-wide actions -- pool resize, Disconnect All, reconnect -- must \
+         each announce through it"
+    );
+
+    let runtime = read_source("src/db/runtime.rs");
+    let announce = runtime
+        .find("pub fn announce_transition(")
+        .expect("the one announcement door should exist");
+    let announce_body = slice_from(&runtime, announce, 500);
+    assert!(
+        announce_body.contains("PoolSessionHandoutHold::take("),
+        "the announcement holds the pools shut as well as labelling them, because they answer \
+         the same fact: {announce_body}"
+    );
+    let drop_impl = runtime
+        .find("impl Drop for ConnectionTransition {")
+        .expect("the promise must be kept by a Drop impl");
+    let drop_body = slice_from(&runtime, drop_impl, 320);
+    assert!(
+        drop_body.contains("refresh_state_from_connection()"),
+        "whatever the action never reached is read back from the connection, which is the \
+         only place the truth was ever kept: {drop_body}"
+    );
+}
+
+/// The connection lock refuses to hand out a connection under an activity that
+/// has already been retired.
+///
+/// `lock_connection_with_activity` creates its registry row BEFORE it waits for
+/// the connection mutex, so a session-ending action can retire it while the
+/// caller is still queued. Reading that back as "there was no canceler" — which
+/// is all `SessionCancelAttachment::attached()` can say — is how the work then
+/// ran with no row in the registry, nothing able to break it, and an action
+/// that had already been told there was none of it. `acquire_session` has
+/// refused exactly this since the first round.
+#[test]
+fn a_connection_lock_under_a_retired_activity_hands_out_nothing() {
+    let connection = read_source("src/db/connection.rs");
+
+    // ONE place decides what a failed attach means, and all three lock helpers
+    // go through it.
+    assert_eq!(
+        connection
+            .matches("publish_connection_lock_canceler(")
+            .count(),
+        5,
+        "the helper plus its four callers: the blocking lock, the two non-blocking ones, and \
+         the lazy `ConnectionLockGuard::activity`"
+    );
+    assert!(
+        !connection.contains("attach_canceler(canceler).attached()"),
+        "no lock helper may collapse `ActivityRetired` into `no canceler`"
+    );
+
+    // Every accessor that hands out a live handle asks first. Scoped to the
+    // guard's own impl block: `DatabaseConnection` has same-named accessors,
+    // and these are the SHADOWS that every guard-based caller reaches through
+    // `Deref`.
+    let guard_impl_start = connection
+        .find("impl<'a> ConnectionLockGuard<'a> {")
+        .expect("the guard's impl block should exist");
+    let guard_impl = slice_from(&connection, guard_impl_start, 4200);
+    for accessor in [
+        "pub fn require_live_connection(&mut self) -> Result<Arc<Connection>, String> {",
+        "pub fn require_live_db_connection(&mut self) -> Result<DbConnection, String> {",
+        "pub fn get_connection(&mut self) -> Option<Arc<Connection>> {",
+        "pub fn get_db_connection(&mut self) -> Option<DbConnection> {",
+        "pub fn get_oracle_thin_connection(&mut self) -> Option<Arc<Mutex<OracleThinSession>>> {",
+        "pub fn get_mysql_connection_mut(&mut self) -> Option<&mut mysql::Conn> {",
+    ] {
+        let start = guard_impl
+            .find(accessor)
+            .unwrap_or_else(|| panic!("{accessor} should exist on the lock guard"));
+        let body = slice_from(guard_impl, start, 220);
+        assert!(
+            body.contains("self.reach_still_holds()"),
+            "{accessor} must refuse a lock whose activity is gone: {body}"
+        );
+    }
+}
+
+/// A pooled session still carrying a cancel aimed at its PREVIOUS holder is
+/// recognised at the one acquire door, on every backend.
+///
+/// Oracle thin can clear such residue for itself (`reset_pending_cancel`, from
+/// both `reset_before_reuse` and `pool_session_canceler`); OCI and the MySQL
+/// family cannot. So the app recognises it instead of handing a user a cancel
+/// they never asked for — and it does that where every pooled session comes
+/// through, rather than once per backend.
+#[test]
+fn a_pooled_session_carrying_a_foreign_cancel_is_closed_and_another_is_taken() {
+    let connection = read_source("src/db/connection.rs");
+    let start = connection
+        .find("    fn acquire_session_untracked(&self) -> Result<DbPoolSession, String> {")
+        .expect("the acquire door should exist");
+    let body = slice_from(&connection, start, 900);
+    assert!(
+        body.contains("message_indicates_query_cancel(&message)"),
+        "the door must ask the shared per-backend cancel catalog, not a per-driver string: \
+         {body}"
+    );
+    assert_eq!(
+        body.matches("self.acquire_prepared_session_once()").count(),
+        2,
+        "once, not in a loop: the first answer is a race, a second is the pool's own answer: \
+         {body}"
+    );
+    let once = connection
+        .find("    fn acquire_prepared_session_once(&self) -> Result<DbPoolSession, String> {")
+        .expect("the prepared-session helper should exist");
+    let once_body = slice_from(&connection, once, 1600);
+    assert!(
+        once_body.contains("DbPoolSessionContext::discard_stale_session(session);"),
+        "and the session it refused goes through the ONE discard choke point rather than back \
+         into the pool: {once_body}"
     );
 }
 

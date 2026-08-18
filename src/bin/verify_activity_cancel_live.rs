@@ -38,6 +38,14 @@
 //       every other tab is on. The tier is driven directly, because a graceful
 //       break always lands against a real server and the watchdog would never
 //       escalate — which is exactly why this hole went unnoticed.
+//   A13 a cancel that is STILL TRAVELLING when its session stops being the
+//       work's must not reach the server. Every liveness question the app asks
+//       is asked before a cancel is dispatched, and on the MySQL family that is
+//       a whole control connection away from the `KILL` — which names a server
+//       THREAD, so one that arrives late aborts whatever that thread is doing:
+//       another tab's statement, or (at the force tier) the session it runs on.
+//       Driven with a claim that lapses between the two halves, because that
+//       window cannot be reached by waiting.
 //   A11 the FORCE tier at the instant a batch GIVES ITS SESSION BACK finds
 //       nothing to tear down. The tab's force target and the DB layer's
 //       registration used to be given up long after the hand-back — after the
@@ -55,7 +63,7 @@ use space_query::db::{
     active_db_activity_snapshots, active_pool_db_activity_snapshots, cancel_db_activity,
     reset_tracked_db_activities_for_probe, sweep_stale_db_activities, track_pool_db_activity,
     ConnectionInfo, ConnectionRegistry, DatabaseConnection, DatabaseType, DbPoolSession,
-    OracleDriverMode,
+    OracleDriverMode, SessionCancelDelivery,
 };
 use space_query::ui::main_window::MainWindow;
 use space_query::ui::sql_editor::{HandBackForceProbe, QueryProgress, SqlEditorWidget};
@@ -173,6 +181,27 @@ impl Target {
             "SELECT COUNT(*) FROM all_objects a, all_objects b, all_objects c              WHERE a.object_id = b.object_id AND b.object_id = c.object_id"
         } else {
             "SELECT * FROM SQ_CANCEL_T"
+        }
+    }
+
+    /// The schema A12 loads metadata for.
+    ///
+    /// It has to hold enough objects that the load spends real time TALKING TO
+    /// THE SERVER, because that is the phase A12 is about: the defect it guards
+    /// left the activity row cancelable for the session checkout and not for
+    /// any of the querying. A load of an empty database is a checkout followed
+    /// by almost nothing, and no measurement of it can tell the two apart --
+    /// which is what made this scenario report a correct load as the defect on
+    /// the MySQL family's small test database.
+    ///
+    /// Oracle's default (the login schema's view of the dictionary) is already
+    /// large; the MySQL family is pointed at `information_schema`, which every
+    /// server has and which no test fixture can empty.
+    fn metadata_probe_scope(self) -> Option<&'static str> {
+        if self.is_oracle() {
+            None
+        } else {
+            Some("information_schema")
         }
     }
 
@@ -859,18 +888,48 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
             .pool_context()?
             .connection_info
             .db_type
-            .metadata_refresh_activity_for_probe(None);
+            .metadata_refresh_activity_for_probe(target.metadata_probe_scope());
 
-        // Pass 1: watch a load all the way through and measure how much of the
+        // What one bare ACQUIRE costs on this connection right now, measured
+        // the same way the load is measured.
+        //
+        // This is the yardstick, and it has to be measured rather than assumed:
+        // the defect left the row cancelable for exactly the acquire and not a
+        // moment longer, so "cancelable for meaningfully longer than an acquire"
+        // is the property that separates a load whose whole DB phase is
+        // reachable from one where only the checkout was. Comparing against the
+        // row's TOTAL life instead -- which is what this scenario used to do --
+        // measures the wrong thing: the load's tail (rebuilding indices and
+        // highlight data) is client-side CPU of roughly constant cost, while
+        // the DB phase shrinks by an order of magnitude once the server's
+        // caches are warm. That made a correct load look like the defect on any
+        // second run, on the baseline as much as on a fix.
+        let bare_acquire = {
+            let mut longest = Duration::ZERO;
+            for _ in 0..3 {
+                let context = harness.pool_context()?;
+                let probe = context.track_activity("Live acquire yardstick");
+                let started = Instant::now();
+                {
+                    let _session =
+                        context.acquire_session_for_scope(target.metadata_probe_scope(), &probe)?;
+                }
+                longest = longest.max(started.elapsed());
+            }
+            longest
+        };
+
+        // Pass 1: watch a load all the way through and measure how long of the
         // row's life it was cancelable for.
         let context = harness.pool_context()?;
         let done = Arc::new(AtomicBool::new(false));
         let loaded = Arc::new(AtomicBool::new(false));
         let done_in_worker = Arc::clone(&done);
         let loaded_in_worker = Arc::clone(&loaded);
+        let probe_scope = target.metadata_probe_scope().map(str::to_string);
         let worker = thread::spawn(move || {
             loaded_in_worker.store(
-                MainWindow::load_schema_metadata_for_probe(context, None),
+                MainWindow::load_schema_metadata_for_probe(context, probe_scope),
                 Ordering::Release,
             );
             done_in_worker.store(true, Ordering::Release);
@@ -879,6 +938,9 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
         let mut cancelable_polls = 0usize;
         let mut cancelable_run = 0usize;
         let mut longest_cancelable_run = 0usize;
+        // The same observation in TIME, which is what the yardstick above is in.
+        let mut cancelable_since: Option<Instant> = None;
+        let mut longest_cancelable_span = Duration::ZERO;
         let deadline = Instant::now() + Duration::from_secs(180);
         while Instant::now() < deadline && !done.load(Ordering::Acquire) {
             if let Some(row) = active_pool_db_activity_snapshots()
@@ -890,14 +952,49 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                     cancelable_polls += 1;
                     cancelable_run += 1;
                     longest_cancelable_run = longest_cancelable_run.max(cancelable_run);
+                    let since = *cancelable_since.get_or_insert_with(Instant::now);
+                    longest_cancelable_span = longest_cancelable_span.max(since.elapsed());
                 } else {
                     cancelable_run = 0;
+                    cancelable_since = None;
                 }
             }
         }
         let _ = worker.join();
+        // TWO measurements, and the load has to satisfy EITHER.
+        //
+        // Neither is sound on its own, and each is unsound on a different
+        // family:
+        //
+        //  * "cancelable for most of the row's life" breaks on Oracle. The
+        //    load's tail -- rebuilding indices and highlight data over the
+        //    metadata it just read -- is client-side CPU of roughly constant
+        //    cost, while the DB phase shrinks by an order of magnitude once the
+        //    server's caches are warm. Measured here on the same build: 81% on
+        //    a cold database and 37% on the next run. That is a correct load
+        //    reported as the defect, on the baseline as much as on a fix.
+        //
+        //  * "cancelable for meaningfully longer than a bare checkout" breaks on
+        //    the MySQL family, whose checkout is several round trips (reset,
+        //    `USE`, session settings) while its metadata read is two cheap
+        //    `information_schema` queries: 11.9ms of reach against a 9.3ms
+        //    checkout, which is healthy and looks marginal.
+        //
+        // What makes the pair sound is what the DEFECT does to both. It dropped
+        // the registration in the closure that acquired the session, so the row
+        // was cancelable only for the instant between the attach at the END of
+        // the checkout and that drop -- not for the checkout, and not for any of
+        // the querying. Measured against a deliberately reintroduced defect:
+        // 0.8% of the row's life, and 469us against a 49ms checkout. It fails
+        // both by two orders of magnitude, so requiring either one keeps the
+        // whole of the sensitivity and neither of the false failures.
+        const MINIMUM_ACQUIRE_MULTIPLE: u32 = 3;
+        let required = bare_acquire * MINIMUM_ACQUIRE_MULTIPLE;
+        let reachable_for_most_of_its_life = cancelable_polls * 2 >= row_polls;
+        let reachable_for_longer_than_a_checkout = longest_cancelable_span >= required;
         println!(
-            "   A12 ({label}) metadata load: cancelable on {cancelable_polls} of {row_polls} \
+            "   A12 ({label}) metadata load: cancelable for {longest_cancelable_span:?} \
+             (a bare acquire takes {bare_acquire:?}); seen on {cancelable_polls} of {row_polls} \
              observations (longest unbroken run {longest_cancelable_run}), produced metadata: {}",
             loaded.load(Ordering::Acquire)
         );
@@ -906,16 +1003,13 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                 "A12 ({label}): the schema metadata load never published an activity row, so \
                  the probe could not observe it (expected {expected_activity:?})"
             ));
-        } else if cancelable_polls * 2 < row_polls {
-            // The load's tail -- rebuilding indices and highlight data -- runs
-            // after the session has gone back to the pool, so the row is
-            // legitimately not cancelable for part of its life. What the defect
-            // produced is the opposite shape: cancelable for the acquire alone
-            // and not for any of the querying.
+        } else if !reachable_for_most_of_its_life && !reachable_for_longer_than_a_checkout {
             failures.push(format!(
-                "A12 ({label}): the schema metadata load held a pooled session the cancel \
-                 button could not offer and a disconnect could not break (cancelable on \
-                 {cancelable_polls} of {row_polls} observations)"
+                "A12 ({label}): the schema metadata load was reachable for \
+                 {longest_cancelable_span:?} -- {cancelable_polls} of {row_polls} observations, \
+                 and no longer than the {bare_acquire:?} its session checkout takes -- so it \
+                 held a pooled session the cancel button could not offer and a disconnect could \
+                 not break"
             ));
         }
         if !loaded.load(Ordering::Acquire) {
@@ -941,9 +1035,10 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
             let loaded = Arc::new(AtomicBool::new(false));
             let done_in_worker = Arc::clone(&done);
             let loaded_in_worker = Arc::clone(&loaded);
+            let probe_scope = target.metadata_probe_scope().map(str::to_string);
             let worker = thread::spawn(move || {
                 loaded_in_worker.store(
-                    MainWindow::load_schema_metadata_for_probe(context, None),
+                    MainWindow::load_schema_metadata_for_probe(context, probe_scope),
                     Ordering::Release,
                 );
                 done_in_worker.store(true, Ordering::Release);
@@ -980,6 +1075,106 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                 "   A12 ({label}) note: every load finished before its own cancel could land \
                  (the break runs on the watchdog thread), so only the reach was checked"
             );
+        }
+    }
+
+    // A13: a cancel that is still on its way when its session stops being the
+    // work's must reach nothing.
+    //
+    // The app asks "is this still our session?" before it DISPATCHES a cancel.
+    // On both Oracle drivers the answer and the effect are microseconds apart;
+    // on the MySQL family they are a whole control connection apart — TCP
+    // connect, handshake, auth — and a `KILL` names a server THREAD, so one
+    // that arrives after the session went back to the pool aborts whichever tab
+    // picked it up. The window cannot be reached by waiting, so it is reached
+    // by SAYING when the session stopped being the work's: the probe's claim
+    // answers yes once (the cancel really was aimed here when it was
+    // dispatched) and no from then on.
+    //
+    // The assertion is asked of the SERVER: the statement the cancel was aimed
+    // at must run to completion, because nothing was sent.
+    {
+        reset_tracked_db_activities_for_probe();
+        let label = target.label();
+        println!(
+            "   A13 ({label}): a cancel that is still travelling when its session moves must \
+             reach nothing"
+        );
+        let harness = Harness::connect(target)?;
+        let mut editor = EditorHarness::new(&harness);
+        // No setup table: this scenario only needs a statement that keeps
+        // running, and `slow_sql` reads the data dictionary. Creating the
+        // shared probe table here would queue behind the open transaction A11
+        // deliberately leaves on it.
+        // A SCRIPT, so the slow statement keeps the operation's own session
+        // rather than handing it to a lazy fetch: a single-statement SELECT
+        // goes down the lazy road, which publishes its own withdrawable target
+        // and leaves the operation slot withdrawn. The window this scenario is
+        // about is the operation's.
+        editor.start_script(&format!("{};\n{}", target.slow_sql(), target.trivial_sql()));
+        let probed = editor.pump_until(Duration::from_secs(30), || {
+            editor
+                .editor
+                .cancel_published_session_with_a_lapsing_claim_for_probe()
+        });
+        match probed {
+            None => failures.push(format!(
+                "A13 ({label}): the query never published a session, so the window could not \
+                 be probed (transcript: {:?})",
+                editor.transcript()
+            )),
+            Some(Err(message)) => failures.push(format!(
+                "A13 ({label}): a cancel whose session had moved on answered a FAILURE the user \
+                 would be invited to retry: {message}"
+            )),
+            Some(Ok(SessionCancelDelivery::Delivered)) => failures.push(format!(
+                "A13 ({label}): the cancel reached the server after its session stopped being \
+                 this work's -- on the MySQL family that is a KILL against whichever tab holds \
+                 that session now"
+            )),
+            Some(Ok(SessionCancelDelivery::Withdrawn)) => {
+                println!("   A13 ({label}) nothing was sent");
+            }
+        }
+        // And the statement itself must be UNTOUCHED. `slow_sql` runs far
+        // longer than any assertion window on purpose, so it is not waited out;
+        // what is asked instead is the pair of facts a landed cancel would have
+        // broken. First: after a settle window long enough for a `KILL` to have
+        // arrived, the statement is still running.
+        editor.pump_until(Duration::from_secs(3), || None::<()>);
+        if editor.is_done() {
+            failures.push(format!(
+                "A13 ({label}): the statement ended anyway (reported: {}), so something reached \
+                 the server after its session stopped being this work's",
+                editor.last_message()
+            ));
+        } else {
+            println!("   A13 ({label}) and the statement it was aimed at kept running");
+        }
+
+        // Second: the session is still THERE and still this tab's -- a real
+        // cancel, down the ordinary road, still lands on it. On the MySQL
+        // family the force tier of the same cancel is `KILL CONNECTION`, so a
+        // session that had been destroyed would answer this with a connection
+        // error instead of a cancel.
+        editor.editor.cancel_current();
+        if editor.wait_done(Duration::from_secs(60)) {
+            let reported = editor.last_message();
+            let looks_like_a_cancel = reported == NO_STATEMENT_RESULT
+                || space_query::db::session_policy::message_indicates_query_cancel(&reported);
+            if looks_like_a_cancel {
+                println!("   A13 ({label}) and its session was still reachable afterwards");
+            } else {
+                failures.push(format!(
+                    "A13 ({label}): the session the lapsed cancel left alone could not be \
+                     cancelled afterwards (reported: {reported})"
+                ));
+            }
+        } else {
+            failures.push(format!(
+                "A13 ({label}): the statement could not be ended afterwards, so its session \
+                 may not have survived"
+            ));
         }
     }
 
@@ -1077,6 +1272,20 @@ impl EditorHarness {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         self.editor.execute_sql_text(sql);
+    }
+
+    /// Run several statements as one batch, the way F5 does.
+    ///
+    /// A single-statement SELECT is handed to a LAZY FETCH, which publishes its
+    /// own withdrawable target and leaves the operation's slot withdrawn; a
+    /// script keeps the session on the operation for its whole run.
+    fn start_script(&mut self, sql: &str) {
+        self.done.store(false, Ordering::Release);
+        self.messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.editor.execute_script_for_harness(sql);
     }
 
     fn is_done(&self) -> bool {
