@@ -277,7 +277,10 @@ struct OracleThinStatementOutcome {
 struct OracleThinBatchOutcome {
     retained_state: RetainedSessionState,
     had_error: bool,
-    timed_out: bool,
+    /// No `timed_out` here any more. The worker used to OR it into
+    /// "is this session broken?", which is the driver's question and only the
+    /// driver's; what a timeout DID to the statement is reported by the
+    /// statement's own result.
     interrupted_sql_kind: Option<crate::db::session_policy::SqlKind>,
     interrupted_state_hint: Option<crate::db::TransactionStatementStateHint>,
     /// Set when a schema sync/clear inside the batch bumped the pool context
@@ -994,10 +997,13 @@ impl<'a> BatchSessionHandBack<'a> {
         log_context: &str,
         current_scope: Option<String>,
     ) -> bool {
+        // Both arms carry the state, and both are what the user is told about
+        // when the session goes: a discard of a session with an open
+        // transaction is the same news as a retain the slot refused.
         let retained_state = match disposition {
-            crate::db::RetainedSessionDisposition::Retain(retained_state) => retained_state,
-            crate::db::RetainedSessionDisposition::DiscardPhysical => {
-                RetainedSessionState::default()
+            crate::db::RetainedSessionDisposition::Retain(retained_state)
+            | crate::db::RetainedSessionDisposition::DiscardPhysical(retained_state) => {
+                retained_state
             }
         };
         let outcome = pooled_db_session.hand_back_worker_session(
@@ -1863,7 +1869,17 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
 
         let cancel_requested = load_mutex_bool(cancel_flag);
         let cancel_affects_session = cancel_requested && batch_outcome.had_error;
-        let mut session_broken = thin_conn.is_broken() || batch_outcome.timed_out;
+        // The DRIVER says whether a timeout cost the session, and it is the only
+        // thing that can: a thin call timeout now completes the same break/reset
+        // handshake a cancel completes, so the wire is back at a clean request
+        // boundary when it lands and desynchronised when it does not, and
+        // `is_broken()` is that answer. This used to be `|| timed_out`, taken
+        // unconditionally -- a blanket rule from when the driver stopped reading
+        // mid-answer and said nothing. It meant every query timeout cost the tab
+        // its session and any open transaction on Oracle thin, while the same
+        // timeout on Oracle OCI (`DPI-1067`) and on MySQL/MariaDB (`ERROR 3024`)
+        // cost only the statement.
+        let mut session_broken = thin_conn.is_broken();
         let health_check_ok = if cancel_affects_session && !session_broken {
             let ok = SqlEditorWidget::oracle_thin_pooled_session_health_check(
                 &mut thin_conn,
@@ -3338,7 +3354,7 @@ fn lazy_fetch_all_timeout_for_fetch_all(
 
 /// Keeps an execution counted as deferred — accepted by the editor but not
 /// started yet — for as long as it lives.
-struct DeferredExecutionGuard {
+pub(crate) struct DeferredExecutionGuard {
     deferred_executions: Arc<AtomicUsize>,
 }
 
@@ -4027,20 +4043,24 @@ impl SqlEditorWidget {
         }
     }
 
-    // Retry pool acquisition against a cloned pool handle. Taking the pool by
-    // reference (not the connection guard) means the retry loop does not depend
-    // on holding the connection mutex. Callers can release the mutex across
-    // the cooperative sleep between attempts so UI threads, metadata
+    // Retry pool acquisition against a cloned pool CONTEXT. Taking the context
+    // by reference (not the connection guard) means the retry loop does not
+    // depend on holding the connection mutex. Callers can release the mutex
+    // across the cooperative sleep between attempts so UI threads, metadata
     // refreshes, and lazy-fetch finalizers stay unblocked while we are only
     // waiting for a pool slot to free up.
+    //
+    // Every attempt goes through the acquire door, so a session-ending action
+    // decided while this loop is sleeping is answered on the next attempt
+    // rather than handed a session for up to `SESSION_POOL_CANCEL_WAIT_TIMEOUT`
+    // longer.
     fn retry_pool_session_after_lazy_cancel(
-        pool: &crate::db::DbConnectionPool,
-        connection_info: &crate::db::ConnectionInfo,
+        context: &crate::db::DbPoolSessionContext,
         activity: &crate::db::DbActivityGuard,
     ) -> Result<crate::db::AcquiredPoolSession, String> {
         let started_at = Instant::now();
         loop {
-            match pool.acquire_session(connection_info, activity) {
+            match context.acquire_session_applying_scope_itself(activity) {
                 Ok(session) => return Ok(session),
                 Err(message)
                     if Self::session_pool_error_is_exhausted(&message)
@@ -4084,21 +4104,26 @@ impl SqlEditorWidget {
         execution_worker_backend_for(db_type).pool_acquire_error_should_retry_fresh(message)
     }
 
+    /// A fresh pooled session for a caller that applies the scope itself.
+    ///
+    /// Takes the pool CONTEXT and not a bare `DbConnectionPool`: the context is
+    /// what names the connection, and naming the connection is what lets the
+    /// acquire door refuse a session on one whose pool a decided teardown is
+    /// holding shut. Reaching the pool directly is no longer expressible --
+    /// `DbConnectionPool::acquire_session` is private to the DB layer.
     fn acquire_fresh_pool_session_once(
-        pool: &crate::db::DbConnectionPool,
+        context: &crate::db::DbPoolSessionContext,
         expected_db_type: crate::db::DatabaseType,
         cancel_strategy: SessionPoolCancelStrategy<'_>,
-        connection_info: &crate::db::ConnectionInfo,
         activity: &crate::db::DbActivityGuard,
     ) -> Result<crate::db::AcquiredPoolSession, String> {
-        match pool.acquire_session(connection_info, activity) {
+        match context.acquire_session_applying_scope_itself(activity) {
             Ok(session) => Self::expected_pool_session(session, expected_db_type),
             Err(message)
                 if Self::session_pool_error_is_exhausted(&message)
                     && Self::request_lazy_fetch_cancel_for_session_pool(cancel_strategy) =>
             {
-                let session =
-                    Self::retry_pool_session_after_lazy_cancel(pool, connection_info, activity)?;
+                let session = Self::retry_pool_session_after_lazy_cancel(context, activity)?;
                 Self::expected_pool_session(session, expected_db_type)
             }
             Err(message) => Err(message),
@@ -4106,17 +4131,15 @@ impl SqlEditorWidget {
     }
 
     fn acquire_fresh_pool_session(
-        pool: &crate::db::DbConnectionPool,
+        context: &crate::db::DbPoolSessionContext,
         expected_db_type: crate::db::DatabaseType,
         cancel_strategy: SessionPoolCancelStrategy<'_>,
-        connection_info: &crate::db::ConnectionInfo,
         activity: &crate::db::DbActivityGuard,
     ) -> Result<crate::db::AcquiredPoolSession, String> {
         match Self::acquire_fresh_pool_session_once(
-            pool,
+            context,
             expected_db_type,
             cancel_strategy,
-            connection_info,
             activity,
         ) {
             Ok(session) => Ok(session),
@@ -4131,10 +4154,9 @@ impl SqlEditorWidget {
                     ),
                 );
                 Self::acquire_fresh_pool_session_once(
-                    pool,
+                    context,
                     expected_db_type,
                     cancel_strategy,
-                    connection_info,
                     activity,
                 )
             }
@@ -4177,12 +4199,11 @@ impl SqlEditorWidget {
         session_pool_sender: Option<&QueryProgressSender>,
         activity: &crate::db::DbActivityGuard,
     ) -> Result<crate::db::HeldSession<mysql::PooledConn>, String> {
-        activity.bind_lifetime(context.activity_lifetime());
+        // The lifetime is bound by the acquire door, for every backend.
         let acquired = Self::acquire_fresh_pool_session(
-            &context.pool,
+            context,
             context.connection_info.db_type,
             SessionPoolCancelStrategy::Request(session_pool_sender),
-            &context.connection_info,
             activity,
         )?;
 
@@ -4493,15 +4514,29 @@ impl SqlEditorWidget {
                                 );
                                 return (conn_guard, Err(message));
                             }
-                            let _ = pooled_db_session.hand_back_worker_session(
+                            // The session being closed is the TAB's retained
+                            // one, so what it was carrying goes with it and the
+                            // user hears about it -- through the same answer
+                            // every other road reports, not a second reading of
+                            // the state beside the call.
+                            let hand_back = pooled_db_session.hand_back_worker_session(
                                 session_owner,
                                 connection_generation,
                                 pool_context_epoch,
                                 DbSessionLease::Oracle(conn),
-                                crate::db::RetainedSessionDisposition::DiscardPhysical,
+                                crate::db::RetainedSessionDisposition::DiscardPhysical(
+                                    prior_retained_state,
+                                ),
                                 "oracle pool session",
                                 None,
                             );
+                            if hand_back.lost_work() {
+                                Self::report_retained_session_lost_with_work(
+                                    Some(sender),
+                                    prior_retained_state,
+                                    "oracle pool session",
+                                );
+                            }
                             if Self::oracle_pool_acquire_error_should_retry_fresh(&message) {
                                 crate::utils::logging::log_warning(
                                 "oracle pool session",
@@ -4520,7 +4555,9 @@ impl SqlEditorWidget {
                         connection_generation,
                         pool_context_epoch,
                         DbSessionLease::Oracle(conn),
-                        crate::db::RetainedSessionDisposition::DiscardPhysical,
+                        crate::db::RetainedSessionDisposition::DiscardPhysical(
+                            prior_retained_state,
+                        ),
                         "oracle pool session",
                         None,
                     );
@@ -4544,28 +4581,26 @@ impl SqlEditorWidget {
             | crate::db::RetainedSessionTakeOutcome::NoSession => {}
         }
 
-        let Some(pool) = conn_guard.get_pool() else {
-            return (
-                conn_guard,
-                Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
-            );
-        };
         // Captured before the lock is released: the session acquired below is
         // tracked under this activity, so it stays visible and cancelable even
         // though the connection mutex is deliberately not held across it.
         let pool_activity = sender
             .operation_activity()
             .unwrap_or_else(|| conn_guard.activity());
-        let pool_connection_info = match conn_guard.pool_session_context() {
-            Ok(context) => context.connection_info,
+        // The CONTEXT and not a bare pool handle: it is what names the
+        // connection, and the acquire door refuses a session on a connection a
+        // decided session-ending action is holding shut. Rebuilt from the
+        // guard for the retry below, so the door is asked about the connection
+        // as it is at that moment rather than as it was at batch start.
+        let mut pool_context = match conn_guard.pool_session_context() {
+            Ok(context) => context,
             Err(message) => return (conn_guard, Err(message)),
         };
         drop(conn_guard);
         let pool_session_result = Self::acquire_fresh_pool_session(
-            &pool,
+            &pool_context,
             crate::db::DatabaseType::Oracle,
             SessionPoolCancelStrategy::Notify(sender),
-            &pool_connection_info,
             &pool_activity,
         );
         conn_guard = lock_connection_with_activity(shared_connection, db_activity.to_string());
@@ -4630,12 +4665,15 @@ impl SqlEditorWidget {
                     if !retried_current_schema
                         && Self::oracle_pool_acquire_error_should_retry_fresh(&message) =>
                 {
-                    let Some(pool) = conn_guard.get_pool() else {
-                        Self::discard_oracle_pool_session(held, "oracle pool session");
-                        return (
-                            conn_guard,
-                            Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
-                        );
+                    pool_context = match conn_guard.pool_session_context() {
+                        Ok(context) => context,
+                        Err(_) => {
+                            Self::discard_oracle_pool_session(held, "oracle pool session");
+                            return (
+                                conn_guard,
+                                Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
+                            );
+                        }
                     };
                     crate::utils::logging::log_warning(
                         "oracle pool session",
@@ -4649,10 +4687,9 @@ impl SqlEditorWidget {
                     Self::discard_oracle_pool_session(held, "oracle pool session");
                     drop(conn_guard);
                     let retry_result = Self::acquire_fresh_pool_session(
-                        &pool,
+                        &pool_context,
                         crate::db::DatabaseType::Oracle,
                         SessionPoolCancelStrategy::Notify(sender),
-                        &pool_connection_info,
                         &pool_activity,
                     );
                     conn_guard =
@@ -5581,10 +5618,34 @@ impl SqlEditorWidget {
         }
     }
 
+    /// The same three answers the OCI and MySQL-family classifiers give.
+    ///
+    /// This one had NO timeout arm, so a query timeout fell through to
+    /// "the session cannot be reused" and was reported as an
+    /// `InterruptKind::ConnectionError` -- which
+    /// `decide_session_after_interrupt` answers at the very top, before it can
+    /// look at anything else, by REPLACING the physical session. The same
+    /// timeout on Oracle OCI (`DPI-1067`) and on MySQL/MariaDB (`ERROR 3024`)
+    /// is a `RecoverableTimeout` and the tab keeps its session and its open
+    /// transaction. A timeout is not a lost connection, and saying it is was
+    /// the difference.
     fn oracle_thin_interrupt_kind_for_message(message: &str) -> InterruptKind {
         let has_connection_error = Self::oracle_error_message_has_connection_error(message);
+        let timed_out = Self::timeout_error_message_contains_timeout_signal(message);
+        if has_connection_error && timed_out {
+            return InterruptKind::NonRecoverableTimeout;
+        }
         if has_connection_error {
             return InterruptKind::ConnectionError;
+        }
+        if timed_out {
+            // Whether the SESSION survived is the driver's answer, not this
+            // message's, and it is asked where it can be answered: the thin
+            // driver resynchronises the wire after a call timeout when it can
+            // and marks the session broken when it cannot, and the health check
+            // in the interrupt decision is what reads that. Naming the
+            // interrupt a timeout is what lets that question be reached at all.
+            return InterruptKind::RecoverableTimeout;
         }
         if Self::oracle_thin_is_cancel_message(message) {
             return InterruptKind::Cancelled;
@@ -5614,7 +5675,7 @@ impl SqlEditorWidget {
         if session_broken
             || retained_state.transaction_state() == TransactionSessionState::InvalidSession
         {
-            return crate::db::RetainedSessionDisposition::DiscardPhysical;
+            return crate::db::RetainedSessionDisposition::DiscardPhysical(retained_state);
         }
 
         if cancel_requested && had_error {
@@ -5654,7 +5715,11 @@ impl SqlEditorWidget {
         match decision {
             crate::db::session_policy::SessionDecision::IgnoreStaleEvent
             | crate::db::session_policy::SessionDecision::ReplacePhysicalSessionKeepUiConnected => {
-                crate::db::RetainedSessionDisposition::DiscardPhysical
+                // Replacing a physical session is a way of LOSING it, and what
+                // it was carrying goes with it. This is the road a
+                // non-recoverable timeout, a failed timeout restore and a
+                // failed health check all end on.
+                crate::db::RetainedSessionDisposition::DiscardPhysical(retained_state)
             }
             crate::db::session_policy::SessionDecision::ReuseSamePhysicalSession => {
                 crate::db::RetainedSessionDisposition::Retain(retained_state)
@@ -10499,7 +10564,14 @@ impl SqlEditorWidget {
 
     /// Count one execution as deferred, from the moment it is scheduled until
     /// the attempt that carries the returned guard has resolved it.
-    fn defer_execution(&self) -> DeferredExecutionGuard {
+    ///
+    /// `pub(crate)` because the editor is not the only place that ACCEPTS an
+    /// execution and then makes it wait: the pool-slot road in the main window
+    /// cancels the oldest lazy fetch and schedules the run for 0.2s later. It
+    /// did not count that wait, so in it the tab read perfectly idle to every
+    /// session-ending gate — which is the same window `has_deferred_execution`
+    /// exists to close.
+    pub(crate) fn defer_execution(&self) -> DeferredExecutionGuard {
         DeferredExecutionGuard::new(self.deferred_executions.clone())
     }
 
@@ -18920,9 +18992,15 @@ impl SqlEditorWidget {
 
         Ok(OracleThinConnectedCandidate {
             connection: candidate_connection,
-            // This session stops being POOLED work here: it becomes the
-            // candidate connection's own, whose canceler is
-            // `CanceledSession::Main`. The reach ends with the take.
+            // This session stops being POOLED WORK here -- the reach ends with
+            // the take -- but it does not become the candidate connection's
+            // own: the batch takes it over with `replace_pooled`, and the
+            // candidate keeps its own main session for everything else. So the
+            // canceler the batch publishes for it stays `CanceledSession::
+            // Pooled`, and tearing it down costs this batch's session and not
+            // the connection. (Oracle OCI's CONNECT is the other shape: it runs
+            // the rest of the batch on the candidate's OWN session and
+            // publishes `CanceledSession::Main`.)
             session: session.take_ending_reach(),
             sanitized_info,
             connection_generation,
@@ -19010,7 +19088,6 @@ impl SqlEditorWidget {
             return OracleThinBatchOutcome {
                 retained_state: prior_retained_state,
                 had_error: false,
-                timed_out: false,
                 interrupted_sql_kind: None,
                 interrupted_state_hint: None,
                 refreshed_pool_context_epoch: None,
@@ -19043,7 +19120,6 @@ impl SqlEditorWidget {
                     TransactionSessionState::InvalidSession,
                 ),
                 had_error: true,
-                timed_out: false,
                 interrupted_sql_kind: None,
                 interrupted_state_hint: None,
                 refreshed_pool_context_epoch: None,
@@ -19062,6 +19138,18 @@ impl SqlEditorWidget {
         let post_processor =
             crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
         let mut retained_state = prior_retained_state;
+        // Whether the session a statement ran on is still usable is the
+        // DRIVER's answer -- `conn.is_broken()` -- and nothing else's. Six arms
+        // of this loop used to OR `statement_timed_out` into that answer --
+        // a blanket rule from when a thin call timeout stopped reading
+        // mid-answer and said nothing about it. A thin call timeout now
+        // completes the same break/reset handshake a cancel completes, so
+        // `is_broken()` really answers: false when the wire is back at a clean
+        // request boundary, true when it could not be put there. With the
+        // blanket rule in place EVERY query timeout cost the tab its session
+        // and any open transaction on this backend, while the same timeout on
+        // Oracle OCI (`DPI-1067`) and MySQL/MariaDB (`ERROR 3024`) cost only
+        // the statement.
         let mut invalid_session = false;
         let mut had_error = false;
         let mut timed_out = false;
@@ -20310,7 +20398,7 @@ impl SqlEditorWidget {
                                     query_timeout,
                                 );
                             timed_out |= statement_timed_out;
-                            invalid_session |= statement_timed_out || conn.is_broken();
+                            invalid_session |= conn.is_broken();
                             Self::emit_non_select_result(
                                 sender,
                                 session,
@@ -20431,7 +20519,7 @@ impl SqlEditorWidget {
                                         query_timeout,
                                     );
                                 timed_out |= statement_timed_out;
-                                invalid_session |= statement_timed_out || conn.is_broken();
+                                invalid_session |= conn.is_broken();
                                 Self::emit_non_select_result(
                                     sender,
                                     session,
@@ -20617,7 +20705,7 @@ impl SqlEditorWidget {
                                 if !result_success_before_commit {
                                     had_error = true;
                                     timed_out |= statement_timed_out;
-                                    invalid_session |= statement_timed_out || conn.is_broken();
+                                    invalid_session |= conn.is_broken();
                                     retained_state =
                                         Self::oracle_retained_state_after_statement_effects(
                                             retained_state,
@@ -20969,8 +21057,7 @@ impl SqlEditorWidget {
                                                         query_timeout,
                                                     );
                                                 timed_out |= statement_timed_out;
-                                                invalid_session |=
-                                                    statement_timed_out || conn.is_broken();
+                                                invalid_session |= conn.is_broken();
                                                 Self::emit_oracle_thin_cursor_fetch_error(
                                                     sender,
                                                     session,
@@ -21030,8 +21117,7 @@ impl SqlEditorWidget {
                                                         query_timeout,
                                                     );
                                                 timed_out |= statement_timed_out;
-                                                invalid_session |=
-                                                    statement_timed_out || conn.is_broken();
+                                                invalid_session |= conn.is_broken();
                                                 Self::emit_oracle_thin_cursor_fetch_error(
                                                     sender,
                                                     session,
@@ -21075,7 +21161,7 @@ impl SqlEditorWidget {
                                 query_timeout,
                             );
                         timed_out |= statement_timed_out;
-                        invalid_session |= statement_timed_out || conn.is_broken();
+                        invalid_session |= conn.is_broken();
                         if load_mutex_bool(cancel_flag) || statement_timed_out {
                             interrupted_sql_kind = Some(statement_sql_kind);
                             interrupted_state_hint = Some(statement_effects.state_hint);
@@ -21195,7 +21281,6 @@ impl SqlEditorWidget {
         OracleThinBatchOutcome {
             retained_state,
             had_error,
-            timed_out,
             interrupted_sql_kind,
             interrupted_state_hint,
             refreshed_pool_context_epoch,
@@ -33174,7 +33259,7 @@ mod query_execution_cleanup_tests {
                 true,
                 false,
             ),
-            crate::db::RetainedSessionDisposition::DiscardPhysical
+            crate::db::RetainedSessionDisposition::DiscardPhysical(_)
         ));
     }
 
@@ -33325,7 +33410,7 @@ mod query_execution_cleanup_tests {
                 true,
                 false,
             ),
-            crate::db::RetainedSessionDisposition::DiscardPhysical
+            crate::db::RetainedSessionDisposition::DiscardPhysical(_)
         ));
         assert!(matches!(
             SqlEditorWidget::oracle_thin_execution_disposition(
@@ -33340,7 +33425,7 @@ mod query_execution_cleanup_tests {
                 true,
                 false,
             ),
-            crate::db::RetainedSessionDisposition::DiscardPhysical
+            crate::db::RetainedSessionDisposition::DiscardPhysical(_)
         ));
     }
 
@@ -44221,7 +44306,7 @@ mod mysql_transaction_feedback_tests {
         );
         assert!(matches!(
             &disposition,
-            crate::db::RetainedSessionDisposition::DiscardPhysical
+            crate::db::RetainedSessionDisposition::DiscardPhysical(_)
         ));
         let pooled_db_session = SharedDbSessionLease::new();
         let _ = pooled_db_session.hand_back_worker_session(

@@ -16,6 +16,7 @@ pub use pool::OracleThinSessionPool;
 pub use session::{
     OracleThinAppContext, OracleThinAuthMode, OracleThinCancelHandle, OracleThinConfig,
     OracleThinEndUserSecurityContext, OracleThinPurity, OracleThinSession, OracleThinWarning,
+    ORACLE_THIN_CALL_TIMEOUT_MESSAGE,
 };
 
 type ConnectPhaseLogger = Box<dyn Fn(&str, &str) + Send + Sync + 'static>;

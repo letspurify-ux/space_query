@@ -68,6 +68,27 @@ const TNS_DATA_FLAGS_END_OF_RESPONSE: u16 = 0x2000;
 const CANCEL_RESET_DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 /// Safety bound on packets drained during a cancel reset handshake.
 const CANCEL_RESET_MAX_PACKETS: usize = 64;
+/// Marks a read timeout that left the wire at a PACKET BOUNDARY: nothing of the
+/// server's answer had been consumed.
+///
+/// The distinction is what makes a call timeout recoverable. A timeout here can
+/// be settled the same way a cancel is -- ask the server to stop, complete the
+/// break/reset handshake, and the session is back at a clean request boundary.
+/// A timeout part way through a packet cannot: those bytes are gone and the
+/// wire is desynchronised, so the session has to go.
+const TNS_READ_TIMEOUT_AT_BOUNDARY: &str = "Read timeout at a TNS packet boundary";
+
+/// What a call that exceeded its call timeout reports when the session SURVIVED
+/// it -- the break/reset handshake completed and the wire is back at a clean
+/// request boundary.
+///
+/// Public because it is the evidence the application classifies on: it is the
+/// thin driver's equivalent of ODPI-C's `DPI-1067` and the MySQL family's
+/// `ERROR 3024`, and without one of those an application has to guess, which is
+/// what "one Oracle answer" written for one of Oracle's two drivers really was.
+/// Deliberately free of the phrases that mark a lost connection ("read
+/// timeout", "operation timed out"): this session is not lost.
+pub const ORACLE_THIN_CALL_TIMEOUT_MESSAGE: &str = "Oracle thin call timeout exceeded";
 const BREAK_SIGNAL_NONE: u8 = 0;
 const BREAK_SIGNAL_OOB: u8 = 1;
 const BREAK_SIGNAL_INBAND: u8 = 2;
@@ -1082,6 +1103,87 @@ impl OracleThinSession {
                 .is_some_and(error_looks_like_oracle_response)
         {
             self.reset_pending_cancel();
+        }
+    }
+
+    /// Settle a read that was INTERRUPTED, and say what to report.
+    ///
+    /// One door for both interruptions a call can suffer, because they need the
+    /// same thing done to the session. A CANCEL the app asked for and a CALL
+    /// TIMEOUT both leave the server's answer pending on the socket, and the
+    /// only way back to a clean request boundary is the break/reset handshake.
+    /// The cancel path always ran it; the timeout path never did, so a query
+    /// timeout left the wire desynchronised and the session had to be thrown
+    /// away -- taking the tab's open transaction with it. Oracle OCI resets
+    /// inside ODPI-C and the MySQL family's timeout is server-side, so the same
+    /// query timeout cost the user their transaction on Oracle thin and on
+    /// neither of the others.
+    ///
+    /// `None` means the read stands on its own.
+    fn settle_interrupted_read<T>(
+        &mut self,
+        response: &Result<T, OracleThinError>,
+    ) -> Option<OracleThinError> {
+        if let Some(signal) = self.current_cancel_signal() {
+            return Some(self.finish_cancelled_read(signal));
+        }
+        let error = response.as_ref().err()?;
+        let text = error.to_string();
+        if text.contains(TNS_READ_TIMEOUT_AT_BOUNDARY) {
+            return Some(self.finish_timed_out_read());
+        }
+        if text.contains("Read timeout while reading") {
+            // A timeout that fired part way through a packet: those bytes are
+            // gone and the wire is desynchronised. Nothing can bring it back,
+            // so the session SAYS it is broken rather than leaving that to be
+            // inferred -- the caller asks `is_broken()` and gets the driver's
+            // own answer, which is the whole point of asking here.
+            self.broken = true;
+        }
+        None
+    }
+
+    /// Complete a call that exceeded its call timeout with nothing of the
+    /// answer consumed.
+    ///
+    /// The same handshake [`Self::finish_cancelled_read`] completes, for the
+    /// same reason: the server is still working on a call this session will
+    /// never read, so it is asked to stop and its break/reset response is
+    /// drained. When that succeeds the session is at a clean request boundary
+    /// and stays usable, which is what makes a query timeout cost a STATEMENT
+    /// on all four backends instead of a statement on three and a session on
+    /// this one. When it cannot -- no out-of-band channel and a server that
+    /// will not look at the socket until it is done -- the session is marked
+    /// broken, which is exactly where it was before.
+    fn finish_timed_out_read(&mut self) -> OracleThinError {
+        if let Err(err) = self.break_execution() {
+            self.broken = true;
+            return OracleThinError::new(format!(
+                "Oracle thin call exceeded its timeout and the session was closed: it could not \
+                 be interrupted: {err}"
+            ));
+        }
+        let Some(signal) = self.current_cancel_signal() else {
+            // A cancel was already in flight and cleared the flag; nothing here
+            // knows what state the wire is in.
+            self.broken = true;
+            return OracleThinError::new(
+                "Oracle thin call exceeded its timeout and the session was closed",
+            );
+        };
+        let outcome = self.drain_cancel_response(signal);
+        self.cancel_signal
+            .store(BREAK_SIGNAL_NONE, Ordering::SeqCst);
+        self.cancel_flag.store(false, Ordering::SeqCst);
+        match outcome {
+            Ok(()) => OracleThinError::new(ORACLE_THIN_CALL_TIMEOUT_MESSAGE),
+            Err(err) => {
+                self.broken = true;
+                OracleThinError::new(format!(
+                    "Oracle thin call exceeded its timeout and the session was closed: the \
+                     break/reset handshake did not complete: {err}"
+                ))
+            }
         }
     }
 
@@ -2149,8 +2251,8 @@ impl OracleThinSession {
             Some(cancel_state),
         );
         self.clear_go_ora_cancel_if_response_completed(&response);
-        if let Some(signal) = self.current_cancel_signal() {
-            return Err(self.finish_cancelled_read(signal));
+        if let Some(error) = self.settle_interrupted_read(&response) {
+            return Err(error);
         }
         let result = match response {
             Ok(mut response) => {
@@ -3176,8 +3278,7 @@ impl OracleThinSession {
             Some(cancel_state),
         );
         self.clear_go_ora_cancel_if_response_completed(&response);
-        if let Some(signal) = self.current_cancel_signal() {
-            let error = self.finish_cancelled_read(signal);
+        if let Some(error) = self.settle_interrupted_read(&response) {
             let _ = self.free_temp_lobs_and_fetched(&temp_lob_locators);
             return Err(error);
         }
@@ -3396,8 +3497,8 @@ impl OracleThinSession {
             Some(cancel_state),
         );
         self.clear_go_ora_cancel_if_response_completed(&response);
-        if let Some(signal) = self.current_cancel_signal() {
-            return Err(self.finish_cancelled_read(signal));
+        if let Some(error) = self.settle_interrupted_read(&response) {
+            return Err(error);
         }
         response
     }
@@ -13131,15 +13232,55 @@ fn read_data_packet_with_flags_and_control_for_cancel(
     }
 }
 
+/// `read_exact`, but it says how far it got.
+///
+/// `std::io::Read::read_exact` discards that, and it is the whole question when
+/// a call timeout fires: a timeout that consumed nothing left the wire at a
+/// packet boundary and the session can be recovered; one that consumed part of
+/// a packet cannot be.
+fn read_exact_tracking_progress(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+) -> Result<(), (std::io::Error, usize)> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err((
+                    std::io::Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer"),
+                    filled,
+                ))
+            }
+            Ok(read) => filled += read,
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err((err, filled)),
+        }
+    }
+    Ok(())
+}
+
+fn read_packet_header_error(
+    context: &str,
+    error: std::io::Error,
+    consumed: usize,
+) -> OracleThinError {
+    if consumed == 0 && matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+        return OracleThinError::new(format!(
+            "{TNS_READ_TIMEOUT_AT_BOUNDARY} while reading {context}: {error}"
+        ));
+    }
+    read_packet_error(context, error)
+}
+
 fn read_tns_packet(
     stream: &mut TcpStream,
     protocol_version: u16,
     context: &str,
 ) -> Result<(u8, Vec<u8>), OracleThinError> {
     let mut header = [0u8; 8];
-    stream
-        .read_exact(&mut header)
-        .map_err(|err| read_packet_error(&format!("{context} header"), err))?;
+    read_exact_tracking_progress(stream, &mut header).map_err(|(err, consumed)| {
+        read_packet_header_error(&format!("{context} header"), err, consumed)
+    })?;
     let size = if protocol_version >= 315 {
         u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize
     } else {
@@ -14571,6 +14712,7 @@ fn bind_count(request: &StatementRequest) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::{ORACLE_THIN_CALL_TIMEOUT_MESSAGE, TNS_READ_TIMEOUT_AT_BOUNDARY};
     use std::collections::{HashMap, HashSet};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -16928,13 +17070,169 @@ mod tests {
         let err = read_data_packet_with_flags(&mut session.stream, 319).unwrap_err();
 
         assert!(
-            err.to_string()
-                .contains("Read timeout while reading TNS data header"),
-            "unexpected timeout error: {err}"
+            err.to_string().contains(TNS_READ_TIMEOUT_AT_BOUNDARY),
+            "a call timeout while waiting for the server consumed nothing, so it left the wire \
+             at a packet boundary and must say so -- that is what makes it recoverable: {err}"
         );
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "read did not honor the configured call timeout"
+        );
+        server.join().unwrap();
+    }
+
+    /// A timeout part way through a packet is NOT at a boundary.
+    ///
+    /// Those bytes are gone and the wire is desynchronised, so this one may not
+    /// be settled by the break/reset handshake: the session has to go.
+    #[test]
+    fn a_read_timeout_inside_a_packet_is_not_reported_at_a_boundary() {
+        let protocol_version = 319;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // A header that promises a body, and then nothing.
+            let mut header = [0u8; 8];
+            header[0..4].copy_from_slice(&64u32.to_be_bytes());
+            header[4] = TNS_PACKET_TYPE_DATA;
+            stream.write_all(&header).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            drop(stream);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session
+            .set_call_timeout(Some(Duration::from_millis(50)))
+            .expect("set thin call timeout");
+
+        let err = read_data_packet_with_flags(&mut session.stream, protocol_version).unwrap_err();
+        assert!(
+            !err.to_string().contains(TNS_READ_TIMEOUT_AT_BOUNDARY),
+            "a timeout inside a packet must not claim the wire is at a boundary: {err}"
+        );
+        assert!(
+            session
+                .settle_interrupted_read(&Err::<(), _>(err))
+                .is_none(),
+            "and nothing may try to recover it: the raw error stands"
+        );
+        server.join().unwrap();
+    }
+
+    /// A call timeout at a packet boundary is settled the same way a CANCEL is,
+    /// and the session survives it.
+    ///
+    /// This is the whole point: on Oracle OCI the driver breaks and resets
+    /// inside ODPI-C, and on MySQL/MariaDB the timeout is server-side, so on
+    /// both the tab keeps its session and its open transaction. Thin used to
+    /// stop reading and leave the wire desynchronised, so the same query
+    /// timeout cost the user their transaction on one backend of four.
+    #[test]
+    fn a_call_timeout_at_a_packet_boundary_leaves_the_session_usable() {
+        let protocol_version = 319;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // The client is waiting for an answer that never comes; after its
+            // call timeout it asks the server to stop.
+            let interrupt = read_tns_test_packet(&mut stream, protocol_version);
+            assert_eq!(interrupt.last().copied(), Some(TNS_MARKER_TYPE_INTERRUPT));
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_MARKER,
+                    &[1, 0, TNS_MARKER_TYPE_RESET],
+                ))
+                .unwrap();
+            let reset = read_tns_test_packet(&mut stream, protocol_version);
+            assert_eq!(reset.last().copied(), Some(TNS_MARKER_TYPE_RESET));
+            let mut data_body = Vec::new();
+            data_body.extend_from_slice(&TNS_DATA_FLAGS_END_OF_RESPONSE.to_be_bytes());
+            data_body.extend_from_slice(&[TNS_MSG_TYPE_ERROR]);
+            stream
+                .write_all(&tns_test_packet(
+                    protocol_version,
+                    TNS_PACKET_TYPE_DATA,
+                    &data_body,
+                ))
+                .unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.protocol_version = Some(protocol_version);
+        session.capabilities.supports_oob = false;
+        session
+            .set_call_timeout(Some(Duration::from_millis(50)))
+            .expect("set thin call timeout");
+
+        let err = read_data_packet_with_flags(&mut session.stream, protocol_version).unwrap_err();
+        let settled = session
+            .settle_interrupted_read(&Err::<(), _>(err))
+            .expect("a boundary timeout must be settled, not passed through");
+
+        assert!(
+            settled
+                .to_string()
+                .contains(ORACLE_THIN_CALL_TIMEOUT_MESSAGE),
+            "it reports a call timeout, which is the evidence the application classifies as \
+             recoverable: {settled}"
+        );
+        assert!(
+            !session.is_broken(),
+            "and the session is back at a clean request boundary, so the tab keeps it"
+        );
+        assert!(!session
+            .cancel_flag
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            session
+                .cancel_signal
+                .load(std::sync::atomic::Ordering::SeqCst),
+            BREAK_SIGNAL_NONE
+        );
+        server.join().unwrap();
+    }
+
+    /// ...and when the handshake cannot complete, the session is exactly where
+    /// it was before: broken, and said to be.
+    #[test]
+    fn a_call_timeout_whose_handshake_cannot_complete_closes_the_session() {
+        let protocol_version = 319;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Never answers the break: a server with no out-of-band channel
+            // that will not look at the socket until its call is done.
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(stream);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.protocol_version = Some(protocol_version);
+        session.capabilities.supports_oob = false;
+        session
+            .set_call_timeout(Some(Duration::from_millis(50)))
+            .expect("set thin call timeout");
+
+        let err = read_data_packet_with_flags(&mut session.stream, protocol_version).unwrap_err();
+        let settled = session
+            .settle_interrupted_read(&Err::<(), _>(err))
+            .expect("a boundary timeout is always settled");
+
+        assert!(
+            !settled
+                .to_string()
+                .contains(ORACLE_THIN_CALL_TIMEOUT_MESSAGE),
+            "a session that could not be resynchronised must NOT carry the marker that says it \
+             survived: {settled}"
+        );
+        assert!(
+            session.is_broken(),
+            "and it is marked broken so the pool closes it"
         );
         server.join().unwrap();
     }

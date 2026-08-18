@@ -1735,7 +1735,31 @@ pub struct DbSessionLeaseEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetainedSessionDisposition {
     Retain(RetainedSessionState),
-    DiscardPhysical,
+    /// Close the session instead of retaining it, and state what closing it
+    /// COSTS: the state that session was carrying.
+    ///
+    /// Stated rather than assumed, because this is the FIFTH road a
+    /// work-carrying session can disappear down and it was the only one that
+    /// reported nothing. The other four all answer
+    /// [`SessionHandBack::lost_work`] -- a take that found a session it could
+    /// not reach, a worker clearing a slot, a filing that displaced an older
+    /// session, and a batch the tab had moved on from. This one hard-coded
+    /// "a discard carries no work", so every road that ends in
+    /// `SessionDecision::ReplacePhysicalSessionKeepUiConnected` -- a
+    /// non-recoverable timeout, a failed timeout restore, a failed health
+    /// check -- threw the user's open transaction away in silence.
+    DiscardPhysical(RetainedSessionState),
+}
+
+impl RetainedSessionDisposition {
+    /// What giving this session up costs the user.
+    fn carried_work(self) -> bool {
+        match self {
+            Self::Retain(retained_state) | Self::DiscardPhysical(retained_state) => {
+                retained_state.may_have_uncommitted_work()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2193,6 +2217,52 @@ impl DbPoolSessionContext {
         self.acquire_session_with_scope_context(&scoped, activity)
     }
 
+    /// A pooled session for a caller that applies the scope ITSELF.
+    ///
+    /// The execution layer's Oracle window does exactly that: it re-takes the
+    /// connection lock, re-checks the generation, applies the requesting tab's
+    /// schema and retries once on a stale session -- all under the lock, which
+    /// is why it cannot use [`Self::acquire_session_for_current_scope`]. What
+    /// it must NOT do is reach the pool itself. Every question
+    /// [`Self::acquire_session_at_the_one_door`] asks is a question about
+    /// *acquiring a session on this connection*, not about applying a scope,
+    /// and the roads that went around it (Oracle OCI's execution acquire, the
+    /// MySQL family's, and the lazy-cancel retry loop) were three quarters of
+    /// the statements the app runs.
+    pub fn acquire_session_applying_scope_itself(
+        &self,
+        activity: &DbActivityGuard,
+    ) -> Result<AcquiredPoolSession, String> {
+        self.acquire_session_at_the_one_door(activity)
+    }
+
+    /// THE door. Every pooled session in the app is acquired through here.
+    ///
+    /// It is not enough for this to be the only place that ASKS; it has to be
+    /// the only place that CAN acquire, which is why
+    /// [`DbConnectionPool::acquire_session`] is private to this module. The
+    /// hold used to be asked in `acquire_session_with_scope_context` only,
+    /// which its own comment called "the one door every pooled session in the
+    /// app comes through -- ... and every statement". It was not: the pool's
+    /// `acquire_session` was `pub`, and the execution layer called it directly
+    /// for Oracle OCI, MySQL and MariaDB. Only Oracle thin's statements came
+    /// through the door that asked.
+    fn acquire_session_at_the_one_door(
+        &self,
+        activity: &DbActivityGuard,
+    ) -> Result<AcquiredPoolSession, String> {
+        // FIRST, before a session exists: a decided session-ending action is
+        // holding this connection's pool shut. See [`PoolSessionHandoutHold`].
+        if pool_session_handout_is_held(self.connection_id) {
+            return Err(POOL_SESSION_HANDOUT_HELD_MESSAGE.to_string());
+        }
+        self.ensure_current()?;
+        // Tie the activity to this connection before the session exists, so a
+        // teardown that lands mid-acquire still retires this work.
+        activity.bind_lifetime(self.activity_lifetime());
+        self.pool.acquire_session(&self.connection_info, activity)
+    }
+
     /// Publish work that will run on THIS connection's pooled sessions.
     ///
     /// One place, because two things were being left out by every caller that
@@ -2242,20 +2312,7 @@ impl DbPoolSessionContext {
         scope_context: &DbPoolSessionContext,
         activity: &DbActivityGuard,
     ) -> Result<AcquiredPoolSession, String> {
-        // FIRST, before a session exists: a decided session-ending action is
-        // holding this connection's pool shut. Asked here because this is the
-        // one door every pooled session in the app comes through — the object
-        // browser's metadata, IntelliSense's schema and column loads, bind
-        // probes and every statement — so no road can start work the action has
-        // already been told there is none of. See [`PoolSessionHandoutHold`].
-        if pool_session_handout_is_held(self.connection_id) {
-            return Err(POOL_SESSION_HANDOUT_HELD_MESSAGE.to_string());
-        }
-        self.ensure_current()?;
-        // Tie the activity to this connection before the session exists, so a
-        // teardown that lands mid-acquire still retires this work.
-        activity.bind_lifetime(self.activity_lifetime());
-        let mut acquired = self.pool.acquire_session(&self.connection_info, activity)?;
+        let mut acquired = self.acquire_session_at_the_one_door(activity)?;
         // Every failure below CLOSES the session, and that is the same rule
         // the execution layer's own Oracle preparation follows, arrived at from
         // this path's own premises rather than copied:
@@ -2771,12 +2828,20 @@ impl DbActivityCanceler for PoolSessionCanceler {
 impl DbConnectionPool {
     /// Acquire a pooled session under a tracked activity.
     ///
-    /// This is the only way to get a pooled session anywhere in the app, and it
-    /// always publishes the session to the activity registry. That is what
+    /// PRIVATE, and that is the point: it is reached only through
+    /// [`DbPoolSessionContext::acquire_session_at_the_one_door`], so the
+    /// questions asked there -- a decided session-ending action holding this
+    /// connection's pool shut, the context still describing the connection,
+    /// the activity bound to it -- are asked of EVERY pooled session rather
+    /// than of the call sites that remembered. While this was `pub` the
+    /// execution layer called it directly and three of the four backends'
+    /// statements went around those questions.
+    ///
+    /// It always publishes the session to the activity registry. That is what
     /// makes the guarantees total rather than per-call-site: work the status
     /// bar cannot show, the cancel button cannot reach, or a teardown cannot
     /// retire is not expressible.
-    pub fn acquire_session(
+    fn acquire_session(
         &self,
         connection_info: &ConnectionInfo,
         activity: &DbActivityGuard,
@@ -3676,12 +3741,16 @@ impl TakenDbSessionLease {
                 discarded_work: false,
             };
         };
+        // What this take found on the session is what closing it costs, so the
+        // caller hears about it through `lost_work()` like every other road
+        // rather than computing it again beside the call.
+        let carried = self.retained_state;
         self.owner.hand_back_worker_session(
             &self.hand_back_owner,
             self.connection_generation,
             self.pool_context_epoch,
             lease,
-            RetainedSessionDisposition::DiscardPhysical,
+            RetainedSessionDisposition::DiscardPhysical(carried),
             "db::session_lease",
             None,
         )
@@ -3693,13 +3762,15 @@ impl Drop for TakenDbSessionLease {
         if let Some(lease) = self.lease.take() {
             // Nobody took responsibility for it. Same door as every deliberate
             // exit, so an abandoned execution's session is closed rather than
-            // filed over the newer one's.
+            // filed over the newer one's -- and it states what that cost, so a
+            // panic on a work-carrying session is not a silent loss either.
+            let carried = self.retained_state;
             let _ = self.owner.hand_back_worker_session(
                 &self.hand_back_owner,
                 self.connection_generation,
                 self.pool_context_epoch,
                 lease,
-                RetainedSessionDisposition::DiscardPhysical,
+                RetainedSessionDisposition::DiscardPhysical(carried),
                 "db::session_lease",
                 None,
             );
@@ -3940,13 +4011,16 @@ impl RetainedLeaseTake {
     }
 }
 
-/// What filing a session into a tab's slot did.
+/// What applying a disposition to a session did.
 struct RetainedSessionStore {
-    /// Whether this session is now the tab's retained one.
+    /// Whether the disposition was carried out: the session is the tab's
+    /// retained one now, or it was closed as asked.
     stored: bool,
-    /// Whether a DIFFERENT session carrying uncommitted work had to be closed
-    /// to make room for it.
-    displaced_work: bool,
+    /// Whether a session carrying uncommitted work was CLOSED doing it. Two
+    /// ways: a DIFFERENT session had to be displaced from the slot to make room
+    /// for this one, or this session was the one the disposition said to
+    /// discard.
+    closed_work: bool,
 }
 
 /// What a worker's attempt to clear the tab's session slot did.
@@ -4383,12 +4457,10 @@ impl SharedDbSessionLease {
         // slot, refused and closed, or discarded — so there is no branch that
         // may keep the reach. See [`SessionCancelReach`].
         owner.withdraw_cancel_reach();
-        let carried_work = match disposition {
-            RetainedSessionDisposition::Retain(retained_state) => {
-                retained_state.may_have_uncommitted_work()
-            }
-            RetainedSessionDisposition::DiscardPhysical => false,
-        };
+        // BOTH arms, and that is the fix: a discard is a way for a session to
+        // disappear, so what it was carrying is exactly as much news to the
+        // user as a refused retain is.
+        let carried_work = disposition.carried_work();
         if !owner.is_current() {
             logging::log_warning(
                 log_context,
@@ -4413,7 +4485,7 @@ impl SharedDbSessionLease {
             // ran, or another session got there first — and filing this one
             // can DISPLACE a session the slot was already holding from an
             // earlier incarnation of this connection.
-            discarded_work: (carried_work && !store.stored) || store.displaced_work,
+            discarded_work: (carried_work && !store.stored) || store.closed_work,
         }
     }
 
@@ -4476,11 +4548,11 @@ impl SharedDbSessionLease {
                 retained_state,
                 current_scope,
             ),
-            RetainedSessionDisposition::DiscardPhysical => {
+            RetainedSessionDisposition::DiscardPhysical(carried) => {
                 lease.discard_physical(log_context);
                 RetainedSessionStore {
                     stored: true,
-                    displaced_work: false,
+                    closed_work: carried.may_have_uncommitted_work(),
                 }
             }
         }
@@ -4516,7 +4588,7 @@ impl SharedDbSessionLease {
         let lease_db_type = lease_to_store.db_type();
         let mut lease_to_store = Some(lease_to_store);
         let mut stored = false;
-        let mut displaced_work = false;
+        let mut closed_work = false;
         // The connection is asked about OUTSIDE the slot lock: it is not a
         // question about the slot, and the ledger is a leaf lock that has no
         // reason to be observed underneath this one.
@@ -4610,7 +4682,7 @@ impl SharedDbSessionLease {
             // down, and it used to be the only one that answered nothing:
             // `stored` says this session was filed, not that the previous one
             // survived.
-            displaced_work = entry.retained_state.may_have_uncommitted_work();
+            closed_work = entry.retained_state.may_have_uncommitted_work();
             entry.discard_physical("db::session_lease");
         }
         if let Some(lease_to_store) = lease_to_store.take() {
@@ -4636,12 +4708,12 @@ impl SharedDbSessionLease {
             lease_to_store.discard_physical("db::session_lease");
             return RetainedSessionStore {
                 stored: false,
-                displaced_work,
+                closed_work,
             };
         }
         RetainedSessionStore {
             stored: true,
-            displaced_work,
+            closed_work,
         }
     }
 }
@@ -5427,8 +5499,19 @@ impl DbBackend for OracleBackend {
         }
     }
 
+    /// BOTH Oracle drivers, because `DatabaseType::Oracle` is two of them.
+    ///
+    /// `DPI-1067` is ODPI-C's call-timeout error and thin never produces it, so
+    /// "the Oracle answer" was the OCI answer and thin's timeouts were classed
+    /// unrecoverable by omission. The thin driver states its own evidence
+    /// ([`tns_thin::ORACLE_THIN_CALL_TIMEOUT_MESSAGE`]) and only when the
+    /// session really did survive the timeout -- it reports a different message
+    /// entirely when the break/reset handshake could not put the wire back at a
+    /// clean request boundary.
     fn is_recoverable_timeout_message(&self, trimmed: &str, lower: &str) -> bool {
-        trimmed.contains("DPI-1067") || lower.contains("dpi-1067")
+        trimmed.contains("DPI-1067")
+            || lower.contains("dpi-1067")
+            || lower.contains(&tns_thin::ORACLE_THIN_CALL_TIMEOUT_MESSAGE.to_ascii_lowercase())
     }
 
     fn after_connect(&self, connection: &mut DatabaseConnection) {
@@ -10616,6 +10699,39 @@ mod tests {
     /// Oracle thin clears such residue for itself — `reset_before_reuse` and
     /// `pool_session_canceler` both call `reset_pending_cancel` — and OCI and
     /// the MySQL family have no way to. So the app recognises it at the one
+    /// A session with work never disappears in silence -- including down the
+    /// road that says DISCARD.
+    ///
+    /// Four roads already answered `SessionHandBack::lost_work()`; this was the
+    /// fifth, and it answered `false` by construction: "a discard carries no
+    /// work". So every decision that ends in
+    /// `SessionDecision::ReplacePhysicalSessionKeepUiConnected` -- a
+    /// non-recoverable timeout, a failed timeout restore, a failed health check
+    /// -- closed the tab's session and took the user's open transaction with it
+    /// without a word, on all four backends.
+    #[test]
+    fn a_discard_states_what_closing_the_session_costs() {
+        let dirty = RetainedSessionState::from_transaction_state(
+            crate::db::TransactionSessionState::MaybeDirty,
+        );
+        let clean = RetainedSessionState::default();
+
+        assert!(
+            RetainedSessionDisposition::DiscardPhysical(dirty).carried_work(),
+            "closing a session that was carrying uncommitted work costs that work, and the \
+             hand-back door is what tells the user"
+        );
+        assert!(
+            !RetainedSessionDisposition::DiscardPhysical(clean).carried_work(),
+            "a session with nothing on it is thrown away in silence, as before"
+        );
+        assert!(
+            RetainedSessionDisposition::Retain(dirty).carried_work(),
+            "the retain arm is unchanged: a slot that refuses it loses the same work"
+        );
+        assert!(!RetainedSessionDisposition::Retain(clean).carried_work());
+    }
+
     /// acquire door instead, and none of the four hands a user a cancel they
     /// did not ask for.
     #[test]
@@ -10807,14 +10923,13 @@ mod tests {
         let source = include_str!("connection.rs");
         let store_body = source_of_fn(source, "fn file_into_slot(");
         assert!(
-            store_body
-                .contains("displaced_work = entry.retained_state.may_have_uncommitted_work()"),
+            store_body.contains("closed_work = entry.retained_state.may_have_uncommitted_work()"),
             "the displaced entry's OWN state is the answer; the incoming session's says nothing \
              about it"
         );
         let door_body = source_of_fn(source, "pub fn hand_back_worker_session(");
         assert!(
-            door_body.contains("(carried_work && !store.stored) || store.displaced_work"),
+            door_body.contains("(carried_work && !store.stored) || store.closed_work"),
             "the hand-back answer must fold BOTH ways a work-carrying session is closed, so \
              `lost_work()` stays the one question every road answers"
         );
@@ -11141,15 +11256,18 @@ mod tests {
     #[test]
     fn the_pool_refuses_a_held_connection_before_it_looks_at_anything_else() {
         let source = include_str!("connection.rs");
-        let acquire = source_of_fn(source, "fn acquire_session_with_scope_context(");
+        let acquire = source_of_fn(source, "fn acquire_session_at_the_one_door(");
         let refusal = acquire
             .find("if pool_session_handout_is_held(self.connection_id) {")
             .expect("the acquire door must ask whether the connection is held");
         let ensure_current = acquire
             .find("self.ensure_current()?;")
             .expect("the acquire door must also check the pool context");
+        let reaches_pool = acquire
+            .find(&format!("self.pool.{}(", "acquire_session"))
+            .expect("the acquire door is what reaches the pool");
         assert!(
-            refusal < ensure_current,
+            refusal < ensure_current && refusal < reaches_pool,
             "asked before anything else, because everything else is about a session this \
              action has already been told there is none of: {acquire}"
         );
@@ -11157,6 +11275,47 @@ mod tests {
             acquire.contains("POOL_SESSION_HANDOUT_HELD_MESSAGE"),
             "and it says so rather than failing as something else: {acquire}"
         );
+    }
+
+    /// Being the only place that ASKS is not enough; it has to be the only
+    /// place that CAN acquire.
+    ///
+    /// `DbConnectionPool::acquire_session` was `pub`, and the execution layer
+    /// called it directly: Oracle OCI's execution acquire, the MySQL family's,
+    /// and the lazy-cancel retry loop all took pooled sessions without the
+    /// door's questions ever being put. Only Oracle thin's statements went
+    /// through the door that asked, so three of the four backends ran
+    /// statements on a connection whose pool a decided teardown was holding
+    /// shut.
+    #[test]
+    fn nothing_can_take_a_pooled_session_without_going_through_the_one_door() {
+        let source = include_str!("connection.rs");
+        // Needles assembled at runtime: spelled out as literals they would
+        // match this test's own text.
+        let public_acquire = format!("pub fn {}(", "acquire_session");
+        let reaches_the_pool = format!("self.pool.{}(", "acquire_session");
+        assert!(
+            !source.contains(&public_acquire),
+            "DbConnectionPool::acquire_session must stay private to the DB layer, or a call \
+             site outside it can acquire a session the door never saw"
+        );
+        // Every road inside the DB layer that reaches the pool is the door
+        // itself; the two public entry points delegate to it.
+        assert_eq!(
+            source.matches(&reaches_the_pool).count(),
+            1,
+            "exactly one place may reach the pool"
+        );
+        for entry in [
+            "fn acquire_session_with_scope_context(",
+            "fn acquire_session_applying_scope_itself(",
+        ] {
+            let body = source_of_fn(source, entry);
+            assert!(
+                body.contains("acquire_session_at_the_one_door(activity)"),
+                "{entry} must acquire through the door: {body}"
+            );
+        }
     }
 
     /// A session the pool could not finish preparing goes through the ONE

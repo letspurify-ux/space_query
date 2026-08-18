@@ -5681,19 +5681,37 @@ enum SqlExecutionRequest {
 }
 
 fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorWidget> {
+    let tab_id = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .active_editor_tab_id;
+    acquire_tab_sql_editor_if_idle(state, tab_id)
+}
+
+/// The editor of the tab that asked, if it is still there and still idle.
+///
+/// Tab-scoped and not active-tab-scoped, because an execution the pool-slot
+/// road accepted runs 0.2s later and the user may have switched tabs in
+/// between: the statement belongs to the tab that asked for it, and so does
+/// the refusal.
+fn acquire_tab_sql_editor_if_idle(
+    state: &Arc<Mutex<AppState>>,
+    tab_id: QueryTabId,
+) -> Option<SqlEditorWidget> {
     let (editor, blocked_message) = {
         let guard = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.find_tab_index(guard.active_editor_tab_id).is_none() {
-            (None, Some("No query tab is open.".to_string()))
-        } else if guard.sql_editor.is_query_running() {
-            (
+        match guard
+            .find_tab_index(tab_id)
+            .and_then(|index| guard.editor_tabs.get(index))
+        {
+            None => (None, Some("No query tab is open.".to_string())),
+            Some(tab) if tab.sql_editor.is_query_running() => (
                 None,
-                Some("The active query tab is already running a query.".to_string()),
-            )
-        } else {
-            (Some(guard.sql_editor.clone()), None)
+                Some("The query tab is already running a query.".to_string()),
+            ),
+            Some(tab) => (Some(tab.sql_editor.clone()), None),
         }
     };
 
@@ -5717,23 +5735,30 @@ fn prepare_active_editor_for_execution(state: &Arc<Mutex<AppState>>) -> bool {
 }
 
 fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -> bool {
-    let (connection_id, connection, configured_pool_size) = {
+    let (connection_id, connection) = {
         let state = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(runtime) = state.active_connection_runtime() else {
             return false;
         };
-        let configured_pool_size = state
-            .config
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .normalized_connection_pool_size();
-        (runtime.id(), runtime.connection(), configured_pool_size)
+        (runtime.id(), runtime.connection())
     };
-    let connection_pool_size = crate::db::try_lock_connection(&connection)
+    // How many slots this connection really has, or NO answer.
+    //
+    // `try_lock_connection` says `None` for a connection that is merely busy --
+    // a neighbour tab is running a query -- and the preference was used as a
+    // stand-in for the real size there. The two disagree exactly when a resize
+    // was refused or has not happened yet, and then this either evicts another
+    // tab's result grid for slots that exist or declines to and lets the
+    // acquire fail as exhausted. Neither is an answer worth inventing: with no
+    // size there is no full pool to act on, and the acquire's own retry (which
+    // asks the tab to cancel its oldest lazy fetch) covers it.
+    let Some(connection_pool_size) = crate::db::try_lock_connection(&connection)
         .map(|connection| connection.connection_pool_size())
-        .unwrap_or(configured_pool_size);
+    else {
+        return false;
+    };
 
     let session_id = {
         let guard = state
@@ -5760,10 +5785,46 @@ fn run_sql_execution_request(state: &Arc<Mutex<AppState>>, request: SqlExecution
     let Some(editor) = acquire_sql_editor_if_idle(state) else {
         return;
     };
+    run_sql_execution_request_on(&editor, request);
+}
+
+fn run_sql_execution_request_on(editor: &SqlEditorWidget, request: SqlExecutionRequest) {
     match request {
         SqlExecutionRequest::Current => editor.execute_current(),
         SqlExecutionRequest::StatementAtCursor => editor.execute_statement_at_cursor(),
         SqlExecutionRequest::Selected => editor.execute_selected(),
+    }
+}
+
+/// How long the pool-slot road waits for the lazy fetch it cancelled to give
+/// its session back before starting the execution it accepted.
+const SESSION_POOL_SLOT_EXECUTION_DELAY_SECONDS: f64 = 0.2;
+
+/// An execution this window ACCEPTED but has not started, bound to the tab that
+/// asked for it.
+///
+/// Both halves matter and both were missing. The count is what
+/// `AppState::tab_has_unfinished_db_work` reads, so without it the tab reads
+/// perfectly idle to a pool resize, a disconnect, a Disconnect All, an exit and
+/// its own close for the whole wait — and the statement then starts against a
+/// connection whose sessions those actions had already been told there were
+/// none of. The tab id is what keeps the statement in the tab that asked: the
+/// wait is a UI timer, the user can switch tabs inside it, and the road used to
+/// resolve "the active tab" again when the timer fired.
+struct AcceptedPoolSlotExecution {
+    tab_id: QueryTabId,
+    deferred: crate::ui::sql_editor::DeferredExecutionGuard,
+}
+
+impl AcceptedPoolSlotExecution {
+    fn for_active_tab(state: &Arc<Mutex<AppState>>) -> Option<Self> {
+        let guard = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tab_id = guard.active_editor_tab_id;
+        let index = guard.find_tab_index(tab_id)?;
+        let deferred = guard.editor_tabs.get(index)?.sql_editor.defer_execution();
+        Some(Self { tab_id, deferred })
     }
 }
 
@@ -5774,14 +5835,28 @@ fn execute_sql_request_with_session_pool_slot(
     if !prepare_active_editor_for_execution(state) {
         return;
     }
-    if cancel_oldest_lazy_fetch_if_session_pool_full(state) {
-        let state_for_execute = Arc::clone(state);
-        crate::ui::ui_timeout::schedule(0.2, move || {
-            run_sql_execution_request(&state_for_execute, request);
-        });
-    } else {
+    if !cancel_oldest_lazy_fetch_if_session_pool_full(state) {
         run_sql_execution_request(state, request);
+        return;
     }
+    // A lazy fetch is being cancelled to make room for this statement, so the
+    // statement has been accepted and is coming. Counting it and naming its tab
+    // is what `AcceptedPoolSlotExecution` is for.
+    let Some(accepted) = AcceptedPoolSlotExecution::for_active_tab(state) else {
+        return;
+    };
+    let state_for_execute = Arc::clone(state);
+    crate::ui::ui_timeout::schedule(SESSION_POOL_SLOT_EXECUTION_DELAY_SECONDS, move || {
+        // The binding was done before the wait; re-doing it here would bind
+        // whichever tab is active NOW, which is not the one that asked.
+        let AcceptedPoolSlotExecution { tab_id, deferred } = accepted;
+        if let Some(editor) = acquire_tab_sql_editor_if_idle(&state_for_execute, tab_id) {
+            run_sql_execution_request_on(&editor, request);
+        }
+        // Released only now: until an attempt has started it or given up on it,
+        // the tab still has a statement coming.
+        drop(deferred);
+    });
 }
 
 fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {

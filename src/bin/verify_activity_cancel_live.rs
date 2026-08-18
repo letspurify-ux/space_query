@@ -58,6 +58,7 @@
 //
 // Usage: verify_activity_cancel_live <thin|oci|mysql|mariadb|all>
 
+use fltk::prelude::InputExt;
 use fltk::{app, input::IntInput};
 use space_query::db::{
     active_db_activity_snapshots, active_pool_db_activity_snapshots, cancel_db_activity,
@@ -156,6 +157,33 @@ impl Target {
             "INSERT INTO SQ_CANCEL_T VALUES (1)"
         } else {
             "START TRANSACTION; INSERT INTO SQ_CANCEL_T VALUES (1)"
+        }
+    }
+
+    /// A14's own probe table.
+    ///
+    /// Deliberately NOT the shared one: A11 leaves an open transaction on
+    /// `SQ_CANCEL_T` on purpose, so creating or writing it here would queue
+    /// behind that lock rather than testing anything. A13 says the same.
+    fn timeout_setup_sql(self) -> Vec<&'static str> {
+        if self.is_oracle() {
+            vec![
+                "DROP TABLE SQ_TIMEOUT_T",
+                "CREATE TABLE SQ_TIMEOUT_T (V NUMBER)",
+            ]
+        } else {
+            vec![
+                "DROP TABLE IF EXISTS SQ_TIMEOUT_T",
+                "CREATE TABLE SQ_TIMEOUT_T (V INT)",
+            ]
+        }
+    }
+
+    fn timeout_retain_sql(self) -> &'static str {
+        if self.is_oracle() {
+            "INSERT INTO SQ_TIMEOUT_T VALUES (1)"
+        } else {
+            "START TRANSACTION; INSERT INTO SQ_TIMEOUT_T VALUES (1)"
         }
     }
 
@@ -1178,6 +1206,113 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
         }
     }
 
+    // A14: a query timeout costs the STATEMENT, and the session's fate is the
+    // same stated answer on all four backends.
+    //
+    // Oracle OCI breaks and resets inside ODPI-C (`DPI-1067`) and the MySQL
+    // family's timeout is server-side (`ERROR 3024`), so on both the tab keeps
+    // its session and its open transaction. Oracle thin had neither: its call
+    // timeout was a bare socket read timeout that left the server's answer
+    // pending on the wire, and its interrupt classifier had no timeout arm at
+    // all, so the timeout was reported as a LOST CONNECTION and the tab's
+    // session -- with the user's uncommitted work on it -- was replaced without
+    // a word.
+    //
+    // The contract this asserts is the one all four now obey: the failure names
+    // a TIMEOUT, and the tab is left in one of exactly two stated conditions --
+    // its session and transaction intact, or the session gone AND the loss
+    // reported.
+    {
+        reset_tracked_db_activities_for_probe();
+        let label = target.label();
+        println!("   A14 ({label}): a query timeout costs the statement, and says what else");
+        let harness = Harness::connect(target)?;
+        let mut editor = EditorHarness::new(&harness);
+        for sql in target.timeout_setup_sql() {
+            let _ = editor.run(sql, Duration::from_secs(30));
+        }
+        if !editor.run(target.timeout_retain_sql(), Duration::from_secs(30)) {
+            failures.push(format!(
+                "A14 ({label}): could not open a transaction to retain the session"
+            ));
+        }
+        let retained_before = editor.retained_session_state().is_some();
+        let carried_work_before = editor
+            .retained_session_state()
+            .is_some_and(|snapshot| snapshot.retained_state.may_have_uncommitted_work());
+        if !retained_before || !carried_work_before {
+            failures.push(format!(
+                "A14 ({label}): the tab did not retain a session carrying work, so there is \
+                 nothing for a timeout to cost"
+            ));
+        }
+
+        editor.set_query_timeout_seconds(2);
+        // As a SCRIPT, for the same reason A13 does it: a single-statement
+        // SELECT is handed to a lazy fetch, and this is about the statement
+        // road the tab's own session runs on.
+        //
+        // Pumped until the tab has SAID something rather than waiting on
+        // `BatchFinished`: a terminal event queued by the previous statement is
+        // drained by the same poll, so the flag can already be set when this
+        // batch starts.
+        editor.start(&format!("{};\n{}", target.slow_sql(), target.trivial_sql()));
+        let reported = editor.pump_until(Duration::from_secs(60), || {
+            let transcript = editor.transcript();
+            (!transcript.is_empty()).then(|| transcript.join(" | "))
+        });
+        let _ = editor.wait_done(Duration::from_secs(20));
+        editor.set_query_timeout_seconds(0);
+        let transcript = reported.unwrap_or_default();
+        let lowered = transcript.to_ascii_lowercase();
+        if transcript.is_empty() {
+            failures.push(format!(
+                "A14 ({label}): the timed-out statement told the user nothing at all"
+            ));
+        } else if !(lowered.contains("timed out")
+            || lowered.contains("timeout")
+            || lowered.contains("ora-01013"))
+        {
+            failures.push(format!(
+                "A14 ({label}): a query timeout must be reported as a timeout, not as something \
+                 else (transcript: {transcript})"
+            ));
+        }
+
+        // The two stated conditions. Either is correct; SILENCE is not.
+        if editor.retained_session_state().is_some() {
+            let usable = editor.run(target.timeout_retain_sql(), Duration::from_secs(30))
+                && !editor.last_message().to_ascii_lowercase().contains("error");
+            if usable {
+                println!(
+                    "   A14 ({label}) the session survived the timeout and the tab's transaction \
+                     is still open"
+                );
+            } else {
+                failures.push(format!(
+                    "A14 ({label}): the tab kept a session it cannot use (transcript: {:?})",
+                    editor.transcript()
+                ));
+            }
+        } else if carried_work_before {
+            if lowered.contains(
+                &space_query::db::result_messages::RETAINED_SESSION_LOST_WITH_WORK
+                    .to_ascii_lowercase(),
+            ) {
+                println!(
+                    "   A14 ({label}) the session could not be resynchronised, and the user was \
+                     told the work went with it"
+                );
+            } else {
+                failures.push(format!(
+                    "A14 ({label}): the tab's work-carrying session was closed by a timeout and \
+                     nothing said so (transcript: {transcript})"
+                ));
+            }
+        }
+        let _ = editor.wait_done(Duration::from_secs(10));
+    }
+
     reset_tracked_db_activities_for_probe();
     Ok(failures)
 }
@@ -1201,6 +1336,8 @@ fn block_mysql_table(target: Target) -> Result<mysql::Conn, String> {
 /// Drives a real `SqlEditorWidget` the way the GUI does.
 struct EditorHarness {
     editor: SqlEditorWidget,
+    /// The tab's query-timeout field, kept so a scenario can set one.
+    timeout_input: IntInput,
     done: Arc<AtomicBool>,
     messages: Arc<Mutex<Vec<String>>>,
     explained: Arc<AtomicBool>,
@@ -1209,7 +1346,8 @@ struct EditorHarness {
 impl EditorHarness {
     fn new(harness: &Harness) -> Self {
         let timeout_input = IntInput::default();
-        let mut editor = SqlEditorWidget::new(Arc::clone(&harness.connection), timeout_input);
+        let mut editor =
+            SqlEditorWidget::new(Arc::clone(&harness.connection), timeout_input.clone());
         let done = Arc::new(AtomicBool::new(false));
         let messages: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let explained = Arc::new(AtomicBool::new(false));
@@ -1237,15 +1375,30 @@ impl EditorHarness {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .extend(lines.iter().cloned());
                 }
+                // A batch that DIED says so here and nowhere else, so a
+                // scenario asking what the user was told has to see it.
+                QueryProgress::ExecutionAbandoned { message, .. }
+                | QueryProgress::WorkerPanicked { message } => {
+                    messages
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(message.clone());
+                }
                 _ => {}
             });
         }
         Self {
             editor,
+            timeout_input,
             done,
             messages,
             explained,
         }
+    }
+
+    /// Give this tab a query timeout, the way the toolbar field does.
+    fn set_query_timeout_seconds(&mut self, seconds: u32) {
+        self.timeout_input.set_value(&seconds.to_string());
     }
 
     /// Run an explain plan and wait for the server's answer. The explain is the

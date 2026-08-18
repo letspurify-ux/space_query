@@ -210,9 +210,15 @@ fn oracle_execution_pool_acquire_happens_outside_connection_mutex() {
     );
     assert!(
         content.contains(
-            "let pool_session_result = Self::acquire_fresh_pool_session(\n            &pool,\n            crate::db::DatabaseType::Oracle,"
+            "let pool_session_result = Self::acquire_fresh_pool_session(\n            &pool_context,\n            crate::db::DatabaseType::Oracle,"
         ),
-        "Oracle execution should acquire fresh pooled sessions through the lock-free helper"
+        "Oracle execution should acquire fresh pooled sessions through the lock-free helper -- \
+         by the pool CONTEXT, which is what names the connection to the acquire door"
+    );
+    assert!(
+        content.contains("drop(conn_guard);\n        let pool_session_result ="),
+        "and the connection mutex must be released before the acquire, which is what this \
+         test has always been about"
     );
 }
 
@@ -6845,9 +6851,11 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         content
             .matches("Self::report_retained_session_lost_with_work(")
             .count(),
-        7,
+        8,
         "every site that loses a work-carrying session reports it: the two replace-and-reset \
-         sites (MySQL family, Oracle OCI), the one door a worker clears the tab's slot through \
+         sites (MySQL family, Oracle OCI), the Oracle acquire window that closes the tab's \
+         retained session after a setup failure it cannot reuse it through, the one door a \
+         worker clears the tab's slot through \
          on the way out of a connection, the two sites that TOOK a lease and found it was \
          not a MySQL session after all (batch finalization, scope recheck) — the take had \
          already emptied the slot there, so a bare return left the tab believing it still had \
@@ -6891,6 +6899,294 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         lost_body.contains("Abandoned { carried_work: true }")
             && lost_body.contains("discarded_work: true"),
         "both ways a work-carrying session is closed must answer `lost_work`"
+    );
+
+    // The FIFTH road, and the one that reported nothing: a disposition that
+    // says DISCARD. `carried_work` was hard-coded to `false` for it, so every
+    // decision ending in `ReplacePhysicalSessionKeepUiConnected` -- a
+    // non-recoverable timeout, a failed timeout restore, a failed health check
+    // -- closed the tab's session and threw its open transaction away in
+    // silence, on all four backends.
+    assert!(
+        connection.contains("DiscardPhysical(RetainedSessionState),"),
+        "a discard must STATE what closing the session costs, so the answer cannot be forgotten"
+    );
+    let carried = connection
+        .find("fn carried_work(self) -> bool {")
+        .expect("the disposition should answer what giving the session up costs");
+    let carried_body = slice_from(&connection, carried, 400);
+    assert!(
+        carried_body
+            .contains("Self::Retain(retained_state) | Self::DiscardPhysical(retained_state)"),
+        "and BOTH ways a session leaves must answer from the state it was carrying: \
+         {carried_body}"
+    );
+    let door = connection
+        .find("pub fn hand_back_worker_session(")
+        .expect("the hand-back door should exist");
+    let door_body = slice_from(&connection, door, 1400);
+    assert!(
+        door_body.contains("let carried_work = disposition.carried_work();"),
+        "the door must ask the disposition rather than matching on it again: {door_body}"
+    );
+    let apply = connection
+        .find("fn apply_retained_session_disposition_with_scope(")
+        .expect("the disposition applier should exist");
+    let apply_body = slice_from(&connection, apply, 1200);
+    assert!(
+        apply_body.contains("closed_work: carried.may_have_uncommitted_work(),"),
+        "and the discard arm must report the close, not answer `false`: {apply_body}"
+    );
+}
+
+/// The force tier asks the rule about the SAME session it tears down.
+///
+/// `force_cancel_blocking` read the tab's cancel slot twice: once through
+/// `canceled_session()` to ask [`CanceledSession::force_tier_may_destroy_it`],
+/// and again inside the tear-down to find the handle to act on. That slot
+/// CHANGES -- an Oracle OCI script `CONNECT` republishes it mid-batch from the
+/// pooled session the batch started with (`Pooled`) to the candidate
+/// connection's own session (`Main`) -- so the rule could answer about one
+/// session while the tear-down landed on another: a drop-close of the
+/// connection every other tab is working on, by a cancel.
+///
+/// The indirection is now resolved ONCE, and what it resolves to is a value
+/// with no indirection variant, so neither tier can be handed a slot to read
+/// again.
+#[test]
+fn a_force_tier_asks_its_rule_about_the_session_it_will_tear_down() {
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+
+    let resolved = editor
+        .find("enum ConcreteCancelSession {")
+        .expect("the resolved cancel session should be its own type");
+    let resolved_body = slice_from(&editor, resolved, 700);
+    let end = resolved_body.find('}').unwrap_or(resolved_body.len());
+    let resolved_body = &resolved_body[..end];
+    assert!(
+        !resolved_body.contains("Withdrawable") && !resolved_body.contains("OperationSlot"),
+        "the value a tier acts on must have no indirection variant, or the two reads come \
+         back: {resolved_body}"
+    );
+
+    let force = editor
+        .find("pub(crate) fn force_cancel_blocking(")
+        .expect("the force tier should exist");
+    let force_body = slice_from(&editor, force, 900);
+    let resolve_at = force_body
+        .find("self.resolve_for_action(claim)")
+        .expect("the force tier must resolve the indirection once");
+    let rule_at = force_body
+        .find("kind.force_tier_may_destroy_it()")
+        .expect("the force tier must ask the app's one rule");
+    let destroy_at = force_body
+        .find("session.destroy(&claim)")
+        .expect("the force tier must tear the resolved session down");
+    assert!(
+        resolve_at < rule_at && rule_at < destroy_at,
+        "resolve, then ask, then destroy -- all about one value: {force_body}"
+    );
+    assert!(
+        force_body.contains("session.canceled_session()"),
+        "the rule is asked of the RESOLVED session, not of the handle that pointed at it: \
+         {force_body}"
+    );
+
+    // Both tiers reach the concrete session the same way, so a future one
+    // cannot invent a second reading.
+    let interrupt = editor
+        .find("pub(crate) fn cancel_interrupt(")
+        .expect("the graceful tier should exist");
+    let interrupt_body = slice_from(&editor, interrupt, 500);
+    assert!(
+        interrupt_body.contains("resolve_for_action(claim)"),
+        "the graceful tier resolves through the same door: {interrupt_body}"
+    );
+}
+
+/// Every backend's STATEMENT takes its session through the door that can be
+/// held shut, and an execution the window accepted is counted until it starts.
+///
+/// Two independent halves of one hole. `acquire_session_with_scope_context`
+/// called itself "the one door every pooled session in the app comes through --
+/// ... and every statement"; it was not. `DbConnectionPool::acquire_session`
+/// was `pub`, and the execution layer called it directly for Oracle OCI, MySQL
+/// and MariaDB (and again in the lazy-cancel retry loop), so three of the four
+/// backends ran statements on a connection whose pool a decided session-ending
+/// action was holding shut. Reaching that window needed the second half: the
+/// pool-slot road cancels the oldest lazy fetch and schedules the execution for
+/// 0.2s later, and it did not count that wait -- so the tab read perfectly idle
+/// to the gate, the prompts ran (modal, pumping the timer that fires it), and
+/// the statement started against sessions the action had already been told
+/// there were none of.
+#[test]
+fn every_statement_takes_its_session_through_the_door_a_teardown_can_hold_shut() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    for road in [
+        "fn acquire_fresh_pool_session_once(",
+        "fn acquire_fresh_pool_session(",
+        "fn retry_pool_session_after_lazy_cancel(",
+        "fn acquire_fresh_mysql_pool_session(",
+    ] {
+        let at = execution
+            .find(road)
+            .unwrap_or_else(|| panic!("{road} should exist"));
+        let body = slice_from(&execution, at, 1400);
+        assert!(
+            body.contains("context: &crate::db::DbPoolSessionContext"),
+            "{road} must take the pool CONTEXT: it is what names the connection, and a pool \
+             handle that cannot name its connection cannot be held shut: {body}"
+        );
+    }
+    assert!(
+        !execution.contains("pool.acquire_session("),
+        "no execution road may reach the pool directly"
+    );
+    // The Oracle window rebuilds its context from the guard for the retry, so
+    // the door is asked about the connection as it is at that moment.
+    let oracle = execution
+        .find("fn acquire_oracle_pooled_execution_connection")
+        .expect("the Oracle execution acquire should exist");
+    let oracle_body = slice_from(&execution, oracle, 16000);
+    for (needle, which) in [
+        (
+            "let mut pool_context = match conn_guard.pool_session_context() {",
+            "the first acquire",
+        ),
+        (
+            "pool_context = match conn_guard.pool_session_context() {",
+            "the retry",
+        ),
+    ] {
+        assert!(
+            oracle_body.contains(needle),
+            "{which} must ask the connection for a context that is current AT THAT MOMENT, so \
+             the door is not answered about a connection as it was at batch start"
+        );
+    }
+
+    // The accepted-but-not-started execution: counted, and bound to the tab
+    // that asked rather than resolved against whichever tab is active when the
+    // timer fires.
+    let main_window = read_source("src/ui/main_window.rs");
+    let accepted = main_window
+        .find("struct AcceptedPoolSlotExecution {")
+        .expect("the accepted pool-slot execution should be a value");
+    let accepted_body = slice_from(&main_window, accepted, 900);
+    assert!(
+        accepted_body.contains("tab_id: QueryTabId,")
+            && accepted_body.contains("deferred: crate::ui::sql_editor::DeferredExecutionGuard,"),
+        "it must carry BOTH: the count the session-ending gates read, and the tab the \
+         statement belongs to: {accepted_body}"
+    );
+    let road = main_window
+        .find("fn execute_sql_request_with_session_pool_slot(")
+        .expect("the pool-slot execution road should exist");
+    let road_body = slice_from(&main_window, road, 1600);
+    assert!(
+        road_body.contains("AcceptedPoolSlotExecution::for_active_tab(state)"),
+        "the road must take one before it schedules: {road_body}"
+    );
+    assert!(
+        road_body.contains("acquire_tab_sql_editor_if_idle(&state_for_execute, tab_id)"),
+        "and run in the tab that asked, not in whichever one is active 0.2s later: {road_body}"
+    );
+    assert!(
+        !road_body.contains("run_sql_execution_request(&state_for_execute"),
+        "the active-tab entry point must not be the one the timer calls"
+    );
+}
+
+/// A query timeout is a TIMEOUT on every backend, and the session survives it
+/// wherever the driver can say so.
+///
+/// The app has three interrupt classifiers, one per backend family, and only
+/// two of them had a timeout arm. Oracle thin's fell through to "this session
+/// cannot be reused" and answered `InterruptKind::ConnectionError`, which
+/// `decide_session_after_interrupt` settles at the very top by REPLACING the
+/// physical session -- so the same query timeout that costs a STATEMENT on
+/// Oracle OCI (`DPI-1067`) and on MySQL/MariaDB (`ERROR 3024`) cost the tab its
+/// SESSION, and with it any open transaction, on thin alone.
+///
+/// Underneath it, the driver has to be able to say the session survived. A thin
+/// call timeout was a bare socket read timeout that left the server's answer
+/// pending on the wire; it now completes the same break/reset handshake a
+/// cancel completes, at the one place a read is settled.
+#[test]
+fn every_backend_classifies_a_query_timeout_as_a_timeout() {
+    let content = read_source("src/ui/sql_editor/execution.rs");
+    for classifier in [
+        "fn oracle_interrupt_kind_for_error(",
+        "fn mysql_interrupt_kind_for_message(",
+        "fn oracle_thin_interrupt_kind_for_message(",
+    ] {
+        let at = content
+            .find(classifier)
+            .unwrap_or_else(|| panic!("{classifier} should exist"));
+        let body = slice_from(&content, at, 1600);
+        let end = body.find("\n    fn ").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("InterruptKind::NonRecoverableTimeout"),
+            "{classifier} must answer for a timeout that also lost the connection: {body}"
+        );
+        assert!(
+            body.contains("InterruptKind::RecoverableTimeout"),
+            "{classifier} must answer for a timeout the session can survive -- without it a \
+             timeout is reported as a lost connection and the tab's session is replaced: {body}"
+        );
+    }
+
+    // And "the Oracle answer" must be both Oracle drivers'. `DPI-1067` is
+    // ODPI-C's call-timeout error; thin never produces it, so a marker list of
+    // one was an OCI-only list wearing the family's name.
+    let connection = read_source("src/db/connection.rs");
+    let oracle_marker = connection
+        .find("fn is_recoverable_timeout_message(&self, trimmed: &str, lower: &str) -> bool {")
+        .expect("the Oracle backend should classify its own timeouts");
+    let oracle_body = slice_from(&connection, oracle_marker, 900);
+    assert!(
+        oracle_body.contains("DPI-1067")
+            && oracle_body.contains("ORACLE_THIN_CALL_TIMEOUT_MESSAGE"),
+        "both Oracle drivers must be named: {oracle_body}"
+    );
+
+    // And nothing in the app may decide FOR the driver that a timeout cost the
+    // session. Seven places did: six arms of the thin batch loop and the
+    // worker's own `session_broken`, all saying `timed_out || is_broken()`.
+    assert!(
+        !content.contains("statement_timed_out || conn.is_broken()"),
+        "whether a session survived a timeout is the driver's answer; a blanket rule beside it \
+         cost the tab its session and any open transaction on every query timeout"
+    );
+    assert!(
+        !content.contains("thin_conn.is_broken() || batch_outcome.timed_out"),
+        "the worker must ask the driver too, not add a timeout of its own to the answer"
+    );
+
+    // The driver settles an interrupted read in ONE place, so a cancel and a
+    // call timeout cannot drift apart: they need the same thing done to the
+    // session.
+    let thin = read_source("crates/tns-thin/src/session.rs");
+    assert_eq!(
+        thin.matches("if let Some(error) = self.settle_interrupted_read(&response) {")
+            .count(),
+        3,
+        "every read that can be interrupted must be settled through the one door"
+    );
+    assert!(
+        !thin.contains("if let Some(signal) = self.current_cancel_signal() {\n            return Err(self.finish_cancelled_read(signal));"),
+        "and none of them may go straight to the cancel half, which is what left the timeout \
+         half unwritten"
+    );
+    let settle = thin
+        .find("fn settle_interrupted_read<T>(")
+        .expect("the settlement door should exist");
+    let settle_body = slice_from(&thin, settle, 900);
+    assert!(
+        settle_body.contains("TNS_READ_TIMEOUT_AT_BOUNDARY"),
+        "only a timeout that consumed nothing may be recovered; one part way through a packet \
+         left the wire desynchronised: {settle_body}"
     );
 }
 
@@ -7798,23 +8094,30 @@ fn every_force_tier_asks_one_rule_before_it_destroys_a_session() {
     let editor_force = editor
         .find("pub(crate) fn force_cancel_blocking(")
         .expect("the query tab's force tier should exist");
-    let editor_force_body = slice_from(&editor, editor_force, 400);
+    let editor_force_body = slice_from(&editor, editor_force, 700);
     assert!(
-        editor_force_body.contains("session.force_tier_may_destroy_it()")
-            && editor_force_body.contains("return self.cancel_interrupt(claim);")
-            && editor_force_body.contains("self.destroy_session(claim)"),
+        editor_force_body.contains("kind.force_tier_may_destroy_it()")
+            && editor_force_body.contains("return session.interrupt(&claim);")
+            && editor_force_body.contains("session.destroy(&claim)"),
         "the query tab's force tier must ask the shared rule before tearing anything down, \
          and re-break instead when it may not: {editor_force_body}"
     );
+    assert!(
+        editor_force_body.contains("self.resolve_for_action(claim)"),
+        "and it must ask about the session it RESOLVED, not about a second reading of a slot \
+         that can change under it: {editor_force_body}"
+    );
     assert_eq!(
-        editor.matches("fn destroy_session(").count(),
+        editor
+            .matches("fn destroy(self, claim: &SessionCancelClaim)")
+            .count(),
         1,
         "the tear-down itself must have exactly one home, reached only through the tier \
          that asks the rule"
     );
     assert!(
-        !editor.contains("pub(crate) fn destroy_session(")
-            && !editor.contains("pub fn destroy_session("),
+        !editor.contains("pub(crate) fn destroy(self, claim")
+            && !editor.contains("pub fn destroy(self, claim"),
         "the tear-down must not be reachable around the rule"
     );
 
@@ -8262,9 +8565,13 @@ fn a_pooled_session_is_never_held_apart_from_its_cancel_reach() {
 
     // The acquire choke point answers with the pair, never with a tuple.
     for acquire in [
-        "pub fn acquire_session(",
+        // Private now -- it is reachable only through the door -- but it still
+        // has to answer with the pair.
+        "fn acquire_session(\n",
         "pub fn acquire_session_for_current_scope(",
         "pub fn acquire_session_for_scope(",
+        "pub fn acquire_session_applying_scope_itself(",
+        "fn acquire_session_at_the_one_door(",
         "fn acquire_session_with_scope_context(",
     ] {
         let start = connection
@@ -8338,30 +8645,47 @@ fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
         editor.contains("OperationSlot(Arc<Mutex<OperationCancelTarget>>)"),
         "the tiers need a handle that can look at the slot again"
     );
+    // Both tiers read the slot again at the moment they act, and they do it in
+    // ONE place -- which is also what stops the force tier reading it twice and
+    // asking its rule about the first read. See
+    // `a_force_tier_asks_its_rule_about_the_session_it_will_tear_down`.
     for tier in [
         "pub(crate) fn cancel_interrupt(",
-        "fn destroy_session(self, claim: &SessionCancelClaim)",
+        "pub(crate) fn force_cancel_blocking(",
     ] {
         let start = editor
             .find(tier)
             .unwrap_or_else(|| panic!("{tier} should exist"));
-        let body = slice_from(&editor, start, 2600);
+        let body = slice_from(&editor, start, 900);
         assert!(
-            body.contains("QueryCancelHandle::OperationSlot(slot)"),
-            "{tier} must have an answer for the operation slot"
+            body.contains("resolve_for_action(claim)"),
+            "{tier} must re-read the slot through the one resolution: {body}"
         );
         assert!(
-            body.contains("Ok(SessionCancelDelivery::Withdrawn)"),
-            "{tier} must say so when the slot has been withdrawn instead of acting: {body}"
-        );
-        assert!(
-            body.contains("claim.and(Self::operation_slot_still_published(")
-                && body.contains("claim.and(target.still_published())"),
-            "{tier} must carry the slot's own question ON into the driver, because reading the \
-             slot here is still a control connection away from the server on the MySQL \
-             family: {body}"
+            body.contains("SessionCancelDelivery"),
+            "{tier} must answer a withdraw rather than acting: {body}"
         );
     }
+    let resolve = editor
+        .find("fn resolve_for_action(")
+        .expect("the one resolution should exist");
+    let resolve_body = slice_from(&editor, resolve, 1800);
+    assert!(
+        resolve_body.contains("QueryCancelHandle::OperationSlot(slot)")
+            && resolve_body.contains("QueryCancelHandle::Withdrawable(target)"),
+        "it must answer for both indirections: {resolve_body}"
+    );
+    assert!(
+        resolve_body.contains("Err(SessionCancelDelivery::Withdrawn)"),
+        "a slot with nothing published is a withdraw, not something to act on: {resolve_body}"
+    );
+    assert!(
+        resolve_body.contains("claim.and(Self::operation_slot_still_published(")
+            && resolve_body.contains("claim.and(target.still_published())"),
+        "and it must carry each indirection's own question ON into the driver, because reading \
+         the slot here is still a control connection away from the server on the MySQL \
+         family: {resolve_body}"
+    );
 
     // The watchdog holds the SLOT, not the handle inside it.
     let watchdog = editor

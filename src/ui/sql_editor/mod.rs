@@ -51,6 +51,12 @@ use tns_thin::OracleThinCancelHandle;
 mod chunked_text;
 mod execution;
 mod formatter;
+
+/// Re-exported so the main window can hold one: the pool-slot execution road
+/// lives there and must count its wait exactly as the editor's own lazy-cancel
+/// retry does.
+pub(crate) use execution::DeferredExecutionGuard;
+
 pub mod hangul_repair;
 mod intellisense;
 mod intellisense_host;
@@ -787,6 +793,104 @@ pub(crate) enum QueryCancelHandle {
     },
 }
 
+/// How many indirections a cancel handle may be nested behind before a tier
+/// gives up on it. Nothing the app publishes nests at all; see
+/// [`QueryCancelHandle::resolve_for_action`].
+const MAX_CANCEL_HANDLE_INDIRECTION: usize = 4;
+
+/// The session a cancel tier acts on, with every indirection already resolved.
+///
+/// A separate type from [`QueryCancelHandle`] so that "the handle the rule was
+/// asked about" and "the handle the tear-down lands on" cannot be two different
+/// reads of the same changing slot. Both tiers reach it only through
+/// [`QueryCancelHandle::resolve_for_action`], and neither
+/// [`Self::interrupt`] nor [`Self::destroy`] can be handed an indirection,
+/// because this enum has no variant for one.
+enum ConcreteCancelSession {
+    Oracle(Arc<Connection>, CanceledSession),
+    OracleThin(OracleThinCancelHandle, CanceledSession),
+    MySql(Box<MySqlQueryCancelContext>, CanceledSession),
+    #[cfg(test)]
+    Test(Arc<AtomicBool>),
+    #[cfg(test)]
+    TestBlockingForce {
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    },
+}
+
+impl ConcreteCancelSession {
+    /// WHICH session this speaks for. `None` only for a test double.
+    fn canceled_session(&self) -> Option<CanceledSession> {
+        match self {
+            Self::Oracle(_, session) | Self::OracleThin(_, session) | Self::MySql(_, session) => {
+                Some(*session)
+            }
+            #[cfg(test)]
+            Self::Test(_) | Self::TestBlockingForce { .. } => None,
+        }
+    }
+
+    /// The graceful tier: ask the server to abort the call.
+    fn interrupt(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
+        match self {
+            Self::Oracle(conn, _) => conn.interrupt(claim),
+            Self::OracleThin(cancel_handle, _) => cancel_handle.interrupt(claim),
+            Self::MySql(context, _) => context.interrupt(claim),
+            #[cfg(test)]
+            Self::Test(called) => claim.deliver(
+                || Ok(()),
+                |()| {
+                    called.store(true, Ordering::Relaxed);
+                    Ok(())
+                },
+            ),
+            #[cfg(test)]
+            Self::TestBlockingForce { started, .. } => claim.deliver(
+                || Ok(()),
+                |()| {
+                    started.store(true, Ordering::Relaxed);
+                    Ok(())
+                },
+            ),
+        }
+    }
+
+    /// The tear-down itself. Reached only through
+    /// [`QueryCancelHandle::force_cancel_blocking`], which is where the rule
+    /// about how far a force may go lives.
+    fn destroy(self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
+        match self {
+            Self::Oracle(conn, _) => conn.terminate(claim),
+            Self::OracleThin(cancel_handle, _) => cancel_handle.terminate(claim),
+            Self::MySql(context, _) => (*context).terminate(claim),
+            #[cfg(test)]
+            Self::Test(called) => claim.deliver(
+                || Ok(()),
+                |()| {
+                    called.store(true, Ordering::Relaxed);
+                    Ok(())
+                },
+            ),
+            // The blocking wait is the SLOW HALF, deliberately: this double
+            // exists to hold a force tier open, and putting the wait in
+            // `prepare` is what makes it stand for the control connection the
+            // MySQL family really opens there.
+            #[cfg(test)]
+            Self::TestBlockingForce { started, release } => claim.deliver(
+                || {
+                    started.store(true, Ordering::Relaxed);
+                    while !release.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(())
+                },
+                |()| Ok(()),
+            ),
+        }
+    }
+}
+
 /// A cancel target its owner can TAKE BACK.
 ///
 /// The force tier is the one that cannot be undone -- an Oracle drop-close, an
@@ -864,12 +968,6 @@ impl QueryCancelTarget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_some()
         })
-    }
-
-    /// Whether this target still speaks for a session, and which.
-    fn canceled_session(&self) -> Option<CanceledSession> {
-        self.published_handle()
-            .and_then(|handle| handle.canceled_session())
     }
 }
 
@@ -1553,7 +1651,10 @@ fn retained_session_disposition_after_late_cancelled_transaction_action(
                     .with_transaction_state(TransactionSessionState::DecisionRequired),
             )
         }
-        Err(_) => RetainedSessionDisposition::DiscardPhysical,
+        // The session cannot be kept, so it goes -- and it states what goes
+        // with it. This is a COMMIT or ROLLBACK the user ran precisely to keep
+        // their work, so the loss is the last thing that may happen quietly.
+        Err(_) => RetainedSessionDisposition::DiscardPhysical(prior_retained_state),
     }
 }
 
@@ -1773,12 +1874,17 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                         current_scope,
                     );
                 } else {
+                    // The action failed with an error this session cannot be
+                    // reused after, so it goes -- carrying whatever the
+                    // COMMIT/ROLLBACK did not resolve.
                     let _ = pooled_db_session.hand_back_worker_session(
                         hand_back_owner,
                         connection_generation,
                         pool_context_epoch,
                         DbSessionLease::OracleThin(thin_conn),
-                        crate::db::RetainedSessionDisposition::DiscardPhysical,
+                        crate::db::RetainedSessionDisposition::DiscardPhysical(
+                            prior_retained_state,
+                        ),
                         activity_label,
                         None,
                     );
@@ -1895,12 +2001,14 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 current_scope,
             );
         } else {
+            // Same answer as the thin twin above: an error this session cannot
+            // be reused after closes it, and it says what that costs.
             let _ = pooled_db_session.hand_back_worker_session(
                 hand_back_owner,
                 connection_generation,
                 pool_context_epoch,
                 DbSessionLease::Oracle(db_conn),
-                crate::db::RetainedSessionDisposition::DiscardPhysical,
+                crate::db::RetainedSessionDisposition::DiscardPhysical(prior_retained_state),
                 activity_label,
                 None,
             );
@@ -2513,68 +2621,100 @@ impl QueryCancelHandle {
         })
     }
 
+    /// This handle with every indirection resolved, if it is one a tier can act
+    /// on right now.
+    fn concrete(self) -> Option<ConcreteCancelSession> {
+        match self {
+            QueryCancelHandle::Oracle(conn, session) => {
+                Some(ConcreteCancelSession::Oracle(conn, session))
+            }
+            QueryCancelHandle::OracleThin(handle, session) => {
+                Some(ConcreteCancelSession::OracleThin(handle, session))
+            }
+            QueryCancelHandle::MySql(context, session) => {
+                Some(ConcreteCancelSession::MySql(context, session))
+            }
+            QueryCancelHandle::Withdrawable(_) | QueryCancelHandle::OperationSlot(_) => None,
+            #[cfg(test)]
+            QueryCancelHandle::Test(called) => Some(ConcreteCancelSession::Test(called)),
+            #[cfg(test)]
+            QueryCancelHandle::TestBlockingForce { started, release } => {
+                Some(ConcreteCancelSession::TestBlockingForce { started, release })
+            }
+        }
+    }
+
+    /// The session a tier will act on, read ONCE, with the claim narrowed by
+    /// every indirection crossed to reach it.
+    ///
+    /// Both tiers go through here, and the force tier is why it exists. It used
+    /// to read the slot TWICE: once through `canceled_session()` to ask the
+    /// app's one rule about how far a force may go, and again inside the
+    /// tear-down to find the handle to act on. Those are two different reads of
+    /// a slot that CHANGES: a script `CONNECT` republishes the tab's operation
+    /// slot mid-batch, and on Oracle OCI what it publishes is the candidate
+    /// connection's OWN session (`CanceledSession::Main`) over the pooled one
+    /// (`CanceledSession::Pooled`) the batch started with. A force landing
+    /// between the two reads asked the rule about a pooled session -- "yes, you
+    /// may destroy this" -- and then drop-closed the connection every other tab
+    /// is working on, which is exactly what
+    /// [`CanceledSession::force_tier_may_destroy_it`] exists to prevent.
+    ///
+    /// Resolving once makes the handle the rule is asked about and the handle
+    /// the tier acts on the same value, by construction.
+    fn resolve_for_action(
+        self,
+        claim: &SessionCancelClaim,
+    ) -> Result<(ConcreteCancelSession, SessionCancelClaim), SessionCancelDelivery> {
+        let mut handle = self;
+        let mut claim = claim.clone();
+        // Nothing in the app publishes an indirection INTO a slot (the two
+        // setters refuse it), so one step is all this ever takes. The bound is
+        // here because the tier it serves cannot be taken back: an unexpected
+        // shape must end as "nothing to act on", never as a spin.
+        for _ in 0..MAX_CANCEL_HANDLE_INDIRECTION {
+            handle = match handle {
+                QueryCancelHandle::Withdrawable(target) => {
+                    claim = claim.and(target.still_published());
+                    match target.published_handle() {
+                        Some(inner) => inner,
+                        None => return Err(SessionCancelDelivery::Withdrawn),
+                    }
+                }
+                QueryCancelHandle::OperationSlot(slot) => {
+                    claim = claim.and(Self::operation_slot_still_published(&slot));
+                    match Self::operation_slot_published(&slot) {
+                        Some(inner) => inner,
+                        None => return Err(SessionCancelDelivery::Withdrawn),
+                    }
+                }
+                resolved => {
+                    return match resolved.concrete() {
+                        Some(session) => Ok((session, claim)),
+                        None => Err(SessionCancelDelivery::Withdrawn),
+                    }
+                }
+            };
+        }
+        crate::utils::logging::log_warning(
+            "query cancel",
+            "A cancel handle nested deeper than the app can publish; nothing was sent",
+        );
+        Err(SessionCancelDelivery::Withdrawn)
+    }
+
     pub(crate) fn cancel_interrupt(
         &self,
         claim: &SessionCancelClaim,
     ) -> Result<SessionCancelDelivery, String> {
-        match self {
-            QueryCancelHandle::Oracle(conn, _) => conn.interrupt(claim),
-            QueryCancelHandle::OracleThin(cancel_handle, _) => cancel_handle.interrupt(claim),
-            QueryCancelHandle::MySql(context, _) => context.interrupt(claim),
-            QueryCancelHandle::Withdrawable(target) => {
-                let claim = claim.and(target.still_published());
-                match target.published_handle() {
-                    Some(handle) => handle.cancel_interrupt(&claim),
-                    None => Ok(SessionCancelDelivery::Withdrawn),
-                }
-            }
-            QueryCancelHandle::OperationSlot(slot) => {
-                let claim = claim.and(Self::operation_slot_still_published(slot));
-                match Self::operation_slot_published(slot) {
-                    Some(handle) => handle.cancel_interrupt(&claim),
-                    None => Ok(SessionCancelDelivery::Withdrawn),
-                }
-            }
-            #[cfg(test)]
-            QueryCancelHandle::Test(called) => claim.deliver(
-                || Ok(()),
-                |()| {
-                    called.store(true, Ordering::Relaxed);
-                    Ok(())
-                },
-            ),
-            #[cfg(test)]
-            QueryCancelHandle::TestBlockingForce { started, .. } => claim.deliver(
-                || Ok(()),
-                |()| {
-                    started.store(true, Ordering::Relaxed);
-                    Ok(())
-                },
-            ),
+        match self.clone().resolve_for_action(claim) {
+            Ok((session, claim)) => session.interrupt(&claim),
+            Err(delivery) => Ok(delivery),
         }
     }
 
     fn force_cancel(self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
         self.force_cancel_blocking(claim)
-    }
-
-    /// WHICH session this handle speaks for.
-    ///
-    /// `None` means there is no session behind it to reason about: a
-    /// withdrawable target whose owner has already taken it back, or a test
-    /// double.
-    fn canceled_session(&self) -> Option<CanceledSession> {
-        match self {
-            QueryCancelHandle::Oracle(_, session)
-            | QueryCancelHandle::OracleThin(_, session)
-            | QueryCancelHandle::MySql(_, session) => Some(*session),
-            QueryCancelHandle::Withdrawable(target) => target.canceled_session(),
-            QueryCancelHandle::OperationSlot(slot) => {
-                Self::operation_slot_published(slot).and_then(|handle| handle.canceled_session())
-            }
-            #[cfg(test)]
-            QueryCancelHandle::Test(_) | QueryCancelHandle::TestBlockingForce { .. } => None,
-        }
     }
 
     /// The force tier, with the app's one rule about it asked HERE and nowhere
@@ -2583,72 +2723,22 @@ impl QueryCancelHandle {
     /// Everything below this point tears a session down and cannot be taken
     /// back, which is why the question is put once, before the match, instead
     /// of per backend: a rule spelled out per driver is a rule the next driver
-    /// can be added without.
+    /// can be added without. And it is put about the SAME value that is then
+    /// torn down -- see [`Self::resolve_for_action`].
     pub(crate) fn force_cancel_blocking(
         self,
         claim: &SessionCancelClaim,
     ) -> Result<SessionCancelDelivery, String> {
-        if let Some(session) = self.canceled_session() {
-            if !session.force_tier_may_destroy_it() {
-                return self.cancel_interrupt(claim);
+        let (session, claim) = match self.resolve_for_action(claim) {
+            Ok(resolved) => resolved,
+            Err(delivery) => return Ok(delivery),
+        };
+        if let Some(kind) = session.canceled_session() {
+            if !kind.force_tier_may_destroy_it() {
+                return session.interrupt(&claim);
             }
         }
-        self.destroy_session(claim)
-    }
-
-    /// The tear-down itself. Private, and reached only through
-    /// [`Self::force_cancel_blocking`], which is where the rule about it lives.
-    fn destroy_session(self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
-        match self {
-            QueryCancelHandle::Oracle(conn, _) => conn.terminate(claim),
-            QueryCancelHandle::OracleThin(cancel_handle, _) => cancel_handle.terminate(claim),
-            QueryCancelHandle::MySql(context, _) => (*context).terminate(claim),
-            // Read again, deliberately: the owner may have withdrawn between
-            // the rule above and here, and a withdraw that lands first must
-            // win. That is the whole point of the type. The claim carries the
-            // same question on into the driver, because on the MySQL family
-            // "here" is still a control connection away from the server.
-            QueryCancelHandle::Withdrawable(target) => {
-                let claim = claim.and(target.still_published());
-                match target.published_handle() {
-                    Some(handle) => handle.destroy_session(&claim),
-                    None => Ok(SessionCancelDelivery::Withdrawn),
-                }
-            }
-            // Same, for the operation road: the hand-back doors set the slot to
-            // `Withdrawn` before the session moves, so a target that is not
-            // published at THIS instant is one no tier may touch.
-            QueryCancelHandle::OperationSlot(slot) => {
-                let claim = claim.and(Self::operation_slot_still_published(&slot));
-                match Self::operation_slot_published(&slot) {
-                    Some(handle) => handle.destroy_session(&claim),
-                    None => Ok(SessionCancelDelivery::Withdrawn),
-                }
-            }
-            #[cfg(test)]
-            QueryCancelHandle::Test(called) => claim.deliver(
-                || Ok(()),
-                |()| {
-                    called.store(true, Ordering::Relaxed);
-                    Ok(())
-                },
-            ),
-            // The blocking wait is the SLOW HALF, deliberately: this double
-            // exists to hold a force tier open, and putting the wait in
-            // `prepare` is what makes it stand for the control connection the
-            // MySQL family really opens there.
-            #[cfg(test)]
-            QueryCancelHandle::TestBlockingForce { started, release } => claim.deliver(
-                || {
-                    started.store(true, Ordering::Relaxed);
-                    while !release.load(Ordering::Relaxed) {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Ok(())
-                },
-                |()| Ok(()),
-            ),
-        }
+        session.destroy(&claim)
     }
 
     pub(crate) fn label(&self) -> &'static str {
@@ -7730,12 +7820,13 @@ mod transaction_action_tests {
                     &Err(message.to_string()),
                     true,
                 ),
-                RetainedSessionDisposition::DiscardPhysical
+                RetainedSessionDisposition::DiscardPhysical(clean)
             );
         }
 
         // ...and so is one whose connection is gone: there is no session left
-        // to keep.
+        // to keep. The discard now STATES what went with it, so the user hears
+        // about an in-doubt transaction instead of losing it in silence.
         let prior =
             RetainedSessionState::from_transaction_state(TransactionSessionState::DecisionRequired);
         assert_eq!(
@@ -7744,7 +7835,7 @@ mod transaction_action_tests {
                 &Err("ORA-03114: not connected to ORACLE".to_string()),
                 true,
             ),
-            RetainedSessionDisposition::DiscardPhysical
+            RetainedSessionDisposition::DiscardPhysical(prior)
         );
     }
 
@@ -7762,7 +7853,7 @@ mod transaction_action_tests {
                 &Err("Query timed out".to_string()),
                 false,
             ),
-            RetainedSessionDisposition::DiscardPhysical
+            RetainedSessionDisposition::DiscardPhysical(prior)
         );
     }
 
@@ -10066,26 +10157,87 @@ mod cancel_watchdog_tests {
             })
         };
 
+        // Asked through the production road: what the force tier resolves to is
+        // what it asks the rule about AND what it tears down, so the test that
+        // proves a handle says which session it speaks for must go through the
+        // same resolution rather than a reader of its own.
+        let speaks_for = |handle: QueryCancelHandle| {
+            handle
+                .resolve_for_action(&SessionCancelClaim::owned_outright())
+                .ok()
+                .and_then(|(session, _)| session.canceled_session())
+        };
+
         assert_eq!(
-            QueryCancelHandle::MySql(context(), CanceledSession::Pooled).canceled_session(),
+            speaks_for(QueryCancelHandle::MySql(context(), CanceledSession::Pooled)),
             Some(CanceledSession::Pooled)
         );
         assert_eq!(
-            QueryCancelHandle::MySql(context(), CanceledSession::Main).canceled_session(),
+            speaks_for(QueryCancelHandle::MySql(context(), CanceledSession::Main)),
             Some(CanceledSession::Main)
         );
 
         // A withdrawable target answers for whatever it still holds, and for
         // nothing once its owner has taken it back.
         let target = QueryCancelTarget::empty();
-        assert_eq!(target.as_handle().canceled_session(), None);
+        assert_eq!(speaks_for(target.as_handle()), None);
         target.publish(QueryCancelHandle::MySql(context(), CanceledSession::Main));
-        assert_eq!(
-            target.as_handle().canceled_session(),
-            Some(CanceledSession::Main)
-        );
+        assert_eq!(speaks_for(target.as_handle()), Some(CanceledSession::Main));
         target.withdraw();
-        assert_eq!(target.as_handle().canceled_session(), None);
+        assert_eq!(speaks_for(target.as_handle()), None);
+    }
+
+    /// The rule is asked about the SAME session the tear-down lands on.
+    ///
+    /// The force tier used to read the tab's slot twice -- once to ask
+    /// `CanceledSession::force_tier_may_destroy_it` and again to find the
+    /// handle to destroy -- and a script `CONNECT` republishes that slot
+    /// mid-batch, on Oracle OCI from a POOLED session to the candidate
+    /// connection's OWN. So the rule could answer about one session while the
+    /// tear-down landed on another: the connection every other tab is working
+    /// on, drop-closed by a cancel.
+    ///
+    /// Observed through the two tiers' own answers rather than a reader of its
+    /// own: on the MySQL family the graceful tier issues `KILL QUERY` and the
+    /// force tier `KILL CONNECTION`, and only the latter labels its failure.
+    /// The control connection cannot be opened here, which is the point -- what
+    /// is under test is WHICH tier was chosen.
+    #[test]
+    fn a_force_tier_asks_the_rule_about_the_session_it_tears_down() {
+        let handle = |session| {
+            QueryCancelHandle::MySql(
+                Box::new(MySqlQueryCancelContext {
+                    connection_info: ConnectionInfo {
+                        host: "127.0.0.1".to_string(),
+                        port: 1,
+                        ..ConnectionInfo::default_for(crate::db::DatabaseType::MySQL)
+                    },
+                    connection_id: 7,
+                }),
+                session,
+            )
+        };
+        let forced_through_slot = |session| {
+            let slot = Arc::new(Mutex::new(OperationCancelTarget::Published(handle(
+                session,
+            ))));
+            QueryCancelHandle::OperationSlot(slot)
+                .force_cancel_blocking(&SessionCancelClaim::owned_outright())
+                .expect_err("no server is listening, so both tiers report a failure")
+        };
+
+        let pooled = forced_through_slot(CanceledSession::Pooled);
+        assert!(
+            pooled.contains("KILL CONNECTION"),
+            "sanity: a POOLED session reaches the tier that destroys it, and that tier labels \
+             its own failure: {pooled}"
+        );
+        let main = forced_through_slot(CanceledSession::Main);
+        assert!(
+            !main.contains("KILL CONNECTION"),
+            "a slot holding the connection's OWN session must be re-broken, never destroyed: \
+             {main}"
+        );
     }
 
     #[test]
