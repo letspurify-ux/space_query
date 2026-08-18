@@ -11,6 +11,14 @@ static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 pub struct ConnectionId(u64);
 
 impl ConnectionId {
+    /// A connection identity for a test that needs one without registering a
+    /// connection. `#[doc(hidden)]`: the app's identities come from the
+    /// registry, which is what makes them unique.
+    #[doc(hidden)]
+    pub fn for_test(raw: u64) -> Self {
+        Self(raw)
+    }
+
     pub fn get(self) -> u64 {
         self.0
     }
@@ -261,11 +269,26 @@ impl ConnectionRuntime {
     ///
     /// Announcing and taking it back are therefore one value: whatever this
     /// guard still holds when it drops is put back where it came from.
+    /// Say that these connections are mid-change, and hold their pools shut
+    /// while they are.
+    ///
+    /// The state is what the SCREEN reads; the hold is what stops new work.
+    /// They travel together because they answer the same fact, and because the
+    /// window they cover is the same one: from the moment a session-ending
+    /// action is decided until it has run. Announce it BEFORE the prompts that
+    /// resolve the tabs' transactions — a modal pumps the event loop, and the
+    /// metadata reads start from events.
     pub fn announce_transition(runtimes: Vec<Arc<ConnectionRuntime>>) -> ConnectionTransition {
         for runtime in &runtimes {
             runtime.set_state(ConnectionRuntimeState::Transitioning);
         }
-        ConnectionTransition { pending: runtimes }
+        let handout_hold = crate::db::PoolSessionHandoutHold::take(
+            runtimes.iter().map(|runtime| runtime.id()).collect(),
+        );
+        ConnectionTransition {
+            pending: runtimes,
+            handout_hold,
+        }
     }
 
     pub fn bound_tab_count(&self) -> usize {
@@ -567,6 +590,9 @@ impl Drop for TabConnectionBindingInner {
 /// own connection, which is the only place the truth was ever kept.
 pub struct ConnectionTransition {
     pending: Vec<Arc<ConnectionRuntime>>,
+    /// Held for exactly as long as the transition is announced, so no road can
+    /// acquire a pooled session on a connection whose sessions are about to go.
+    handout_hold: crate::db::PoolSessionHandoutHold,
 }
 
 impl ConnectionTransition {
@@ -580,6 +606,10 @@ impl ConnectionTransition {
         runtime.refresh_state_from_connection();
         self.pending
             .retain(|pending| !Arc::ptr_eq(pending, runtime));
+        // Re-opened one connection at a time, like the state above: a rebuild
+        // that walks several must not keep the ones it has already finished
+        // shut until the last one is done.
+        self.handout_hold.release(runtime.id());
     }
 }
 
@@ -588,6 +618,8 @@ impl Drop for ConnectionTransition {
         for runtime in self.pending.drain(..) {
             runtime.refresh_state_from_connection();
         }
+        // `handout_hold` drops with this value, releasing whatever `finished`
+        // did not -- a worker that never started, or died partway.
     }
 }
 

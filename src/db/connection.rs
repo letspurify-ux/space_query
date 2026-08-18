@@ -49,6 +49,10 @@ pub const CANCELLED_BEFORE_SESSION_MESSAGE: &str =
     "The operation was cancelled before its database session was ready.";
 const STALE_POOL_CONTEXT_MESSAGE: &str =
     "Connection changed before a pooled session could be acquired. Retry the action.";
+/// Answered while a DECIDED session-ending action is being carried out on this
+/// connection. See [`PoolSessionHandoutHold`].
+pub const POOL_SESSION_HANDOUT_HELD_MESSAGE: &str =
+    "This connection's sessions are being closed. Retry the action when it finishes.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConnectionAttemptPolicy {
@@ -199,6 +203,121 @@ fn lock_retired_connection_generations() -> MutexGuard<'static, std::collections
 pub(crate) fn connection_generation_is_retired(connection_generation: u64) -> bool {
     connection_generation != 0
         && lock_retired_connection_generations().contains(&connection_generation)
+}
+
+/// Connections whose pool must not hand out a NEW session, and how many
+/// decided session-ending actions are holding each one shut.
+///
+/// The gate that refuses a teardown when DB work is already running
+/// (`db_work_blocking_session_teardown`) is asked ONCE, on the UI thread, and
+/// what follows it is a modal: the per-tab commit/rollback prompts. A modal
+/// runs a nested `app::wait()`, so a progress event or a UI timer is dispatched
+/// inside it — and those are what start the object browser's and IntelliSense's
+/// metadata reads. Work begun there walks past a gate that has already
+/// answered, and the rebuild's generation and epoch bump then take its session
+/// out from under it.
+///
+/// Re-asking the gate after the prompts is not available: a prompt performs a
+/// real COMMIT or ROLLBACK, and refusing then would leave the user's
+/// transaction resolved for an action that never happened — the rule every
+/// session-ending action in the app already obeys. So the window is CLOSED
+/// rather than re-checked, at the one door every pooled session comes through.
+///
+/// A counter and not a flag: Disconnect All and a pool rebuild can name the
+/// same connection, and a count makes the second hold's release harmless to the
+/// first.
+static POOL_SESSION_HANDOUT_HOLDS: OnceLock<Mutex<HashMap<ConnectionId, usize>>> = OnceLock::new();
+
+fn lock_pool_session_handout_holds() -> MutexGuard<'static, HashMap<ConnectionId, usize>> {
+    POOL_SESSION_HANDOUT_HOLDS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            logging::log_warning(
+                "db::connection",
+                "pool session handout hold ledger lock was poisoned; recovering",
+            );
+            poisoned.into_inner()
+        })
+}
+
+/// Whether a decided session-ending action is holding this connection's pool
+/// shut.
+///
+/// A context with NO connection id is never held, and that is the same answer
+/// `background_work_blocking_session_teardown` gives about an activity with no
+/// connection id: work that cannot be attributed to a connection cannot be
+/// named by an action on one either. Every connection the app registers is
+/// stamped with its id (`ConnectionRegistry::register`), so in production this
+/// is only reached by a connection no action can be aimed at.
+fn pool_session_handout_is_held(connection_id: Option<ConnectionId>) -> bool {
+    let Some(connection_id) = connection_id else {
+        return false;
+    };
+    lock_pool_session_handout_holds()
+        .get(&connection_id)
+        .is_some_and(|holds| *holds > 0)
+}
+
+/// A decided session-ending action holding shut the pools it is about to tear
+/// down.
+///
+/// Taken BEFORE the prompts that resolve the tabs' transactions and released
+/// when the action has run, so there is no moment in which the action has been
+/// decided and a new pooled session can still be handed out. See
+/// [`POOL_SESSION_HANDOUT_HOLDS`].
+#[must_use = "the hold is released the moment this value is dropped, which               re-opens the window it exists to close"]
+pub struct PoolSessionHandoutHold {
+    connection_ids: Vec<ConnectionId>,
+}
+
+impl PoolSessionHandoutHold {
+    /// Hold every connection this action covers.
+    pub fn take(connection_ids: Vec<ConnectionId>) -> Self {
+        {
+            let mut holds = lock_pool_session_handout_holds();
+            for connection_id in &connection_ids {
+                *holds.entry(*connection_id).or_insert(0) += 1;
+            }
+        }
+        Self { connection_ids }
+    }
+
+    /// This connection's part of the action is over; the rest stay held.
+    ///
+    /// Used by [`ConnectionTransition::finished`], so a rebuild that walks
+    /// several connections re-opens each one as it finishes rather than all of
+    /// them at the end.
+    pub fn release(&mut self, connection_id: ConnectionId) {
+        let Some(at) = self
+            .connection_ids
+            .iter()
+            .position(|held| *held == connection_id)
+        else {
+            return;
+        };
+        self.connection_ids.swap_remove(at);
+        Self::release_one(connection_id);
+    }
+
+    fn release_one(connection_id: ConnectionId) {
+        let mut holds = lock_pool_session_handout_holds();
+        let Some(remaining) = holds.get_mut(&connection_id) else {
+            return;
+        };
+        *remaining = remaining.saturating_sub(1);
+        if *remaining == 0 {
+            holds.remove(&connection_id);
+        }
+    }
+}
+
+impl Drop for PoolSessionHandoutHold {
+    fn drop(&mut self) {
+        for connection_id in self.connection_ids.drain(..) {
+            Self::release_one(connection_id);
+        }
+    }
 }
 
 /// Reclaim what a connection incarnation leaves behind.
@@ -2102,15 +2221,41 @@ impl DbPoolSessionContext {
         scope_context: &DbPoolSessionContext,
         activity: &DbActivityGuard,
     ) -> Result<AcquiredPoolSession, String> {
+        // FIRST, before a session exists: a decided session-ending action is
+        // holding this connection's pool shut. Asked here because this is the
+        // one door every pooled session in the app comes through — the object
+        // browser's metadata, IntelliSense's schema and column loads, bind
+        // probes and every statement — so no road can start work the action has
+        // already been told there is none of. See [`PoolSessionHandoutHold`].
+        if pool_session_handout_is_held(self.connection_id) {
+            return Err(POOL_SESSION_HANDOUT_HELD_MESSAGE.to_string());
+        }
         self.ensure_current()?;
         // Tie the activity to this connection before the session exists, so a
         // teardown that lands mid-acquire still retires this work.
         activity.bind_lifetime(self.activity_lifetime());
         let mut acquired = self.pool.acquire_session(&self.connection_info, activity)?;
-        // Every failure below closes the session, and `AcquiredPoolSession::
-        // discard` is what keeps the order right: the reach ends BEFORE the
-        // session does, so a cancel that lands between the discard and this
-        // frame returning is never aimed at a session that has already gone.
+        // Every failure below CLOSES the session, and that is the same rule
+        // the execution layer's own Oracle preparation follows, arrived at from
+        // this path's own premises rather than copied:
+        //
+        //  * `apply_current_scope_to_session` is SEVERAL steps on the MySQL
+        //    family — reset-or-`USE`, session settings, transaction options —
+        //    so a failure between them leaves a session whose state nobody has
+        //    accounted for.
+        //  * on Oracle it is one statement, and the one failure that leaves a
+        //    perfectly good session — the tracked schema having been dropped —
+        //    is already answered `Ok(())` INSIDE the apply. What is left to
+        //    fail here is the session or the connection itself.
+        //
+        // So "close it" is not a blunter answer than the execution layer's
+        // "ask whether the session survived"; on every input this path can
+        // reach, they are the same answer.
+        //
+        // `AcquiredPoolSession::discard` is what keeps the order right: the
+        // reach ends BEFORE the session does, so a cancel that lands between
+        // the discard and this frame returning is never aimed at a session that
+        // has already gone.
         if let Err(err) = self.ensure_current() {
             acquired.discard();
             return Err(err);
@@ -10429,6 +10574,106 @@ mod tests {
             dropped.contains("if self.usability.is_unusable()")
                 && dropped.contains("DbPoolSessionContext::discard_stale_session(session)"),
             "and the owner CLOSES such a session instead of returning it to the pool: {dropped}"
+        );
+    }
+
+    /// A decided session-ending action holds its connections' pools shut, so
+    /// no road can start pool work in the window the gate has already answered
+    /// about.
+    #[test]
+    fn a_decided_session_ending_action_holds_the_pool_shut() {
+        let held = ConnectionId::for_test(90_001);
+        let other = ConnectionId::for_test(90_002);
+        assert!(
+            !pool_session_handout_is_held(Some(held)),
+            "a connection nothing is tearing down hands out sessions"
+        );
+        {
+            let _hold = PoolSessionHandoutHold::take(vec![held]);
+            assert!(
+                pool_session_handout_is_held(Some(held)),
+                "the action holds the door for as long as it is being carried out"
+            );
+            assert!(
+                !pool_session_handout_is_held(Some(other)),
+                "and only for the connections it named"
+            );
+            assert!(
+                !pool_session_handout_is_held(None),
+                "work that cannot be attributed to a connection cannot be named by an action \
+                 on one either"
+            );
+        }
+        assert!(
+            !pool_session_handout_is_held(Some(held)),
+            "the door re-opens when the action is over, including when it unwinds"
+        );
+    }
+
+    /// Two actions can name the same connection; the first to finish must not
+    /// re-open the door under the second.
+    #[test]
+    fn overlapping_session_ending_actions_each_hold_their_own_door() {
+        let connection_id = ConnectionId::for_test(90_003);
+        let first = PoolSessionHandoutHold::take(vec![connection_id]);
+        let second = PoolSessionHandoutHold::take(vec![connection_id]);
+        drop(first);
+        assert!(
+            pool_session_handout_is_held(Some(connection_id)),
+            "the second action is still carrying its own out"
+        );
+        drop(second);
+        assert!(
+            !pool_session_handout_is_held(Some(connection_id)),
+            "and the door re-opens once both are done"
+        );
+    }
+
+    /// A rebuild that walks several connections re-opens each as it finishes.
+    #[test]
+    fn a_finished_connection_re_opens_before_the_rest_of_the_action() {
+        let first = ConnectionId::for_test(90_004);
+        let second = ConnectionId::for_test(90_005);
+        let mut hold = PoolSessionHandoutHold::take(vec![first, second]);
+        hold.release(first);
+        assert!(
+            !pool_session_handout_is_held(Some(first)),
+            "the connection whose part is done hands out sessions again"
+        );
+        assert!(
+            pool_session_handout_is_held(Some(second)),
+            "the ones still waiting stay shut"
+        );
+        // Releasing the same connection twice must not reach past this hold and
+        // re-open a door another action is still holding.
+        hold.release(first);
+        drop(hold);
+        assert!(
+            !pool_session_handout_is_held(Some(second)),
+            "and the rest re-open with the value"
+        );
+    }
+
+    /// The refusal is asked at the ONE door every pooled session comes through,
+    /// and it is asked FIRST.
+    #[test]
+    fn the_pool_refuses_a_held_connection_before_it_looks_at_anything_else() {
+        let source = include_str!("connection.rs");
+        let acquire = source_of_fn(source, "fn acquire_session_with_scope_context(");
+        let refusal = acquire
+            .find("if pool_session_handout_is_held(self.connection_id) {")
+            .expect("the acquire door must ask whether the connection is held");
+        let ensure_current = acquire
+            .find("self.ensure_current()?;")
+            .expect("the acquire door must also check the pool context");
+        assert!(
+            refusal < ensure_current,
+            "asked before anything else, because everything else is about a session this \
+             action has already been told there is none of: {acquire}"
+        );
+        assert!(
+            acquire.contains("POOL_SESSION_HANDOUT_HELD_MESSAGE"),
+            "and it says so rather than failing as something else: {acquire}"
         );
     }
 

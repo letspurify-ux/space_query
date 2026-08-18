@@ -8492,3 +8492,137 @@ fn every_road_a_pooled_session_leaves_a_frame_ends_the_reach_first() {
         );
     }
 }
+
+/// A pooled session goes back to the pool only when what it carries is KNOWN,
+/// and both layers that prepare one say so from their own premises.
+///
+/// The DB layer's scope apply is SEVERAL steps on the MySQL family, so a
+/// failure between them leaves state nobody has accounted for and the session
+/// is closed. The execution layer's Oracle preparation is ONE statement whose
+/// benign failure — the tracked schema having been dropped — is already
+/// answered `Ok` inside the apply, so what is left to fail is the session or
+/// the connection, and it asks which. Its retry arm always asked; its FINAL
+/// arm did not, and returned a session the app itself had just classified as
+/// broken to the pool for the next tab.
+#[test]
+fn a_pooled_session_returns_to_the_pool_only_when_it_is_known_usable() {
+    let connection = read_source("src/db/connection.rs");
+    let scoped = connection
+        .find("fn acquire_session_with_scope_context(")
+        .expect("the DB layer's acquire door should exist");
+    let scoped_body = slice_from(&connection, scoped, 3600);
+    assert_eq!(
+        scoped_body.matches("acquired.discard();").count(),
+        3,
+        "every failure after the acquire closes the session: {scoped_body}"
+    );
+
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let oracle = execution
+        .find("let mut held = match pool_session_result {")
+        .expect("the Oracle acquire window should exist");
+    let oracle_body = slice_from(&execution, oracle, 9000);
+    let final_arm = oracle_body
+        .find("Err(message) => {")
+        .expect("the Oracle preparation must have a final failure arm");
+    let final_arm = slice_from(oracle_body, final_arm, 2200);
+    assert!(
+        final_arm.contains("Self::oracle_error_message_allows_session_reuse(&message)"),
+        "the arm the retry has already been spent on must ask the SAME question the retry arm \
+         asks -- did this session survive? -- rather than handing it to the next tab: \
+         {final_arm}"
+    );
+    assert!(
+        final_arm.contains("Self::discard_oracle_pool_session(held, \"oracle pool session\");"),
+        "and close it when the answer is no: {final_arm}"
+    );
+}
+
+/// A DECIDED session-ending action holds its connections' pools shut, and it
+/// takes that hold BEFORE it prompts.
+///
+/// The gate that refuses a teardown when DB work is running is asked once, on
+/// the UI thread. What follows it is modal — the per-tab commit/rollback
+/// prompts — and a modal runs a nested `app::wait()`, so the progress events
+/// and UI timers that start the object browser's and IntelliSense's metadata
+/// reads are dispatched inside it. That work walked past a gate which had
+/// already answered, and the teardown's generation bump then took its session.
+///
+/// Re-asking the gate afterwards is not available: a prompt performs a real
+/// COMMIT/ROLLBACK, and refusing then would leave the user's transaction
+/// resolved for an action that never happened. So the window is CLOSED.
+#[test]
+fn a_decided_session_ending_action_holds_the_pool_before_it_prompts() {
+    let connection = read_source("src/db/connection.rs");
+    assert!(
+        connection.contains("pub struct PoolSessionHandoutHold"),
+        "the hold has to be a value with a drop, so an action that unwinds re-opens the door"
+    );
+    assert!(
+        connection.contains("impl Drop for PoolSessionHandoutHold"),
+        "and it must release itself rather than leave each action to remember"
+    );
+
+    let main_window = read_source("src/ui/main_window.rs");
+
+    // The disconnect family: the shared preflight HANDS BACK the hold, so a
+    // caller cannot run the preflight without holding the door.
+    let preflight = main_window
+        .find("fn prepare_session_teardown(")
+        .expect("the disconnect family's shared preflight should exist");
+    let preflight_body = slice_from(&main_window, preflight, 2200);
+    assert!(
+        preflight_body.contains("-> Result<crate::db::PoolSessionHandoutHold, String>"),
+        "the preflight must answer with the hold: {preflight_body}"
+    );
+    assert!(
+        preflight_body.contains("hold_pool_session_handout(state)"),
+        "and take it for the connections its scope covers: {preflight_body}"
+    );
+    // Every caller keeps it. `if let Err(..) = preflight(..)` compiles and
+    // drops the hold on the spot, which is the shape this is here to ban.
+    assert!(
+        !main_window.contains("if let Err(message) = Self::prepare_session_teardown("),
+        "a caller that only looks at the failure drops the hold where it stands, which \
+         re-opens the window the preflight just closed"
+    );
+    assert_eq!(
+        main_window
+            .matches("match Self::prepare_session_teardown(")
+            .count(),
+        3,
+        "the reconnect, the disconnect and Disconnect All all keep what the preflight gave them"
+    );
+
+    // The pool rebuild carries the hold in the value that already says these
+    // connections are mid-change -- and announces it BEFORE the prompts.
+    let runtime = read_source("src/db/runtime.rs");
+    let announce = runtime
+        .find("pub fn announce_transition(")
+        .expect("the transition announcement should exist");
+    let announce_body = slice_from(&runtime, announce, 700);
+    assert!(
+        announce_body.contains("PoolSessionHandoutHold::take("),
+        "announcing a transition must hold the door as well as label it: {announce_body}"
+    );
+    let finished = runtime
+        .find("pub fn finished(&mut self, runtime: &Arc<ConnectionRuntime>)")
+        .expect("the transition must be able to finish one connection at a time");
+    let finished_body = slice_from(&runtime, finished, 700);
+    assert!(
+        finished_body.contains("self.handout_hold.release(runtime.id());"),
+        "and a rebuild that walks several must re-open each as it finishes: {finished_body}"
+    );
+
+    let resize = main_window
+        .find("let mut transition = ConnectionRuntime::announce_transition(runtimes);")
+        .expect("the pool rebuild should announce its transition");
+    let prompt = main_window
+        .find("if !Self::resolve_pooled_sessions_before_pool_resize(state) {")
+        .expect("the pool rebuild should prompt for the tabs' sessions");
+    assert!(
+        resize < prompt,
+        "the rebuild must hold the door BEFORE it prompts: the prompts are modal, and a modal \
+         pumps the event loop that starts metadata reads"
+    );
+}

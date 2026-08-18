@@ -4675,9 +4675,32 @@ impl SqlEditorWidget {
                         Err(message) => return (conn_guard, Err(message)),
                     }
                 }
-                // Nothing ran on this session, so it goes back to the pool the
-                // ordinary way -- but `held`'s drop ends the reach first.
-                Err(message) => return (conn_guard, Err(message)),
+                Err(message) => {
+                    // The SAME question the retry arm above asks, and the one
+                    // the MySQL family's own preparation asks before it hands a
+                    // session back: did this session survive?
+                    //
+                    // This arm is where the one retry has already been spent,
+                    // so a session the app itself classified as broken --
+                    // interrupted, or failed because the connection went -- has
+                    // nothing left but to be closed. It used to go back into the
+                    // pool for the next tab, which is the opposite of what the
+                    // DB layer does with a session whose scope could not be
+                    // applied. A schema that is merely GONE is not a failure at
+                    // all and never reaches here:
+                    // `apply_tracked_oracle_current_schema_on_session` answers
+                    // `SessionScopeAssertion::unavailable` for ORA-01435 and the
+                    // per-statement assertion reports it.
+                    if Self::oracle_error_message_allows_session_reuse(&message) {
+                        // Nothing ran on this session and it is still good, so
+                        // it goes back to the pool the ordinary way -- `held`'s
+                        // drop ends the reach first.
+                        drop(held);
+                    } else {
+                        Self::discard_oracle_pool_session(held, "oracle pool session");
+                    }
+                    return (conn_guard, Err(message));
+                }
             }
         }
     }

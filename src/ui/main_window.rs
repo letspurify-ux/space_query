@@ -5305,6 +5305,30 @@ impl SessionTeardownScope {
     /// actually ended that work was the stale sweep's force tier — a tear-down
     /// of sessions nobody had asked about, while the UI thread was meanwhile
     /// waiting on a connection mutex those same jobs were holding.
+    /// Hold shut the pools this DECIDED action is about to tear down.
+    ///
+    /// The other half of `cancel_background_db_work`: that ends the work which
+    /// is already running, this stops any more from starting. Both are needed
+    /// because the gate is asked once and the prompts that follow it pump the
+    /// event loop. See `crate::db::PoolSessionHandoutHold`.
+    fn hold_pool_session_handout(
+        self,
+        state: &Arc<Mutex<AppState>>,
+    ) -> crate::db::PoolSessionHandoutHold {
+        let connection_ids = match self {
+            Self::EveryConnection => state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .connection_registry
+                .runtimes()
+                .into_iter()
+                .map(|runtime| runtime.id())
+                .collect(),
+            Self::Connection(id) => vec![id],
+        };
+        crate::db::PoolSessionHandoutHold::take(connection_ids)
+    }
+
     fn cancel_background_db_work(self, force_timeout: Duration) -> usize {
         match self {
             Self::EveryConnection => crate::db::cancel_all_db_activities(force_timeout),
@@ -7573,7 +7597,7 @@ impl MainWindow {
         connection: &crate::db::SharedConnection,
         connection_id: ConnectionId,
         probe_activity: &str,
-    ) -> Result<(), String> {
+    ) -> Result<crate::db::PoolSessionHandoutHold, String> {
         let (tab_work, force_timeout) = {
             let s = state
                 .lock()
@@ -7595,7 +7619,17 @@ impl MainWindow {
         if try_lock_connection_with_activity(connection, probe_activity.to_string()).is_none() {
             return Err(format_connection_busy_message());
         }
-        Ok(())
+        // The action is DECIDED from here, and what follows it is a modal: the
+        // per-tab commit/rollback prompts. A modal runs a nested `app::wait()`,
+        // so the progress events and UI timers that start the object browser's
+        // and IntelliSense's metadata reads are dispatched inside it — work that
+        // would walk past the gate above, which has already answered. Re-asking
+        // the gate afterwards is not available (a prompt performs a real
+        // COMMIT/ROLLBACK, and refusing then would leave the user's transaction
+        // resolved for a disconnect that never happened), so the door is HELD
+        // instead of re-checked, and handed back here rather than left to each
+        // caller to remember. It re-opens when the caller drops it.
+        Ok(SessionTeardownScope::Connection(connection_id).hold_pool_session_handout(state))
     }
 
     fn resolve_pooled_sessions_before_runtime_disconnect(
@@ -13011,15 +13045,21 @@ impl MainWindow {
                 // disconnect does, so it asks the same preflight — including
                 // the busy probe it never had, which is what kept it from
                 // parking the UI thread on a wedged call below.
-                if let Err(message) = Self::prepare_session_teardown(
+                // Held, not dropped: the preflight's answer is what keeps this
+                // connection's pool shut from the moment the reconnect is
+                // decided until it has run. It rides into the worker below.
+                let handout_hold = match Self::prepare_session_teardown(
                     state,
                     &runtime.connection(),
                     runtime.id(),
                     "Reconnecting session",
                 ) {
-                    crate::ui::alert_on_main(&message);
-                    return true;
-                }
+                    Ok(hold) => hold,
+                    Err(message) => {
+                        crate::ui::alert_on_main(&message);
+                        return true;
+                    }
+                };
                 // The stored password is a reason to refuse the reconnect, so it
                 // is read before anything asks the user to resolve a session:
                 // otherwise a missing password aborted the reconnect after the
@@ -13068,6 +13108,11 @@ impl MainWindow {
                 if let Err(err) = thread::Builder::new()
                     .name("space-query-reconnect".to_string())
                     .spawn(move || {
+                        // Moved in, so the connection's pool stays shut until
+                        // the reconnect has actually run -- and re-opens if this
+                        // worker panics or never starts, because the hold drops
+                        // with the closure either way.
+                        let _handout_hold = handout_hold;
                         let result = panic::catch_unwind(AssertUnwindSafe(|| {
                             connect_shared_connection_with_policy(
                                 &connection,
@@ -13129,24 +13174,28 @@ impl MainWindow {
                 // and refusing afterwards leaves the user's transaction
                 // committed for a disconnect that never happened.
                 let connection = runtime.connection();
-                if let Err(message) = Self::prepare_session_teardown(
+                // Held for the whole disconnect -- see `prepare_session_teardown`.
+                let _handout_hold = match Self::prepare_session_teardown(
                     state,
                     &connection,
                     connection_id,
                     "Disconnecting session",
                 ) {
-                    crate::ui::alert_on_main(&message);
-                    let mut s = state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let conn_info = s
-                        .connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    s.status_bar.set_label(&format_status(&message, &conn_info));
-                    return true;
-                }
+                    Ok(hold) => hold,
+                    Err(message) => {
+                        crate::ui::alert_on_main(&message);
+                        let mut s = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let conn_info = s
+                            .connection_info
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        s.status_bar.set_label(&format_status(&message, &conn_info));
+                        return true;
+                    }
+                };
 
                 if !Self::resolve_pooled_sessions_before_runtime_disconnect(state, connection_id) {
                     return true;
@@ -13248,18 +13297,25 @@ impl MainWindow {
                 // for the same reason the prompts themselves are collected
                 // first: refusing halfway would leave the earlier connections'
                 // work committed for a disconnect that never happened.
+                let mut handout_holds = Vec::with_capacity(runtimes.len());
                 for runtime in &runtimes {
-                    if let Err(message) = Self::prepare_session_teardown(
+                    match Self::prepare_session_teardown(
                         state,
                         &runtime.connection(),
                         runtime.id(),
                         "Disconnecting all connections",
                     ) {
-                        crate::ui::alert_on_main(&format!(
-                            "'{}': {message}",
-                            runtime.display_name()
-                        ));
-                        return true;
+                        // Every connection's hold is kept until the whole
+                        // action is over, so the ones cleared first cannot
+                        // start new work while the rest are still being asked.
+                        Ok(hold) => handout_holds.push(hold),
+                        Err(message) => {
+                            crate::ui::alert_on_main(&format!(
+                                "'{}': {message}",
+                                runtime.display_name()
+                            ));
+                            return true;
+                        }
                     }
                 }
                 // Disconnecting many connections is still a DISCONNECT, so it
@@ -14041,6 +14097,42 @@ impl MainWindow {
                         ));
                         return true;
                     }
+                    // Announced BEFORE the prompts, not after them.
+                    //
+                    // The rebuild runs on a worker and walks EVERY connection,
+                    // while the gate above ran once on the UI thread. Without
+                    // saying the connections are in transition, an execution
+                    // started in that gap loses its session to the generation
+                    // and epoch bump the rebuild makes — silently, because an
+                    // InvalidSession is auto-discarded. Every other
+                    // connection-wide change publishes the same state first.
+                    //
+                    // The gap is not only the worker's: the prompts below are
+                    // MODAL, and a modal runs a nested `app::wait()`, so the
+                    // progress events and UI timers that start the object
+                    // browser's and IntelliSense's metadata reads are dispatched
+                    // inside it. That work walked past a gate which had already
+                    // answered. Re-asking the gate afterwards is not available —
+                    // a prompt performs a real COMMIT/ROLLBACK, and refusing
+                    // then would leave the user's transaction resolved for a
+                    // resize that never happened — so the transition, which now
+                    // holds the pools shut as well as labelling them, is
+                    // announced first and the window is closed instead of
+                    // re-checked.
+                    //
+                    // Announced and taken back as one value: a worker that
+                    // never starts, or dies partway, would otherwise leave its
+                    // connections claiming they are transitioning for the life
+                    // of the process — and their pools shut — with reconnect,
+                    // Disconnect All and preferences all refusing them.
+                    let mut transition = ConnectionRuntime::announce_transition(runtimes);
+                    {
+                        let mut s = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        s.object_browser.refresh_runtime_labels();
+                        s.refresh_connection_dependent_controls();
+                    }
                     if !Self::resolve_pooled_sessions_before_pool_resize(state) {
                         return true;
                     }
@@ -14050,26 +14142,6 @@ impl MainWindow {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         s.status_bar.set_label("Rebuilding connection pool...");
-                    }
-                    // The rebuild runs on a worker and walks EVERY connection,
-                    // while the gates above ran once on the UI thread. Without
-                    // saying the connections are in transition, an execution
-                    // started in that gap loses its session to the generation
-                    // and epoch bump the rebuild makes — silently, because an
-                    // InvalidSession is auto-discarded. Every other
-                    // connection-wide change publishes the same state first.
-                    // Announced and taken back as one value: a worker that
-                    // never starts, or dies partway, would otherwise leave its
-                    // connections claiming they are transitioning for the life
-                    // of the process, with reconnect, Disconnect All and
-                    // preferences all refusing them.
-                    let mut transition = ConnectionRuntime::announce_transition(runtimes);
-                    {
-                        let mut s = state
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        s.object_browser.refresh_runtime_labels();
-                        s.refresh_connection_dependent_controls();
                     }
                     let sender = conn_sender.clone();
                     let spawn_failure_sender = sender.clone();
