@@ -323,6 +323,19 @@ pub(crate) struct QueryProgressSendError;
 /// Keeps the session this operation is running on reachable by the cancel
 /// button for as long as the operation runs.
 impl crate::db::HoldsSessionCancelRegistration for QueryProgressSender {
+    fn release_session_registration(&self) {
+        let released = {
+            let mut registrations = crate::db::lock_order::Tracked::new(
+                crate::db::lock_order::names::SENDER_REGISTRATIONS,
+                &self.session_registrations,
+            );
+            std::mem::take(&mut *registrations)
+        };
+        // Dropped outside the lock: releasing a registration takes the activity
+        // registry lock.
+        drop(released);
+    }
+
     fn hold_session_registration(&self, registration: crate::db::DbSessionCancelRegistration) {
         // REPLACES rather than appends. An execution uses one session at a time,
         // and the retry paths discard a session and acquire another; keeping the
@@ -435,7 +448,7 @@ impl QueryProgressSender {
             } => QueryProgress::BatchStart {
                 activity,
                 total_units,
-                status_activity: status_activity.or_else(|| self.status_activity.clone()),
+                status_activity: status_activity.or_else(|| self.status_finish_handle()),
                 sql,
             },
             progress => progress,
@@ -514,7 +527,14 @@ pub enum QueryProgress {
     BatchStart {
         activity: String,
         total_units: Option<usize>,
-        status_activity: Option<crate::db::DbActivityGuard>,
+        /// The registry row this batch is shown under, as a NON-OWNING handle.
+        ///
+        /// The work owns its row; a receiver only observes and finishes it.
+        /// Sending a strong `DbActivityGuard` down this channel handed the UI
+        /// (and the queue itself) part-ownership of the row, so the row — and
+        /// with it the force tier's "the work is still running" answer — stayed
+        /// alive until the UI drained the batch's terminal event.
+        status_activity: Option<crate::db::DbActivityFinishHandle>,
         /// The text this batch was handed, so a caller that reserved a result
         /// tab for a statement of its own can tell whether this is that
         /// statement starting or somebody else's.
@@ -827,6 +847,93 @@ impl QueryCancelTarget {
     }
 }
 
+/// Everything ONE execution has published over the session it is running on.
+///
+/// The app has two of them and they are published in different layers: the
+/// tab's own force target (the per-operation [`OperationCancelTarget`] a query
+/// cancel watchdog reads, or the withdrawable [`QueryCancelTarget`] a lazy
+/// fetch publishes) and the DB layer's [`crate::db::DbSessionCancelRegistration`],
+/// parked in the operation's progress sender so it outlives the frame that
+/// acquired the session.
+///
+/// Both used to be given up LATER than the session itself: the tab's target
+/// when the execution guard finally dropped (after the hand-back, after the
+/// progress events, after a runtime read that waits on the shared connection
+/// mutex), and the registration only when its holder died. For that whole
+/// window both cancel tiers answered "this session is still this work's" about
+/// a session that was already the tab's retained one, or back in the pool and
+/// possibly running another tab's statement.
+///
+/// So they are ONE value here, carried by [`crate::db::SessionHandBackOwner`]
+/// and withdrawn by the hand-back doors themselves — the same separation the
+/// lazy-fetch road already had, now on every road and every backend.
+pub(crate) struct WorkerSessionCancelReach {
+    /// The tab's per-operation force target. Withdrawn, never merely cleared:
+    /// a cancel waiting for a session that is never coming must be told so.
+    operation_cancel_handle: Option<Arc<Mutex<OperationCancelTarget>>>,
+    /// The withdrawable target a lazy fetch publishes for its own watchdog.
+    lazy_force_target: Option<QueryCancelTarget>,
+    /// Where the DB layer's registration for this session is parked.
+    registration_holder: Option<Arc<dyn crate::db::HoldsSessionCancelRegistration + Send + Sync>>,
+}
+
+impl WorkerSessionCancelReach {
+    /// The reach a tab EXECUTION publishes: the operation's force target, and
+    /// the registration parked in the operation's sender.
+    pub(crate) fn for_operation(
+        operation_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
+        sender: &QueryProgressSender,
+    ) -> crate::db::SessionCancelReach {
+        crate::db::SessionCancelReach::published(Arc::new(Self {
+            operation_cancel_handle: Some(Arc::clone(operation_cancel_handle)),
+            lazy_force_target: None,
+            registration_holder: Some(Arc::new(sender.clone())),
+        }))
+    }
+
+    /// The reach a LAZY FETCH publishes. Its force target is the withdrawable
+    /// one its own watchdog reads; the registration is still the starting
+    /// execution's, because that is where the session was acquired.
+    pub(crate) fn for_lazy_fetch(
+        lazy_force_target: &QueryCancelTarget,
+        sender: &QueryProgressSender,
+    ) -> crate::db::SessionCancelReach {
+        crate::db::SessionCancelReach::published(Arc::new(Self {
+            operation_cancel_handle: None,
+            lazy_force_target: Some(lazy_force_target.clone()),
+            registration_holder: Some(Arc::new(sender.clone())),
+        }))
+    }
+
+    /// The reach a call publishes when it holds the registration somewhere
+    /// other than an operation's sender — a UI-thread action, or a statement
+    /// whose batch has no sender to park it in.
+    pub(crate) fn for_registration_holder(
+        operation_cancel_handle: Option<&Arc<Mutex<OperationCancelTarget>>>,
+        holder: Arc<dyn crate::db::HoldsSessionCancelRegistration + Send + Sync>,
+    ) -> crate::db::SessionCancelReach {
+        crate::db::SessionCancelReach::published(Arc::new(Self {
+            operation_cancel_handle: operation_cancel_handle.map(Arc::clone),
+            lazy_force_target: None,
+            registration_holder: Some(holder),
+        }))
+    }
+}
+
+impl crate::db::WithdrawsSessionCancelReach for WorkerSessionCancelReach {
+    fn withdraw_session_cancel_reach(&self) {
+        if let Some(handle) = self.operation_cancel_handle.as_ref() {
+            SqlEditorWidget::set_current_query_cancel_handle(handle, None);
+        }
+        if let Some(target) = self.lazy_force_target.as_ref() {
+            target.withdraw();
+        }
+        if let Some(holder) = self.registration_holder.as_ref() {
+            holder.release_session_registration();
+        }
+    }
+}
+
 pub(crate) type LazyFetchCancelHandle = QueryCancelHandle;
 
 #[derive(Clone)]
@@ -863,10 +970,57 @@ struct StartedTabOperation {
     connection_lifetime: crate::db::DbActivityLifetime,
 }
 
+/// What one tab operation currently has published for a cancel to reach.
+///
+/// THREE answers, not two. `Option<QueryCancelHandle>` could only say "there is
+/// a session" and "there is not", and the second meaning covered two situations
+/// that a cancel must treat oppositely: the operation has not published its
+/// session YET (wait — a cancel clicked while a query is starting must still
+/// land), and the operation has GIVEN THE SESSION BACK (stop — the session is
+/// the tab's retained one, or the pool's, or another tab's now, and neither
+/// tier may touch it). Reading the second as the first is what let the force
+/// tier tear down a session that had already left the work, and what would
+/// otherwise make a withdrawn target look like a query that never published one
+/// and be reported as "Cancel context was not published before the timeout".
+#[derive(Clone, Default)]
+pub(crate) enum OperationCancelTarget {
+    /// The operation has not published a session yet.
+    #[default]
+    NotPublished,
+    /// This session, and which kind it is.
+    Published(QueryCancelHandle),
+    /// The work handed the session back. Nothing may reach it any more.
+    Withdrawn,
+}
+
+impl OperationCancelTarget {
+    /// The session a cancel may act on right now, if any.
+    fn published(&self) -> Option<&QueryCancelHandle> {
+        match self {
+            Self::Published(handle) => Some(handle),
+            Self::NotPublished | Self::Withdrawn => None,
+        }
+    }
+
+    /// Whether this operation may still put a session here.
+    ///
+    /// Asked by the FORCE tier only, and only to decide what to REPORT. The
+    /// graceful tier deliberately treats a withdrawn target exactly like one
+    /// that has not arrived — it keeps the cancel requested and waits — because
+    /// "the work gave that session back" does not mean the operation is over:
+    /// the MySQL family re-acquires the tab's session for every statement, and
+    /// a script `CONNECT` replaces it mid-batch. Only the tier that DESTROYS
+    /// needs the distinction, and for it the answer is absolute: a session that
+    /// is not published right now is never torn down.
+    fn may_still_publish(&self) -> bool {
+        matches!(self, Self::NotPublished)
+    }
+}
+
 #[derive(Clone)]
 struct OperationCancelHandleSlot {
     token: QueryOperationToken,
-    handle: Arc<Mutex<Option<QueryCancelHandle>>>,
+    handle: Arc<Mutex<OperationCancelTarget>>,
     cancel_watchdog_started: Arc<AtomicBool>,
     status_activity: crate::db::DbActivityFinishHandle,
 }
@@ -1141,7 +1295,7 @@ trait ExplainPlanBackend: Sync {
         query_timeout: Option<Duration>,
         current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
         current_oracle_thin_cancel_context: &Arc<Mutex<Option<OracleThinCancelHandle>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
     ) -> Result<ExplainPlanData, String>;
@@ -1181,7 +1335,7 @@ struct TransactionActionRequest<'a> {
     session_pool_sender: &'a QueryProgressSender,
     current_query_connection: &'a Arc<Mutex<Option<Arc<Connection>>>>,
     current_oracle_thin_cancel_context: &'a Arc<Mutex<Option<OracleThinCancelHandle>>>,
-    current_query_cancel_handle: &'a Arc<Mutex<Option<QueryCancelHandle>>>,
+    current_query_cancel_handle: &'a Arc<Mutex<OperationCancelTarget>>,
     current_mysql_cancel_context: &'a Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     tab_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
     tab_transaction_mode_override: &'a Arc<Mutex<Option<TransactionMode>>>,
@@ -2070,7 +2224,7 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
         query_timeout: Option<Duration>,
         current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
         current_oracle_thin_cancel_context: &Arc<Mutex<Option<OracleThinCancelHandle>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         _current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
     ) -> Result<ExplainPlanData, String> {
@@ -2157,7 +2311,7 @@ impl ExplainPlanBackend for MysqlExplainPlanBackend {
         query_timeout: Option<Duration>,
         _current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
         _current_oracle_thin_cancel_context: &Arc<Mutex<Option<OracleThinCancelHandle>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
     ) -> Result<ExplainPlanData, String> {
@@ -2400,7 +2554,7 @@ pub struct SqlEditorWidget {
     query_running: Arc<Mutex<bool>>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
     current_oracle_thin_cancel_context: Arc<Mutex<Option<OracleThinCancelHandle>>>,
-    current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>>,
+    current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>>,
     current_operation_cancel_handle: Arc<Mutex<Option<OperationCancelHandleSlot>>>,
     pooled_db_session: SharedDbSessionLease,
     active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
@@ -2485,6 +2639,25 @@ pub struct SqlEditorWidget {
     /// `snippets::SnippetSession`.
     snippet_session: Arc<Mutex<Option<snippets::SnippetSession>>>,
 }
+/// What the FORCE tier finds at the exact moment a batch gives its session
+/// back.
+///
+/// `#[doc(hidden)]`, for the live verification harness — see
+/// [`SqlEditorWidget::force_the_tier_at_a_hand_back_for_probe`].
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum HandBackForceProbe {
+    /// This tab holds no retained session, so there is nothing to probe.
+    NoSession,
+    /// The hand-back door ended the reach, so the tier had nothing to tear
+    /// down. This is what the door exists for.
+    ReachWithdrawn,
+    /// The tier tore a session down AFTER it had been handed back: the tab's
+    /// own retained transaction, or a session the pool has already given to
+    /// another tab.
+    ForcedAfterHandBack(Result<(), String>),
+}
+
 impl SqlEditorWidget {
     fn shared_editor_instance_counter() -> Arc<AtomicU64> {
         static COUNTER: OnceLock<Arc<AtomicU64>> = OnceLock::new();
@@ -2549,8 +2722,8 @@ impl SqlEditorWidget {
         &self,
         token: QueryOperationToken,
         status_activity: crate::db::DbActivityFinishHandle,
-    ) -> Arc<Mutex<Option<QueryCancelHandle>>> {
-        let handle = Arc::new(Mutex::new(None));
+    ) -> Arc<Mutex<OperationCancelTarget>> {
+        let handle = Arc::new(Mutex::new(OperationCancelTarget::NotPublished));
         *self
             .current_operation_cancel_handle
             .lock()
@@ -3511,7 +3684,7 @@ impl SqlEditorWidget {
         let query_running = Arc::new(Mutex::new(false));
         let current_query_connection = Arc::new(Mutex::new(None));
         let current_oracle_thin_cancel_context = Arc::new(Mutex::new(None));
-        let current_query_cancel_handle = Arc::new(Mutex::new(None));
+        let current_query_cancel_handle = Arc::new(Mutex::new(OperationCancelTarget::default()));
         let current_operation_cancel_handle = Arc::new(Mutex::new(None));
         let pooled_db_session = SharedDbSessionLease::new();
         let active_lazy_fetch = Arc::new(Mutex::new(None));
@@ -3722,19 +3895,22 @@ impl SqlEditorWidget {
         // could not reach the tab's session closed it, and saying `NoSession`
         // about that loses the user's work in silence.
         // The scope statement runs on this session inside this function.
-        let scope_registration = crate::db::ActionSessionCancelRegistration::new();
+        let scope_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
+        let scope_hand_back_owner = crate::db::SessionHandBackOwner::untracked(
+            WorkerSessionCancelReach::for_registration_holder(None, scope_registration.clone()),
+        );
         let mut retained_session = match self
             .pooled_db_session
             .take_reusable_lease_for_context_update(
                 // The UI thread, with the tab idle: the scope-change gate
                 // refuses while an execution is running, so there is no newer
                 // operation this session could belong to.
-                &crate::db::SessionHandBackOwner::untracked(),
+                &scope_hand_back_owner,
                 connection_generation,
                 db_type,
                 &scope_connection_info,
                 &scope_activity,
-                &scope_registration,
+                scope_registration.as_ref(),
             ) {
             crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
             crate::db::RetainedLeaseTake::Empty => {
@@ -3901,15 +4077,17 @@ impl SqlEditorWidget {
         // that never ran, then closed the tab.
         // The close prompt's COMMIT/ROLLBACK runs on the UI thread inside this
         // function; the reach lasts exactly that long.
-        let close_registration = crate::db::ActionSessionCancelRegistration::new();
-        let close_hand_back_owner = crate::db::SessionHandBackOwner::untracked();
+        let close_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
+        let close_hand_back_owner = crate::db::SessionHandBackOwner::untracked(
+            WorkerSessionCancelReach::for_registration_holder(None, close_registration.clone()),
+        );
         let retained_session = match self.pooled_db_session.take_reusable_lease_for_resolution(
             &close_hand_back_owner,
             connection_generation,
             db_type,
             &close_connection_info,
             &close_activity,
-            &close_registration,
+            close_registration.as_ref(),
         ) {
             crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
             crate::db::RetainedLeaseTake::Empty => {
@@ -5247,7 +5425,7 @@ impl SqlEditorWidget {
         query_timeout: Option<Duration>,
         current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
         current_oracle_thin_cancel_context: &Arc<Mutex<Option<OracleThinCancelHandle>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
     ) -> Result<ExplainPlanData, String> {
@@ -5551,10 +5729,17 @@ impl SqlEditorWidget {
                 let operation_activity = operation_activity;
                 // This action IS an operation of the tab, so its session
                 // hand-back says so: an abandoned commit/rollback must close
-                // its session rather than file it over the newer batch's.
+                // its session rather than file it over the newer batch's. And
+                // it states what it published over the session, so the
+                // hand-back ends the cancel's reach before the session goes
+                // back to the tab's slot.
                 let hand_back_owner = crate::db::SessionHandBackOwner::for_operation(
                     Some(&current_operation_id),
                     operation_id,
+                    WorkerSessionCancelReach::for_operation(
+                        &current_query_cancel_handle,
+                        &session_pool_sender,
+                    ),
                 );
                 let action_result = panic::catch_unwind(AssertUnwindSafe(|| {
                     if let Some(message) = transaction_action_block_message(
@@ -5936,7 +6121,111 @@ impl SqlEditorWidget {
             .as_ref()
             .map(|slot| slot.handle.clone())?;
         Self::clone_current_query_cancel_handle(&published)
+            .published()
+            .cloned()
             .map(QueryCancelHandle::force_cancel_blocking)
+    }
+
+    /// Drive the FORCE tier at the exact instant a batch gives its session
+    /// back, and answer what it found.
+    ///
+    /// `#[doc(hidden)]`, for the live verification harness, and for the same
+    /// reason [`Self::force_cancel_published_session_for_probe`] exists: the
+    /// window this reproduces cannot be reached by waiting out a cancel
+    /// timeout, because it lasts only as long as a worker's own return path —
+    /// which, on Oracle thin and the MySQL family, includes a runtime read that
+    /// waits on the shared connection mutex, so in real use it is as long as
+    /// another tab keeps that mutex.
+    ///
+    /// It does exactly what a batch does, in the same order and through the
+    /// same doors: take the tab's retained session, publish it as this
+    /// operation's cancel target, give it back through
+    /// `SharedDbSessionLease::hand_back_worker_session`, and only then ask the
+    /// force tier. Nothing here touches the server, so what it proves is the
+    /// ORDER — and the caller can then ask the real server whether the tab's
+    /// session survived.
+    #[doc(hidden)]
+    pub fn force_the_tier_at_a_hand_back_for_probe(&self) -> HandBackForceProbe {
+        let Some(runtime) = self.connection_binding.snapshot().runtime else {
+            return HandBackForceProbe::NoSession;
+        };
+        let connection = runtime.connection();
+        let Some((connection_generation, pool_context_epoch, connection_info, db_type)) =
+            crate::db::try_lock_connection(&connection).map(|guard| {
+                (
+                    guard.connection_generation(),
+                    guard.pool_context_epoch(),
+                    guard
+                        .runtime_connection_info()
+                        .unwrap_or_else(|| guard.get_info().clone()),
+                    guard.db_type(),
+                )
+            })
+        else {
+            return HandBackForceProbe::NoSession;
+        };
+
+        let activity = crate::db::track_db_activity("Probing the hand-back door", Some(db_type));
+        let target = Arc::new(Mutex::new(OperationCancelTarget::NotPublished));
+        let owner = crate::db::SessionHandBackOwner::untracked(
+            WorkerSessionCancelReach::for_operation(&target, &self.progress_sender),
+        );
+        let crate::db::RetainedSessionTakeOutcome::Reusable(taken) =
+            self.pooled_db_session.take_reusable_lease(
+                &owner,
+                connection_generation,
+                pool_context_epoch,
+                db_type,
+                &connection_info,
+                &activity,
+                &self.progress_sender,
+            )
+        else {
+            return HandBackForceProbe::NoSession;
+        };
+        let current_scope = taken.current_scope().map(str::to_string);
+        let Some((mut lease, retained_state)) = taken.into_lease_with_retained_state() else {
+            return HandBackForceProbe::NoSession;
+        };
+
+        // Published exactly as each backend's batch publishes it.
+        let handle = match &mut lease {
+            DbSessionLease::Oracle(conn) => {
+                QueryCancelHandle::Oracle(Arc::clone(conn), CanceledSession::Pooled)
+            }
+            DbSessionLease::OracleThin(conn) => {
+                conn.reset_pending_cancel();
+                QueryCancelHandle::OracleThin(conn.cancel_handle(), CanceledSession::Pooled)
+            }
+            DbSessionLease::MySQL { conn, .. } => QueryCancelHandle::MySql(
+                Box::new(MySqlQueryCancelContext {
+                    connection_info: connection_info.clone(),
+                    connection_id: conn.connection_id(),
+                }),
+                CanceledSession::Pooled,
+            ),
+        };
+        Self::set_current_query_cancel_handle(&target, Some(handle));
+
+        // THE HAND-BACK. From here the session is the tab's again.
+        let _ = Self::restore_pooled_session(
+            &self.pooled_db_session,
+            &owner,
+            connection_generation,
+            pool_context_epoch,
+            lease,
+            retained_state,
+            current_scope,
+        );
+
+        // And now the tier, driven the way the cancel watchdog drives it.
+        match Self::clone_current_query_cancel_handle(&target)
+            .published()
+            .cloned()
+        {
+            None => HandBackForceProbe::ReachWithdrawn,
+            Some(handle) => HandBackForceProbe::ForcedAfterHandBack(handle.force_cancel_blocking()),
+        }
     }
 
     pub fn cancel_current(&self) {
@@ -6076,7 +6365,7 @@ impl SqlEditorWidget {
                     });
                     app::awake();
                 };
-                let mut cancel_handle = SqlEditorWidget::clone_current_query_cancel_handle(
+                let mut cancel_target = SqlEditorWidget::clone_current_query_cancel_handle(
                     &current_query_cancel_handle,
                 );
 
@@ -6091,8 +6380,14 @@ impl SqlEditorWidget {
                     return;
                 }
 
+                // A withdrawn target is treated exactly like one that has not
+                // arrived yet, and deliberately so: the MySQL family re-acquires
+                // the tab's session PER STATEMENT and a script `CONNECT`
+                // replaces it mid-batch, so "the work gave that session back"
+                // does not mean the operation is over. Only the force tier
+                // cares about the difference, because only it destroys.
                 if !SqlEditorWidget::is_query_running_flag(&query_running)
-                    && cancel_handle.is_none()
+                    && cancel_target.published().is_none()
                 {
                     // Execution can still be transitioning into "running" and may not
                     // have published a query cancel handle yet. Wait briefly so a
@@ -6115,17 +6410,17 @@ impl SqlEditorWidget {
                             break;
                         }
                         thread::sleep(Duration::from_millis(25));
-                        cancel_handle = SqlEditorWidget::clone_current_query_cancel_handle(
+                        cancel_target = SqlEditorWidget::clone_current_query_cancel_handle(
                             &current_query_cancel_handle,
                         );
-                        if cancel_handle.is_some() {
+                        if cancel_target.published().is_some() {
                             break;
                         }
                     }
                 }
 
                 if !SqlEditorWidget::is_query_running_flag(&query_running)
-                    && cancel_handle.is_none()
+                    && cancel_target.published().is_none()
                 {
                     // This editor is idle. Do not attempt to cancel through the
                     // global DB connection because that can interrupt a query that
@@ -6142,7 +6437,7 @@ impl SqlEditorWidget {
                     return;
                 }
 
-                if cancel_handle.is_none() {
+                if cancel_target.published().is_none() {
                     // Execution may still be initializing the DB connection.
                     // Wait briefly so a single cancel click can still interrupt reliably.
                     for _ in 0..40 {
@@ -6160,10 +6455,10 @@ impl SqlEditorWidget {
                             return;
                         }
                         thread::sleep(Duration::from_millis(25));
-                        cancel_handle = SqlEditorWidget::clone_current_query_cancel_handle(
+                        cancel_target = SqlEditorWidget::clone_current_query_cancel_handle(
                             &current_query_cancel_handle,
                         );
-                        if cancel_handle.is_some() {
+                        if cancel_target.published().is_some() {
                             break;
                         }
                     }
@@ -6188,27 +6483,24 @@ impl SqlEditorWidget {
                     return;
                 }
 
-                if cancel_handle.is_none() {
-                    // The worker has not published a break-able connection yet.
-                    // Keep cancel requested so execution stops at the first safe
-                    // cancellation point, and surface a status update instead of
-                    // pretending the DB-level break already happened.
+                let Some(cancel_handle) = cancel_target.published().cloned() else {
+                    // The worker has no break-able session published — it has not
+                    // reached one yet, or it has just given one back between
+                    // statements. Keep cancel requested so execution stops at the
+                    // first safe cancellation point, and surface a status update
+                    // instead of pretending the DB-level break already happened.
                     send_outcome(QueryCancelOutcome::PendingInitialization);
                     return;
-                }
+                };
 
-                let interrupt_result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    cancel_handle
-                        .as_ref()
-                        .map(QueryCancelHandle::cancel_interrupt)
-                        .unwrap_or(Ok(()))
-                }))
-                .unwrap_or_else(|payload| {
-                    Err(format!(
-                        "Graceful cancel panicked: {}",
-                        SqlEditorWidget::panic_payload_to_string(payload.as_ref())
-                    ))
-                });
+                let interrupt_result =
+                    panic::catch_unwind(AssertUnwindSafe(|| cancel_handle.cancel_interrupt()))
+                        .unwrap_or_else(|payload| {
+                            Err(format!(
+                                "Graceful cancel panicked: {}",
+                                SqlEditorWidget::panic_payload_to_string(payload.as_ref())
+                            ))
+                        });
                 if interrupt_result.is_err()
                     && (!load_mutex_bool(&cancel_flag)
                         || !SqlEditorWidget::is_query_running_flag(&query_running)
@@ -6244,7 +6536,7 @@ impl SqlEditorWidget {
 
     fn abandon_query_cancel_operation_if_matches(
         current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         current_oracle_thin_cancel_context: &Arc<Mutex<Option<OracleThinCancelHandle>>>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         current_operation_id: &Arc<AtomicU64>,
@@ -6300,7 +6592,7 @@ impl SqlEditorWidget {
     }
 
     fn start_query_cancel_watchdog(
-        current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>>,
         current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
         current_oracle_thin_cancel_context: Arc<Mutex<Option<OracleThinCancelHandle>>>,
         current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
@@ -6368,9 +6660,9 @@ impl SqlEditorWidget {
                         return;
                     }
 
-                    if let Some(handle) =
-                        Self::clone_current_query_cancel_handle(&current_query_cancel_handle)
-                    {
+                    let target =
+                        Self::clone_current_query_cancel_handle(&current_query_cancel_handle);
+                    if let Some(handle) = target.published().cloned() {
                         let _ = progress_sender.send(QueryProgress::CancelOutcome {
                             token: operation_token,
                             outcome: QueryCancelOutcome::ForceStarted,
@@ -6443,6 +6735,26 @@ impl SqlEditorWidget {
                         return;
                     }
                     if Instant::now() >= missing_context_abandon_deadline {
+                        if !target.may_still_publish() {
+                            // The work GAVE THE SESSION BACK. There is nothing
+                            // to force — it is the tab's retained session now,
+                            // or the pool's, or another tab's — and nothing
+                            // failed either, so the user must not be invited to
+                            // retry a tear-down that must never happen. This is
+                            // the whole reason the slot has three answers rather
+                            // than `Some`/`None`: before it did, this window
+                            // (which lasts as long as the worker's own return
+                            // path, including a runtime read that waits on the
+                            // shared connection mutex) was the one in which the
+                            // force tier destroyed a session that had already
+                            // moved on.
+                            crate::utils::logging::log_info(
+                                "sql_editor::cancel",
+                                "Cancel target was withdrawn before the force tier ran; the \
+                                 session is no longer this operation's",
+                            );
+                            return;
+                        }
                         let message =
                             "Cancel context was not published before the timeout".to_string();
                         crate::utils::logging::log_error("sql_editor::cancel", &message);
@@ -6481,7 +6793,7 @@ impl SqlEditorWidget {
     /// main session that the force tier would then destroy.
     fn set_current_query_connection(
         current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         published: Option<(Arc<Connection>, CanceledSession)>,
     ) {
         let cancel_handle = published.as_ref().map(|(connection, session)| {
@@ -6505,7 +6817,7 @@ impl SqlEditorWidget {
     /// travels with it: the explain plan publishes the MAIN connection here.
     fn set_current_mysql_cancel_context(
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         published: Option<(MySqlQueryCancelContext, CanceledSession)>,
     ) {
         let cancel_handle = published.as_ref().map(|(context, session)| {
@@ -6536,7 +6848,7 @@ impl SqlEditorWidget {
     /// travels with it: the explain plan publishes the MAIN session here.
     fn set_current_oracle_thin_cancel_context(
         current_oracle_thin_cancel_context: &Arc<Mutex<Option<OracleThinCancelHandle>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         published: Option<(OracleThinCancelHandle, CanceledSession)>,
     ) {
         let cancel_handle = published
@@ -6556,8 +6868,8 @@ impl SqlEditorWidget {
     }
 
     fn clone_current_query_cancel_handle(
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
-    ) -> Option<QueryCancelHandle> {
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
+    ) -> OperationCancelTarget {
         match current_query_cancel_handle.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => {
@@ -6567,19 +6879,30 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Publish (`Some`) or WITHDRAW (`None`) this operation's cancel target.
+    ///
+    /// `None` is a withdraw, never "back to not published": every caller that
+    /// passes it has finished with the session — the batch handed it back, the
+    /// operation was abandoned, or a startup check gave up before running
+    /// anything. Saying so is what stops a cancel from waiting for a session
+    /// that is never coming.
     fn set_current_query_cancel_handle(
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         value: Option<QueryCancelHandle>,
     ) {
-        match current_query_cancel_handle.lock() {
-            Ok(mut guard) => {
-                *guard = value;
-            }
+        let value = value.map_or(OperationCancelTarget::Withdrawn, |handle| {
+            OperationCancelTarget::Published(handle)
+        });
+        let replaced = match current_query_cancel_handle.lock() {
+            Ok(mut guard) => std::mem::replace(&mut *guard, value),
             Err(poisoned) => {
                 eprintln!("Warning: current query cancel handle lock was poisoned; recovering.");
-                *poisoned.into_inner() = value;
+                std::mem::replace(&mut *poisoned.into_inner(), value)
             }
-        }
+        };
+        // Dropped outside the lock, like every other caller-supplied value: a
+        // MySQL context clears its password on the way out.
+        drop(replaced);
     }
 
     pub fn set_execute_callback<F>(&mut self, callback: F)
@@ -9134,13 +9457,13 @@ mod cancel_watchdog_tests {
 
     #[test]
     fn query_cancel_watchdog_abandons_stuck_operation_and_emits_cancelled_progress() {
-        let current_query_cancel_handle = Arc::new(Mutex::new(Some(QueryCancelHandle::Test(
-            Arc::new(AtomicBool::new(false)),
-        ))));
+        let current_query_cancel_handle = Arc::new(Mutex::new(OperationCancelTarget::Published(
+            QueryCancelHandle::Test(Arc::new(AtomicBool::new(false))),
+        )));
         let force_called = match current_query_cancel_handle
             .lock()
             .unwrap()
-            .as_ref()
+            .published()
             .unwrap()
         {
             QueryCancelHandle::Test(called) => called.clone(),
@@ -9204,7 +9527,10 @@ mod cancel_watchdog_tests {
         assert!(!load_mutex_bool(&cancel_flag));
         assert!(!load_mutex_bool(&query_running));
         assert!(status_activity.is_finished());
-        assert!(current_query_cancel_handle.lock().unwrap().is_none());
+        assert!(matches!(
+            *current_query_cancel_handle.lock().unwrap(),
+            OperationCancelTarget::Withdrawn
+        ));
         assert!(matches!(
             force_started_event,
             QueryProgress::CancelOutcome {
@@ -9265,11 +9591,12 @@ mod cancel_watchdog_tests {
     fn query_cancel_watchdog_waits_for_force_cancel_completion_before_abandoning() {
         let force_started = Arc::new(AtomicBool::new(false));
         let force_release = Arc::new(AtomicBool::new(false));
-        let current_query_cancel_handle =
-            Arc::new(Mutex::new(Some(QueryCancelHandle::TestBlockingForce {
+        let current_query_cancel_handle = Arc::new(Mutex::new(OperationCancelTarget::Published(
+            QueryCancelHandle::TestBlockingForce {
                 started: force_started.clone(),
                 release: force_release.clone(),
-            })));
+            },
+        )));
         let current_query_connection = Arc::new(Mutex::new(None));
         let current_oracle_thin_cancel_context = Arc::new(Mutex::new(None));
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
@@ -9499,9 +9826,163 @@ mod cancel_watchdog_tests {
         assert!(!load_mutex_bool(&current_operation_autocommit));
     }
 
+    /// A target the work has WITHDRAWN is not a target that has yet to arrive.
+    ///
+    /// The force tier is the one that cannot be taken back, so the difference
+    /// decides between tearing a session down and leaving it alone. Before the
+    /// three answers existed the slot said only `None`, which the watchdog read
+    /// as "not published yet" — so a batch that had already handed its session
+    /// back to the tab's slot (or to the pool) was either force-destroyed,
+    /// because every other liveness flag is cleared only afterwards, or spent
+    /// the whole grace period and reported a cancel failure the user was
+    /// invited to retry.
+    #[test]
+    fn a_withdrawn_cancel_target_stops_the_force_watchdog_instead_of_failing_it() {
+        let current_query_cancel_handle = Arc::new(Mutex::new(OperationCancelTarget::Withdrawn));
+        let current_query_connection = Arc::new(Mutex::new(None));
+        let current_oracle_thin_cancel_context = Arc::new(Mutex::new(None));
+        let current_mysql_cancel_context = Arc::new(Mutex::new(None));
+        let current_operation_id = Arc::new(AtomicU64::new(42));
+        let current_cancel_operation = cancel_operation_metadata(42, 0);
+        let current_operation_sql_kind =
+            Arc::new(Mutex::new(crate::db::session_policy::SqlKind::SelectLike));
+        let current_operation_autocommit = Arc::new(Mutex::new(false));
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        let progress_sender = QueryProgressSender::new(progress_sender);
+        // Everything else still says the operation is running, exactly as it
+        // does in the window between a hand-back and the execution guard's drop.
+        let cancel_flag = Arc::new(Mutex::new(true));
+        let query_running = Arc::new(Mutex::new(true));
+        let cancel_watchdog_started = Arc::new(AtomicBool::new(false));
+        let token = QueryOperationToken {
+            tab_id: 7,
+            editor_id: 11,
+            operation_id: 42,
+            connection_generation: 0,
+        };
+
+        SqlEditorWidget::start_query_cancel_watchdog(
+            current_query_cancel_handle.clone(),
+            current_query_connection,
+            current_oracle_thin_cancel_context,
+            current_mysql_cancel_context,
+            current_operation_id.clone(),
+            current_cancel_operation,
+            current_operation_sql_kind,
+            current_operation_autocommit,
+            progress_sender,
+            cancel_flag.clone(),
+            query_running.clone(),
+            token,
+            42,
+            0,
+            true,
+            Duration::from_millis(1),
+            cancel_watchdog_started.clone(),
+            None,
+        )
+        .expect("query cancel watchdog should start");
+
+        assert!(
+            progress_receiver
+                .recv_timeout(Duration::from_millis(400))
+                .is_err(),
+            "a withdrawn target must not start a force tier and must not report a failure"
+        );
+        assert_eq!(
+            current_operation_id.load(Ordering::Relaxed),
+            42,
+            "and it must not abandon the operation either"
+        );
+    }
+
+    /// What one execution publishes over its session, and that all of it goes
+    /// at once.
+    #[test]
+    fn an_operations_reach_ends_in_one_place_for_both_of_the_things_it_published() {
+        let target = Arc::new(Mutex::new(OperationCancelTarget::Published(
+            QueryCancelHandle::Test(Arc::new(AtomicBool::new(false))),
+        )));
+        let (raw_sender, _receiver) = mpsc::channel();
+        let sender = QueryProgressSender::new(raw_sender);
+
+        let activity = crate::db::track_db_activity("reach test", None);
+        let activity_id = activity.id();
+        let registration = activity
+            .attach_canceler(Arc::new(QueryCancelHandle::Test(Arc::new(
+                AtomicBool::new(false),
+            ))))
+            .attached()
+            .expect("a fresh activity accepts a canceler");
+        crate::db::HoldsSessionCancelRegistration::hold_session_registration(&sender, registration);
+        assert!(
+            activity_is_cancelable(activity_id),
+            "the DB layer can reach the session while the work holds the registration"
+        );
+
+        WorkerSessionCancelReach::for_operation(&target, &sender).withdraw_for_test();
+
+        assert!(
+            matches!(*target.lock().unwrap(), OperationCancelTarget::Withdrawn),
+            "the tab's force target is withdrawn, not merely emptied"
+        );
+        assert!(
+            !activity_is_cancelable(activity_id),
+            "and the DB layer's registration goes with it, in the same breath"
+        );
+    }
+
+    /// The graceful tier must not read a withdraw as "the operation finished".
+    ///
+    /// Between two statements of a MySQL-family script the tab's session really
+    /// has gone back to its slot, so the target really is withdrawn — and the
+    /// operation is still running. A tier that concluded "already finished"
+    /// there would clear the cancel flag and the script would carry on.
+    #[test]
+    fn only_the_force_tier_treats_a_withdrawn_target_as_the_end_of_the_operation() {
+        assert!(OperationCancelTarget::NotPublished.published().is_none());
+        assert!(OperationCancelTarget::Withdrawn.published().is_none());
+        assert!(
+            OperationCancelTarget::NotPublished.may_still_publish(),
+            "a session that has not arrived may still arrive"
+        );
+        assert!(
+            !OperationCancelTarget::Withdrawn.may_still_publish(),
+            "a session that was given back is not one this force tier is waiting for"
+        );
+
+        // And the graceful road's fallback is the answer that KEEPS the cancel
+        // requested, for both of the not-published answers.
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("let Some(cancel_handle) = cancel_target.published().cloned() else {")
+            .expect("the graceful tier must gate on a published session");
+        let fallback = &source[start..start + 700];
+        assert!(
+            fallback.contains("QueryCancelOutcome::PendingInitialization"),
+            "a cancel with no session to break must stay requested so the run stops at the \
+             next safe point: {fallback}"
+        );
+        assert!(
+            !fallback.contains("QueryCancelOutcome::AlreadyFinished"),
+            "and it must never report the operation finished on the strength of the target \
+             alone: {fallback}"
+        );
+    }
+
+    fn activity_is_cancelable(id: u64) -> bool {
+        crate::db::active_db_activity_snapshots()
+            .into_iter()
+            .any(|activity| activity.id == id && activity.cancelable)
+    }
+
     #[test]
     fn query_cancel_watchdog_reports_failure_when_cancel_context_never_publishes() {
-        let current_query_cancel_handle = Arc::new(Mutex::new(None));
+        // NOT published, deliberately: the failure this test is about is a
+        // worker that never got as far as publishing a session. A target the
+        // work has WITHDRAWN is the opposite answer and must stop the watchdog
+        // instead — see `query_cancel_watchdog_stops_when_the_target_is_withdrawn`.
+        let current_query_cancel_handle = Arc::new(Mutex::new(OperationCancelTarget::NotPublished));
         let current_query_connection = Arc::new(Mutex::new(None));
         let current_oracle_thin_cancel_context = Arc::new(Mutex::new(None));
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
@@ -9553,7 +10034,10 @@ mod cancel_watchdog_tests {
             "local cancellation must remain requested so startup cannot continue into a DB call"
         );
         assert!(load_mutex_bool(&query_running));
-        assert!(current_query_cancel_handle.lock().unwrap().is_none());
+        assert!(matches!(
+            *current_query_cancel_handle.lock().unwrap(),
+            OperationCancelTarget::NotPublished
+        ));
         assert!(matches!(
             outcome_event,
             QueryProgress::CancelOutcome {

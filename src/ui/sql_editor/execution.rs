@@ -355,7 +355,7 @@ struct OracleThinConnectionTransitionContext<'a> {
     connection_binding: &'a crate::db::TabConnectionBinding,
     pooled_db_session: &'a SharedDbSessionLease,
     current_oracle_thin_cancel_context: &'a Arc<Mutex<Option<OracleThinCancelHandle>>>,
-    current_query_cancel_handle: &'a Arc<Mutex<Option<QueryCancelHandle>>>,
+    current_query_cancel_handle: &'a Arc<Mutex<OperationCancelTarget>>,
     current_operation_id: &'a Arc<AtomicU64>,
     operation_id: u64,
     pool_size: u32,
@@ -591,13 +591,18 @@ impl OracleTransactionBoundaryStep {
 }
 
 impl OracleThinConnectionTransitionContext<'_> {
-    /// Which execution the tab's session slot and binding belong to right now.
+    /// Which execution the tab's session slot and binding belong to right now,
+    /// and what that execution has published over its session.
     /// A script CONNECT/DISCONNECT mutates both, and an abandoned batch reaches
     /// them after the tab has moved on.
-    fn session_owner(&self) -> crate::db::SessionHandBackOwner {
+    fn session_owner(&self, sender: &QueryProgressSender) -> crate::db::SessionHandBackOwner {
         crate::db::SessionHandBackOwner::for_operation(
             Some(self.current_operation_id),
             self.operation_id,
+            crate::ui::sql_editor::WorkerSessionCancelReach::for_operation(
+                self.current_query_cancel_handle,
+                sender,
+            ),
         )
     }
 }
@@ -786,6 +791,7 @@ impl<S: WorkerSessionLease> WorkerSessionOwner<S> {
         sender: QueryProgressSender,
         current_operation_id: &Arc<AtomicU64>,
         operation_id: u64,
+        cancel_reach: crate::db::SessionCancelReach,
         connection_generation: u64,
         pool_context_epoch: u64,
         prior_retained_state: RetainedSessionState,
@@ -800,6 +806,7 @@ impl<S: WorkerSessionLease> WorkerSessionOwner<S> {
             hand_back_owner: crate::db::SessionHandBackOwner::for_operation(
                 Some(current_operation_id),
                 operation_id,
+                cancel_reach,
             ),
             connection_generation,
             pool_context_epoch,
@@ -818,6 +825,7 @@ impl<S: WorkerSessionLease> WorkerSessionOwner<S> {
         db_type: crate::db::DatabaseType,
         pooled_db_session: SharedDbSessionLease,
         sender: QueryProgressSender,
+        cancel_reach: crate::db::SessionCancelReach,
         connection_generation: u64,
         pool_context_epoch: u64,
         prior_retained_state: RetainedSessionState,
@@ -829,7 +837,7 @@ impl<S: WorkerSessionLease> WorkerSessionOwner<S> {
             db_type,
             pooled_db_session,
             sender,
-            hand_back_owner: crate::db::SessionHandBackOwner::untracked(),
+            hand_back_owner: crate::db::SessionHandBackOwner::untracked(cancel_reach),
             connection_generation,
             pool_context_epoch,
             prior_retained_state,
@@ -1167,7 +1175,7 @@ struct ExecutionWorkerContext<'a> {
     active_lazy_fetch: &'a Arc<Mutex<Option<LazyFetchHandle>>>,
     next_lazy_fetch_session_id: &'a Arc<AtomicU64>,
     current_oracle_thin_cancel_context: &'a Arc<Mutex<Option<OracleThinCancelHandle>>>,
-    current_query_cancel_handle: &'a Arc<Mutex<Option<QueryCancelHandle>>>,
+    current_query_cancel_handle: &'a Arc<Mutex<OperationCancelTarget>>,
     current_mysql_cancel_context: &'a Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     cancel_flag: &'a Arc<Mutex<bool>>,
     current_operation_id: &'a Arc<AtomicU64>,
@@ -1372,6 +1380,10 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                     &crate::db::SessionHandBackOwner::for_operation(
                         Some(current_operation_id),
                         operation_id,
+                        crate::ui::sql_editor::WorkerSessionCancelReach::for_operation(
+                            current_query_cancel_handle,
+                            sender,
+                        ),
                     ),
                     connection_generation,
                     pool_context_epoch,
@@ -1478,6 +1490,10 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 &crate::db::SessionHandBackOwner::for_operation(
                     Some(current_operation_id),
                     operation_id,
+                    crate::ui::sql_editor::WorkerSessionCancelReach::for_operation(
+                        current_query_cancel_handle,
+                        sender,
+                    ),
                 ),
                 db_activity,
             );
@@ -1590,6 +1606,10 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             sender.clone(),
             current_operation_id,
             operation_id,
+            crate::ui::sql_editor::WorkerSessionCancelReach::for_operation(
+                current_query_cancel_handle,
+                sender,
+            ),
             connection_generation,
             pool_context_epoch,
             prior_retained_state,
@@ -1871,6 +1891,10 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             let owner = crate::db::SessionHandBackOwner::for_operation(
                 Some(current_operation_id),
                 operation_id,
+                crate::ui::sql_editor::WorkerSessionCancelReach::for_operation(
+                    current_query_cancel_handle,
+                    sender,
+                ),
             );
             BatchSessionHandBack::new(&owner, Some(sender)).apply(
                 pooled_db_session,
@@ -1887,6 +1911,10 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             let owner = crate::db::SessionHandBackOwner::for_operation(
                 Some(current_operation_id),
                 operation_id,
+                crate::ui::sql_editor::WorkerSessionCancelReach::for_operation(
+                    current_query_cancel_handle,
+                    sender,
+                ),
             );
             SqlEditorWidget::clear_worker_session_for_batch(
                 pooled_db_session,
@@ -2066,7 +2094,7 @@ struct QueryExecutionCleanupGuard {
     sender: QueryProgressSender,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
     current_oracle_thin_cancel_context: Arc<Mutex<Option<OracleThinCancelHandle>>>,
-    current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>>,
+    current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     cancel_flag: Arc<Mutex<bool>>,
     query_running: Arc<Mutex<bool>>,
@@ -2250,7 +2278,7 @@ impl QueryExecutionCleanupGuard {
         sender: QueryProgressSender,
         current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
         current_oracle_thin_cancel_context: Arc<Mutex<Option<OracleThinCancelHandle>>>,
-        current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>>,
         current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: Arc<Mutex<bool>>,
         query_running: Arc<Mutex<bool>>,
@@ -3106,6 +3134,10 @@ impl Drop for QueryExecutionCleanupGuard {
             let owner = crate::db::SessionHandBackOwner::for_operation(
                 Some(&self.current_operation_id),
                 self.execution_metadata.operation_id,
+                crate::ui::sql_editor::WorkerSessionCancelReach::for_operation(
+                    &self.current_query_cancel_handle,
+                    &self.sender,
+                ),
             );
             let mut applier = OracleCleanupSessionDecisionApplier {
                 pooled_db_session,
@@ -5632,6 +5664,10 @@ impl SqlEditorWidget {
             crate::db::DatabaseType::Oracle,
             pooled_db_session.clone(),
             sender.clone(),
+            crate::ui::sql_editor::WorkerSessionCancelReach::for_lazy_fetch(
+                &lazy_force_target,
+                &sender,
+            ),
             connection_generation,
             pool_context_epoch,
             prior_retained_state,
@@ -6027,7 +6063,12 @@ impl SqlEditorWidget {
                         // operation id.
                         Self::release_lazy_fetch_session(&lazy_force_target, || {
                             let _ = pooled_db_session.hand_back_worker_session(
-                                &crate::db::SessionHandBackOwner::untracked(),
+                                &crate::db::SessionHandBackOwner::untracked(
+                                    crate::ui::sql_editor::WorkerSessionCancelReach::for_lazy_fetch(
+                                        &lazy_force_target,
+                                        &sender,
+                                    ),
+                                ),
                                 connection_generation,
                                 pool_context_epoch,
                                 DbSessionLease::Oracle(Arc::clone(&conn)),
@@ -6155,11 +6196,20 @@ impl SqlEditorWidget {
         // are a panic and a worker that never starts. Both used to drop the
         // session into the pool, where `reset_before_reuse` rolls back whatever
         // the tab had open, in silence.
+        // Withdrawable, like every other lazy fetch's: the reach ends the
+        // moment `release_lazy_fetch_session` gives the session back. Created
+        // BEFORE the owner, because the owner is what carries this reach into
+        // every hand-back door — including its own `Drop`.
+        let lazy_force_target = QueryCancelTarget::empty();
         let mut lazy_session = WorkerSessionOwner::for_lazy_fetch(
             conn,
             crate::db::DatabaseType::Oracle,
             pooled_db_session.clone(),
             sender.clone(),
+            crate::ui::sql_editor::WorkerSessionCancelReach::for_lazy_fetch(
+                &lazy_force_target,
+                &sender,
+            ),
             connection_generation,
             pool_context_epoch,
             prior_retained_state,
@@ -6174,9 +6224,6 @@ impl SqlEditorWidget {
         };
         lazy_conn.reset_pending_cancel();
         let cancel_handle = lazy_conn.cancel_handle();
-        // Withdrawable, like every other lazy fetch's: the reach ends the
-        // moment `release_lazy_fetch_session` gives the session back.
-        let lazy_force_target = QueryCancelTarget::empty();
         lazy_force_target.publish(QueryCancelHandle::OracleThin(
             cancel_handle,
             CanceledSession::Pooled,
@@ -6892,7 +6939,12 @@ impl SqlEditorWidget {
                         let stored = Self::release_lazy_fetch_session(&lazy_force_target, || {
                             pooled_db_session
                                 .hand_back_worker_session(
-                                    &crate::db::SessionHandBackOwner::untracked(),
+                                    &crate::db::SessionHandBackOwner::untracked(
+                                        crate::ui::sql_editor::WorkerSessionCancelReach::for_lazy_fetch(
+                                            &lazy_force_target,
+                                            &sender,
+                                        ),
+                                    ),
                                     connection_generation,
                                     pool_context_epoch,
                                     DbSessionLease::OracleThin(Box::new(lease_conn)),
@@ -7030,12 +7082,17 @@ impl SqlEditorWidget {
         // hand-back cannot be judged by operation currency. Its own gate
         // (`lazy_fetch_can_keep_session`) is what says whether this fetch is
         // still the tab's.
-        let lazy_fetch_hand_back_owner = crate::db::SessionHandBackOwner::untracked();
         let db_display_name = connection_info.db_type.display_name();
         let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
         // Withdrawable, like every other lazy fetch's: the reach ends the
         // moment `release_lazy_fetch_session` gives the session back.
         let lazy_force_target = QueryCancelTarget::empty();
+        let lazy_fetch_hand_back_owner = crate::db::SessionHandBackOwner::untracked(
+            crate::ui::sql_editor::WorkerSessionCancelReach::for_lazy_fetch(
+                &lazy_force_target,
+                &sender,
+            ),
+        );
         // The tab's session is out of its slot from here until the fetch worker
         // takes it INSIDE its own thread; a worker that never starts must not
         // let it fall into the pool, where the connection reset rolls back
@@ -7045,6 +7102,10 @@ impl SqlEditorWidget {
             connection_info.db_type,
             pooled_db_session.clone(),
             sender.clone(),
+            crate::ui::sql_editor::WorkerSessionCancelReach::for_lazy_fetch(
+                &lazy_force_target,
+                &sender,
+            ),
             connection_generation,
             pool_context_epoch,
             prior_retained_state,
@@ -8237,7 +8298,7 @@ impl SqlEditorWidget {
         session: &Arc<Mutex<SessionState>>,
         pooled_db_session: &SharedDbSessionLease,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         cancel_flag: &Arc<Mutex<bool>>,
         current_operation_id: &Arc<AtomicU64>,
         operation_id: u64,
@@ -8349,7 +8410,7 @@ impl SqlEditorWidget {
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         next_lazy_fetch_session_id: &Arc<AtomicU64>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         cancel_flag: &Arc<Mutex<bool>>,
         script_mode: bool,
         initial_mysql_delimiter_override: Option<String>,
@@ -8382,8 +8443,14 @@ impl SqlEditorWidget {
         // unwinding after the tab has started the next one, and every hand-back
         // below is refused once that happens rather than filing this batch's
         // session over the newer one's.
-        let hand_back_owner =
-            crate::db::SessionHandBackOwner::for_operation(current_operation_id, operation_id);
+        let hand_back_owner = crate::db::SessionHandBackOwner::for_operation(
+            current_operation_id,
+            operation_id,
+            crate::ui::sql_editor::WorkerSessionCancelReach::for_operation(
+                current_query_cancel_handle,
+                sender,
+            ),
+        );
         let hand_back = BatchSessionHandBack::new(&hand_back_owner, Some(sender));
 
         let _ = sender.send(QueryProgress::BatchStart {
@@ -11353,6 +11420,10 @@ impl SqlEditorWidget {
                         &crate::db::SessionHandBackOwner::for_operation(
                             Some(&current_operation_id),
                             operation_id,
+                            crate::ui::sql_editor::WorkerSessionCancelReach::for_operation(
+                                &current_query_cancel_handle,
+                                &sender,
+                            ),
                         ),
                         acquire_scope.as_deref(),
                     );
@@ -13361,6 +13432,10 @@ impl SqlEditorWidget {
                                                     &crate::db::SessionHandBackOwner::for_operation(
                                                         Some(&current_operation_id),
                                                         operation_id,
+                                                        crate::ui::sql_editor::WorkerSessionCancelReach::for_operation(
+                                                            &current_query_cancel_handle,
+                                                            &sender,
+                                                        ),
                                                     ),
                                                     &db_activity,
                                                 );
@@ -13514,6 +13589,10 @@ impl SqlEditorWidget {
                                             &crate::db::SessionHandBackOwner::for_operation(
                                                 Some(&current_operation_id),
                                                 operation_id,
+                                                crate::ui::sql_editor::WorkerSessionCancelReach::for_operation(
+                                                    &current_query_cancel_handle,
+                                                    &sender,
+                                                ),
                                             ),
                                             &db_activity,
                                         );
@@ -16130,9 +16209,15 @@ impl SqlEditorWidget {
                                                     SqlEditorWidget::record_batch_scope_on_tab_binding(
                                                         &connection_binding_for_worker,
                                                         binding_revision,
+                                                        // A BINDING write, not a session
+                                                        // hand-back: this owner is asked
+                                                        // only whether the tab is still on
+                                                        // this execution, and nothing is
+                                                        // published over a session here.
                                                         &crate::db::SessionHandBackOwner::for_operation(
                                                             Some(&current_operation_id),
                                                             operation_id,
+                                                            crate::db::SessionCancelReach::none(),
                                                         ),
                                                         scope,
                                                     );
@@ -19689,7 +19774,7 @@ impl SqlEditorWidget {
                                     Self::clear_worker_session_for_batch(
                                         context.pooled_db_session,
                                         Some(sender),
-                                        &context.session_owner(),
+                                        &context.session_owner(sender),
                                         "oracle thin execution",
                                     );
                                     if let Err(message) = conn.replace_pooled(candidate.session) {
@@ -19868,7 +19953,7 @@ impl SqlEditorWidget {
                             Self::clear_worker_session_for_batch(
                                 context.pooled_db_session,
                                 Some(sender),
-                                &context.session_owner(),
+                                &context.session_owner(sender),
                                 "oracle thin execution",
                             );
                             // Keeps the STALE revision when the detach is
@@ -20589,7 +20674,7 @@ impl SqlEditorWidget {
                                                         Self::record_batch_scope_on_tab_binding(
                                                             context.connection_binding,
                                                             context.binding_revision,
-                                                            &context.session_owner(),
+                                                            &context.session_owner(sender),
                                                             scope,
                                                         );
                                                         context.scope = Some(scope.to_string());
@@ -25710,8 +25795,16 @@ impl SqlEditorWidget {
         // A toolbar/menu option change runs on the UI thread with no batch of
         // its own: the option gate has already refused it while the tab is
         // executing, so there is no newer operation this session could belong
-        // to.
-        let hand_back_owner = crate::db::SessionHandBackOwner::untracked();
+        // to. It still states its reach: the round trips it makes are published
+        // to the cancel button, and that reach has to end when the session goes
+        // back to the tab's slot.
+        let mutation_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
+        let hand_back_owner = crate::db::SessionHandBackOwner::untracked(
+            crate::ui::sql_editor::WorkerSessionCancelReach::for_registration_holder(
+                None,
+                mutation_registration.clone(),
+            ),
+        );
         let hand_back = BatchSessionHandBack::new(&hand_back_owner, None);
         let Some(db_type) = Self::mysql_pooled_session_db_type_for_generation(
             shared_connection,
@@ -25724,7 +25817,7 @@ impl SqlEditorWidget {
         let mutation_connection_info = Self::retained_session_connection_info(shared_connection);
         // The option change runs on the session inside this function, so its
         // cancel reach begins and ends here.
-        let mutation_registration = crate::db::ActionSessionCancelRegistration::new();
+
         // A take that could not reach the tab's session CLOSED it, so this push
         // has to say so rather than answer `NoSession` about a session that was
         // there a moment ago.
@@ -25734,7 +25827,7 @@ impl SqlEditorWidget {
             db_type,
             &mutation_connection_info,
             &mutation_activity,
-            &mutation_registration,
+            mutation_registration.as_ref(),
         ) {
             crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
             crate::db::RetainedLeaseTake::Empty => {
@@ -25847,8 +25940,14 @@ impl SqlEditorWidget {
         // A toolbar/menu option change runs on the UI thread with no batch of
         // its own: the option gate has already refused it while the tab is
         // executing, so there is no newer operation this session could belong
-        // to.
-        let hand_back_owner = crate::db::SessionHandBackOwner::untracked();
+        // to. See the auto-commit twin for why the reach is still stated.
+        let mutation_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
+        let hand_back_owner = crate::db::SessionHandBackOwner::untracked(
+            crate::ui::sql_editor::WorkerSessionCancelReach::for_registration_holder(
+                None,
+                mutation_registration.clone(),
+            ),
+        );
         let hand_back = BatchSessionHandBack::new(&hand_back_owner, None);
         let Some((db_type, default_transaction_isolation)) = ({
             let conn_guard =
@@ -25864,7 +25963,7 @@ impl SqlEditorWidget {
         let mutation_connection_info = Self::retained_session_connection_info(shared_connection);
         // The option change runs on the session inside this function, so its
         // cancel reach begins and ends here.
-        let mutation_registration = crate::db::ActionSessionCancelRegistration::new();
+
         // A take that could not reach the tab's session CLOSED it, so this push
         // has to say so rather than answer `NoSession` about a session that was
         // there a moment ago.
@@ -25874,7 +25973,7 @@ impl SqlEditorWidget {
             db_type,
             &mutation_connection_info,
             &mutation_activity,
-            &mutation_registration,
+            mutation_registration.as_ref(),
         ) {
             crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
             crate::db::RetainedLeaseTake::Empty => {
@@ -26954,7 +27053,7 @@ impl SqlEditorWidget {
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         scope: Option<&str>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         cancel_flag: &Arc<Mutex<bool>>,
         query_timeout: Option<Duration>,
         log_context: &str,
@@ -27114,7 +27213,7 @@ impl SqlEditorWidget {
         // statement, so the latch belongs to the run, not to this call.
         scope_report: &SessionScopeReport,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
         cancel_flag: &Arc<Mutex<bool>>,
         current_operation_id: Option<&Arc<AtomicU64>>,
         operation_id: u64,
@@ -27156,20 +27255,32 @@ impl SqlEditorWidget {
         // tab's session per statement, so an abandoned batch that reaches one
         // of the hand-backs below would otherwise file its session over the one
         // the tab's newer batch is running on.
-        let hand_back_owner =
-            crate::db::SessionHandBackOwner::for_operation(current_operation_id, operation_id);
-        let hand_back = BatchSessionHandBack::new(&hand_back_owner, session_pool_sender);
         // Where the session's cancel registration lives while this action runs.
         // The operation's sender when there is one — the batch keeps using the
         // session after this call — and otherwise a holder scoped to exactly
         // this call, which is the whole life of the work for a toolbar
         // commit/rollback.
-        let action_registration = crate::db::ActionSessionCancelRegistration::new();
-        let registration_holder: &dyn crate::db::HoldsSessionCancelRegistration =
+        let action_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
+        let registration_holder: Arc<dyn crate::db::HoldsSessionCancelRegistration + Send + Sync> =
             match session_pool_sender {
-                Some(sender) => sender,
-                None => &action_registration,
+                Some(sender) => Arc::new(sender.clone()),
+                None => action_registration.clone(),
             };
+        // Which execution owns this session. The MySQL family re-acquires the
+        // tab's session per statement, so an abandoned batch that reaches one
+        // of the hand-backs below would otherwise file its session over the one
+        // the tab's newer batch is running on — and the hand-back is also where
+        // this statement's cancel reach ends, whichever of the two holders it
+        // was parked in.
+        let hand_back_owner = crate::db::SessionHandBackOwner::for_operation(
+            current_operation_id,
+            operation_id,
+            crate::ui::sql_editor::WorkerSessionCancelReach::for_registration_holder(
+                Some(current_query_cancel_handle),
+                registration_holder.clone(),
+            ),
+        );
+        let hand_back = BatchSessionHandBack::new(&hand_back_owner, session_pool_sender);
         let AcquiredMySqlPooledSession {
             connection_generation,
             pool_context_epoch,
@@ -27183,7 +27294,7 @@ impl SqlEditorWidget {
         } = Self::acquire_mysql_pooled_session(
             shared_connection,
             pooled_db_session,
-            registration_holder,
+            registration_holder.as_ref(),
             execution_scope,
             log_context,
             auto_commit,
@@ -28317,7 +28428,7 @@ mod query_execution_cleanup_tests {
             sender,
             current_query_connection,
             Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None::<QueryCancelHandle>)),
+            Arc::new(Mutex::new(super::OperationCancelTarget::NotPublished)),
             current_mysql_cancel_context,
             cancel_flag,
             query_running,
@@ -31110,9 +31221,10 @@ mod query_execution_cleanup_tests {
         let (sender, receiver) = progress_channel();
         let cancel_flag = Arc::new(Mutex::new(true));
         let query_running = Arc::new(Mutex::new(true));
-        let current_query_cancel_handle = Arc::new(Mutex::new(Some(QueryCancelHandle::Test(
-            Arc::new(AtomicBool::new(false)),
-        ))));
+        let current_query_cancel_handle =
+            Arc::new(Mutex::new(super::OperationCancelTarget::Published(
+                QueryCancelHandle::Test(Arc::new(AtomicBool::new(false))),
+            )));
         let current_operation_id = Arc::new(AtomicU64::new(43));
         let last_completed_operation_id = Arc::new(AtomicU64::new(0));
 
@@ -31146,7 +31258,10 @@ mod query_execution_cleanup_tests {
         assert!(*query_running.lock().unwrap());
         assert_eq!(current_operation_id.load(Ordering::Relaxed), 43);
         assert_eq!(last_completed_operation_id.load(Ordering::Relaxed), 0);
-        assert!(current_query_cancel_handle.lock().unwrap().is_some());
+        assert!(matches!(
+            *current_query_cancel_handle.lock().unwrap(),
+            super::OperationCancelTarget::Published(_)
+        ));
         assert!(
             receiver
                 .try_iter()
@@ -31169,7 +31284,7 @@ mod query_execution_cleanup_tests {
                 sender,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(None::<QueryCancelHandle>)),
+                Arc::new(Mutex::new(super::OperationCancelTarget::NotPublished)),
                 Arc::new(Mutex::new(None)),
                 cancel_flag,
                 query_running,
@@ -31216,7 +31331,7 @@ mod query_execution_cleanup_tests {
                 sender,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(None::<QueryCancelHandle>)),
+                Arc::new(Mutex::new(super::OperationCancelTarget::NotPublished)),
                 Arc::new(Mutex::new(None::<MySqlQueryCancelContext>)),
                 Arc::new(Mutex::new(false)),
                 Arc::new(Mutex::new(true)),
@@ -37080,7 +37195,7 @@ mod cancelled_lazy_fetch_history_tests {
 #[cfg(test)]
 mod mysql_batch_execution_regression_tests {
     use super::{
-        LazyFetchCommand, LazyFetchHandle, MySqlQueryCancelContext, QueryCancelHandle,
+        LazyFetchCommand, LazyFetchHandle, MySqlQueryCancelContext, OperationCancelTarget,
         QueryProgress, SqlEditorWidget,
     };
     use crate::db::{
@@ -37413,7 +37528,7 @@ mod mysql_batch_execution_regression_tests {
         shared_connection: Arc<Mutex<DatabaseConnection>>,
         session: Arc<Mutex<SessionState>>,
         current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-        current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>>,
+        current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>>,
         pooled_db_session: crate::db::SharedDbSessionLease,
         tab_auto_commit_override: Arc<Mutex<Option<bool>>>,
         tab_transaction_mode_override: Arc<Mutex<Option<TransactionMode>>>,
@@ -37472,7 +37587,7 @@ mod mysql_batch_execution_regression_tests {
                 shared_connection: Arc::new(Mutex::new(connection)),
                 session,
                 current_mysql_cancel_context: Arc::new(Mutex::new(None)),
-                current_query_cancel_handle: Arc::new(Mutex::new(None)),
+                current_query_cancel_handle: Arc::new(Mutex::new(OperationCancelTarget::default())),
                 pooled_db_session: crate::db::SharedDbSessionLease::new(),
                 tab_auto_commit_override: Arc::new(Mutex::new(None)),
                 tab_transaction_mode_override: Arc::new(Mutex::new(None)),
@@ -37586,7 +37701,9 @@ mod mysql_batch_execution_regression_tests {
             let crate::db::RetainedLeaseTake::Taken(mut retained_session) = self
                 .pooled_db_session
                 .take_reusable_lease_for_context_update(
-                    &crate::db::SessionHandBackOwner::untracked(),
+                    &crate::db::SessionHandBackOwner::untracked(
+                        crate::db::SessionCancelReach::none(),
+                    ),
                     connection_generation,
                     db_type,
                     &crate::db::ConnectionInfo::default(),
@@ -37624,8 +37741,8 @@ mod mysql_batch_execution_regression_tests {
     ) -> Vec<QueryProgress> {
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
-        let current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>> =
-            Arc::new(Mutex::new(None));
+        let current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>> =
+            Arc::new(Mutex::new(OperationCancelTarget::default()));
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -38156,8 +38273,8 @@ mod mysql_batch_execution_regression_tests {
         }));
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
-        let current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>> =
-            Arc::new(Mutex::new(None));
+        let current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>> =
+            Arc::new(Mutex::new(OperationCancelTarget::default()));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
         let tab_auto_commit_override = Arc::new(Mutex::new(None));
         let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
@@ -38284,8 +38401,8 @@ mod mysql_batch_execution_regression_tests {
         }));
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
-        let current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>> =
-            Arc::new(Mutex::new(None));
+        let current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>> =
+            Arc::new(Mutex::new(OperationCancelTarget::default()));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
         let tab_auto_commit_override = Arc::new(Mutex::new(None));
         let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
@@ -38579,8 +38696,8 @@ mod mysql_batch_execution_regression_tests {
         }));
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
-        let current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>> =
-            Arc::new(Mutex::new(None));
+        let current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>> =
+            Arc::new(Mutex::new(OperationCancelTarget::default()));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
         let tab_auto_commit_override = Arc::new(Mutex::new(None));
         let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
@@ -39211,8 +39328,8 @@ SELECT 'FINAL_STATUS' AS section_name,
         }));
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
-        let current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>> =
-            Arc::new(Mutex::new(None));
+        let current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>> =
+            Arc::new(Mutex::new(OperationCancelTarget::default()));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
         let tab_auto_commit_override = Arc::new(Mutex::new(None));
         let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
@@ -43679,7 +43796,9 @@ mod mysql_transaction_feedback_tests {
         assert!(
             pooled_db_session
                 .hand_back_worker_session(
-                    &crate::db::SessionHandBackOwner::untracked(),
+                    &crate::db::SessionHandBackOwner::untracked(
+                        crate::db::SessionCancelReach::none()
+                    ),
                     1,
                     1,
                     crate::db::DbSessionLease::OracleThin(Box::new(sentinel_conn)),
@@ -43786,7 +43905,7 @@ mod mysql_transaction_feedback_tests {
 
         let retained_session = match SqlEditorWidget::stale_take_reported(
             pooled_db_session.take_reusable_lease(
-                &crate::db::SessionHandBackOwner::untracked(),
+                &crate::db::SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
                 1,
                 1,
                 crate::db::DatabaseType::Oracle,
@@ -43896,7 +44015,7 @@ mod mysql_transaction_feedback_tests {
         ));
         let pooled_db_session = SharedDbSessionLease::new();
         let _ = pooled_db_session.hand_back_worker_session(
-            &crate::db::SessionHandBackOwner::untracked(),
+            &crate::db::SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
             1,
             1,
             crate::db::DbSessionLease::OracleThin(Box::new(conn)),
@@ -45041,7 +45160,7 @@ mod tab_scope_live_tests {
             None,
             &Arc::new(Mutex::new(None)),
             &Arc::new(Mutex::new(None)),
-            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(super::OperationCancelTarget::default())),
             &Arc::new(Mutex::new(None)),
             &Arc::new(Mutex::new(false)),
         )

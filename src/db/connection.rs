@@ -1653,6 +1653,98 @@ impl RetainedSessionMutationOutcome {
 /// session is never the frame that finishes using it.
 pub trait HoldsSessionCancelRegistration {
     fn hold_session_registration(&self, registration: DbSessionCancelRegistration);
+
+    /// Give up the registration now, because the session it speaks for is
+    /// about to stop being this work's.
+    ///
+    /// Holding it until the holder itself dies is NOT the same thing: a batch
+    /// hands its session back and then keeps running (progress events, a
+    /// runtime read that waits on the connection mutex, the worker's own
+    /// return path), and for that whole window the registration still answered
+    /// "this session is mine" — which is exactly what both cancel tiers ask
+    /// before they touch it. See [`SessionCancelReach`].
+    fn release_session_registration(&self);
+}
+
+/// Everything a cancel can still use to REACH the session a hand-back is about
+/// to give up.
+///
+/// The rule this exists to make structural is one sentence: **the reach ends
+/// before the session stops being the work's.** It held on exactly two roads
+/// and nowhere else — the lazy fetch's `QueryCancelTarget`
+/// (`SqlEditorWidget::release_lazy_fetch_session`) and the connection mutex
+/// ([`DbSessionCancelRegistration::release_reach`], called from
+/// `ConnectionLockGuard`'s drop). The ordinary execution road, on all four
+/// backends, filed its session into the tab's slot or returned it to the pool
+/// while the tab's force target was still published and while the DB layer's
+/// own registration still said the session was this work's; every liveness
+/// test the force tier had (a cancel flag, a running bool, an operation id, a
+/// `Weak` upgrade) was cleared only afterwards. A force landing in that window
+/// drop-closes the tab's OWN retained transaction, or `KILL CONNECTION`s a
+/// pooled session another tab has just picked up.
+///
+/// So the reach travels with [`SessionHandBackOwner`] — the value that already
+/// says WHICH execution a hand-back belongs to — and the hand-back doors
+/// withdraw it themselves, first, before anything else. A backend cannot join
+/// the app without joining that order, and a new hand-back site cannot be
+/// written without stating what its execution published.
+#[derive(Clone, Default)]
+pub struct SessionCancelReach {
+    withdraw: Option<Arc<dyn WithdrawsSessionCancelReach>>,
+}
+
+impl SessionCancelReach {
+    /// Nothing is published over this session, so there is nothing to end.
+    ///
+    /// A stated answer rather than an omission: a harness seeding a slot and a
+    /// take whose session no cancel can see are both legitimately in this case,
+    /// and naming it is what makes the other case impossible to forget.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// This session is reachable through `reach` until it is handed back.
+    pub fn published(reach: Arc<dyn WithdrawsSessionCancelReach>) -> Self {
+        Self {
+            withdraw: Some(reach),
+        }
+    }
+
+    /// End every reach over the session that is about to be given back.
+    ///
+    /// Called with NO lock held, from the top of each hand-back door, because
+    /// withdrawing touches the UI's published cancel target and the activity
+    /// registry.
+    fn withdraw(&self) {
+        if let Some(reach) = self.withdraw.as_ref() {
+            reach.withdraw_session_cancel_reach();
+        }
+    }
+
+    /// Drive the withdraw directly. Only for tests that assert what one
+    /// execution's reach covers; production always goes through a hand-back
+    /// door, which is the point of the value.
+    #[cfg(test)]
+    pub(crate) fn withdraw_for_test(&self) {
+        self.withdraw();
+    }
+}
+
+impl fmt::Debug for SessionCancelReach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionCancelReach")
+            .field("published", &self.withdraw.is_some())
+            .finish()
+    }
+}
+
+/// What one execution has published over the session it is running on.
+///
+/// `Send + Sync` because a hand-back can happen on any thread — including a
+/// worker's `Drop` while it unwinds from a panic.
+pub trait WithdrawsSessionCancelReach: Send + Sync {
+    fn withdraw_session_cancel_reach(&self);
 }
 
 /// A holder for ONE synchronous action's session — the toolbar
@@ -1689,6 +1781,15 @@ impl HoldsSessionCancelRegistration for ActionSessionCancelRegistration {
         // registry lock.
         drop(replaced);
     }
+
+    fn release_session_registration(&self) {
+        let released = self
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(released);
+    }
 }
 
 /// A holder for work that is deliberately NOT cancelable through the registry.
@@ -1703,6 +1804,9 @@ impl HoldsSessionCancelRegistration for UncancelableSessionAction {
     fn hold_session_registration(&self, registration: DbSessionCancelRegistration) {
         drop(registration);
     }
+
+    /// Nothing was ever held, so there is nothing to release.
+    fn release_session_registration(&self) {}
 }
 
 /// What taking the tab's retained session FOR EXECUTION found.
@@ -1974,18 +2078,26 @@ impl DbPoolSessionContext {
         // Tie the activity to this connection before the session exists, so a
         // teardown that lands mid-acquire still retires this work.
         activity.bind_lifetime(self.activity_lifetime());
-        let (mut session, registration) =
+        let (mut session, mut registration) =
             self.pool.acquire_session(&self.connection_info, activity)?;
-        if let Err(err) = self.ensure_current() {
+        // Same order as every hand-back door: the reach ends BEFORE the session
+        // does. Nothing here can hand the session on, so a cancel that lands
+        // between the discard and this frame returning would be aimed at a
+        // session that is already gone.
+        let discard = |session, registration: &mut DbSessionCancelRegistration| {
+            registration.release_reach();
             Self::discard_stale_session(session);
+        };
+        if let Err(err) = self.ensure_current() {
+            discard(session, &mut registration);
             return Err(err);
         }
         if let Err(err) = scope_context.apply_current_scope_to_session(&mut session) {
-            Self::discard_stale_session(session);
+            discard(session, &mut registration);
             return Err(err);
         }
         if let Err(err) = self.ensure_current() {
-            Self::discard_stale_session(session);
+            discard(session, &mut registration);
             return Err(err);
         }
         Ok((session, registration))
@@ -2381,7 +2493,18 @@ impl DbConnectionPool {
                 db_type: *db_type,
             },
         };
-        backend_for(self.db_type()).apply_pool_session_settings(&mut session, self.advanced())?;
+        if let Err(err) =
+            backend_for(self.db_type()).apply_pool_session_settings(&mut session, self.advanced())
+        {
+            // Half-applied, so what this session carries is unknown — and the
+            // failure is often the connection itself going away. Returning it
+            // to the pool by simply dropping it (which is what an early `?`
+            // did) hands the next tab a session nobody has accounted for; it
+            // goes through the ONE discard choke point instead, exactly like a
+            // session whose scope could not be applied.
+            DbPoolSessionContext::discard_stale_session(session);
+            return Err(err);
+        }
         Ok(session)
     }
 
@@ -2980,21 +3103,46 @@ impl Drop for DbSessionLeaseEntry {
 pub struct SessionHandBackOwner {
     current_operation_id: Option<Arc<AtomicU64>>,
     operation_id: u64,
+    /// What this execution published over the session, so the hand-back door
+    /// can end the reach before the session stops being the work's. See
+    /// [`SessionCancelReach`].
+    cancel_reach: SessionCancelReach,
 }
 
 impl SessionHandBackOwner {
-    pub fn for_operation(current_operation_id: Option<&Arc<AtomicU64>>, operation_id: u64) -> Self {
+    pub fn for_operation(
+        current_operation_id: Option<&Arc<AtomicU64>>,
+        operation_id: u64,
+        cancel_reach: SessionCancelReach,
+    ) -> Self {
         Self {
             current_operation_id: current_operation_id.cloned(),
             operation_id,
+            cancel_reach,
         }
     }
 
     /// A hand-back from a path that runs outside any tab operation — a
     /// UI-thread transaction action, an internal execution, a test. There is no
     /// newer execution that could own the slot, so every hand-back is current.
-    pub fn untracked() -> Self {
-        Self::default()
+    ///
+    /// The reach is still stated: "outside any operation" says nothing about
+    /// whether a cancel can see the session, and a lazy fetch — the biggest
+    /// user of this constructor — is reachable for its whole life.
+    pub fn untracked(cancel_reach: SessionCancelReach) -> Self {
+        Self {
+            current_operation_id: None,
+            operation_id: 0,
+            cancel_reach,
+        }
+    }
+
+    /// End every reach over the session this hand-back is about to give up.
+    ///
+    /// Asked by the hand-back doors themselves, FIRST, so the order is the
+    /// door's property rather than each caller's.
+    fn withdraw_cancel_reach(&self) {
+        self.cancel_reach.withdraw();
     }
 
     /// The tab's live operation counter, for a caller that has to pass the
@@ -3537,6 +3685,12 @@ impl SharedDbSessionLease {
         log_context: &str,
         current_scope: Option<String>,
     ) -> SessionHandBack {
+        // FIRST, before anything can observe the session as anyone else's:
+        // whatever this execution published over it stops speaking for it here.
+        // Every road out of this function gives the session up — filed into the
+        // slot, refused and closed, or discarded — so there is no branch that
+        // may keep the reach. See [`SessionCancelReach`].
+        owner.withdraw_cancel_reach();
         let carried_work = match disposition {
             RetainedSessionDisposition::Retain(retained_state) => {
                 retained_state.may_have_uncommitted_work()
@@ -3585,6 +3739,10 @@ impl SharedDbSessionLease {
         owner: &SessionHandBackOwner,
         log_context: &str,
     ) -> WorkerSlotClear {
+        // Same order as [`Self::hand_back_worker_session`], and for the same
+        // reason: a script `CONNECT`/`DISCONNECT` reaches here while the tab's
+        // force target still names the session this batch was on.
+        owner.withdraw_cancel_reach();
         if !owner.is_current() {
             logging::log_warning(
                 log_context,
@@ -7544,7 +7702,9 @@ fn wait_for_connection_transition(connection: &SharedConnection) {
     }
 }
 
-fn lock_database_connection_raw(connection: &SharedConnection) -> DatabaseConnectionGuard<'_> {
+pub(crate) fn lock_database_connection_raw(
+    connection: &SharedConnection,
+) -> DatabaseConnectionGuard<'_> {
     let _order =
         crate::db::lock_order::LockOrderScope::enter(crate::db::lock_order::names::DB_CONNECTION);
     DatabaseConnectionGuard {
@@ -8211,14 +8371,44 @@ impl DbActivityGuardInner {
 }
 
 #[derive(Clone)]
-pub(crate) struct DbActivityFinishHandle {
+pub struct DbActivityFinishHandle {
     inner: Weak<DbActivityGuardInner>,
 }
 
 impl DbActivityFinishHandle {
-    pub(crate) fn finish(&self) {
+    pub fn finish(&self) {
         if let Some(inner) = self.inner.upgrade() {
             inner.finish();
+        }
+    }
+
+    /// The row this handle observes, or `None` once the WORK has let go of it.
+    fn activity_id(&self) -> Option<u64> {
+        self.inner.upgrade().map(|inner| inner.id)
+    }
+
+    /// Rename the row, if it is still there.
+    ///
+    /// The mutators exist on the non-owning handle for one reason: an observer
+    /// that only reports progress must not OWN the row. A strong
+    /// `DbActivityGuard` clone held by the UI kept the activity alive after the
+    /// work was over, and that liveness is what the force tier reads as "the
+    /// graceful break was ignored" (`DispatchedCancel::still_running_on_its_session`).
+    pub fn set_activity(&self, activity: impl Into<String>) {
+        if let Some(id) = self.activity_id() {
+            set_db_activity_name(id, activity.into());
+        }
+    }
+
+    pub fn set_progress(&self, progress: DbActivityProgress) {
+        if let Some(id) = self.activity_id() {
+            set_db_activity_progress(id, progress);
+        }
+    }
+
+    pub fn set_connection_id(&self, connection_id: ConnectionId) {
+        if let Some(id) = self.activity_id() {
+            set_db_activity_connection_id(id, connection_id);
         }
     }
 
@@ -8226,7 +8416,7 @@ impl DbActivityFinishHandle {
     /// registry. False once the guard was dropped or finished, which makes a
     /// stored handle self-clearing: callers do not have to track completion
     /// separately to know the work is over.
-    pub(crate) fn is_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         self.inner
             .upgrade()
             .is_some_and(|inner| !inner.finished.load(Ordering::Acquire))
@@ -8276,22 +8466,11 @@ impl DbActivityGuard {
     }
 
     pub fn set_activity(&self, activity: impl Into<String>) {
-        let activity = activity.into();
-        if let Some(tracked) = lock_db_activities()
-            .iter_mut()
-            .find(|tracked| tracked.id == self.inner.id)
-        {
-            tracked.activity = activity;
-        }
+        set_db_activity_name(self.inner.id, activity.into());
     }
 
     pub fn set_progress(&self, progress: DbActivityProgress) {
-        if let Some(tracked) = lock_db_activities()
-            .iter_mut()
-            .find(|tracked| tracked.id == self.inner.id)
-        {
-            tracked.progress = progress;
-        }
+        set_db_activity_progress(self.inner.id, progress);
     }
 
     fn set_db_type(&self, db_type: DatabaseType) {
@@ -8304,12 +8483,7 @@ impl DbActivityGuard {
     }
 
     pub fn set_connection_id(&self, connection_id: ConnectionId) {
-        if let Some(tracked) = lock_db_activities()
-            .iter_mut()
-            .find(|tracked| tracked.id == self.inner.id)
-        {
-            tracked.connection_id = Some(connection_id);
-        }
+        set_db_activity_connection_id(self.inner.id, connection_id);
     }
 
     /// Bind this activity to the pool context it runs on, so the registry can
@@ -8543,6 +8717,33 @@ fn track_db_activity_entry(
     DbActivityGuard { inner }
 }
 
+fn set_db_activity_name(id: u64, activity: String) {
+    if let Some(tracked) = lock_db_activities()
+        .iter_mut()
+        .find(|tracked| tracked.id == id)
+    {
+        tracked.activity = activity;
+    }
+}
+
+fn set_db_activity_progress(id: u64, progress: DbActivityProgress) {
+    if let Some(tracked) = lock_db_activities()
+        .iter_mut()
+        .find(|tracked| tracked.id == id)
+    {
+        tracked.progress = progress;
+    }
+}
+
+fn set_db_activity_connection_id(id: u64, connection_id: ConnectionId) {
+    if let Some(tracked) = lock_db_activities()
+        .iter_mut()
+        .find(|tracked| tracked.id == id)
+    {
+        tracked.connection_id = Some(connection_id);
+    }
+}
+
 fn remove_db_activity(id: u64) {
     // Move the entry out before dropping it. It owns caller-supplied values —
     // the cancel hook's closure and the session cancelers — and running any of
@@ -8752,11 +8953,12 @@ impl DispatchedCancel {
     /// this session.
     ///
     /// The whole question the force tier has to answer, in one place: the work
-    /// must still hold its activity guard (so the graceful break was ignored)
-    /// AND this session must still be that work's. The second half is what the
-    /// guard alone cannot say — one activity can hold several sessions, and a
-    /// parked lazy fetch keeps its guard alive long after the sessions under it
-    /// were released.
+    /// must still be RUNNING (so the graceful break was ignored) AND this
+    /// session must still be that work's. The second half is what the guard
+    /// alone cannot say — one activity can hold several sessions, and a parked
+    /// lazy fetch keeps its guard alive long after the sessions under it were
+    /// released.
+    ///
     fn still_running_on_its_session(&self) -> bool {
         self.owns_its_session() && self.guard.upgrade().is_some()
     }
@@ -9499,7 +9701,11 @@ mod tests {
         // operation the tab is on now, not against the connection generation,
         // which both batches share.
         let current_operation_id = Arc::new(AtomicU64::new(7));
-        let owner = SessionHandBackOwner::for_operation(Some(&current_operation_id), 7);
+        let owner = SessionHandBackOwner::for_operation(
+            Some(&current_operation_id),
+            7,
+            crate::db::SessionCancelReach::none(),
+        );
         assert!(owner.is_current(), "the running batch owns the slot");
 
         current_operation_id.store(8, Ordering::Relaxed);
@@ -9510,9 +9716,16 @@ mod tests {
 
         // Paths outside any tab operation (a UI-thread transaction action, an
         // internal execution, a test) have nothing newer to lose to.
-        assert!(SessionHandBackOwner::untracked().is_current());
         assert!(
-            SessionHandBackOwner::for_operation(Some(&current_operation_id), 0).is_current(),
+            SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()).is_current()
+        );
+        assert!(
+            SessionHandBackOwner::for_operation(
+                Some(&current_operation_id),
+                0,
+                crate::db::SessionCancelReach::none()
+            )
+            .is_current(),
             "an unrecorded operation id is not a stale one"
         );
     }
@@ -9620,6 +9833,106 @@ mod tests {
         );
     }
 
+    /// The order the hand-back doors exist to make structural.
+    ///
+    /// A cancel's reach must end BEFORE the session stops being the work's,
+    /// never after: the tab's force target and the DB layer's registration were
+    /// both released only when their holders died, which is after the session
+    /// had already been filed into the tab's slot or returned to the pool. In
+    /// that window both tiers still answered "this session is mine".
+    #[test]
+    fn a_worker_hand_back_ends_the_cancels_reach_before_it_touches_the_session() {
+        struct MovesTheTabOn {
+            current_operation_id: Arc<AtomicU64>,
+        }
+        impl WithdrawsSessionCancelReach for MovesTheTabOn {
+            fn withdraw_session_cancel_reach(&self) {
+                // Anything the door does AFTER the withdraw can see this.
+                self.current_operation_id.store(9, Ordering::Relaxed);
+            }
+        }
+
+        let lease = SharedDbSessionLease::default();
+        let current_operation_id = Arc::new(AtomicU64::new(7));
+        let owner = SessionHandBackOwner::for_operation(
+            Some(&current_operation_id),
+            7,
+            SessionCancelReach::published(Arc::new(MovesTheTabOn {
+                current_operation_id: Arc::clone(&current_operation_id),
+            })),
+        );
+        assert_eq!(
+            lease.clear_worker_session(&owner, "test"),
+            WorkerSlotClear::NotOurs,
+            "the withdraw must happen before the door reads anything else: the currency check \
+             saw the operation this reach moved on, so the reach was ended first"
+        );
+
+        // The hand-back twin cannot be driven without a real driver session, so
+        // its order is asserted where it is written.
+        let source = include_str!("connection.rs");
+        let door_body = source_of_fn(source, "pub fn hand_back_worker_session(");
+        let withdraw = door_body
+            .find("owner.withdraw_cancel_reach();")
+            .expect("the hand-back door must end the cancel's reach");
+        let currency = door_body
+            .find("if !owner.is_current()")
+            .expect("the hand-back door must ask whose session it is");
+        let filing = door_body
+            .find("apply_retained_session_disposition_with_scope(")
+            .expect("the hand-back door must file the session");
+        assert!(
+            withdraw < currency && withdraw < filing,
+            "the reach ends before the session moves, on every road out of the door"
+        );
+    }
+
+    /// The registry row belongs to the WORK, and observers may not keep it.
+    #[test]
+    fn an_activity_row_belongs_to_the_work_not_to_the_screen_that_watches_it() {
+        let _test_guard = db_activity_test_lock();
+        let guard = track_db_activity("watched work", None);
+        let id = guard.id();
+        let watcher = guard.finish_handle();
+        assert!(
+            activity_is_registered(id),
+            "the row is there while the work holds its guard"
+        );
+        drop(guard);
+        assert!(
+            !activity_is_registered(id),
+            "the work let go, so the row is gone even though the screen still watches it"
+        );
+        assert!(
+            !watcher.is_active(),
+            "and the watcher says so instead of keeping the work alive"
+        );
+    }
+
+    /// A session the pool could not finish preparing goes through the ONE
+    /// discard door, never back into the pool by falling out of scope.
+    #[test]
+    fn a_pool_session_whose_settings_could_not_be_applied_is_not_returned_to_the_pool() {
+        let source = include_str!("connection.rs");
+        let body = source_of_fn(source, "fn acquire_session_untracked(");
+        assert!(
+            body.contains("DbPoolSessionContext::discard_stale_session(session);"),
+            "a half-configured session must be discarded through the choke point, not dropped \
+             back into the pool for the next tab to inherit: {body}"
+        );
+        let scoped = source_of_fn(source, "fn acquire_session_with_scope_context(");
+        let release = scoped
+            .find("registration.release_reach();")
+            .expect("the discard path must end the cancel's reach");
+        let discard = scoped
+            .find("Self::discard_stale_session(session);")
+            .expect("the discard path must destroy the session");
+        assert!(
+            release < discard,
+            "same order as every hand-back: the reach ends before the session does"
+        );
+    }
+
     #[test]
     fn a_worker_may_not_clear_a_slot_its_tab_has_moved_on_from() {
         // The discard twin of the hand-back door. A force-cancelled batch keeps
@@ -9627,8 +9940,16 @@ mod tests {
         // started -- and filed a session for -- a newer execution.
         let lease = SharedDbSessionLease::default();
         let current_operation_id = Arc::new(AtomicU64::new(7));
-        let stale = SessionHandBackOwner::for_operation(Some(&current_operation_id), 4);
-        let current = SessionHandBackOwner::for_operation(Some(&current_operation_id), 7);
+        let stale = SessionHandBackOwner::for_operation(
+            Some(&current_operation_id),
+            4,
+            crate::db::SessionCancelReach::none(),
+        );
+        let current = SessionHandBackOwner::for_operation(
+            Some(&current_operation_id),
+            7,
+            crate::db::SessionCancelReach::none(),
+        );
         assert_eq!(
             lease.clear_worker_session(&stale, "test"),
             WorkerSlotClear::NotOurs,
@@ -10828,7 +11149,7 @@ mod tests {
         assert!(
             tab_lease
                 .hand_back_worker_session(
-                    &SessionHandBackOwner::untracked(),
+                    &SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
                     ctx.connection_generation,
                     ctx.pool_context_epoch(),
                     reacquired_first,
@@ -10852,7 +11173,7 @@ mod tests {
         assert!(
             orphaned_tab_lease
                 .hand_back_worker_session(
-                    &SessionHandBackOwner::untracked(),
+                    &SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
                     ctx.connection_generation,
                     ctx.pool_context_epoch(),
                     reacquired_second,
@@ -10882,7 +11203,7 @@ mod tests {
         assert!(
             !closed_tab_lease
                 .hand_back_worker_session(
-                    &SessionHandBackOwner::untracked(),
+                    &SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
                     ctx.connection_generation,
                     ctx.pool_context_epoch(),
                     late,
@@ -10912,7 +11233,7 @@ mod tests {
         assert!(
             tab_lease
                 .hand_back_worker_session(
-                    &SessionHandBackOwner::untracked(),
+                    &SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
                     ctx.connection_generation,
                     ctx.pool_context_epoch(),
                     retained,
@@ -10947,7 +11268,7 @@ mod tests {
         assert!(
             tab_lease
                 .hand_back_worker_session(
-                    &SessionHandBackOwner::untracked(),
+                    &SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
                     ctx.connection_generation,
                     ctx.pool_context_epoch(),
                     retained,
@@ -10978,7 +11299,7 @@ mod tests {
         assert!(
             tab_lease
                 .hand_back_worker_session(
-                    &SessionHandBackOwner::untracked(),
+                    &SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
                     ctx.connection_generation,
                     ctx.pool_context_epoch(),
                     retained,
@@ -11066,7 +11387,7 @@ mod tests {
             let tab_lease = SharedDbSessionLease::new();
             tab_lease
                 .hand_back_worker_session(
-                    &SessionHandBackOwner::untracked(),
+                    &SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
                     ctx.connection_generation,
                     ctx.pool_context_epoch(),
                     held,
@@ -11105,7 +11426,7 @@ mod tests {
             assert!(
                 survivor_lease
                     .hand_back_worker_session(
-                        &SessionHandBackOwner::untracked(),
+                        &SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
                         survivor_ctx.connection_generation,
                         survivor_ctx.pool_context_epoch(),
                         survivor_retained,
@@ -11126,7 +11447,7 @@ mod tests {
             assert!(
                 departing_lease
                     .hand_back_worker_session(
-                        &SessionHandBackOwner::untracked(),
+                        &SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
                         departing_ctx.connection_generation,
                         departing_ctx.pool_context_epoch(),
                         departing_retained,
@@ -11859,6 +12180,16 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(registration);
         }
+
+        fn release_session_registration(&self) {
+            let released = std::mem::take(
+                &mut *self
+                    .held
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            drop(released);
+        }
     }
 
     #[test]
@@ -12265,7 +12596,7 @@ mod tests {
         // case where "nothing happened" is the whole truth.
         let registration = ActionSessionCancelRegistration::new();
         let take = lease.take_reusable_lease_for_resolution(
-            &SessionHandBackOwner::untracked(),
+            &SessionHandBackOwner::untracked(crate::db::SessionCancelReach::none()),
             1,
             DatabaseType::MySQL,
             &info,

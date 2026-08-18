@@ -38,6 +38,15 @@
 //       every other tab is on. The tier is driven directly, because a graceful
 //       break always lands against a real server and the watchdog would never
 //       escalate — which is exactly why this hole went unnoticed.
+//   A11 the FORCE tier at the instant a batch GIVES ITS SESSION BACK finds
+//       nothing to tear down. The tab's force target and the DB layer's
+//       registration used to be given up long after the hand-back — after the
+//       progress events and after a runtime read that waits on the shared
+//       connection mutex — so a force landing in that window drop-closed the
+//       tab's own open transaction (or a session another tab had just taken
+//       from the pool). Driven directly for the same reason A10 is, and the
+//       assertion is asked of the SERVER: the tab's transaction must still be
+//       there afterwards.
 //
 // Usage: verify_activity_cancel_live <thin|oci|mysql|mariadb|all>
 
@@ -47,7 +56,7 @@ use space_query::db::{
     sweep_stale_db_activities, track_pool_db_activity, ConnectionInfo, DatabaseConnection,
     DatabaseType, DbPoolSession, OracleDriverMode,
 };
-use space_query::ui::sql_editor::{QueryProgress, SqlEditorWidget};
+use space_query::ui::sql_editor::{HandBackForceProbe, QueryProgress, SqlEditorWidget};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -749,6 +758,69 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                  (transcript: {:?})",
                 editor.transcript()
             ));
+        }
+        let _ = editor.wait_done(Duration::from_secs(10));
+    }
+
+    // A11: the force tier must find nothing to tear down at a hand-back.
+    //
+    // The tab is left holding a real open transaction, and the probe then does
+    // exactly what a batch does in the same order — take the session, publish
+    // it as the operation's cancel target, hand it back through the door — and
+    // drives the tier. The door has to have ended the reach by then; if it has
+    // not, the tier destroys the session the tab is holding, and the server is
+    // asked about that afterwards.
+    {
+        reset_tracked_db_activities_for_probe();
+        let label = target.label();
+        println!(
+            "   A11 ({label}): a hand-back must end the cancel's reach before the session moves"
+        );
+        let harness = Harness::connect(target)?;
+        let mut editor = EditorHarness::new(&harness);
+        for sql in target.setup_sql() {
+            let _ = editor.run(sql, Duration::from_secs(30));
+        }
+        if !editor.run(target.retain_session_sql(), Duration::from_secs(30)) {
+            failures.push(format!(
+                "A11 ({label}): could not open a transaction to retain the session"
+            ));
+        }
+        if editor.retained_session_state().is_none() {
+            failures.push(format!(
+                "A11 ({label}): the tab did not retain its session, so there is no hand-back to probe"
+            ));
+        } else {
+            match editor.editor.force_the_tier_at_a_hand_back_for_probe() {
+                HandBackForceProbe::ReachWithdrawn => {
+                    println!("   A11 ({label}) the door ended the reach before the session moved");
+                }
+                answer => failures.push(format!(
+                    "A11 ({label}): the force tier still spoke for a session that had been handed \
+                     back: {answer:?}"
+                )),
+            }
+
+            // THE ASSERTION, asked of the server: the tab's own transaction is
+            // still open on a session that still works. Before the door ended
+            // the reach first, the tier had just drop-closed (Oracle) or
+            // KILLed (MySQL family) exactly this session.
+            if editor.retained_session_state().is_none() {
+                failures.push(format!(
+                    "A11 ({label}): the tab lost its retained session to the force tier"
+                ));
+            }
+            let survived = editor.run(target.retain_session_sql(), Duration::from_secs(30))
+                && !editor.last_message().to_ascii_lowercase().contains("error");
+            if survived {
+                println!("   A11 ({label}) the tab's own transaction survived the force tier");
+            } else {
+                failures.push(format!(
+                    "A11 ({label}): the tab's retained session could not be used after the force \
+                     tier (transcript: {:?})",
+                    editor.transcript()
+                ));
+            }
         }
         let _ = editor.wait_done(Duration::from_secs(10));
     }

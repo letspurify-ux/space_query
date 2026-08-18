@@ -7914,6 +7914,131 @@ fn a_lazy_fetch_gives_up_its_force_target_before_it_gives_back_its_session() {
     );
 }
 
+/// The ordinary execution road gives up its cancel reach before its session,
+/// on every backend — the rule the lazy-fetch road already had.
+///
+/// The tab's per-operation force target was cleared only when the execution
+/// guard dropped, which is AFTER the batch handed its session back, after the
+/// progress events, and after a runtime read that waits on the shared
+/// connection mutex; the DB layer's registration was released only when its
+/// holder died. Everything the force tier asks — a cancel flag, a running bool,
+/// an operation id — is cleared in that same late block, so for the whole window
+/// both tiers answered "this session is still this work's" about a session that
+/// was already the tab's retained one or back in the pool.
+#[test]
+fn every_worker_hand_back_ends_the_cancels_reach_before_the_session_moves() {
+    let connection = read_source("src/db/connection.rs");
+
+    // The reach travels with the value that already says WHICH execution a
+    // hand-back belongs to, so no site can name one without the other.
+    assert!(
+        connection.contains("cancel_reach: SessionCancelReach,")
+            && compact_for_pattern(&connection).contains(
+                "pubfnfor_operation(current_operation_id:Option<&Arc<AtomicU64>>,\
+                 operation_id:u64,cancel_reach:SessionCancelReach,"
+            )
+            && connection.contains("pub fn untracked(cancel_reach: SessionCancelReach) -> Self {"),
+        "both `SessionHandBackOwner` constructors must require the reach, so a hand-back that \
+         publishes nothing says so rather than leaving it out"
+    );
+
+    // Both doors withdraw FIRST.
+    for door in [
+        "pub fn hand_back_worker_session(",
+        "pub fn clear_worker_session(",
+    ] {
+        let start = connection
+            .find(door)
+            .unwrap_or_else(|| panic!("{door} should exist"));
+        let end = connection[start..]
+            .find("\n    /// ")
+            .map_or(connection.len(), |offset| start + offset);
+        let body = &connection[start..end];
+        let withdraw = body
+            .find("owner.withdraw_cancel_reach();")
+            .unwrap_or_else(|| panic!("{door} must end the cancel's reach"));
+        let first_use = body
+            .find("owner.is_current()")
+            .unwrap_or_else(|| panic!("{door} must ask whose session it is"));
+        assert!(
+            withdraw < first_use,
+            "{door} must end the reach before it reads or moves anything else"
+        );
+    }
+
+    // Every backend's EXECUTION names the reach it published, and every
+    // backend's LAZY FETCH names its withdrawable one. Three of each: Oracle
+    // OCI, Oracle thin, and the MySQL family.
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    for worker in [
+        "fn start_oracle_lazy_select(",
+        "fn start_oracle_thin_lazy_select(",
+        "fn start_mysql_lazy_select(",
+    ] {
+        let start = execution
+            .find(worker)
+            .unwrap_or_else(|| panic!("{worker} should exist"));
+        let end = execution[start + worker.len()..]
+            .find("\n    fn ")
+            .map_or(execution.len(), |offset| start + worker.len() + offset);
+        assert!(
+            execution[start..end].contains("WorkerSessionCancelReach::for_lazy_fetch("),
+            "{worker} must name the reach its session is published under, so its hand-backs \
+             end that reach first"
+        );
+    }
+    assert!(
+        execution
+            .matches("WorkerSessionCancelReach::for_operation(")
+            .count()
+            >= 8,
+        "every batch road — both Oracle drivers' takes, batch ends and script CONNECT/DISCONNECT, \
+         and the MySQL family's batch and per-statement acquires — must name its reach"
+    );
+
+    // And the reach covers BOTH of the things one execution publishes.
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let start = editor
+        .find("impl crate::db::WithdrawsSessionCancelReach for WorkerSessionCancelReach {")
+        .expect("the editor must implement the reach");
+    let body = slice_from(&editor, start, 700);
+    assert!(
+        body.contains("set_current_query_cancel_handle(handle, None)")
+            && body.contains("target.withdraw()")
+            && body.contains("holder.release_session_registration()"),
+        "one withdraw must end the tab's force target, a lazy fetch's withdrawable target and \
+         the DB layer's registration: {body}"
+    );
+
+    // A withdrawn target is a third answer, not "not published yet".
+    assert!(
+        editor.contains("pub(crate) enum OperationCancelTarget {")
+            && editor.contains("    Withdrawn,")
+            && editor.contains("fn may_still_publish(&self) -> bool {"),
+        "the tab's cancel slot must tell a session that has not arrived from one that has been \
+         given back"
+    );
+
+    // The activity row belongs to the WORK. An observer that holds a strong
+    // `DbActivityGuard` co-owns it, and the force tier reads that ownership as
+    // "the work is still running" — the screen kept a clone until it drained
+    // the batch's terminal event, and a `BatchStart` queued in the progress
+    // channel carried another.
+    assert!(
+        editor.contains("status_activity: Option<crate::db::DbActivityFinishHandle>,"),
+        "a progress event must carry a NON-OWNING handle to the row, never a guard"
+    );
+    let window = read_source("src/ui/main_window.rs");
+    assert!(
+        window.contains("enum StatusActivity {")
+            && window.contains("    Owned(crate::db::DbActivityGuard),")
+            && window.contains("    Observed(crate::db::DbActivityFinishHandle),")
+            && window.contains("    status_activity: Option<StatusActivity>,"),
+        "the screen may own a row it created itself, and may only OBSERVE one an execution \
+         already owns"
+    );
+}
+
 #[test]
 fn a_script_disconnect_is_tab_local_on_every_backend() {
     // `DISCONNECT` ends the TAB's session. Both Oracle drivers did that; the

@@ -500,12 +500,17 @@ fn next_connection_id() -> ConnectionId {
     ConnectionId(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Read a connection's identity and state.
+///
+/// Through the tracked lock, like every other acquisition of this mutex. A bare
+/// `connection.lock()` here was invisible to the app-wide lock-order tracker,
+/// which is the one thing that can say whether two locks are ever taken in both
+/// orders — and this is called from worker threads right after a batch has
+/// handed its session back, and from `ConnectionTransition`'s drop.
 fn runtime_metadata(
     connection: &SharedConnection,
 ) -> (ConnectionInfo, ConnectionRuntimeState, u64, u64) {
-    let connection = connection
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let connection = crate::db::connection::lock_database_connection_raw(connection);
     let info = connection.get_info().clone();
     let state = if connection.is_connected() {
         ConnectionRuntimeState::Connected

@@ -892,7 +892,7 @@ struct QueryProgressContext {
     running_statement_index: Option<usize>,
     state_label: String,
     auto_selected_result_tab: bool,
-    status_activity: Option<crate::db::DbActivityGuard>,
+    status_activity: Option<StatusActivity>,
     status_activity_label: String,
     completed_statement_indices: HashSet<usize>,
     total_units: Option<usize>,
@@ -1023,6 +1023,47 @@ fn query_cancel_activity_color(pulse_frame: usize, active: bool, hovered: bool) 
         theme::hover_feedback_color(base)
     } else {
         base
+    }
+}
+
+/// The registry row a result tab's progress is shown under, and who owns it.
+///
+/// Two shapes because the row has two possible owners, and reading them as one
+/// is what kept a finished operation's activity alive. Work that has an
+/// OPERATION behind it (a query tab execution) already owns its row through the
+/// worker's own guard; this context only observes and finishes it. Work with no
+/// operation behind it — a table page, a grid refill — has no such row, so this
+/// context creates and OWNS one.
+///
+/// The distinction is not cosmetic: `DispatchedCancel::still_running_on_its_session`
+/// reads "does the work still hold its activity guard" as "the graceful break
+/// was ignored", and a strong clone parked here answered yes for as long as the
+/// UI had not drained the batch's terminal event.
+enum StatusActivity {
+    Owned(crate::db::DbActivityGuard),
+    Observed(crate::db::DbActivityFinishHandle),
+}
+
+impl StatusActivity {
+    fn set_activity(&self, activity: impl Into<String>) {
+        match self {
+            Self::Owned(guard) => guard.set_activity(activity),
+            Self::Observed(handle) => handle.set_activity(activity),
+        }
+    }
+
+    fn set_progress(&self, progress: crate::db::DbActivityProgress) {
+        match self {
+            Self::Owned(guard) => guard.set_progress(progress),
+            Self::Observed(handle) => handle.set_progress(progress),
+        }
+    }
+
+    fn set_connection_id(&self, connection_id: ConnectionId) {
+        match self {
+            Self::Owned(guard) => guard.set_connection_id(connection_id),
+            Self::Observed(handle) => handle.set_connection_id(connection_id),
+        }
     }
 }
 
@@ -1484,10 +1525,17 @@ impl QueryProgressContext {
         total_units: Option<usize>,
         db_type: Option<DatabaseType>,
         connection_id: Option<ConnectionId>,
-        status_activity: Option<crate::db::DbActivityGuard>,
+        status_activity: Option<crate::db::DbActivityFinishHandle>,
     ) {
-        let status_activity = status_activity
-            .unwrap_or_else(|| crate::db::track_db_activity(&self.status_activity_label, db_type));
+        let status_activity = status_activity.map_or_else(
+            || {
+                StatusActivity::Owned(crate::db::track_db_activity(
+                    &self.status_activity_label,
+                    db_type,
+                ))
+            },
+            StatusActivity::Observed,
+        );
         if let Some(connection_id) = connection_id {
             status_activity.set_connection_id(connection_id);
         }
