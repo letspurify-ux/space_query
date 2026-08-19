@@ -40,7 +40,10 @@
 //      the wire ends with it
 //   T16 a cancel ENDS work but does not STOP it: the registry entry goes at
 //      dispatch, so exit has to wait for the cancelled job to let go of the
-//      session it was holding before it takes the connection away and quits
+//      session it was holding before it takes the connection away and quits --
+//      and it must wait on the APP's standing answer, because the road that
+//      ended the work (exit cancels the object browser's loads first) is not
+//      the cancel it waits behind
 //   T17 ...and the same fact seen from the other side: a connection is still
 //      NAMED by work that was cancelled and has not let go, so the removal
 //      that ENDS a transient connection cannot pull it out from under a
@@ -1382,7 +1385,8 @@ fn verify(target: Target) -> Result<bool, String> {
     // Held for the scenario, like a real connection's runtime is: registering
     // is what stamps the id, and keeping the runtime is what makes the setup
     // look like the app's rather than like a bare connection.
-    let _worker_runtime = worker_registry.register_unmanaged(Arc::clone(&worker_connection));
+    let worker_runtime = worker_registry.register_unmanaged(Arc::clone(&worker_connection));
+    let worker_connection_id = worker_runtime.id();
     let worker_running = Arc::new(AtomicBool::new(false));
     let worker_done = Arc::new(AtomicBool::new(false));
     let worker_running_in_thread = Arc::clone(&worker_running);
@@ -1417,15 +1421,29 @@ fn verify(target: Target) -> Result<bool, String> {
     let with_worker = stable_count(&mut census)?;
     println!("    server sessions with the background read running: {with_worker}");
 
-    // Exit's own sequence, at the DB layer, in exit's own order: cancel the
-    // work, WAIT FOR IT TO LET GO, then take the connection away and let the
-    // logoffs land.
-    let cancelled = space_query::db::cancel_all_db_activities(Duration::from_secs(60));
-    report.check_flag(
-        "T16 the background read was still holding its session when the cancel was dispatched",
-        cancelled.still_holding_a_session() > 0,
+    // Exit's own sequence, at the DB layer, in exit's own ORDER — and the order
+    // is the point. Exit's FIRST action is
+    // `object_browser.cancel_metadata_refresh()`, which retires the metadata
+    // rows; only then does it call `cancel_all_db_activities`. So the road that
+    // ended this read is not the cancel exit waits behind, and a wait asked of
+    // that cancel's own answer would skip exactly the sessions exit says it
+    // breaks first.
+    space_query::db::cancel_db_activities_for_connection(
+        worker_connection_id,
+        Duration::from_secs(60),
     );
-    let still_holding = cancelled.wait_until_the_work_let_go(Duration::from_secs(20));
+    report.check_flag(
+        "T16 the background read was still holding its session when it was ended",
+        space_query::db::cancelled_db_work_still_holding_a_session() > 0,
+    );
+    // Exit's own cancel, which can no longer see the row above.
+    space_query::db::cancel_all_db_activities(Duration::from_secs(60));
+    report.check_flag(
+        "T16 and the app still knows about it after a LATER cancel that cannot see its row",
+        space_query::db::cancelled_db_work_still_holding_a_session() > 0,
+    );
+    let still_holding =
+        space_query::db::wait_until_cancelled_db_work_let_go(Duration::from_secs(20));
     report.check(
         "T16 and the wait ends only once it has let go",
         still_holding,

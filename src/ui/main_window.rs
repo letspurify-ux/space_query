@@ -5480,7 +5480,7 @@ impl SessionTeardownScope {
 
     fn cancel_background_db_work(self, force_timeout: Duration) -> usize {
         match self {
-            Self::EveryConnection => crate::db::cancel_all_db_activities(force_timeout).retired(),
+            Self::EveryConnection => crate::db::cancel_all_db_activities(force_timeout),
             Self::Connection(id) => {
                 crate::db::cancel_db_activities_for_connection(id, force_timeout)
             }
@@ -16516,8 +16516,12 @@ impl MainWindow {
             let mut s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Break metadata sessions before tearing the connections down, so
-            // exit does not wait on a job blocked in a DB call.
+            // Break the metadata sessions first, so the wait below has already
+            // been asked of them by the time it runs. It does NOT mean exit
+            // skips them: cancelling retires their registry rows, and the app
+            // remembers ended-but-not-stopped work in one place precisely so
+            // that a road which cancels early cannot fall out of the wait
+            // (`crate::db::wait_until_cancelled_db_work_let_go`).
             s.object_browser.cancel_metadata_refresh();
             (
                 s.popups.clone(),
@@ -16534,7 +16538,7 @@ impl MainWindow {
         // what this used to do — threw away every session canceler and every
         // hook without breaking anything, and it did so on the FORCED exit
         // path too, the one reached only because the work would not stop.
-        let cancelled = crate::db::cancel_all_db_activities(force_timeout);
+        crate::db::cancel_all_db_activities(force_timeout);
         {
             let mut popups = popups
                 .lock()
@@ -16556,7 +16560,15 @@ impl MainWindow {
         // still checked out of a pool this loop is about to retire. Waited for
         // HERE, before the connections are taken away, so the sessions go back
         // to pools that are still open and the close below logs them off.
-        let still_holding = cancelled.wait_until_the_work_let_go(APPLICATION_EXIT_WORK_STOP_GRACE);
+        //
+        // Asked of the APP, not of the cancel above, and this function is the
+        // proof that the difference matters: the very first thing it did was
+        // `object_browser.cancel_metadata_refresh()`, which retires those rows —
+        // so `cancel_all_db_activities` could not see the metadata loads at all,
+        // and waiting on what it returned skipped exactly the sessions the
+        // comment up there says are broken first.
+        let still_holding =
+            crate::db::wait_until_cancelled_db_work_let_go(APPLICATION_EXIT_WORK_STOP_GRACE);
         if still_holding > 0 {
             crate::utils::logging::log_warning(
                 "app",

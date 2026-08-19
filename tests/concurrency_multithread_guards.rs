@@ -8345,6 +8345,42 @@ fn every_backend_reports_a_cancel_during_session_preparation_as_a_cancel() {
         "all four preparation steps must still be covered: Oracle thin, Oracle OCI, and the \
          MySQL family's database and session-option steps"
     );
+
+    // The four wraps above are the ones the EXECUTION layer applies itself, and
+    // they are not all of the preparation there is. The scope apply inside the
+    // ONE DOOR every pooled session comes through belongs to the DB layer, and
+    // its failure went out verbatim — to the execution layer, the object
+    // browser, IntelliSense and the bind probes alike. Live-observed as
+    // `verify_activity_cancel_live` A9 failing about 1 run in 3 on Oracle thin,
+    // recorded for two rounds as a harness race, which it was not.
+    let connection = read_source("src/db/connection.rs");
+    let door_classifier = connection
+        .find("fn preparation_failure(message: String) -> String {")
+        .map(|offset| slice_to_end_of_fn(&connection, offset))
+        .expect("the acquire door's preparation answer should exist");
+    assert!(
+        door_classifier
+            .contains("crate::db::session_policy::message_indicates_query_cancel(&message)")
+            && door_classifier.contains("result_messages::QUERY_CANCELLED"),
+        "the door must answer from the SAME shared catalog, so every backend and every caller \
+         gets the same answer: {door_classifier}"
+    );
+    let door = connection
+        .find("fn acquire_session_at_the_one_door(")
+        .map(|offset| slice_to_end_of_fn(&connection, offset))
+        .expect("the one acquire door should exist");
+    assert!(
+        compact_for_pattern(door).contains(".map_err(Self::preparation_failure)"),
+        "what the pool answers must be classified before it leaves the door: {door}"
+    );
+    let scoped = connection
+        .find("fn acquire_session_with_scope_context(")
+        .map(|offset| slice_to_end_of_fn(&connection, offset))
+        .expect("the scope-applying acquire should exist");
+    assert!(
+        compact_for_pattern(scoped).contains("Err(Self::preparation_failure(err))"),
+        "and so must the scope apply the door performs itself: {scoped}"
+    );
 }
 
 #[test]
@@ -10089,29 +10125,29 @@ fn application_exit_waits_for_the_teardown_it_decided() {
 fn application_exit_waits_for_the_work_it_cancelled_to_let_go() {
     let connection = read_source("src/db/connection.rs");
 
-    // The cancel ANSWERS with what it ended, and the answer cannot be dropped
-    // on the floor without saying so.
+    // The app keeps ONE standing answer to "what have I ended that has not
+    // stopped", filled by every cancel road — not a per-cancel value. Waiting
+    // on what YOUR OWN cancel returned is not enough, and application exit is
+    // the proof: its first action cancels the object browser's metadata loads,
+    // which retires their rows, so the `cancel_all_db_activities` it runs a
+    // moment later cannot see them.
     assert!(
-        connection.contains("pub struct CancelledDbWork {"),
-        "a cancel must answer with the work it ended, or nothing can wait for it"
-    );
-    let cancelled = connection
-        .find("pub struct CancelledDbWork {")
-        .expect("the answer type should exist");
-    let cancelled_body = slice_to_end_of_item(&connection, cancelled);
-    assert!(
-        compact_for_pattern(cancelled_body)
-            .contains("holding_a_session:Vec<Weak<DbActivityGuardInner>>,"),
-        "and it must hold the work's own GUARD: the registry row is gone at dispatch, so the \
-         guard is the only thing left that says the frame holding the session has ended: \
-         {cancelled_body}"
+        connection.contains("static CANCELLED_WORK_STILL_HOLDING_A_SESSION"),
+        "the app must remember work it ended until that work has stopped"
     );
     assert!(
-        connection.contains(
-            "#[must_use = \"a cancel that is never waited for leaves the caller unable to say \
-             whether the work \\"
-        ) || connection[..cancelled].contains("#[must_use"),
-        "the answer must be `#[must_use]`, so a caller that ignores it does so on purpose"
+        connection.contains("pub fn wait_until_cancelled_db_work_let_go(timeout: Duration)")
+            && connection.contains("pub fn cancelled_db_work_still_holding_a_session()"),
+        "and it must be askable and waitable process-wide, which is what exit needs"
+    );
+    let ledger_entry = connection
+        .find("static CANCELLED_WORK_STILL_HOLDING_A_SESSION")
+        .expect("the ledger should exist");
+    assert!(
+        compact_for_pattern(&connection[ledger_entry..ledger_entry + 400])
+            .contains("Weak<DbActivityGuardInner>"),
+        "it must remember the work's own GUARD: the registry row is gone at dispatch, so the \
+         guard is the only thing left that says the frame holding the session has ended"
     );
 
     // Only the rows that were holding a SESSION are waited for. A row with no
@@ -10136,14 +10172,26 @@ fn application_exit_waits_for_the_work_it_cancelled_to_let_go() {
         .find("fn finish_application_exit(")
         .expect("the decided half of the exit should exist");
     let finish_body = slice_to_end_of_fn(&main_window, finish);
+    let browser_cancel_at = finish_body
+        .find("s.object_browser.cancel_metadata_refresh();")
+        .unwrap_or_else(|| panic!("exit breaks the metadata sessions first: {finish_body}"));
     let cancel_at = finish_body
         .find("crate::db::cancel_all_db_activities(force_timeout)")
         .unwrap_or_else(|| panic!("exit cancels every tracked activity: {finish_body}"));
     let let_go_at = finish_body
-        .find("cancelled.wait_until_the_work_let_go(")
+        .find("crate::db::wait_until_cancelled_db_work_let_go(")
         .unwrap_or_else(|| {
-            panic!("exit must wait for the work it cancelled to let go: {finish_body}")
+            panic!(
+                "exit must wait on the APP's standing answer, not on what its own cancel \
+                 returned — it cancels the object browser's loads BEFORE that cancel, so \
+                 those rows are already gone from it: {finish_body}"
+            )
         });
+    assert!(
+        browser_cancel_at < cancel_at,
+        "the browser cancel really does come first, which is why the wait cannot be asked of \
+         the cancel below it: {finish_body}"
+    );
     let disconnect_at = finish_body
         .find("db_conn.disconnect();")
         .unwrap_or_else(|| panic!("exit disconnects every connection: {finish_body}"));

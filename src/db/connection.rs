@@ -2426,6 +2426,31 @@ impl DbPoolSessionContext {
     /// `acquire_session` was `pub`, and the execution layer called it directly
     /// for Oracle OCI, MySQL and MariaDB. Only Oracle thin's statements came
     /// through the door that asked.
+    /// Tell a failure that happened while a session was being PREPARED as what
+    /// it is.
+    ///
+    /// A cancel that lands before the statement ever reaches the server is a
+    /// CANCEL, not a driver complaint about the preparation step it interrupted.
+    /// The user asked for it, so they must be told it happened — otherwise the
+    /// same click produces the canonical cancel text or a raw ORA-01013 wrapped
+    /// in whichever preparation step the break landed in, depending on the
+    /// microsecond.
+    ///
+    /// The execution layer has had this rule since the four preparation wraps it
+    /// applies itself (`SqlEditorWidget::session_preparation_failure`). This is
+    /// the same rule at the ONE DOOR every pooled session comes through, which
+    /// those four do not cover: the scope apply inside the door belongs to the
+    /// DB layer, and its failure went out verbatim — to the execution layer, the
+    /// object browser, IntelliSense and the bind probes alike. Live-observed as
+    /// `verify_activity_cancel_live` A9 failing about 1 run in 3 on Oracle thin,
+    /// which had been recorded as a harness race and is not one.
+    fn preparation_failure(message: String) -> String {
+        if crate::db::session_policy::message_indicates_query_cancel(&message) {
+            return crate::db::query::result_messages::QUERY_CANCELLED.to_string();
+        }
+        message
+    }
+
     fn acquire_session_at_the_one_door(
         &self,
         activity: &DbActivityGuard,
@@ -2439,7 +2464,9 @@ impl DbPoolSessionContext {
         // Tie the activity to this connection before the session exists, so a
         // teardown that lands mid-acquire still retires this work.
         activity.bind_lifetime(self.activity_lifetime());
-        self.pool.acquire_session(&self.connection_info, activity)
+        self.pool
+            .acquire_session(&self.connection_info, activity)
+            .map_err(Self::preparation_failure)
     }
 
     /// Publish work that will run on THIS connection's pooled sessions.
@@ -2569,7 +2596,7 @@ impl DbPoolSessionContext {
         };
         if let Err(err) = scope_context.apply_current_scope_to_session(session) {
             acquired.discard();
-            return Err(err);
+            return Err(Self::preparation_failure(err));
         }
         if let Err(err) = self.ensure_current() {
             acquired.discard();
@@ -10508,66 +10535,8 @@ fn spawn_force_cancel_watchdog(dispatched: Vec<DispatchedCancel>, force_timeout:
     }
 }
 
-/// The work a cancel has ENDED, so a caller can wait for it to have STOPPED.
-///
-/// A cancel is DISPATCHED, not delivered: the breaks run on the watchdog
-/// thread, and on the MySQL family the first one has to open a control
-/// connection before it can say anything at all. The registry entry goes at
-/// dispatch — which is right, the screen must not go on showing work the user
-/// has ended — and that is exactly why the registry cannot answer the next
-/// question. After a cancel, "is it still running?" has no asker: the row is
-/// gone, and the only thing still tied to the work is its own activity GUARD,
-/// which lives until the frame holding the session ends.
-///
-/// Nothing needed to ask while the process was still there: a cancelled read
-/// lets go a moment later, gives its session back, and the pool logs it off.
-/// Application EXIT is the one caller for which a moment later is never — it
-/// disconnects, retires the pool and quits while the worker is still unwinding,
-/// and the session goes with the process, leaving the server to reap it from a
-/// dropped socket. Measured on all four backends by
-/// `verify_session_leak_live` T16.
-#[must_use = "a cancel that is never waited for leaves the caller unable to say whether the work               it ended has actually stopped"]
-pub struct CancelledDbWork {
-    retired: usize,
-    /// The guard of every cancelled row that had a SESSION published under it,
-    /// and only those.
-    ///
-    /// A row with no canceler was holding no session, so there is nothing about
-    /// it a teardown could be too early for — and waiting on it would be
-    /// waiting on whoever happens to hold the guard, which for a status row is
-    /// the SCREEN. That is how a wait meant for the work would come to be spent
-    /// on the UI's own bookkeeping.
-    holding_a_session: Vec<Weak<DbActivityGuardInner>>,
-}
-
-impl CancelledDbWork {
-    /// How many registry entries this cancel retired.
-    pub fn retired(&self) -> usize {
-        self.retired
-    }
-
-    /// How much of that work is still running on the session it was holding.
-    pub fn still_holding_a_session(&self) -> usize {
-        self.holding_a_session
-            .iter()
-            .filter(|guard| guard.strong_count() > 0)
-            .count()
-    }
-
-    /// Wait, up to `timeout`, for the work this cancel ended to let go of its
-    /// sessions. Answers how much of it is still holding one.
-    ///
-    /// The same shape every other wait in the app uses
-    /// ([`wait_for_graceful_cancel`]): the question is asked FIRST on every
-    /// pass, so an already elapsed deadline is never an answer on its own.
-    pub fn wait_until_the_work_let_go(&self, timeout: Duration) -> usize {
-        wait_for_graceful_cancel(timeout, || self.still_holding_a_session() > 0);
-        self.still_holding_a_session()
-    }
-}
-
-/// Work the app has ENDED but which has not STOPPED, listed by the connection
-/// it is still holding a session on.
+/// Work the app has ENDED but which has not STOPPED, with the connection it is
+/// still holding a session on.
 ///
 /// `cancel_db_activities_where` removes the registry entry at DISPATCH, and
 /// that is right — the screen must not go on showing work the user ended. It
@@ -10576,18 +10545,26 @@ impl CancelledDbWork {
 /// takes: the breaks run on the watchdog thread, and on the MySQL family the
 /// first one opens a control connection before it can say anything at all.
 ///
-/// For every question in the app but one, that is harmless: the work is over
-/// either way and its session goes back a moment later. The exception is the
-/// question that ENDS a connection.
-/// [`crate::db::ConnectionRuntime::is_idle`] asks whether anything can still
-/// reach a transient connection, and `remove_transient_if_idle` does not merely
-/// forget one — it disconnects it. Closing a query tab cancels that tab's
-/// object-browser card (`remove_entry_widget` -> `cancel_metadata_refresh`) and
-/// then asks that question in the same UI-thread frame, so a metadata load that
-/// had just been ended was no longer named by anything, and its connection was
-/// pulled out from under it. That is round 13's defect reopened one road along:
-/// there the registry was not asked at all, here it is asked a question a
-/// cancel has already made stale.
+/// Two questions in the app need the difference, and both would otherwise be
+/// answered wrongly in the direction that costs a session:
+///
+/// * [`crate::db::ConnectionRuntime::is_idle`], which decides whether a
+///   transient connection may leave the registry — and that removal
+///   DISCONNECTS it. Closing a query tab cancels that tab's object-browser card
+///   and asks this in the same UI-thread frame, so a metadata load that had
+///   just been ended was named by nothing and had its connection pulled out
+///   from under it.
+/// * application EXIT, which waits for the work it ended to let go before it
+///   takes the connections away and quits. Waiting on what ITS OWN cancel
+///   returned is not enough, and exit is the proof: its first action is to
+///   cancel the object browser's metadata loads, so the
+///   `cancel_all_db_activities` it runs a moment later cannot see them — the
+///   very sessions it says it breaks first. One standing answer, filled by
+///   every cancel road, is what both of them ask.
+///
+/// Pruned on every read and every write, so it holds only work that is still
+/// running: a `Weak` whose guard is gone is work whose frame has ended, and
+/// with it the session it was holding.
 static CANCELLED_WORK_STILL_HOLDING_A_SESSION: OnceLock<
     Mutex<Vec<(Option<ConnectionId>, Weak<DbActivityGuardInner>)>>,
 > = OnceLock::new();
@@ -10601,25 +10578,10 @@ fn lock_cancelled_work_still_holding_a_session(
 }
 
 /// Remember what a cancel ended, until it has actually stopped.
-///
-/// Pruned on every write and every read, so it holds only work that is still
-/// running: a `Weak` whose guard is gone is work whose frame has ended, and
-/// with it the session it was holding.
 fn remember_cancelled_work_still_holding_a_session(
     work: Vec<(Option<ConnectionId>, Weak<DbActivityGuardInner>)>,
 ) {
-    // Only what can be ATTRIBUTED to a connection. Work that names none cannot
-    // answer a question about one — the same rule
-    // [`db_activity_names_connection`] and [`pool_session_handout_is_held`]
-    // already state — so parking it here would only be something to prune.
-    // Note the difference from [`CancelledDbWork::holding_a_session`], which
-    // deliberately keeps ALL of it: application exit waits for every job it
-    // ended, whether or not the app can say which connection it was on.
-    let mut work = work
-        .into_iter()
-        .filter(|(connection_id, _)| connection_id.is_some())
-        .peekable();
-    if work.peek().is_none() {
+    if work.is_empty() {
         return;
     }
     let mut ledger = lock_cancelled_work_still_holding_a_session();
@@ -10628,17 +10590,46 @@ fn remember_cancelled_work_still_holding_a_session(
 }
 
 /// Whether work this connection carries was ended but has not let go yet.
+///
+/// Work that names no connection is not counted here, for the same reason
+/// [`db_activity_names_connection`] and [`pool_session_handout_is_held`] do not
+/// count it: work that cannot be attributed to a connection cannot answer a
+/// question about one. It is still REMEMBERED, because application exit waits
+/// for every job the app ended whether or not it can say which connection it
+/// was on — the difference is stated at the reader, so there is one store.
 fn cancelled_work_still_holds_a_session_on(connection_id: ConnectionId) -> bool {
     let mut ledger = lock_cancelled_work_still_holding_a_session();
     ledger.retain(|(_, guard)| guard.strong_count() > 0);
     ledger.iter().any(|(on, _)| *on == Some(connection_id))
 }
 
+/// How much work the app has ENDED is still holding a session, anywhere.
+///
+/// The question application EXIT asks. Deliberately not "what did MY cancel
+/// end": see [`CANCELLED_WORK_STILL_HOLDING_A_SESSION`].
+pub fn cancelled_db_work_still_holding_a_session() -> usize {
+    let mut ledger = lock_cancelled_work_still_holding_a_session();
+    ledger.retain(|(_, guard)| guard.strong_count() > 0);
+    ledger.len()
+}
+
+/// Wait, up to `timeout`, for the work the app has ended to let go of the
+/// sessions it was holding. Answers how much is still holding one.
+///
+/// The same shape every other wait in the app uses
+/// ([`wait_for_graceful_cancel`]): the question is asked FIRST on every pass,
+/// so an already elapsed deadline is never an answer on its own.
+pub fn wait_until_cancelled_db_work_let_go(timeout: Duration) -> usize {
+    wait_for_graceful_cancel(timeout, || cancelled_db_work_still_holding_a_session() > 0);
+    cancelled_db_work_still_holding_a_session()
+}
+
 /// Cancel every tracked activity matching `select`, removing their entries.
+/// Returns how many were retired.
 fn cancel_db_activities_where(
     force_timeout: Duration,
     select: impl Fn(&TrackedDbActivity) -> bool,
-) -> CancelledDbWork {
+) -> usize {
     // Nothing that can block or re-enter runs while the registry lock is held:
     // `interrupt` makes a network call (MySQL cancels over a second
     // connection), and a cancel hook calls back into the owner, which may touch
@@ -10705,24 +10696,17 @@ fn cancel_db_activities_where(
         }
     }
     spawn_force_cancel_watchdog(dispatched, force_timeout);
-    let holding_a_session = still_holding
-        .iter()
-        .map(|(_, guard)| guard.clone())
-        .collect();
     // Outside the registry lock, like everything else this function does with
     // what it took out of it: the registry is a leaf and nothing may be taken
     // under it.
     remember_cancelled_work_still_holding_a_session(still_holding);
-    CancelledDbWork {
-        retired,
-        holding_a_session,
-    }
+    retired
 }
 
 /// Cancel one activity by id. Used by the cancel button for work that has no
 /// query tab behind it.
 pub fn cancel_db_activity(id: u64, force_timeout: Duration) -> bool {
-    cancel_db_activities_where(force_timeout, |tracked| tracked.id == id).retired() > 0
+    cancel_db_activities_where(force_timeout, |tracked| tracked.id == id) > 0
 }
 
 /// Retire every activity whose connection is gone.
@@ -10731,7 +10715,7 @@ pub fn cancel_db_activity(id: u64, force_timeout: Duration) -> bool {
 /// on the status bar tick, so a disconnect clears within one UI frame no matter
 /// which code path started the work.
 pub fn sweep_stale_db_activities(force_timeout: Duration) -> usize {
-    cancel_db_activities_where(force_timeout, TrackedDbActivity::is_stale).retired()
+    cancel_db_activities_where(force_timeout, TrackedDbActivity::is_stale)
 }
 
 /// Retire every activity belonging to a connection that is being closed.
@@ -10742,7 +10726,6 @@ pub fn cancel_db_activities_for_connection(
     cancel_db_activities_where(force_timeout, |tracked| {
         tracked.connection_id == Some(connection_id)
     })
-    .retired()
 }
 
 /// Retire every activity in the app, because the app itself is ending.
@@ -10757,7 +10740,7 @@ pub fn cancel_db_activities_for_connection(
 /// breaking anything. That was done on the FORCED exit path too, the one
 /// reached only because the work would not stop, so the one mechanism able to
 /// end those sessions was destroyed a statement before they needed ending.
-pub fn cancel_all_db_activities(force_timeout: Duration) -> CancelledDbWork {
+pub fn cancel_all_db_activities(force_timeout: Duration) -> usize {
     cancel_db_activities_where(force_timeout, |_| true)
 }
 
@@ -11774,6 +11757,15 @@ mod tests {
     /// describe what a function DOES, so a comment added inside it could push
     /// the very line being asserted past the end of the window and turn a
     /// documentation change into a red test that says nothing true.
+    /// Source with every whitespace character removed, so a needle asserts a
+    /// RULE rather than the shape `cargo fmt` happens to give it. A call that
+    /// grows an argument gets re-wrapped across lines, and a literal needle
+    /// then stops matching what it still asserts — twice already in this file's
+    /// history.
+    fn compacted(source: &str) -> String {
+        source.chars().filter(|ch| !ch.is_whitespace()).collect()
+    }
+
     fn source_of_fn(source: &'static str, signature: &str) -> &'static str {
         let start = source
             .find(signature)
@@ -12553,9 +12545,9 @@ mod tests {
     #[test]
     fn the_pool_refuses_a_held_connection_before_it_looks_at_anything_else() {
         let source = include_str!("connection.rs");
-        let acquire = source_of_fn(source, "fn acquire_session_at_the_one_door(");
+        let acquire = compacted(source_of_fn(source, "fn acquire_session_at_the_one_door("));
         let refusal = acquire
-            .find("if pool_session_handout_is_held(self.connection_id) {")
+            .find("ifpool_session_handout_is_held(self.connection_id){")
             .expect("the acquire door must ask whether the connection is held");
         let ensure_current = acquire
             .find("self.ensure_current()?;")
@@ -12599,7 +12591,7 @@ mod tests {
         // Every road inside the DB layer that reaches the pool is the door
         // itself; the two public entry points delegate to it.
         assert_eq!(
-            source.matches(&reaches_the_pool).count(),
+            compacted(source).matches(&reaches_the_pool).count(),
             1,
             "exactly one place may reach the pool"
         );
@@ -12609,7 +12601,7 @@ mod tests {
         ] {
             let body = source_of_fn(source, entry);
             assert!(
-                body.contains("acquire_session_at_the_one_door(activity)"),
+                compacted(body).contains("acquire_session_at_the_one_door(activity)"),
                 "{entry} must acquire through the door: {body}"
             );
         }
@@ -14687,56 +14679,112 @@ mod tests {
         }
     }
 
-    /// A cancel ENDS work; it does not STOP it. What it answers with is what
-    /// lets a caller wait for the difference.
+    /// A cancel ENDS work; it does not STOP it — and the app keeps ONE answer
+    /// to the difference, whoever ended the work.
     ///
-    /// The registry entry goes at DISPATCH — which is right, the screen must not
-    /// go on showing work the user ended — so after a cancel nothing but the
+    /// The registry entry goes at DISPATCH, so after a cancel nothing but the
     /// work's own activity guard is still tied to it. Application exit is the
     /// caller that has to know: it disconnects, retires the pool and quits, and
     /// a session a cancelled job is still holding goes with the process.
+    ///
+    /// A per-cancel answer is NOT enough, and exit is the proof: its first
+    /// action cancels the object browser's metadata loads, so the
+    /// `cancel_all_db_activities` it runs a moment later cannot see them.
     #[test]
-    fn a_cancel_answers_with_the_work_it_ended_so_a_caller_can_wait_for_it_to_stop() {
+    fn the_app_remembers_work_it_ended_until_that_work_has_stopped() {
+        let _test_guard = db_activity_test_lock();
         // The registry is process-wide and the tests that reach for it EMPTY it
         // (`reset_tracked_db_activities_for_probe`), so every one of them takes
-        // this lock. Without it a reset landing between the row being published
+        // that lock. Without it a reset landing between the row being published
         // and its canceler being attached makes the attach answer
-        // `ActivityRetired` — which is what made this test intermittently red.
-        let _test_guard = db_activity_test_lock();
-        let activity = track_db_activity("a job holding a session", None);
+        // `ActivityRetired`.
+        let connection_id = ConnectionId::for_test(4244);
+        let activity =
+            track_db_activity_for_connection("a job holding a session", None, connection_id);
         let registration = activity
             .attach_canceler(Arc::new(TestCanceler::default()))
             .attached()
             .expect("the canceler should attach");
         let id = activity.id();
 
-        let cancelled = cancel_db_activity_for_test(id);
-        assert_eq!(cancelled.retired(), 1, "the row is retired at dispatch");
+        // Ended by SOMETHING ELSE than the caller that will wait — which is the
+        // shape exit is in.
+        assert_eq!(
+            cancel_db_activity_for_test(id),
+            1,
+            "the row is retired at dispatch"
+        );
         assert!(
             !activity_is_registered(id),
             "and it leaves the registry there, which is why the registry cannot answer next"
         );
-        assert_eq!(
-            cancelled.still_holding_a_session(),
-            1,
-            "but the work is still running on the session it was holding, and the answer says so"
+        assert!(
+            cancelled_db_work_still_holding_a_session() > 0,
+            "but the work is still running on the session it was holding, and the app says so \
+             without being told who ended it"
         );
         // A bounded wait that cannot succeed still ANSWERS, rather than
         // pretending the work stopped.
-        assert_eq!(
-            cancelled.wait_until_the_work_let_go(Duration::from_millis(50)),
-            1,
+        assert!(
+            wait_until_cancelled_db_work_let_go(Duration::from_millis(50)) > 0,
             "a wait that runs out reports what is still holding on"
         );
 
         // The worker's frame ends: its registration goes, then its guard.
         drop(registration);
         drop(activity);
-        assert_eq!(
-            cancelled.wait_until_the_work_let_go(Duration::from_secs(5)),
-            0,
-            "and the wait ends the moment the work has let go"
+        let started = Instant::now();
+        wait_until_cancelled_db_work_let_go(Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "and the wait ends because the work let go, not because time passed"
         );
+        assert!(
+            !db_activity_names_connection(connection_id),
+            "with nothing of it left"
+        );
+    }
+
+    /// A cancel that lands while a session is being PREPARED is reported as a
+    /// cancel, not as the preparation step it interrupted.
+    ///
+    /// The user asked for it, so the same click must not produce "Query
+    /// cancelled" or a driver complaint depending on which microsecond the
+    /// break landed in. The execution layer has had this rule for the four
+    /// wraps it applies itself; the ONE DOOR every pooled session comes through
+    /// did not, and its scope apply belongs to the DB layer — so the raw
+    /// message went out to the execution layer, the object browser,
+    /// IntelliSense and the bind probes alike.
+    #[test]
+    fn a_cancel_that_lands_while_a_session_is_prepared_is_reported_as_a_cancel() {
+        // Every backend's own marker, through the shared catalog, so no backend
+        // can join the app with a cancel this door would not recognise.
+        for raw in [
+            "Failed to apply Oracle current schema: ORA-01013: user requested cancel of current \
+             operation",
+            "Failed to apply Oracle session setting `ALTER SESSION SET TIME_ZONE = '+00:00'`: \
+             ORA-01013: user requested cancel of current operation",
+            "Failed to select database: Query execution was interrupted",
+        ] {
+            assert_eq!(
+                DbPoolSessionContext::preparation_failure(raw.to_string()),
+                crate::db::query::result_messages::QUERY_CANCELLED,
+                "a cancel during preparation must be told as a cancel: {raw}"
+            );
+        }
+
+        // ...and nothing else is rewritten: a real preparation failure must
+        // still say what went wrong.
+        for raw in [
+            "Failed to apply Oracle current schema: ORA-01435: user does not exist",
+            "Failed to select database: Unknown database 'gone'",
+        ] {
+            assert_eq!(
+                DbPoolSessionContext::preparation_failure(raw.to_string()),
+                raw,
+                "a failure that is not a cancel must keep its own words: {raw}"
+            );
+        }
     }
 
     /// A connection goes on being NAMED by work the app has ended until that
@@ -14763,8 +14811,7 @@ mod tests {
             "a running read names its connection"
         );
 
-        let cancelled = cancel_db_activity_for_test(activity.id());
-        assert_eq!(cancelled.retired(), 1);
+        assert_eq!(cancel_db_activity_for_test(activity.id()), 1);
         assert!(
             !activity_is_registered(activity.id()),
             "the row leaves the registry at dispatch, which is what makes the next answer hard"
@@ -14798,8 +14845,7 @@ mod tests {
         let activity =
             track_db_activity_for_connection("a row with no session", None, connection_id);
 
-        let cancelled = cancel_db_activity_for_test(activity.id());
-        assert_eq!(cancelled.retired(), 1);
+        assert_eq!(cancel_db_activity_for_test(activity.id()), 1);
         assert!(
             !db_activity_names_connection(connection_id),
             "nothing here was holding a session, so nothing keeps the connection named"
@@ -14817,21 +14863,27 @@ mod tests {
     #[test]
     fn a_cancelled_row_that_was_holding_no_session_is_not_waited_for() {
         let _test_guard = db_activity_test_lock();
+        let before = cancelled_db_work_still_holding_a_session();
         let activity = track_db_activity("a row the screen owns", None);
         let id = activity.id();
 
-        let cancelled = cancel_db_activity_for_test(id);
-        assert_eq!(cancelled.retired(), 1, "the row is still retired");
         assert_eq!(
-            cancelled.still_holding_a_session(),
-            0,
-            "but nothing here is holding a session, so there is nothing to wait for"
+            cancel_db_activity_for_test(id),
+            1,
+            "the row is still retired"
         );
-        // Still held, and deliberately: this is the shape that would otherwise
-        // make every exit wait out its whole budget.
         assert_eq!(
-            cancelled.wait_until_the_work_let_go(Duration::from_secs(5)),
-            0,
+            cancelled_db_work_still_holding_a_session(),
+            before,
+            "but nothing here was holding a session, so there is nothing to wait for"
+        );
+        // The guard is STILL HELD, deliberately: this is the shape that would
+        // otherwise make every exit wait out its whole budget on the screen's
+        // own bookkeeping.
+        let started = Instant::now();
+        wait_until_cancelled_db_work_let_go(Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
             "so the wait returns at once even though the guard is still alive"
         );
         drop(activity);
@@ -14867,14 +14919,10 @@ mod tests {
         activity_row(id).is_some()
     }
 
-    /// Cancel ONE row and keep what the cancel answered with.
-    ///
-    /// `cancel_db_activity` throws that answer away for its `bool`, and the
-    /// answer is what the tests below are about. Scoped to one id for the same
-    /// reason `activity_row` is: the registry is process-wide and the suite is
-    /// multi-threaded, so `cancel_all_db_activities` here would end whatever
-    /// else is running.
-    fn cancel_db_activity_for_test(id: u64) -> CancelledDbWork {
+    /// Cancel ONE row. Scoped to one id for the same reason `activity_row` is:
+    /// the registry is process-wide and the suite is multi-threaded, so
+    /// `cancel_all_db_activities` here would end whatever else is running.
+    fn cancel_db_activity_for_test(id: u64) -> usize {
         cancel_db_activities_where(Duration::from_secs(60), |tracked| tracked.id == id)
     }
 
