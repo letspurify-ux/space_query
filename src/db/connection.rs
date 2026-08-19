@@ -3126,12 +3126,19 @@ impl DbConnectionPool {
     /// RESIZE, where the connection stays up and only the pool is replaced.
     ///
     /// Two of the three arms are empty, and that is an answer rather than an
-    /// omission: only the thin pool needs telling.
+    /// omission: only the thin pool needs telling. The rule all three follow is
+    /// the same -- a session sitting IDLE in the pool has no holder and must be
+    /// logged off when the pool is retired, while a session still CHECKED OUT
+    /// belongs to whoever holds it and is closed by that holder.
     ///
     /// * **Oracle OCI** — `oracle::pool::Pool` owns a `DpiPool` handle, and
     ///   releasing the last reference makes ODPI-C destroy the session pool
     ///   itself, which logs its sessions off. Calling `close` here as well
-    ///   would only race the drop for the right to report the same error.
+    ///   would only race the drop for the right to report the same error — and
+    ///   it could only be `CloseMode::Default`, because `Force` would tear down
+    ///   a session another tab is running on (the rule
+    ///   [`CanceledSession::force_tier_may_destroy_it`] states for every other
+    ///   road in the app that could destroy one).
     /// * **MySQL / MariaDB** — the driver's pool closes the connections queued
     ///   in it when its last handle goes. A session still CHECKED OUT keeps the
     ///   inner pool alive until it is given back, which is what must happen:
@@ -3141,14 +3148,21 @@ impl DbConnectionPool {
     ///   dropping the `Arc` says nothing to the server. So it is asked
     ///   explicitly.
     ///
-    /// What the leak census (`verify_session_leak_live`) proves about this is
-    /// bounded, and worth stating: its T- and P-scenarios count the SERVER's
-    /// sessions after both roads on all four backends, and every session they
-    /// can create is one that was CHECKED OUT — a tab's retained session, a
-    /// lazy fetch's — which is closed individually by the holder that gives it
-    /// up. (Measured: leaking the retired pool outright still leaves those
-    /// counts correct.) A session sitting IDLE in the pool has no such holder,
-    /// and that is what this call is for.
+    /// The IDLE case is what this is about, and it is now MEASURED rather than
+    /// reasoned about. Round 9 recorded that the leak census could only create
+    /// sessions that were CHECKED OUT — a tab's retained session, a lazy
+    /// fetch's — each closed by its own holder, so the empty arms stood on an
+    /// argument. `verify_session_leak_live` T14 creates the missing case on all
+    /// four backends: it acquires a pooled read on a script-created connection
+    /// and gives it back, leaving exactly one session IDLE in that pool, and
+    /// then ends the connection. The census settles back to the baseline on
+    /// every backend, which is what says the two empty arms are right.
+    ///
+    /// It also says what a holder that outlives the teardown costs: while
+    /// anything still holds a clone of the pool — a `DbPoolSessionContext` in a
+    /// worker's frame is the real-world one — the idle sessions stay up on OCI
+    /// and the MySQL family until that clone goes. That is bounded and
+    /// self-healing (the frame ends), and it is why T14 drops its context.
     fn close(&self) {
         match self {
             DbConnectionPool::Oracle { .. } | DbConnectionPool::MySQL { .. } => {}
@@ -10049,6 +10063,33 @@ pub fn active_db_activity_snapshots() -> Vec<DbActivitySnapshot> {
         .collect()
 }
 
+/// Whether the registry still names work running on this connection.
+///
+/// The same question `background_work_blocking_session_teardown` asks of a
+/// `SessionTeardownScope::Connection`, in the form the DB layer can ask: a
+/// predicate rather than a snapshot list, because the one caller is
+/// [`crate::db::ConnectionRuntime::is_idle`] and it is asked under the
+/// connection registry's own lock.
+///
+/// It exists because "nothing can still reach this connection" was answered by
+/// three counters that count TABS and EXECUTIONS. Everything else that holds a
+/// pooled session on a connection -- the object browser's metadata reads,
+/// IntelliSense's schema and column loads, the bind-parameter probes, the
+/// signature hints, the object export/import -- is in none of them, and the
+/// registry is the one place that knows about all of it, on every backend.
+/// Answering yes without asking it let `remove_transient_if_idle` DISCONNECT a
+/// connection with a read still running on it, leaving the status tick's stale
+/// sweep to force-cancel work that was never asked to stop.
+///
+/// A row that names NO connection is not counted, for the same reason
+/// `background_work_blocking_session_teardown` does not count one: work that
+/// cannot be attributed to a connection must not refuse an action on one.
+pub(crate) fn db_activity_names_connection(connection_id: ConnectionId) -> bool {
+    lock_db_activities()
+        .iter()
+        .any(|tracked| tracked.connection_id == Some(connection_id))
+}
+
 /// Wait out the graceful tier of a two-tier cancel.
 ///
 /// Polls `still_pending` until `timeout` elapses. Returns true when the
@@ -12038,6 +12079,82 @@ mod tests {
     /// A decided session-ending action holds its connections' pools shut, so
     /// no road can start pool work in the window the gate has already answered
     /// about.
+    /// The announcement and the pool hold are one fact, and they travel
+    /// together in both directions.
+    #[test]
+    fn an_announced_transition_shuts_the_pool_and_re_opens_it() {
+        let registry = crate::db::ConnectionRegistry::new();
+        let (runtime, registration_claim) = registry.register_transient(create_shared_connection());
+        drop(registration_claim);
+        let id = runtime.id();
+
+        assert!(!pool_session_handout_is_held(Some(id)));
+        let mut transition =
+            crate::db::ConnectionRuntime::announce_transition(vec![runtime.clone()]);
+        assert_eq!(
+            runtime.state(),
+            crate::db::ConnectionRuntimeState::Transitioning
+        );
+        assert!(
+            pool_session_handout_is_held(Some(id)),
+            "a connection that says it is mid-change must not hand out new sessions"
+        );
+
+        transition.finished(&runtime);
+        assert_ne!(
+            runtime.state(),
+            crate::db::ConnectionRuntimeState::Transitioning
+        );
+        assert!(!pool_session_handout_is_held(Some(id)));
+    }
+
+    /// Finishing re-opens the pool BEFORE it publishes the state.
+    ///
+    /// The order is observable because `finish_announced_transition` reads the
+    /// connection back, so holding the connection mutex parks it there: with
+    /// the right order the hold is already gone at that point, and with the
+    /// wrong one the state is already published and the pool is still shut --
+    /// which is a refusal ("a session-ending action is holding this
+    /// connection's pool shut") the user sees for an action that is over.
+    #[test]
+    fn finishing_a_transition_re_opens_the_pool_before_it_publishes_the_state() {
+        let registry = crate::db::ConnectionRegistry::new();
+        let shared = create_shared_connection();
+        let (runtime, registration_claim) = registry.register_transient(Arc::clone(&shared));
+        drop(registration_claim);
+        let id = runtime.id();
+        let mut transition =
+            crate::db::ConnectionRuntime::announce_transition(vec![runtime.clone()]);
+
+        let parked = lock_connection(&shared);
+        let runtime_for_finisher = runtime.clone();
+        let finisher = std::thread::spawn(move || {
+            transition.finished(&runtime_for_finisher);
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pool_session_handout_is_held(Some(id)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !pool_session_handout_is_held(Some(id)),
+            "the pool re-opens before the state is handed back"
+        );
+        assert_eq!(
+            runtime.state(),
+            crate::db::ConnectionRuntimeState::Transitioning,
+            "and the finisher really is still parked, so this proves an ORDER and not \
+             just an outcome"
+        );
+
+        drop(parked);
+        finisher.join().expect("the finisher should not panic");
+        assert_ne!(
+            runtime.state(),
+            crate::db::ConnectionRuntimeState::Transitioning
+        );
+    }
+
     #[test]
     fn a_decided_session_ending_action_holds_the_pool_shut() {
         let held = ConnectionId::for_test(90_001);

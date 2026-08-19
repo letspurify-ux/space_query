@@ -4852,11 +4852,13 @@ impl SqlEditorWidget {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_lazy_fetch_handle(
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         index: usize,
         session_id: u64,
         connection_generation: u64,
+        connection_id: Option<crate::db::ConnectionId>,
         db_type: crate::db::DatabaseType,
         sender: mpsc::Sender<LazyFetchCommand>,
         cancel_handle: Option<LazyFetchCancelHandle>,
@@ -4869,6 +4871,7 @@ impl SqlEditorWidget {
             session_id,
             operation_id: session_id,
             connection_generation,
+            connection_id,
             db_type,
             sender,
             cancel_handle,
@@ -5950,6 +5953,7 @@ impl SqlEditorWidget {
             index,
             session_id,
             connection_generation,
+            sender.execution_connection_id(),
             crate::db::DatabaseType::Oracle,
             command_sender,
             Some(lazy_force_target.as_handle()),
@@ -5960,6 +5964,8 @@ impl SqlEditorWidget {
             session_id,
             operation_id: session_id,
             connection_generation,
+            // Stated by the sender from the operation's execution origin.
+            connection_id: None,
         });
         app::awake();
         let cleanup_sender = sender.clone();
@@ -6507,6 +6513,7 @@ impl SqlEditorWidget {
             index,
             session_id,
             connection_generation,
+            sender.execution_connection_id(),
             crate::db::DatabaseType::Oracle,
             command_sender,
             Some(lazy_force_target.as_handle()),
@@ -6517,6 +6524,8 @@ impl SqlEditorWidget {
             session_id,
             operation_id: session_id,
             connection_generation,
+            // Stated by the sender from the operation's execution origin.
+            connection_id: None,
         });
         app::awake();
         let cleanup_sender = sender.clone();
@@ -7390,6 +7399,7 @@ impl SqlEditorWidget {
             index,
             session_id,
             connection_generation,
+            sender.execution_connection_id(),
             connection_info.db_type,
             command_sender,
             Some(lazy_force_target.as_handle()),
@@ -7400,6 +7410,8 @@ impl SqlEditorWidget {
             session_id,
             operation_id: session_id,
             connection_generation,
+            // Stated by the sender from the operation's execution origin.
+            connection_id: None,
         });
         app::awake();
         let cleanup_sender = sender.clone();
@@ -13450,13 +13462,9 @@ impl SqlEditorWidget {
                                                     operation_id,
                                                     &cancel_flag,
                                                 ) {
-                                                    if let Some(mut guard) =
-                                                        crate::db::try_lock_connection(
-                                                            &candidate_connection,
-                                                        )
-                                                    {
-                                                        guard.disconnect();
-                                                    }
+                                                    crate::db::end_connection_leaving_the_app(
+                                                        candidate_connection.clone(),
+                                                    );
                                                     SqlEditorWidget::emit_script_message(
                                                         &sender,
                                                         &session,
@@ -13522,13 +13530,9 @@ impl SqlEditorWidget {
                                                 let Some(prepared_conn) =
                                                     next_conn_opt.as_ref().cloned()
                                                 else {
-                                                    if let Some(mut guard) =
-                                                        crate::db::try_lock_connection(
-                                                            &candidate_connection,
-                                                        )
-                                                    {
-                                                        guard.disconnect();
-                                                    }
+                                                    crate::db::end_connection_leaving_the_app(
+                                                        candidate_connection.clone(),
+                                                    );
                                                     SqlEditorWidget::emit_script_message(
                                                         &sender,
                                                         &session,
@@ -13542,13 +13546,9 @@ impl SqlEditorWidget {
                                                 if let Err(err) =
                                                     prepared_conn.set_call_timeout(query_timeout)
                                                 {
-                                                    if let Some(mut guard) =
-                                                        crate::db::try_lock_connection(
-                                                            &candidate_connection,
-                                                        )
-                                                    {
-                                                        guard.disconnect();
-                                                    }
+                                                    crate::db::end_connection_leaving_the_app(
+                                                        candidate_connection.clone(),
+                                                    );
                                                     SqlEditorWidget::emit_script_message(
                                                         &sender,
                                                         &session,
@@ -13656,13 +13656,9 @@ impl SqlEditorWidget {
                                                         Err(message) => Some(message),
                                                     };
                                                     if let Some(err) = failure {
-                                                        if let Some(mut guard) =
-                                                            crate::db::try_lock_connection(
-                                                                &candidate_connection,
-                                                            )
-                                                        {
-                                                            guard.disconnect();
-                                                        }
+                                                        crate::db::end_connection_leaving_the_app(
+                                                            candidate_connection.clone(),
+                                                        );
                                                         SqlEditorWidget::emit_script_message(
                                                             &sender,
                                                             &session,
@@ -13691,13 +13687,9 @@ impl SqlEditorWidget {
                                                     operation_id,
                                                     &cancel_flag,
                                                 ) {
-                                                    if let Some(mut guard) =
-                                                        crate::db::try_lock_connection(
-                                                            &candidate_connection,
-                                                        )
-                                                    {
-                                                        guard.disconnect();
-                                                    }
+                                                    crate::db::end_connection_leaving_the_app(
+                                                        candidate_connection.clone(),
+                                                    );
                                                     SqlEditorWidget::emit_script_message(
                                                         &sender,
                                                         &session,
@@ -13706,13 +13698,18 @@ impl SqlEditorWidget {
                                                     );
                                                     continue;
                                                 }
-                                                let candidate_runtime = connection_binding_for_worker
-                                                    .register_transient_connection(
-                                                        candidate_connection.clone(),
-                                                    );
+                                                // Registered and CLAIMED in one
+                                                // step: a transient runtime that
+                                                // is in the registry while nothing
+                                                // claims it reads idle to
+                                                // `remove_idle_transient_runtimes`,
+                                                // which ENDS it.
+                                                let (candidate_runtime, candidate_work_guard) =
+                                                    connection_binding_for_worker
+                                                        .register_transient_connection(
+                                                            candidate_connection.clone(),
+                                                        );
                                                 let candidate_runtime_id = candidate_runtime.id();
-                                                let candidate_work_guard =
-                                                    candidate_runtime.begin_work();
                                                 let Ok(next_binding_revision) =
                                                     connection_binding_for_worker.bind_if_revision(
                                                         binding_revision,
@@ -19121,10 +19118,12 @@ impl SqlEditorWidget {
             );
         }
 
-        let candidate_runtime =
+        // Registered and CLAIMED in one step, like the OCI road: a transient
+        // runtime published before anything claims it reads idle to
+        // `remove_idle_transient_runtimes`, which ENDS the connection.
+        let (candidate_runtime, candidate_work_guard) =
             connection_binding.register_transient_connection(candidate_connection.clone());
         let candidate_runtime_id = candidate_runtime.id();
-        let candidate_work_guard = candidate_runtime.begin_work();
         let binding_revision = match connection_binding.bind_if_revision(
             expected_binding_revision,
             candidate_runtime,
@@ -33792,6 +33791,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -33839,6 +33839,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -33867,6 +33868,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -33906,6 +33908,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: Some(LazyFetchCancelHandle::Test(db_cancel_called.clone())),
@@ -33937,6 +33940,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: Some(LazyFetchCancelHandle::Test(db_cancel_called.clone())),
@@ -33976,6 +33980,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: Some(LazyFetchCancelHandle::Test(db_cancel_called.clone())),
@@ -34019,6 +34024,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender: command_sender,
             cancel_handle: Some(LazyFetchCancelHandle::Test(db_cancel_called.clone())),
@@ -34081,6 +34087,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender: command_sender,
             cancel_handle: Some(LazyFetchCancelHandle::TestBlockingForce {
@@ -34153,6 +34160,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::MySQL,
             sender: command_sender,
             // A GENUINE failure: the fetch has no force-cancel handle at all
@@ -34212,6 +34220,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::MySQL,
             sender: command_sender,
             cancel_handle: Some(target.as_handle()),
@@ -34255,6 +34264,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -34310,6 +34320,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -34404,6 +34415,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -34437,6 +34449,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -34463,6 +34476,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -34498,6 +34512,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -34534,6 +34549,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -34569,6 +34585,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -34604,6 +34621,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -34632,6 +34650,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
@@ -37335,6 +37354,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
+            connection_id: None,
             db_type: crate::db::DatabaseType::Oracle,
             sender: command_sender,
             cancel_handle: None,

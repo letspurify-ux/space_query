@@ -548,12 +548,28 @@ impl ConnectionRuntime {
     /// an action cannot stop being refused while it is still running. See
     /// [`RuntimeStateCell`].
     pub fn announce_transition(runtimes: Vec<Arc<ConnectionRuntime>>) -> ConnectionTransition {
-        for runtime in &runtimes {
-            runtime.begin_announced_transition();
-        }
+        // The POOL IS SHUT FIRST, and the announcement follows it.
+        //
+        // The two are one fact -- "this connection is mid-change" -- and taking
+        // them in two steps left a window with the state already published and
+        // the pool still handing sessions out. That window is exactly the one
+        // the hold exists to close: the pool rebuild has no earlier hold of its
+        // own (the disconnect family gets one from `prepare_session_teardown`
+        // before it announces), so a metadata read reaching the acquire door in
+        // it takes a session on a connection whose generation is about to move,
+        // and loses it to the bump.
+        //
+        // Shutting the pool first can only refuse EARLY, and by this point the
+        // action is already decided -- the gate has answered and nothing below
+        // refuses -- so an early refusal is the right answer rather than a cost.
+        // See `ConnectionTransition::finished` for the other end, which gives
+        // them back in the mirror order for the same reason.
         let handout_hold = crate::db::PoolSessionHandoutHold::take(
             runtimes.iter().map(|runtime| runtime.id()).collect(),
         );
+        for runtime in &runtimes {
+            runtime.begin_announced_transition();
+        }
         ConnectionTransition {
             pending: runtimes,
             handout_hold,
@@ -578,17 +594,37 @@ impl ConnectionRuntime {
     ///
     /// The one question [`ConnectionRegistry::remove_transient_if_idle`] asks
     /// before taking a connection out of the list every session-ending action
-    /// walks, so it has to name every way a connection is still reachable, not
-    /// most of them. It used to ask about bound tabs and running work only,
-    /// while a DETACHED tab goes on reading metadata through the very same
-    /// connection -- so a script `CONNECT` followed by a script `DISCONNECT`
-    /// left a live, still-used connection that application exit, Disconnect
-    /// All, Reconnect and the pool rebuild could no longer name, and whose
-    /// server sessions were therefore never logged off.
+    /// walks -- and that removal ENDS the connection, so this is a
+    /// session-ending decision and has to name every way a connection is still
+    /// reachable, not most of them.
+    ///
+    /// It used to ask about bound tabs and running work only, while a DETACHED
+    /// tab goes on reading metadata through the very same connection -- so a
+    /// script `CONNECT` followed by a script `DISCONNECT` left a live,
+    /// still-used connection that application exit, Disconnect All, Reconnect
+    /// and the pool rebuild could no longer name, and whose server sessions
+    /// were therefore never logged off.
+    ///
+    /// Then it still asked three COUNTERS, and the counters count tabs and
+    /// EXECUTIONS: `active_work` is taken by the query-execution road and by
+    /// nothing else. The object browser's metadata reads, IntelliSense's schema
+    /// and column loads, the bind-parameter probes, the signature hints and the
+    /// object export/import all hold a pooled session on a connection and are
+    /// in none of the three. So this answered "nothing can reach it" for a
+    /// connection with a read in flight, and the removal disconnected it
+    /// underneath that read -- which the stale sweep then force-cancelled,
+    /// exactly the shape the pool-resize gate was given the activity registry
+    /// to stop. Every OTHER session-ending action asks the registry
+    /// (`background_work_blocking_session_teardown`); this one asks it too now.
+    ///
+    /// A connection that stays is not a leak: it stays in the list every
+    /// session-ending action walks, which is what keeps it endable, and the
+    /// next `OperationFinished` or tab close asks again.
     pub fn is_idle(&self) -> bool {
         self.bound_tab_count() == 0
             && self.detached_tab_count() == 0
             && self.active_work_count() == 0
+            && !crate::db::connection::db_activity_names_connection(self.id)
     }
 
     fn attach_tab(&self) {
@@ -730,16 +766,47 @@ impl ConnectionRegistry {
         }
     }
 
-    pub fn register_transient(&self, connection: SharedConnection) -> Arc<ConnectionRuntime> {
-        self.register(connection, ConnectionOrigin::TransientScript)
+    /// Register a script-created connection, CLAIMED by the work that is about
+    /// to run on it.
+    ///
+    /// The claim is taken BEFORE the runtime is published, and that order is
+    /// the whole point of this returning a pair. `remove_transient_if_idle`
+    /// does not merely forget a connection, it ENDS it, and it runs from the UI
+    /// thread on every tab's `OperationFinished` -- so a transient runtime that
+    /// is in the registry while nothing claims it can be disconnected between
+    /// the insert and the caller's own `begin_work()`. The script `CONNECT`
+    /// roads took the claim as their next statement, which is one statement too
+    /// late; handing it back with the runtime makes "registered" and "claimed"
+    /// one step instead of two.
+    ///
+    /// Only the TRANSIENT origin needs this: a saved or unmanaged runtime is
+    /// never removed by `remove_transient_if_idle`, which asks the origin
+    /// first.
+    pub fn register_transient(
+        &self,
+        connection: SharedConnection,
+    ) -> (Arc<ConnectionRuntime>, ConnectionWorkGuard) {
+        let runtime = Self::build_runtime(connection, ConnectionOrigin::TransientScript);
+        // Claimed first, published second.
+        let claim = runtime.begin_work();
+        self.lock_inner()
+            .runtimes
+            .insert(runtime.id(), runtime.clone());
+        (runtime, claim)
     }
 
     pub fn register_unmanaged(&self, connection: SharedConnection) -> Arc<ConnectionRuntime> {
-        self.register(connection, ConnectionOrigin::Unmanaged)
+        let runtime = Self::build_runtime(connection, ConnectionOrigin::Unmanaged);
+        self.lock_inner()
+            .runtimes
+            .insert(runtime.id(), runtime.clone());
+        runtime
     }
 
-    fn register(
-        &self,
+    /// The runtime itself, stamped onto its connection and ready to be
+    /// published. Publishing is the caller's step, because for a transient
+    /// runtime it has to happen after the claim.
+    fn build_runtime(
         connection: SharedConnection,
         origin: ConnectionOrigin,
     ) -> Arc<ConnectionRuntime> {
@@ -756,7 +823,6 @@ impl ConnectionRegistry {
             pool_context_epoch,
         ));
         runtime.claim_connection();
-        self.lock_inner().runtimes.insert(id, runtime.clone());
         runtime
     }
 
@@ -966,6 +1032,15 @@ impl ConnectionTransition {
     }
 
     /// This connection's work is done: read its state back and stop holding it.
+    ///
+    /// The mirror of [`ConnectionRuntime::announce_transition`]: the POOL
+    /// re-opens FIRST and the state follows. Publishing the state first left a
+    /// window in which the connection reads `Connected` while the acquire door
+    /// still answers "a session-ending action is holding this connection's pool
+    /// shut" -- a refusal the user sees for an action that is over. The other
+    /// order can only let a session out on a connection still LABELLED
+    /// transitioning, which is a connection this transition has finished with:
+    /// its new pool is installed and its work is done.
     pub fn finished(&mut self, runtime: &Arc<ConnectionRuntime>) {
         if !self
             .pending
@@ -978,23 +1053,26 @@ impl ConnectionTransition {
             // another action's hold.
             return;
         }
-        runtime.finish_announced_transition();
         self.pending
             .retain(|pending| !Arc::ptr_eq(pending, runtime));
-        // Re-opened one connection at a time, like the state above: a rebuild
+        // Re-opened one connection at a time, like the state below: a rebuild
         // that walks several must not keep the ones it has already finished
         // shut until the last one is done.
         self.handout_hold.release(runtime.id());
+        runtime.finish_announced_transition();
     }
 }
 
 impl Drop for ConnectionTransition {
     fn drop(&mut self) {
+        // Same order as `finished`, which is why the hold is released here by
+        // name instead of being left to the field's own drop: fields drop
+        // AFTER this body, so leaving it to `handout_hold` would put every
+        // state back before any pool re-opened.
         for runtime in self.pending.drain(..) {
+            self.handout_hold.release(runtime.id());
             runtime.finish_announced_transition();
         }
-        // `handout_hold` drops with this value, releasing whatever `finished`
-        // did not -- a worker that never started, or died partway.
     }
 }
 
@@ -1133,29 +1211,26 @@ impl TabConnectionBinding {
         }
     }
 
-    /// Registers a script-created connection in the owning application registry.
+    /// Registers a script-created connection in the owning application registry,
+    /// CLAIMED by the work that is about to run on it.
+    ///
     /// Legacy/editor-only bindings still receive a transient runtime, but it is
-    /// intentionally scoped to the binding because no application registry exists.
+    /// intentionally scoped to the binding because no application registry
+    /// exists -- and it is claimed the same way, so the caller cannot tell the
+    /// two apart and cannot forget the claim on either.
+    /// See [`ConnectionRegistry::register_transient`] for why the claim comes
+    /// back with the runtime instead of being the caller's next statement.
     pub fn register_transient_connection(
         &self,
         connection: SharedConnection,
-    ) -> Arc<ConnectionRuntime> {
+    ) -> (Arc<ConnectionRuntime>, ConnectionWorkGuard) {
         if let Some(registry) = self.inner.registry.as_ref() {
             registry.register_transient(connection)
         } else {
-            let (info, state, connection_generation, pool_context_epoch) =
-                runtime_metadata(&connection);
-            let runtime = Arc::new(ConnectionRuntime::new(
-                next_connection_id(),
-                ConnectionOrigin::TransientScript,
-                connection,
-                info,
-                state,
-                connection_generation,
-                pool_context_epoch,
-            ));
-            runtime.claim_connection();
-            runtime
+            let runtime =
+                ConnectionRegistry::build_runtime(connection, ConnectionOrigin::TransientScript);
+            let claim = runtime.begin_work();
+            (runtime, claim)
         }
     }
 
@@ -1491,7 +1566,7 @@ mod tests {
     fn registry_ids_are_unique_across_saved_and_transient_runtimes() {
         let registry = ConnectionRegistry::new();
         let saved = registry.register_saved("saved", connection()).runtime;
-        let transient = registry.register_transient(connection());
+        let (transient, _transient_claim) = registry.register_transient(connection());
 
         assert_ne!(saved.id(), transient.id());
     }
@@ -1517,6 +1592,74 @@ mod tests {
 
         assert!(runtime.sanitized_info().password.is_empty());
         assert!(!format!("{runtime:?}").contains("top-secret"));
+    }
+
+    /// A connection with work the REGISTRY still names is not idle.
+    ///
+    /// `is_idle` decides whether a transient connection may be taken out of the
+    /// list every session-ending action walks -- and the removal does not
+    /// forget it, it ENDS it. Its three counters count tabs and EXECUTIONS
+    /// (`active_work` is taken by the query-execution road and by nothing
+    /// else), so the object browser's metadata reads, IntelliSense's schema and
+    /// column loads, the bind probes and the signature hints -- each of which
+    /// holds a pooled session on the connection -- were in none of them. The
+    /// activity registry is the one place that knows about all of it, and it is
+    /// what every OTHER session-ending action already asks.
+    #[test]
+    fn a_connection_the_registry_still_names_work_on_is_not_idle() {
+        let registry = ConnectionRegistry::new();
+        let (runtime, registration_claim) = registry.register_transient(connection());
+        let id = runtime.id();
+        drop(registration_claim);
+
+        // No tab and no execution: all three counters say idle.
+        assert_eq!(runtime.bound_tab_count(), 0);
+        assert_eq!(runtime.detached_tab_count(), 0);
+        assert_eq!(runtime.active_work_count(), 0);
+
+        // A pooled read on this connection, recorded the only way the app
+        // records one.
+        let reading = crate::db::track_db_activity_for_connection("metadata read", None, id);
+        assert!(
+            !runtime.is_idle(),
+            "a connection with a pooled read still running on it is not idle"
+        );
+        assert!(!registry.remove_transient_if_idle(id));
+        assert!(
+            registry.get(id).is_some(),
+            "so it stays in the list every session-ending action walks, which is what \
+             keeps it endable"
+        );
+
+        drop(reading);
+        assert!(runtime.is_idle());
+        assert!(registry.remove_transient_if_idle(id));
+        assert!(registry.get(id).is_none());
+    }
+
+    /// A transient runtime is CLAIMED from the moment it is published.
+    ///
+    /// `remove_idle_transient_runtimes` runs from the UI thread on every tab's
+    /// `OperationFinished`, so a runtime that is in the registry while nothing
+    /// claims it can be disconnected between the insert and the caller's own
+    /// `begin_work()` -- which is where the script `CONNECT` roads used to take
+    /// it, one statement too late.
+    #[test]
+    fn a_transient_runtime_is_claimed_from_the_moment_it_is_registered() {
+        let registry = ConnectionRegistry::new();
+        let (runtime, registration_claim) = registry.register_transient(connection());
+        let id = runtime.id();
+
+        assert_eq!(runtime.active_work_count(), 1);
+        assert!(!runtime.is_idle());
+        assert!(
+            !registry.remove_transient_if_idle(id),
+            "nothing may end a connection its registrar has not finished with"
+        );
+
+        drop(registration_claim);
+        assert!(runtime.is_idle());
+        assert!(registry.remove_transient_if_idle(id));
     }
 
     #[test]
@@ -2126,7 +2269,7 @@ mod tests {
     #[test]
     fn forked_detached_tab_stays_detached_without_counting_as_bound() {
         let registry = ConnectionRegistry::new();
-        let runtime = registry.register_transient(connection());
+        let (runtime, _runtime_claim) = registry.register_transient(connection());
         let first = TabConnectionBinding::bound_in_registry(registry, runtime.clone(), None);
         first
             .detach_if_revision(first.snapshot().revision)
@@ -2144,9 +2287,9 @@ mod tests {
     #[test]
     fn binding_revision_compare_and_swap_preserves_newer_binding() {
         let registry = ConnectionRegistry::new();
-        let original = registry.register_transient(connection());
-        let stale_candidate = registry.register_transient(connection());
-        let current = registry.register_transient(connection());
+        let (original, _original_claim) = registry.register_transient(connection());
+        let (stale_candidate, _stale_candidate_claim) = registry.register_transient(connection());
+        let (current, _current_claim) = registry.register_transient(connection());
         let binding = TabConnectionBinding::bound(original, None);
         let revision = binding.snapshot().revision;
 
@@ -2160,8 +2303,8 @@ mod tests {
     #[test]
     fn binding_snapshot_does_not_deadlock_behind_session_reset() {
         let registry = ConnectionRegistry::new();
-        let original = registry.register_transient(connection());
-        let replacement = registry.register_transient(connection());
+        let (original, _original_claim) = registry.register_transient(connection());
+        let (replacement, _replacement_claim) = registry.register_transient(connection());
         let binding = TabConnectionBinding::bound(original, None);
         let session = binding.session_state();
         let session_guard = session.lock().unwrap();
@@ -2253,9 +2396,13 @@ mod tests {
     #[test]
     fn transient_runtime_is_removed_only_after_tabs_and_work_finish() {
         let registry = ConnectionRegistry::new();
-        let runtime = registry.register_transient(connection());
+        let (runtime, registration_claim) = registry.register_transient(connection());
         let binding = TabConnectionBinding::bound(runtime.clone(), None);
         let work = runtime.begin_work();
+        // The claim the registration hands back is given up once the tab and
+        // the work hold the runtime, which is the hand-over the script CONNECT
+        // road makes when its bind succeeds.
+        drop(registration_claim);
 
         assert!(!registry.remove_transient_if_idle(runtime.id()));
         drop(binding);
@@ -2278,10 +2425,11 @@ mod tests {
     #[test]
     fn a_tab_that_detached_from_a_runtime_still_names_it() {
         let registry = ConnectionRegistry::new();
-        let runtime = registry.register_transient(connection());
+        let (runtime, registration_claim) = registry.register_transient(connection());
         let id = runtime.id();
         let binding =
             TabConnectionBinding::bound_in_registry(registry.clone(), runtime.clone(), None);
+        drop(registration_claim);
 
         let revision = binding.snapshot().revision;
         assert!(binding.detach_if_revision(revision).is_ok());
@@ -2315,9 +2463,10 @@ mod tests {
     #[test]
     fn forking_a_detached_binding_names_the_runtime_a_second_time() {
         let registry = ConnectionRegistry::new();
-        let runtime = registry.register_transient(connection());
+        let (runtime, registration_claim) = registry.register_transient(connection());
         let binding =
             TabConnectionBinding::bound_in_registry(registry.clone(), runtime.clone(), None);
+        drop(registration_claim);
         let revision = binding.snapshot().revision;
         assert!(binding.detach_if_revision(revision).is_ok());
 
@@ -2347,10 +2496,11 @@ mod tests {
     #[test]
     fn binding_a_tab_elsewhere_gives_up_the_runtime_it_detached_from() {
         let registry = ConnectionRegistry::new();
-        let detached = registry.register_transient(connection());
-        let next = registry.register_transient(connection());
+        let (detached, detached_claim) = registry.register_transient(connection());
+        let (next, _next_claim) = registry.register_transient(connection());
         let binding =
             TabConnectionBinding::bound_in_registry(registry.clone(), detached.clone(), None);
+        drop(detached_claim);
         let revision = binding.snapshot().revision;
         assert!(binding.detach_if_revision(revision).is_ok());
         assert_eq!(detached.detached_tab_count(), 1);

@@ -426,6 +426,18 @@ impl QueryProgressSender {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = origin;
     }
 
+    /// Which connection this operation's work is running on, as the operation
+    /// itself says: the execution origin, which a script `CONNECT` moves when
+    /// the work moves. The one source for anything that has to outlive the
+    /// batch and still name its connection.
+    fn execution_connection_id(&self) -> Option<crate::db::ConnectionId> {
+        self.execution_origin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|origin| origin.connection_id)
+    }
+
     fn set_execution_scope(&self, scope: Option<String>) {
         if let Some(origin) = self
             .execution_origin
@@ -498,6 +510,22 @@ impl QueryProgressSender {
                 total_units,
                 status_activity: status_activity.or_else(|| self.status_finish_handle()),
                 sql,
+            },
+            // The same shape, for the same reason: the connection a lazy
+            // fetch's session is on is the OPERATION's fact, and the sender is
+            // where the operation keeps it.
+            QueryProgress::LazyFetchSession {
+                index,
+                session_id,
+                operation_id,
+                connection_generation,
+                connection_id,
+            } => QueryProgress::LazyFetchSession {
+                index,
+                session_id,
+                operation_id,
+                connection_generation,
+                connection_id: connection_id.or_else(|| self.execution_connection_id()),
             },
             progress => progress,
         };
@@ -621,6 +649,15 @@ pub enum QueryProgress {
         session_id: u64,
         operation_id: u64,
         connection_generation: u64,
+        /// The connection this fetch's SESSION is on.
+        ///
+        /// Stated by the work rather than looked up from the tab later: a lazy
+        /// fetch outlives the batch that opened it and its session stays where
+        /// it was taken, while the tab's binding can move (a script `CONNECT`
+        /// / `DISCONNECT`). Filled in by [`QueryProgressSender::send`] from the
+        /// operation's own execution origin, so no emitter can state it wrongly
+        /// and none can leave it out.
+        connection_id: Option<crate::db::ConnectionId>,
     },
     LazyFetchWaiting {
         index: usize,
@@ -1179,6 +1216,12 @@ pub(crate) struct LazyFetchHandle {
     pub session_id: u64,
     pub operation_id: u64,
     pub connection_generation: u64,
+    /// The connection this fetch's SESSION is on, from the operation's own
+    /// execution origin. The window between registering this handle and the
+    /// window's `LazyFetchSession` event being processed is the one in which
+    /// the app knows about the fetch here and nowhere else, so the answer has
+    /// to be here too — see `QueryProgress::LazyFetchSession::connection_id`.
+    pub connection_id: Option<crate::db::ConnectionId>,
     pub db_type: DatabaseType,
     pub sender: mpsc::Sender<LazyFetchCommand>,
     pub cancel_handle: Option<LazyFetchCancelHandle>,
@@ -4880,6 +4923,25 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
+            .map(|handle| handle.session_id)
+    }
+
+    /// This tab's live lazy fetch, if its SESSION is on `connection_id`.
+    ///
+    /// Asked instead of "does this tab's binding name that connection", because
+    /// a fetch's session stays on the connection it was opened on while the
+    /// binding can move. A handle that does not state its connection is
+    /// attributed to none — the same rule the activity registry uses for a row
+    /// with no connection id, and the `EveryConnection` questions still see it.
+    pub fn active_lazy_fetch_session_on_connection(
+        &self,
+        connection_id: crate::db::ConnectionId,
+    ) -> Option<u64> {
+        self.active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|handle| handle.connection_id == Some(connection_id))
             .map(|handle| handle.session_id)
     }
 

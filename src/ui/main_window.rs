@@ -1348,6 +1348,14 @@ struct LazyFetchProgressToken {
     statement_index: usize,
     operation_id: u64,
     connection_generation: u64,
+    /// The connection this fetch's SESSION is on, as the operation stated it.
+    ///
+    /// A lazy fetch outlives the batch that opened it and keeps the session it
+    /// was handed; the TAB's binding can move away from that connection (a
+    /// script `CONNECT`/`DISCONNECT`). So "which lazy fetches are on connection
+    /// C" is asked of this record and not of the tab — the same rule the
+    /// activity registry follows for every other kind of DB work.
+    connection_id: Option<ConnectionId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1653,6 +1661,7 @@ impl QueryProgressContext {
         statement_index: usize,
         operation_id: u64,
         connection_generation: u64,
+        connection_id: Option<ConnectionId>,
     ) {
         self.lazy_fetch_sessions.insert(session_id, statement_index);
         self.lazy_fetch_tokens.insert(
@@ -1661,9 +1670,28 @@ impl QueryProgressContext {
                 statement_index,
                 operation_id,
                 connection_generation,
+                connection_id,
             },
         );
         self.waiting_lazy_fetch_sessions.remove(&session_id);
+    }
+
+    /// The lazy fetches this batch opened whose SESSION is on `connection_id`.
+    ///
+    /// A record that names no connection is attributed to none, exactly as
+    /// `background_work_blocking_session_teardown` treats an activity row with
+    /// no connection id: guessing would refuse one connection's teardown for
+    /// another's work. Nothing is lost by it — the `EveryConnection` questions
+    /// (`lazy_fetch_sessions_for_abort`, `has_running_query_or_lazy_fetch`)
+    /// walk every record whatever it names.
+    fn lazy_fetch_sessions_on_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> impl Iterator<Item = u64> + '_ {
+        self.lazy_fetch_tokens
+            .iter()
+            .filter(move |(_, token)| token.connection_id == Some(connection_id))
+            .map(|(session_id, _)| *session_id)
     }
 
     fn lazy_fetch_event_matches(
@@ -3699,33 +3727,34 @@ impl AppState {
         session_ids
     }
 
+    /// Every lazy fetch whose SESSION is on this connection.
+    ///
+    /// Asked of the WORK, not of the tab. It used to group by
+    /// `tab.connection_binding.snapshot().connection_id()` and take every lazy
+    /// fetch those tabs owned — but a fetch keeps the session it was handed
+    /// while the tab's binding can move away from that connection (a script
+    /// `CONNECT`/`DISCONNECT` is tab-local and leaves the fetch where it was).
+    /// The two agree today only because starting any statement cancels the
+    /// tab's live lazy fetch first, so the binding cannot move while one is
+    /// open — an invariant held by an unrelated check, which is exactly the
+    /// shape that breaks the next time that check changes.
+    ///
+    /// Both sources state the connection themselves: the progress record
+    /// (`LazyFetchProgressToken`), and the editor's live handle for the window
+    /// before that record exists.
     fn lazy_fetch_sessions_for_connection(&self, connection_id: ConnectionId) -> Vec<u64> {
-        let query_tab_ids = self
-            .editor_tabs
-            .iter()
-            .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
-            .map(|tab| tab.tab_id)
-            .collect::<HashSet<_>>();
         let mut session_ids = Vec::new();
-        for tab in self
-            .editor_tabs
-            .iter()
-            .filter(|tab| query_tab_ids.contains(&tab.tab_id))
-        {
-            for session_id in tab.result_tabs.lazy_fetch_sessions() {
+        for context in self.progress_contexts.values() {
+            for session_id in context.lazy_fetch_sessions_on_connection(connection_id) {
                 Self::push_unique_session_id(&mut session_ids, session_id);
             }
+        }
+        for tab in self.tabs_that_can_own_db_work() {
             Self::push_unique_session_id_if_some(
                 &mut session_ids,
-                tab.sql_editor.active_lazy_fetch_session(),
+                tab.sql_editor
+                    .active_lazy_fetch_session_on_connection(connection_id),
             );
-        }
-        for (tab_id, context) in &self.progress_contexts {
-            if query_tab_ids.contains(tab_id) {
-                for session_id in context.lazy_fetch_sessions.keys().copied() {
-                    Self::push_unique_session_id(&mut session_ids, session_id);
-                }
-            }
         }
         session_ids
     }
@@ -5181,6 +5210,7 @@ fn registered_lazy_fetch_progress_matches(
             session_id,
             operation_id,
             connection_generation,
+            ..
         }
         | QueryProgress::LazyFetchClosed {
             index,
@@ -11843,6 +11873,7 @@ impl MainWindow {
                     session_id,
                     operation_id,
                     connection_generation,
+                    connection_id: lazy_fetch_connection_id,
                 } => {
                     let (active_lazy_fetch_session, event_is_current) = s
                         .find_tab_index(tab_id)
@@ -11898,6 +11929,7 @@ impl MainWindow {
                             index,
                             operation_id,
                             connection_generation,
+                            lazy_fetch_connection_id,
                         );
                         context.active_statement_index = Some(index);
                         context.state_label = if preserve_canceling {
@@ -19577,11 +19609,56 @@ mod tests {
             None
         );
 
-        context.register_lazy_fetch_session(77, 3, 77, 1);
+        context.register_lazy_fetch_session(77, 3, 77, 1, None);
         assert_eq!(
             lazy_fetch_canceling_statement_index(&context, 77, true),
             Some(3)
         );
+    }
+
+    /// A lazy fetch is attributed to the connection its SESSION is on, which is
+    /// stated when the record is created and never re-derived from the tab.
+    ///
+    /// A lazy fetch outlives the batch that opened it and keeps the session it
+    /// was handed; the tab's binding can move away from that connection (a
+    /// script `CONNECT`/`DISCONNECT` is tab-local and leaves the fetch where it
+    /// was). Asking the tab therefore answers about the wrong connection in
+    /// both directions -- it misses a fetch still holding a session on the
+    /// connection a teardown is about to end, and it counts one that is not
+    /// there.
+    #[test]
+    fn a_lazy_fetch_is_attributed_to_the_connection_its_session_is_on() {
+        let mut context = QueryProgressContext::new(None, "Fetching".to_string(), None);
+        let first = ConnectionId::for_test(70_001);
+        let second = ConnectionId::for_test(70_002);
+
+        context.register_lazy_fetch_session(11, 0, 11, 1, Some(first));
+        context.register_lazy_fetch_session(22, 1, 22, 2, Some(second));
+        // A record whose batch could not state a connection is attributed to
+        // none, exactly like an activity row with no connection id.
+        context.register_lazy_fetch_session(33, 2, 33, 3, None);
+
+        fn on(context: &QueryProgressContext, connection_id: ConnectionId) -> Vec<u64> {
+            let mut sessions = context
+                .lazy_fetch_sessions_on_connection(connection_id)
+                .collect::<Vec<_>>();
+            sessions.sort_unstable();
+            sessions
+        }
+        assert_eq!(on(&context, first), vec![11]);
+        assert_eq!(on(&context, second), vec![22]);
+        assert_eq!(
+            on(&context, ConnectionId::for_test(70_003)),
+            Vec::<u64>::new()
+        );
+
+        // Every one of them is still visible to the questions that cover every
+        // connection, which is what keeps an unattributable fetch from being
+        // lost.
+        assert_eq!(context.lazy_fetch_sessions.len(), 3);
+
+        context.remove_lazy_fetch_session(11);
+        assert_eq!(on(&context, first), Vec::<u64>::new());
     }
 
     #[test]
@@ -19750,7 +19827,7 @@ mod tests {
         };
         let mut context =
             QueryProgressContext::new(None, "Executing SQL".to_string(), Some(query_token));
-        context.register_lazy_fetch_session(44, 2, 44, 17);
+        context.register_lazy_fetch_session(44, 2, 44, 17, None);
         let close = QueryProgress::LazyFetchClosed {
             index: 2,
             session_id: 44,
@@ -19800,7 +19877,7 @@ mod tests {
         };
         let mut context =
             QueryProgressContext::new(None, "Executing SQL".to_string(), Some(query_token));
-        context.register_lazy_fetch_session(44, 2, 44, 17);
+        context.register_lazy_fetch_session(44, 2, 44, 17, None);
         let stale_close = QueryProgress::LazyFetchClosed {
             index: 2,
             session_id: 44,
@@ -19984,7 +20061,7 @@ mod tests {
     fn progress_context_distinguishes_registered_and_waiting_lazy_fetch() {
         let mut context = QueryProgressContext::new(None, "Executing".to_string(), None);
 
-        context.register_lazy_fetch_session(44, 2, 44, 7);
+        context.register_lazy_fetch_session(44, 2, 44, 7, None);
         assert!(!context.has_waiting_lazy_fetch());
 
         assert!(context.mark_lazy_fetch_waiting(44, 2));
@@ -19997,7 +20074,7 @@ mod tests {
     #[test]
     fn progress_context_rejects_stale_lazy_fetch_waiting_event() {
         let mut context = QueryProgressContext::new(None, "Executing".to_string(), None);
-        context.register_lazy_fetch_session(44, 2, 44, 7);
+        context.register_lazy_fetch_session(44, 2, 44, 7, None);
 
         assert!(!context.mark_lazy_fetch_waiting(44, 3));
         assert!(!context.mark_lazy_fetch_waiting(55, 2));
@@ -20007,7 +20084,7 @@ mod tests {
     #[test]
     fn progress_context_rejects_stale_lazy_fetch_close_token() {
         let mut context = QueryProgressContext::new(None, "Executing".to_string(), None);
-        context.register_lazy_fetch_session(44, 2, 44, 7);
+        context.register_lazy_fetch_session(44, 2, 44, 7, None);
 
         assert!(context.lazy_fetch_event_matches(44, 2, 44, 7));
         assert!(!context.lazy_fetch_event_matches(44, 2, 45, 7));
@@ -20018,7 +20095,7 @@ mod tests {
     #[test]
     fn progress_context_remove_lazy_fetch_clears_waiting_state() {
         let mut context = QueryProgressContext::new(None, "Executing".to_string(), None);
-        context.register_lazy_fetch_session(44, 2, 44, 7);
+        context.register_lazy_fetch_session(44, 2, 44, 7, None);
         assert!(context.mark_lazy_fetch_waiting(44, 2));
 
         assert_eq!(context.remove_lazy_fetch_session(44), Some(2));

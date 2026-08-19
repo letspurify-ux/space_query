@@ -64,8 +64,8 @@
 use fltk::{app, input::IntInput};
 use mysql::prelude::Queryable;
 use space_query::db::{
-    ConnectionInfo, ConnectionRegistry, DatabaseConnection, DatabaseType, OracleDriverMode,
-    TabConnectionBinding,
+    pool_session_context_for_shared_connection, ConnectionInfo, ConnectionRegistry,
+    DatabaseConnection, DatabaseType, DbPoolSession, OracleDriverMode, TabConnectionBinding,
 };
 use space_query::ui::sql_editor::{LazyFetchRequest, QueryProgress, SqlEditorWidget};
 use std::env;
@@ -73,6 +73,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tns_thin::{ConnectTarget, OracleThinConfig, OracleThinSession};
+
+/// A trivial round trip on a pooled session, so T14 can say the read the
+/// removal used to break still ANSWERS rather than only that its connection is
+/// still marked connected. One shape per backend, because the point is that all
+/// four go through the same door.
+fn probe_pool_session_answers(session: &mut DbPoolSession) -> bool {
+    match session {
+        DbPoolSession::Oracle(conn) => conn
+            .query_row_as::<i64>("SELECT 1 FROM DUAL", &[])
+            .map(|value| value == 1)
+            .unwrap_or(false),
+        DbPoolSession::OracleThin(conn) => {
+            DatabaseConnection::oracle_thin_select_one_text_for_test(conn, "SELECT '1' FROM dual")
+                .map(|value| value.as_deref() == Some("1"))
+                .unwrap_or(false)
+        }
+        DbPoolSession::MySQL { conn, .. } => conn
+            .query_first::<i64, _>("SELECT 1")
+            .map(|value| value == Some(1))
+            .unwrap_or(false),
+    }
+}
 
 const PROBE_NAME: &str = "sq_session_probe_ui";
 const PROBE_ORACLE_PASSWORD: &str = "sq_probe_2026";
@@ -966,8 +988,18 @@ fn verify(target: Target) -> Result<bool, String> {
     // reference would end the connection by itself and the census could not
     // tell "the removal ended it" from "the last Arc happened to go".
     let script_connection = Arc::new(Mutex::new(script_connection));
-    let runtime = registry.register_transient(Arc::clone(&script_connection));
+    // Registered and CLAIMED in one step. The claim comes back with the runtime
+    // because a transient runtime that sits in the registry while nothing holds
+    // it is one `remove_idle_transient_runtimes` away from being disconnected --
+    // and that sweep runs from the UI thread on every tab's `OperationFinished`,
+    // so the script `CONNECT` road's own `begin_work()` one statement later was
+    // one statement too late.
+    let (runtime, registration_claim) = registry.register_transient(Arc::clone(&script_connection));
     let runtime_id = runtime.id();
+    report.check_flag(
+        "T13 a transient runtime is claimed from the moment it is registered",
+        !registry.remove_transient_if_idle(runtime_id) && registry.get(runtime_id).is_some(),
+    );
     let with_script_connection = stable_count(&mut census)?;
     println!("    server sessions with the script connection open: {with_script_connection}");
     report.check_flag(
@@ -977,6 +1009,9 @@ fn verify(target: Target) -> Result<bool, String> {
 
     // The script DISCONNECT: tab-local, so the tab detaches and keeps naming it.
     let binding = TabConnectionBinding::bound_in_registry(registry.clone(), runtime.clone(), None);
+    // The tab holds it from here, which is the hand-over the script `CONNECT`
+    // road makes when its `bind_if_revision` succeeds.
+    drop(registration_claim);
     let revision = binding.snapshot().revision;
     binding
         .detach_if_revision(revision)
@@ -990,8 +1025,57 @@ fn verify(target: Target) -> Result<bool, String> {
         stable_count(&mut census)? > connected_baseline,
     );
 
-    // The tab closed: nothing names it now.
+    // The tab closed: no tab names it now.
     drop(binding);
+
+    // T14: work still running on the connection keeps it in the registry.
+    //
+    // `ConnectionRuntime::is_idle` answered from three counters -- bound tabs,
+    // detached tabs, and `active_work`, which the QUERY EXECUTION road takes and
+    // nothing else does. Everything else that holds a pooled session on a
+    // connection (the object browser's metadata reads, IntelliSense's schema and
+    // column loads, the bind probes, the signature hints, the object
+    // export/import) is in none of them, so "nothing can reach this connection"
+    // was answered yes with a read in flight -- and the removal does not merely
+    // forget a connection, it DISCONNECTS it. The read then lost its session and
+    // the status tick's stale sweep force-cancelled it, which is exactly the
+    // shape the pool-resize gate was given the activity registry to stop.
+    //
+    // Driven with a REAL pooled session, on all four backends, because that is
+    // what the defect took away.
+    println!("  --- T14 work still running keeps its connection in the registry ---");
+    let read_context =
+        pool_session_context_for_shared_connection(&script_connection, Some("T14 metadata read"))
+            .map_err(|err| format!("T14 pool context: {err}"))?;
+    let read_activity = read_context.track_activity("T14 metadata read");
+    let mut read_session = read_context
+        .acquire_session_for_current_scope(&read_activity)
+        .map_err(|err| format!("T14 acquire: {err}"))?;
+    report.check_flag(
+        "T14 a connection with a pooled read still running does not leave the registry",
+        !registry.remove_transient_if_idle(runtime_id) && registry.get(runtime_id).is_some(),
+    );
+    report.check_flag(
+        "T14 the connection the read is on is still connected",
+        script_connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_connected(),
+    );
+    report.check_flag(
+        "T14 and the read's session still answers",
+        read_session
+            .session_mut()
+            .is_some_and(probe_pool_session_answers),
+    );
+    // Everything the read was holding goes with its frame, exactly as a real
+    // metadata read's does -- the CONTEXT included, because it owns a clone of
+    // the connection's pool and would otherwise keep that pool (and every
+    // session idle in it) alive past the teardown this scenario is measuring.
+    drop(read_session);
+    drop(read_activity);
+    drop(read_context);
+
     report.check_flag(
         "T13 a connection nothing can reach leaves the registry",
         registry.remove_transient_if_idle(runtime_id) && registry.get(runtime_id).is_none(),

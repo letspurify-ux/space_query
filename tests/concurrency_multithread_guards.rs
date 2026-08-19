@@ -2980,10 +2980,44 @@ fn object_browser_actions_are_routed_to_the_tab_that_raised_them() {
 #[test]
 fn script_connect_transfers_runtime_work_tracking_before_old_guard_is_dropped() {
     let execution = read_source("src/ui/sql_editor/execution.rs");
-    assert!(execution.contains("let candidate_work_guard = candidate_runtime.begin_work();"));
+    // The claim comes back WITH the runtime rather than being taken as the next
+    // statement: a transient runtime that is in the registry while nothing
+    // claims it reads idle to `remove_idle_transient_runtimes`, which does not
+    // forget a connection but ENDS it -- and that sweep runs from the UI thread
+    // on every tab's `OperationFinished`.
+    let claimed = compact_for_pattern(&execution)
+        .matches("let(candidate_runtime,candidate_work_guard)=")
+        .count();
+    assert_eq!(
+        claimed, 2,
+        "both script-CONNECT roads must register their candidate runtime already claimed"
+    );
+    assert!(
+        !execution.contains("let candidate_work_guard = candidate_runtime.begin_work();"),
+        "and neither may take the claim as a second step, which is one statement too late"
+    );
     assert!(execution.contains("runtime_work_guard = Some(candidate_work_guard);"));
     assert!(execution.contains("*context.runtime_work_guard = Some(candidate.work_guard);"));
     assert!(execution.contains("drop(candidate_work_guard);"));
+
+    // The registration is the only way to get one, so it cannot be forgotten.
+    let runtime = read_source("src/db/runtime.rs");
+    let register = runtime
+        .find("pub fn register_transient(")
+        .map(|offset| slice_to_end_of_fn(&runtime, offset))
+        .expect("the transient registration door should exist");
+    let register_compact = compact_for_pattern(register);
+    let claim_at = register_compact
+        .find("letclaim=runtime.begin_work();")
+        .unwrap_or_else(|| panic!("registration must claim the runtime itself: {register}"));
+    let publish_at = register_compact
+        .find(".runtimes.insert(")
+        .unwrap_or_else(|| panic!("registration must publish the runtime: {register}"));
+    assert!(
+        claim_at < publish_at,
+        "claimed FIRST, published second: the window between them is the one in which a \
+         concurrent sweep sees an idle transient runtime and disconnects it: {register}"
+    );
 }
 
 /// An operation's registry row follows the connection its work is on.
@@ -9260,11 +9294,28 @@ fn every_connection_wide_state_change_is_announced_and_taken_back_as_one_value()
     let announce = runtime
         .find("pub fn announce_transition(")
         .expect("the one announcement door should exist");
-    let announce_body = slice_from(&runtime, announce, 500);
+    // Bounded by the FUNCTION, never by a byte count: a byte window fails when a
+    // comment is added to the code it guards, which is the opposite of what
+    // these tests are for.
+    let announce_body = slice_to_end_of_fn(&runtime, announce);
+    let announce_compact = compact_for_pattern(announce_body);
+    let hold_at = announce_compact
+        .find("PoolSessionHandoutHold::take(")
+        .unwrap_or_else(|| {
+            panic!(
+                "the announcement holds the pools shut as well as labelling them, because they \
+                 answer the same fact: {announce_body}"
+            )
+        });
+    let label_at = announce_compact
+        .find("begin_announced_transition();")
+        .unwrap_or_else(|| panic!("the announcement must label the runtimes: {announce_body}"));
     assert!(
-        announce_body.contains("PoolSessionHandoutHold::take("),
-        "the announcement holds the pools shut as well as labelling them, because they answer \
-         the same fact: {announce_body}"
+        hold_at < label_at,
+        "and the POOL IS SHUT FIRST: they are one fact, and taking them in two steps in this \
+         order leaves a window with the state already published and the pool still handing \
+         sessions out -- which is the window the hold exists to close, and the pool rebuild has \
+         no earlier hold of its own: {announce_body}"
     );
     let drop_impl = runtime
         .find("impl Drop for ConnectionTransition {")
@@ -9273,6 +9324,22 @@ fn every_connection_wide_state_change_is_announced_and_taken_back_as_one_value()
     assert!(
         drop_body.contains("finish_announced_transition()"),
         "whatever the action never reached must end its announcement: {drop_body}"
+    );
+    let drop_compact = compact_for_pattern(drop_body);
+    let drop_release_at = drop_compact
+        .find("self.handout_hold.release(runtime.id());")
+        .unwrap_or_else(|| {
+            panic!(
+                "and it must re-open the pools by NAME rather than leaving it to the field's own \
+                 drop, which runs after this body: {drop_body}"
+            )
+        });
+    let drop_publish_at = drop_compact
+        .find("runtime.finish_announced_transition();")
+        .unwrap_or_else(|| panic!("the drop must end every announcement: {drop_body}"));
+    assert!(
+        drop_release_at < drop_publish_at,
+        "in the same order `finished` uses -- pool first, state second: {drop_body}"
     );
     let finish = runtime
         .find("fn finish_announced_transition(")
@@ -9761,7 +9828,7 @@ fn a_decided_session_ending_action_holds_the_pool_before_it_prompts() {
     let announce = runtime
         .find("pub fn announce_transition(")
         .expect("the transition announcement should exist");
-    let announce_body = slice_from(&runtime, announce, 700);
+    let announce_body = slice_to_end_of_fn(&runtime, announce);
     assert!(
         announce_body.contains("PoolSessionHandoutHold::take("),
         "announcing a transition must hold the door as well as label it: {announce_body}"
@@ -9773,6 +9840,20 @@ fn a_decided_session_ending_action_holds_the_pool_before_it_prompts() {
     assert!(
         finished_body.contains("self.handout_hold.release(runtime.id());"),
         "and a rebuild that walks several must re-open each as it finishes: {finished_body}"
+    );
+    let finished_compact = compact_for_pattern(finished_body);
+    let release_at = finished_compact
+        .find("self.handout_hold.release(runtime.id());")
+        .expect("the release should be found");
+    let publish_at = finished_compact
+        .find("runtime.finish_announced_transition();")
+        .unwrap_or_else(|| panic!("finishing must hand the state back: {finished_body}"));
+    assert!(
+        release_at < publish_at,
+        "and the POOL RE-OPENS FIRST -- the mirror of the announcement. Publishing the state \
+         first leaves a window in which the connection reads `Connected` while the acquire door \
+         still answers that a session-ending action is holding its pool shut, which is a refusal \
+         the user sees for an action that is over: {finished_body}"
     );
     assert!(
         compact_for_pattern(finished_body)
@@ -10439,6 +10520,30 @@ fn a_connection_leaves_the_registry_only_when_it_has_been_ended() {
              leaves the list every session-ending action walks: {idle}"
         );
     }
+    // And the counters are not the whole question. `active_work` is taken by
+    // the query-EXECUTION road and by nothing else, so the object browser's
+    // metadata reads, IntelliSense's schema and column loads, the bind probes,
+    // the signature hints and the object export/import -- every one of which
+    // holds a pooled session on the connection -- are in none of the three.
+    // The activity registry is the one place that knows about all of it, and
+    // every OTHER session-ending action already asks it
+    // (`background_work_blocking_session_teardown`). This removal ENDS the
+    // connection, so it has to ask it too.
+    assert!(
+        idle.contains("!crate::db::connection::db_activity_names_connection(self.id)"),
+        "`is_idle` must ask the ACTIVITY REGISTRY as well as its own counters, or a connection \
+         with a pooled read still running on it is disconnected underneath that read: {idle}"
+    );
+    let connection_source = read_source("src/db/connection.rs");
+    let names = connection_source
+        .find("pub(crate) fn db_activity_names_connection(connection_id: ConnectionId) -> bool {")
+        .map(|offset| slice_to_end_of_item(&connection_source, offset))
+        .expect("the registry question the removal asks should exist");
+    assert!(
+        compact_for_pattern(names).contains("tracked.connection_id==Some(connection_id)"),
+        "and it answers from the row's own connection, exactly like \
+         `cancel_db_activities_for_connection`: {names}"
+    );
 
     // A tab that detaches keeps NAMING the runtime, counted by a value rather
     // than by each of the five writers of the field.
@@ -10498,11 +10603,14 @@ fn a_connection_leaves_the_registry_only_when_it_has_been_ended() {
         execution
             .matches("crate::db::end_connection_leaving_the_app(")
             .count(),
-        3,
-        "all three script-CONNECT roads that reject a candidate connection use the door"
+        8,
+        "every script-CONNECT road that rejects a candidate connection uses the door"
     );
+    // The needle is compacted TOO. It used to be spelled with spaces and
+    // compared against a whitespace-stripped haystack, so it could never match
+    // and five OCI rejection roads kept the hand-written shape it bans.
     assert!(
-        !compact_for_pattern(&execution).contains("{ guard.disconnect(); }"),
+        !compact_for_pattern(&execution).contains("{guard.disconnect();}"),
         "and none of them keeps a hand-written `try_lock` + `disconnect`, which simply \
          gave up when the mutex was busy"
     );
@@ -10517,6 +10625,92 @@ fn a_connection_leaves_the_registry_only_when_it_has_been_ended() {
         compact_for_pattern(exit).contains("s.connection_registry.runtimes(),"),
         "application exit closes exactly the connections the registry names, which is why \
          leaving it early is a leak: {exit}"
+    );
+}
+
+/// A lazy fetch says which connection its SESSION is on; the tab is not asked.
+///
+/// A lazy fetch outlives the batch that opened it and keeps the session it was
+/// handed. The tab's binding can move away from that connection -- a script
+/// `CONNECT`/`DISCONNECT` is tab-local and leaves the fetch exactly where it
+/// was -- so grouping lazy fetches by `connection_binding.snapshot()
+/// .connection_id()` answers about the wrong connection in both directions: a
+/// per-connection teardown stops refusing for a fetch still holding a session
+/// on it (`DecidedSessionTeardown::ask` refuses on tab work, and its `commit`
+/// would then CANCEL that fetch as if it were background work), and the
+/// pool-slot eviction counts a fetch that occupies no slot in the pool it is
+/// trying to free.
+///
+/// The two agreed only because starting any statement cancels the tab's live
+/// lazy fetch first, so the binding could not move while one was open -- an
+/// invariant held by an unrelated check, which is the shape that breaks the
+/// next time that check changes.
+#[test]
+fn a_lazy_fetch_says_which_connection_its_session_is_on() {
+    let main_window = read_source("src/ui/main_window.rs");
+
+    // The record states it, beside the generation it already stated.
+    let token = main_window
+        .find("struct LazyFetchProgressToken {")
+        .map(|offset| slice_to_end_of_item(&main_window, offset))
+        .expect("the lazy fetch progress record should exist");
+    assert!(
+        compact_for_pattern(token).contains("connection_id:Option<ConnectionId>,"),
+        "the record a lazy fetch is remembered by must state its connection: {token}"
+    );
+
+    // And the per-connection question is answered from it, not from the tab.
+    let question = main_window
+        .find("fn lazy_fetch_sessions_for_connection(&self, connection_id: ConnectionId) -> Vec<u64> {")
+        .map(|offset| slice_to_end_of_fn(&main_window, offset))
+        .expect("the per-connection lazy fetch question should exist");
+    assert!(
+        !question.contains("connection_binding"),
+        "which lazy fetches are on a connection is the WORK's answer, never the tab's \
+         binding: {question}"
+    );
+    for asked in [
+        "lazy_fetch_sessions_on_connection(connection_id)",
+        "active_lazy_fetch_session_on_connection(connection_id)",
+    ] {
+        assert!(
+            question.contains(asked),
+            "both sources must state the connection themselves ({asked}): {question}"
+        );
+    }
+
+    // The live handle carries it too: between registering the handle and the
+    // window processing the `LazyFetchSession` event, it is the only record.
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let handle = editor
+        .find("pub(crate) struct LazyFetchHandle {")
+        .map(|offset| slice_to_end_of_item(&editor, offset))
+        .expect("the lazy fetch handle should exist");
+    assert!(
+        compact_for_pattern(handle).contains("pubconnection_id:Option<crate::db::ConnectionId>,"),
+        "the live handle must state its connection as well: {handle}"
+    );
+
+    // One place fills it in, from the operation's own execution origin, so no
+    // emitter can state it wrongly and none can leave it out.
+    let send = editor
+        .find("pub(crate) fn send(&self, progress: QueryProgress) -> Result<(), QueryProgressSendError> {")
+        .map(|offset| slice_to_end_of_fn(&editor, offset))
+        .expect("the sender's one send door should exist");
+    assert!(
+        compact_for_pattern(send)
+            .contains("connection_id:connection_id.or_else(||self.execution_connection_id())"),
+        "the sender states which connection the operation is on, because that is where the \
+         operation keeps it -- a script CONNECT moves it when the work moves: {send}"
+    );
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    assert_eq!(
+        execution
+            .matches("sender.execution_connection_id(),")
+            .count(),
+        3,
+        "and all three lazy-select roads (Oracle OCI, Oracle thin, the MySQL family) give \
+         their handle the same answer"
     );
 }
 
