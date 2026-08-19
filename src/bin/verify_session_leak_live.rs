@@ -31,6 +31,16 @@
 //      ended -- the registry is the list every session-ending action walks,
 //      application exit included, so a live connection that leaves it early
 //      can never be logged off again
+//   T14 work still running keeps its connection in the registry
+//   T15 a DECIDED teardown has actually reached the server once the app has
+//      waited for it: `disconnect()` hands the logoff to the connection
+//      cleanup worker, so it returns before the sessions are gone, and
+//      application exit is the one caller for which "decided" is not enough --
+//      `app::quit()` is followed by the process ending, and a worker still on
+//      the wire ends with it
+//   T16 a cancel ENDS work but does not STOP it: the registry entry goes at
+//      dispatch, so exit has to wait for the cancelled job to let go of the
+//      session it was holding before it takes the connection away and quits
 //
 // A POOL REBUILD is the third road a session dies down, and the only one where
 // the CONNECTION stays up: the preferences dialog replaces the pool, bumps the
@@ -64,8 +74,9 @@
 use fltk::{app, input::IntInput};
 use mysql::prelude::Queryable;
 use space_query::db::{
-    pool_session_context_for_shared_connection, ConnectionInfo, ConnectionRegistry,
-    DatabaseConnection, DatabaseType, DbPoolSession, OracleDriverMode, TabConnectionBinding,
+    pool_session_context_for_shared_connection, wait_for_connection_cleanups, ConnectionInfo,
+    ConnectionRegistry, DatabaseConnection, DatabaseType, DbPoolSession, OracleDriverMode,
+    TabConnectionBinding,
 };
 use space_query::ui::sql_editor::{LazyFetchRequest, QueryProgress, SqlEditorWidget};
 use std::env;
@@ -78,6 +89,18 @@ use tns_thin::{ConnectTarget, OracleThinConfig, OracleThinSession};
 /// removal used to break still ANSWERS rather than only that its connection is
 /// still marked connected. One shape per backend, because the point is that all
 /// four go through the same door.
+/// Run an arbitrary statement on a pooled session, so a scenario can put a
+/// SLOW one on the server and then cancel it.
+fn probe_pool_session_runs(session: &mut DbPoolSession, sql: &str) -> bool {
+    match session {
+        DbPoolSession::Oracle(conn) => conn.query_row_as::<i64>(sql, &[]).is_ok(),
+        DbPoolSession::OracleThin(conn) => {
+            DatabaseConnection::oracle_thin_select_one_text_for_test(conn, sql).is_ok()
+        }
+        DbPoolSession::MySQL { conn, .. } => conn.query_first::<i64, _>(sql).is_ok(),
+    }
+}
+
 fn probe_pool_session_answers(session: &mut DbPoolSession) -> bool {
     match session {
         DbPoolSession::Oracle(conn) => conn
@@ -218,6 +241,19 @@ impl Target {
             "SELECT 1 AS N FROM dual"
         } else {
             "SELECT 1 AS N"
+        }
+    }
+
+    /// A statement slow enough to still be on the server when a cancel is
+    /// dispatched at it. Not a SLEEP on either family: Oracle's is
+    /// uninterruptible server-side and MySQL's returns success when killed, so
+    /// neither could tell a landed cancel from a finished statement.
+    fn slow_sql(self) -> &'static str {
+        if self.is_oracle() {
+            "SELECT COUNT(*) FROM all_objects a, all_objects b, all_objects c WHERE a.object_id > 0"
+        } else {
+            "SELECT COUNT(*) FROM information_schema.COLUMNS a, information_schema.COLUMNS b, \
+             information_schema.COLUMNS c"
         }
     }
 
@@ -1097,6 +1133,200 @@ fn verify(target: Target) -> Result<bool, String> {
     );
     drop(runtime);
     drop(script_connection);
+
+    // T15: a teardown that has been DECIDED is not a teardown that has
+    // HAPPENED.
+    //
+    // Every road that ends a connection hands the part that talks to the server
+    // to the connection cleanup worker, because `bump_connection_generation`
+    // hands off WITH THE CONNECTION MUTEX HELD and closing a session is a
+    // network call. So `disconnect()` returning means decided. Every other
+    // caller can leave the worker to it -- the process is still there when it
+    // finishes -- but application exit cannot: `app::quit()` is followed by the
+    // process ending, and a worker still on the wire ends with it, leaving the
+    // server to reap sessions from a dropped socket. On Oracle thin that also
+    // takes the pool's IDLE sessions, whose only logoff is
+    // `DbConnectionPool::close`.
+    //
+    // Driven with exactly that case: a session acquired and GIVEN BACK, so one
+    // sits idle in the pool with no holder of its own.
+    println!("  --- T15 a decided teardown has reached the server once the app has waited ---");
+    let mut closing_connection = DatabaseConnection::new();
+    closing_connection
+        .connect(target.probe_connection_info(&probe_user, &probe_service))
+        .map_err(|err| format!("T15 connect: {err}"))?;
+    let closing_connection = Arc::new(Mutex::new(closing_connection));
+    {
+        let idle_context = pool_session_context_for_shared_connection(
+            &closing_connection,
+            Some("T15 idle pooled session"),
+        )
+        .map_err(|err| format!("T15 pool context: {err}"))?;
+        let idle_activity = idle_context.track_activity("T15 idle pooled session");
+        let mut idle_session = idle_context
+            .acquire_session_for_current_scope(&idle_activity)
+            .map_err(|err| format!("T15 acquire: {err}"))?;
+        report.check_flag(
+            "T15 the session that will be left idle in the pool answers first",
+            idle_session
+                .session_mut()
+                .is_some_and(probe_pool_session_answers),
+        );
+        // Given BACK, not closed: from here the pool holds it and nobody else
+        // does, which is the case only `DbConnectionPool::close` can log off.
+        // The context goes too -- it owns a clone of the pool, and a holder that
+        // outlives the teardown keeps the idle sessions up until its frame ends.
+    }
+    let with_idle_session = stable_count(&mut census)?;
+    println!("    server sessions with an idle pooled session: {with_idle_session}");
+    report.check_flag(
+        "T15 the connection really opened sessions",
+        with_idle_session > connected_baseline,
+    );
+
+    closing_connection
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .disconnect();
+    // The premise, measured rather than argued: `disconnect()` has returned and
+    // the teardown it decided has NOT run. A zero-length wait answers the count
+    // without waiting for it. Nothing here is a race the app could win by being
+    // quick -- the tasks were handed off microseconds ago and each of them talks
+    // to the server -- so this is what application exit used to reach
+    // `app::quit()` on top of.
+    let outstanding_at_return = wait_for_connection_cleanups(Instant::now());
+    println!(
+        "    connection cleanup outstanding the moment disconnect() returned: \
+         {outstanding_at_return}"
+    );
+    report.check_flag(
+        "T15 a disconnect DECIDES the teardown and returns before it has run",
+        outstanding_at_return > 0,
+    );
+    let cleanup_started_at = Instant::now();
+    let still_outstanding = wait_for_connection_cleanups(Instant::now() + Duration::from_secs(20));
+    report.check(
+        "T15 every teardown task the disconnect decided has run when the wait returns",
+        still_outstanding,
+        0,
+    );
+    // ONE sample, deliberately: `settled_count` polls, and polling is exactly
+    // what this scenario must not need. It is a weaker statement than the count
+    // above -- the census query itself takes long enough for a LOCAL server to
+    // have finished either way -- so it stands as confirmation that the wait
+    // ends in the right place, not as the proof that waiting was needed.
+    let immediately_after = census.count()?;
+    println!(
+        "    server sessions immediately after the wait: {immediately_after} \
+         (waited {:?})",
+        cleanup_started_at.elapsed()
+    );
+    report.check(
+        "T15 and the sessions are gone from the SERVER without waiting any longer",
+        immediately_after,
+        connected_baseline,
+    );
+    drop(closing_connection);
+
+    // T16: exit must not quit while a job it CANCELLED is still holding a
+    // session.
+    //
+    // Exit cancels every tracked activity, but a cancel is DISPATCHED, not
+    // delivered: the breaks run on the watchdog thread, and on the MySQL family
+    // the first one has to open a control connection before it can say anything
+    // at all. Meanwhile a pooled worker holds no connection mutex, so exit's
+    // connection walk is not delayed by it for a moment -- it disconnects,
+    // retires the pool, waits for the cleanup queue, and quits, while the
+    // worker is still unwinding a session that the process then takes with it.
+    println!("  --- T16 a cancelled background job lets go before exit quits ---");
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    let worker_connection = {
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(target.probe_connection_info(&probe_user, &probe_service))
+            .map_err(|err| format!("T16 connect: {err}"))?;
+        Arc::new(Mutex::new(connection))
+    };
+    // Registering stamps the connection with its id, so the row the worker
+    // publishes NAMES it -- the same shape a real background read has.
+    let worker_registry = ConnectionRegistry::new();
+    // Held for the scenario, like a real connection's runtime is: registering
+    // is what stamps the id, and keeping the runtime is what makes the setup
+    // look like the app's rather than like a bare connection.
+    let _worker_runtime = worker_registry.register_unmanaged(Arc::clone(&worker_connection));
+    let worker_running = Arc::new(AtomicBool::new(false));
+    let worker_done = Arc::new(AtomicBool::new(false));
+    let worker_running_in_thread = Arc::clone(&worker_running);
+    let worker_done_in_thread = Arc::clone(&worker_done);
+    let worker_connection_for_thread = Arc::clone(&worker_connection);
+    let slow_sql = target.slow_sql();
+    let worker = std::thread::spawn(move || {
+        let context = match pool_session_context_for_shared_connection(
+            &worker_connection_for_thread,
+            Some("T16 background read"),
+        ) {
+            Ok(context) => context,
+            Err(_) => return,
+        };
+        let activity = context.track_activity("T16 background read");
+        let Ok(mut acquired) = context.acquire_session_for_current_scope(&activity) else {
+            return;
+        };
+        worker_running_in_thread.store(true, Ordering::Release);
+        if let Some(session) = acquired.session_mut() {
+            let _ = probe_pool_session_runs(session, slow_sql);
+        }
+        drop(acquired);
+        drop(activity);
+        drop(context);
+        worker_done_in_thread.store(true, Ordering::Release);
+    });
+    let started = wait_until(Duration::from_secs(20), || {
+        worker_running.load(Ordering::Acquire)
+    });
+    println!("    the background read acquired its session: {started}");
+    let with_worker = stable_count(&mut census)?;
+    println!("    server sessions with the background read running: {with_worker}");
+
+    // Exit's own sequence, at the DB layer, in exit's own order: cancel the
+    // work, WAIT FOR IT TO LET GO, then take the connection away and let the
+    // logoffs land.
+    let cancelled = space_query::db::cancel_all_db_activities(Duration::from_secs(60));
+    report.check_flag(
+        "T16 the background read was still holding its session when the cancel was dispatched",
+        cancelled.still_holding_a_session() > 0,
+    );
+    let still_holding = cancelled.wait_until_the_work_let_go(Duration::from_secs(20));
+    report.check(
+        "T16 and the wait ends only once it has let go",
+        still_holding,
+        0,
+    );
+    worker_connection
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .disconnect();
+    let outstanding = wait_for_connection_cleanups(Instant::now() + Duration::from_secs(20));
+    report.check(
+        "T16 every teardown task has run when the cleanup wait returns",
+        outstanding,
+        0,
+    );
+    // The moment exit would call `app::quit()`. ONE sample: a session the
+    // worker is still holding would be dropped with the process here.
+    let immediately_after = census.count()?;
+    println!(
+        "    server sessions the moment exit would quit: {immediately_after} \
+         (worker finished: {})",
+        worker_done.load(Ordering::Acquire)
+    );
+    report.check(
+        "T16 no session a cancelled background job was holding is left for the server to reap",
+        immediately_after,
+        connected_baseline,
+    );
+    let _ = worker.join();
+    drop(worker_connection);
 
     // P1: a POOL REBUILD is the road where the connection stays up. Three tabs
     // are each holding a retained session of the pool that is about to be

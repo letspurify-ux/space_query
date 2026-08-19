@@ -5981,12 +5981,15 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
     let background = content
         .find("fn background_work_blocking_session_teardown(")
         .expect("the background half of the session-teardown gate should exist");
-    let background_body = compact_for_pattern(slice_from(&content, background, 700));
+    // Bounded by the function, not by a byte count: a window that stops
+    // reaching what it asserts stops asserting it.
+    let background_body = compact_for_pattern(slice_to_end_of_fn(&content, background));
     assert!(
         background_body.contains("crate::db::active_db_activity_snapshots()")
-            && background_body.contains("scope.covers(activity.connection_id)"),
-        "the background half must ask the activity registry, scoped to the connections \
-         whose sessions are about to end: {background_body}"
+            && background_body.contains("scope.covers(activity)"),
+        "the background half must ask the activity registry, and the filter must be the \
+         SCOPE's own question asked of the whole row -- a row that runs on no connection of \
+         the app's is work a teardown cannot end, and must not refuse one: {background_body}"
     );
 
     // The tab half must still cover the query tabs' own work, for both scopes.
@@ -8157,7 +8160,7 @@ fn production_ui_ends_db_work_by_cancelling_it_not_by_emptying_the_registry() {
     let main_window = read_source("src/ui/main_window.rs");
     let exit = main_window
         .find("fn finish_application_exit(")
-        .map(|offset| slice_from(&main_window, offset, 3000))
+        .map(|offset| slice_to_end_of_fn(&main_window, offset))
         .expect("the application exit teardown should exist");
     assert!(
         exit.contains("crate::db::cancel_all_db_activities(force_timeout)"),
@@ -8168,9 +8171,12 @@ fn production_ui_ends_db_work_by_cancelling_it_not_by_emptying_the_registry() {
     // moment to let go of its connection before exit can log the session off
     // rather than drop its socket.
     assert!(
-        exit.contains("Self::lock_connection_for_exit(&connection, teardown_deadline)"),
-        "application exit must wait out a cancelled call before giving up on a clean \
-         logoff: {exit}"
+        compact_for_pattern(exit)
+            .contains("Self::lock_connection_for_exit(&connection,Instant::now()+share)"),
+        "application exit must wait out a cancelled call before giving up on a clean logoff -- \
+         and what it waits is this connection's SHARE of the whole teardown's budget, not one \
+         deadline every connection races for, which left the ones behind a wedged connection \
+         with nothing: {exit}"
     );
 }
 
@@ -9771,14 +9777,16 @@ fn a_decided_session_ending_action_holds_the_pool_before_it_prompts() {
         preflight_body.contains("-> Result<crate::db::PoolSessionHandoutHold, String>"),
         "the preflight must answer with the hold: {preflight_body}"
     );
-    // The hold is taken by the DECIDED half and by nothing else, so there is
-    // no way to reach it without having spent every refusal first.
+    // The hold is taken by a DECIDED half and by nothing else, so there is no
+    // way to reach it without having spent every refusal first. There are TWO
+    // such halves: the disconnect family's preflight, and application exit --
+    // which is a session-ending action like the other three and was the one
+    // that never closed this door at all.
     assert_eq!(
-        main_window
-            .matches("hold_pool_session_handout(state)")
-            .count(),
-        1,
-        "only the decided half of the preflight may take the hold"
+        main_window.matches(".hold_pool_session_handout(").count(),
+        2,
+        "only a decided half may take the hold: the disconnect family's `commit`, and \
+         application exit"
     );
     let commit_body = slice_to_end_of_fn(
         &main_window,
@@ -9820,6 +9828,52 @@ fn a_decided_session_ending_action_holds_the_pool_before_it_prompts() {
     assert!(
         compact_for_pattern(disconnect_all_body).contains("let_handout_holds=decided.into_iter()"),
         "Disconnect All must keep every hold its commits produced: {disconnect_all_body}"
+    );
+
+    // Application exit: the hold is taken at ONE decided point, after every
+    // refusal that abandons the exit without touching anything, and BEFORE the
+    // two things that touch something -- `cancel_all_running_queries` and the
+    // per-tab prompts, which perform real COMMIT/ROLLBACKs. Exit used to take
+    // none at all, so the metadata reads its own modal prompts dispatch walked
+    // past a gate that had already answered and were then force-cancelled --
+    // with their sessions acquired too late for the connection walk to log off.
+    let exit = main_window
+        .find("fn continue_application_exit(")
+        .expect("the exit road should exist");
+    let exit_body = slice_to_end_of_fn(&main_window, exit);
+    let exit_hold = exit_body
+        .find("SessionTeardownScope::EveryConnection.hold_pool_session_handout(&state)")
+        .unwrap_or_else(|| {
+            panic!("application exit must hold every connection's pool shut: {exit_body}")
+        });
+    let exit_cancel = exit_body
+        .find("Self::cancel_all_running_queries(&state);")
+        .unwrap_or_else(|| panic!("the decided exit ends the running work: {exit_body}"));
+    let exit_prompt = exit_body
+        .find("Self::resolve_pooled_sessions_before_exit(&state)")
+        .unwrap_or_else(|| panic!("the decided exit resolves the tabs' sessions: {exit_body}"));
+    assert!(
+        exit_hold < exit_cancel && exit_hold < exit_prompt,
+        "exit must hold the door before it ends anything and before it prompts: {exit_body}"
+    );
+    let exit_refusal = exit_body
+        .find("Self::confirm_cancel_running_query_for_exit(&state)")
+        .unwrap_or_else(|| panic!("the exit asks before it cancels: {exit_body}"));
+    assert!(
+        exit_refusal < exit_hold,
+        "and only AFTER the refusals that abandon it without touching anything: {exit_body}"
+    );
+    // And the half that runs once it is decided cannot be reached without it,
+    // because the door IS its argument.
+    let finish_exit = main_window
+        .find("fn finish_application_exit(")
+        .expect("the decided half of the exit should exist");
+    let finish_exit_body = slice_to_end_of_fn(&main_window, finish_exit);
+    assert!(
+        compact_for_pattern(finish_exit_body)
+            .contains("decided:crate::db::PoolSessionHandoutHold,"),
+        "the decided half of the exit must TAKE the hold, so no caller can reach it without \
+         having closed the door: {finish_exit_body}"
     );
 
     // The pool rebuild carries the hold in the value that already says these
@@ -9872,6 +9926,299 @@ fn a_decided_session_ending_action_holds_the_pool_before_it_prompts() {
         resize < prompt,
         "the rebuild must hold the door BEFORE it prompts: the prompts are modal, and a modal \
          pumps the event loop that starts metadata reads"
+    );
+}
+
+/// A session-ending action is refused only by work it could actually END.
+///
+/// `SessionTeardownScope::EveryConnection` used to answer yes to every registry
+/// row, including one that runs on no connection of the app's. The connection
+/// dialog's "Testing connection" probe is exactly that: it opens a session on a
+/// connection the app does not manage, names no connection and binds no
+/// lifetime. A pool rebuild has nothing to end there, so refusing it named an
+/// entry the user could not act on -- the probe carries no canceler, so the
+/// status bar's cancel button does not offer it either, and the only way out
+/// was to wait out the connect timeout.
+///
+/// Ignoring such a row does not widen what a teardown may destroy, and the
+/// reason is structural rather than a judgement: the gate refuses on work a
+/// teardown would BREAK, and `PoolSessionHandoutHold` stops new work from
+/// starting after the gate has answered. If a row with no connection then goes
+/// to take a session on a real one, the one acquire door refuses it.
+#[test]
+fn a_teardown_is_refused_only_by_work_it_could_end() {
+    let connection = read_source("src/db/connection.rs");
+    let snapshot = connection
+        .find("pub struct DbActivitySnapshot {")
+        .expect("the registry snapshot should exist");
+    let snapshot_body = slice_to_end_of_item(&connection, snapshot);
+    assert!(
+        compact_for_pattern(snapshot_body).contains("pubruns_on_a_connection:bool,"),
+        "the registry must say whether a row runs on one of the app's connections: \
+         {snapshot_body}"
+    );
+    let make = connection
+        .find("fn snapshot(&self) -> DbActivitySnapshot {")
+        .expect("the snapshot builder should exist");
+    let make_body = slice_to_end_of_fn(&connection, make);
+    assert!(
+        compact_for_pattern(make_body).contains(
+            "runs_on_a_connection:self.connection_id.is_some()||self.lifetime.is_some(),"
+        ),
+        "and it must answer from BOTH facts: a row bound to a connection's lifetime runs on one \
+         even before it names it, which is the state an operation row is in between its creation \
+         and its acquire: {make_body}"
+    );
+
+    let window = read_source("src/ui/main_window.rs");
+    let covers = window
+        .find("fn covers(self, activity: &crate::db::DbActivitySnapshot)")
+        .expect("the scope question must be asked of the whole row, not of its id alone");
+    let covers_body = slice_to_end_of_fn(&window, covers);
+    assert!(
+        compact_for_pattern(covers_body)
+            .contains("Self::EveryConnection=>activity.runs_on_a_connection,"),
+        "a teardown of every connection is refused only by work on a connection: {covers_body}"
+    );
+    assert!(
+        compact_for_pattern(covers_body)
+            .contains("Self::Connection(id)=>activity.connection_id==Some(id),"),
+        "and a per-connection teardown still names only what it can match: {covers_body}"
+    );
+}
+
+/// A teardown that has been DECIDED is not a teardown that has HAPPENED, and
+/// application exit is the one caller that has to know the difference.
+///
+/// Every road that ends a connection -- `disconnect()`, a pool resize, a
+/// connection being dropped, a script connection leaving the app -- hands the
+/// part that talks to the server to the connection cleanup worker, because
+/// `bump_connection_generation` hands off WITH THE CONNECTION MUTEX HELD and
+/// closing a session is a network call. So `disconnect()` returning has always
+/// meant *decided*. Every other caller can leave the worker to it: the process
+/// is still there when it finishes, and the status tick starts anything a
+/// failed spawn parked. Exit cannot -- `app::quit()` is followed by the process
+/// ending, and a worker still on the wire ends with it, leaving the server to
+/// reap sessions from a dropped socket instead of receiving a logoff. On Oracle
+/// thin that also takes the pool's IDLE sessions, whose only logoff is
+/// `DbConnectionPool::close`.
+#[test]
+fn application_exit_waits_for_the_teardown_it_decided() {
+    let connection = read_source("src/db/connection.rs");
+
+    // The count is part of the TASK, so a task cannot be queued, run, or lost
+    // while unwinding without the count following it. Maintained by the call
+    // sites instead, the wait would be a hopeful answer rather than a total one.
+    assert!(
+        connection.contains("struct ConnectionCleanupTask {"),
+        "a cleanup task must be a value that carries its own place in the outstanding count"
+    );
+    let task = connection
+        .find("struct ConnectionCleanupTask {")
+        .expect("the cleanup task type should exist");
+    let task_body = slice_to_end_of_item(&connection, task);
+    assert!(
+        compact_for_pattern(task_body).contains("_outstanding:OutstandingConnectionCleanup,"),
+        "and it must hold that place as a FIELD, so dropping the task releases it: {task_body}"
+    );
+    assert!(
+        connection.contains("impl Drop for OutstandingConnectionCleanup {"),
+        "the count is released by a drop, not by whoever remembers to"
+    );
+
+    // The wait STARTS what a failed spawn parked. Waiting for a parked task
+    // without starting it spends the whole deadline and still leaves the
+    // sessions open -- the one way the answer could be wrong in the direction
+    // that costs a session.
+    let wait = connection
+        .find("pub fn wait_for_connection_cleanups(")
+        .expect("the app must be able to wait for the teardown it decided");
+    let wait_body = slice_to_end_of_fn(&connection, wait);
+    let start_at = wait_body
+        .find("start_pending_connection_cleanups();")
+        .unwrap_or_else(|| panic!("the wait must start what nothing is running: {wait_body}"));
+    let wait_at = wait_body
+        .find("wait_timeout(")
+        .unwrap_or_else(|| panic!("the wait must be bounded by a deadline: {wait_body}"));
+    assert!(
+        start_at < wait_at,
+        "and it must start them BEFORE it waits, or it waits out its deadline for work nothing \
+         is running: {wait_body}"
+    );
+
+    // Exit asks it, after the connections have been walked and before it quits.
+    let main_window = read_source("src/ui/main_window.rs");
+    let finish = main_window
+        .find("fn finish_application_exit(")
+        .expect("the decided half of the exit should exist");
+    let finish_body = slice_to_end_of_fn(&main_window, finish);
+    let disconnect_at = finish_body
+        .find("db_conn.disconnect();")
+        .unwrap_or_else(|| panic!("exit disconnects every connection: {finish_body}"));
+    let drain_at = finish_body
+        .find("crate::db::wait_for_connection_cleanups(")
+        .unwrap_or_else(|| {
+            panic!(
+                "exit must wait for the logoffs it decided to actually reach the server: \
+                 {finish_body}"
+            )
+        });
+    let quit_at = finish_body
+        .find("app::quit();")
+        .unwrap_or_else(|| panic!("exit quits at the end: {finish_body}"));
+    assert!(
+        disconnect_at < drain_at && drain_at < quit_at,
+        "the wait belongs after the connections are walked and before the process goes: \
+         {finish_body}"
+    );
+}
+
+/// A cancel ENDS work; it does not STOP it — and application exit is the one
+/// caller that has to wait for the difference.
+///
+/// The registry entry goes at DISPATCH, which is right: the screen must not go
+/// on showing work the user has ended. But it means that after a cancel the
+/// registry can no longer answer "is it still running", and the breaks
+/// themselves run on the watchdog thread — on the MySQL family the first one
+/// has to open a control connection before it can say anything at all. A pooled
+/// worker holds no connection mutex, so nothing in exit's connection walk waits
+/// for it: exit retired the pool out from under a cancelled read and quit while
+/// it was still unwinding, and the session went with the process. Measured on
+/// all four backends by `verify_session_leak_live` T16.
+#[test]
+fn application_exit_waits_for_the_work_it_cancelled_to_let_go() {
+    let connection = read_source("src/db/connection.rs");
+
+    // The cancel ANSWERS with what it ended, and the answer cannot be dropped
+    // on the floor without saying so.
+    assert!(
+        connection.contains("pub struct CancelledDbWork {"),
+        "a cancel must answer with the work it ended, or nothing can wait for it"
+    );
+    let cancelled = connection
+        .find("pub struct CancelledDbWork {")
+        .expect("the answer type should exist");
+    let cancelled_body = slice_to_end_of_item(&connection, cancelled);
+    assert!(
+        compact_for_pattern(cancelled_body)
+            .contains("holding_a_session:Vec<Weak<DbActivityGuardInner>>,"),
+        "and it must hold the work's own GUARD: the registry row is gone at dispatch, so the \
+         guard is the only thing left that says the frame holding the session has ended: \
+         {cancelled_body}"
+    );
+    assert!(
+        connection.contains(
+            "#[must_use = \"a cancel that is never waited for leaves the caller unable to say \
+             whether the work \\"
+        ) || connection[..cancelled].contains("#[must_use"),
+        "the answer must be `#[must_use]`, so a caller that ignores it does so on purpose"
+    );
+
+    // Only the rows that were holding a SESSION are waited for. A row with no
+    // canceler had none, and its guard may be the SCREEN's own
+    // (`StatusActivity::Owned`), which does not let go until the app is gone —
+    // waiting on that would spend exit's budget on the UI's bookkeeping every
+    // time.
+    let dispatch = connection
+        .find("fn cancel_db_activities_where(")
+        .expect("the cancel dispatch should exist");
+    let dispatch_body = slice_to_end_of_fn(&connection, dispatch);
+    assert!(
+        compact_for_pattern(dispatch_body).contains("if!tracked.cancelers.is_empty(){"),
+        "only work that had a session published under it may be waited for: {dispatch_body}"
+    );
+
+    // Exit asks it, in the one place where it still helps: after the work has
+    // been cancelled and BEFORE the connections are taken away, so the sessions
+    // go back to pools that are still open.
+    let main_window = read_source("src/ui/main_window.rs");
+    let finish = main_window
+        .find("fn finish_application_exit(")
+        .expect("the decided half of the exit should exist");
+    let finish_body = slice_to_end_of_fn(&main_window, finish);
+    let cancel_at = finish_body
+        .find("crate::db::cancel_all_db_activities(force_timeout)")
+        .unwrap_or_else(|| panic!("exit cancels every tracked activity: {finish_body}"));
+    let let_go_at = finish_body
+        .find("cancelled.wait_until_the_work_let_go(")
+        .unwrap_or_else(|| {
+            panic!("exit must wait for the work it cancelled to let go: {finish_body}")
+        });
+    let disconnect_at = finish_body
+        .find("db_conn.disconnect();")
+        .unwrap_or_else(|| panic!("exit disconnects every connection: {finish_body}"));
+    assert!(
+        cancel_at < let_go_at && let_go_at < disconnect_at,
+        "the wait belongs between the cancel and the connection walk: after it, the pool has \
+         been retired and the session the worker gives back can no longer be logged off by \
+         its close: {finish_body}"
+    );
+}
+
+/// The pool stays held shut until after the LAST thing that can ask for a
+/// session.
+///
+/// `shutdown_column_load_workers` does not join its workers: it sends each a
+/// Shutdown and hands the joins to a reaper thread. So a worker can still pick
+/// up one more task while exit is on its way out, and the hold is what refuses
+/// it a session nothing is left to log off. Nothing hangs on this: the acquire
+/// door ANSWERS a held pool, it does not block on one.
+#[test]
+fn the_exit_hold_outlives_the_last_thing_that_can_ask_for_a_session() {
+    let main_window = read_source("src/ui/main_window.rs");
+    let finish = main_window
+        .find("fn finish_application_exit(")
+        .expect("the decided half of the exit should exist");
+    let finish_body = slice_to_end_of_fn(&main_window, finish);
+    let workers_at = finish_body
+        .find("SqlEditorWidget::shutdown_column_load_workers();")
+        .unwrap_or_else(|| panic!("exit shuts the column load workers down: {finish_body}"));
+    let release_at = finish_body
+        .find("drop(decided);")
+        .unwrap_or_else(|| panic!("exit releases its hold by name: {finish_body}"));
+    assert!(
+        workers_at < release_at,
+        "the hold must outlive the column load workers' shutdown, which is the last road in \
+         the app to the acquire door: {finish_body}"
+    );
+}
+
+/// Every connection gets a SHARE of the exit teardown budget; the first one
+/// cannot spend it all.
+///
+/// One deadline for everybody bounds the exit, which is right, but it decides
+/// WHETHER a connection is waited for at all -- not, like the cancel
+/// watchdog's one batch deadline, only when a session is escalated to the tier
+/// that cannot be taken back. A connection that reached it with nothing left
+/// was skipped, and its sessions went the way this budget exists to prevent.
+/// Two busy connections is all it takes, and `try_lock_connection` also answers
+/// "busy" while a transition is in flight, so quitting during a reconnect or a
+/// pool rebuild puts every connection in that state.
+#[test]
+fn the_exit_teardown_budget_is_shared_out_rather_than_raced_for() {
+    let main_window = read_source("src/ui/main_window.rs");
+    let finish = main_window
+        .find("fn finish_application_exit(")
+        .expect("the decided half of the exit should exist");
+    let finish_body = slice_to_end_of_fn(&main_window, finish);
+    assert!(
+        finish_body.contains("exit_teardown_share_for_connection("),
+        "the exit loop must share the budget out rather than let every connection race for one \
+         deadline: {finish_body}"
+    );
+    assert!(
+        !compact_for_pattern(finish_body)
+            .contains("Self::lock_connection_for_exit(&connection,teardown_deadline)"),
+        "and no connection may be handed the WHOLE budget's deadline, which is what left the \
+         ones behind a wedged connection with nothing: {finish_body}"
+    );
+    let share = main_window
+        .find("fn exit_teardown_share_for_connection(")
+        .expect("the share rule should exist");
+    let share_body = slice_to_end_of_fn(&main_window, share);
+    assert!(
+        share_body.contains("connections_left.max(1)"),
+        "an empty list must not be a division by zero: {share_body}"
     );
 }
 
@@ -10033,6 +10380,14 @@ fn what_a_gate_refuses_on_and_what_a_cancel_offers_is_one_list_of_editors() {
     // which pushed the mirror as a fifth owner one level down where the rule
     // could not see it. That list is what the pool-resize gate and
     // application exit's poll loop read.
+    // `resolve_pooled_sessions_before_retained_action` and
+    // `release_all_resolved_pooled_db_sessions` are here because the rule is
+    // not only about what a gate REFUSES on. The first is what a pool rebuild
+    // and application exit ask before they COMMIT OR ROLL BACK a tab's
+    // transaction -- so a tab it does not name is a tab whose work is destroyed
+    // without being asked about -- and it walked the tab STRIP's entries, a
+    // third list maintained beside `editor_tabs`. The second gives retained
+    // sessions back and asked the active-tab mirror as a sixth owner.
     for name in [
         "fn is_any_query_running(&self)",
         "fn has_running_query_or_lazy_fetch(&self)",
@@ -10041,6 +10396,8 @@ fn what_a_gate_refuses_on_and_what_a_cancel_offers_is_one_list_of_editors() {
         "fn lazy_fetch_session_is_active_in_editor(&self, session_id: u64)",
         "fn active_lazy_fetch_tab_id(&self, session_id: u64)",
         "fn request_lazy_fetch_on_editors(",
+        "fn resolve_pooled_sessions_before_retained_action(",
+        "fn release_all_resolved_pooled_db_sessions(&self)",
     ] {
         let body = slice_to_end_of_fn(
             &window,
@@ -10056,6 +10413,11 @@ fn what_a_gate_refuses_on_and_what_a_cancel_offers_is_one_list_of_editors() {
         assert!(
             !body.contains("self.sql_editor"),
             "{name} must not ask the active-tab mirror as if it were a separate owner: {body}"
+        );
+        assert!(
+            !compact_for_pattern(body).contains(".query_tabs.tab_ids()"),
+            "{name} must not ask the tab STRIP either: it is a third list, kept beside the one \
+             the rest of the app agrees on: {body}"
         );
     }
 

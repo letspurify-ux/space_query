@@ -87,7 +87,138 @@ impl Default for ConnectionAttemptPolicy {
     }
 }
 
-type ConnectionCleanupTask = Box<dyn FnOnce() + Send + 'static>;
+/// One piece of connection teardown, and the app's knowledge that it is not
+/// finished yet, as ONE value.
+///
+/// Every road that ends a connection — `disconnect()`, a pool resize, a
+/// connection being dropped, a script connection leaving the app — hands the
+/// part that TALKS TO THE SERVER to a cleanup worker, because
+/// `bump_connection_generation` does it with the connection mutex held and
+/// closing a session is a network call. So "this connection was disconnected"
+/// has always meant *decided*, not *done*, and nothing could ask whether the
+/// logoffs had actually landed. Application exit is the one caller for which
+/// the difference is permanent: after `app::quit()` the process goes, and a
+/// cleanup worker still on the wire goes with it, leaving the server to reap
+/// sessions from a dropped socket instead of receiving a logoff.
+///
+/// The count lives in the VALUE rather than in the two call sites that would
+/// otherwise maintain it. A task cannot be queued, handed to a worker, run, or
+/// lost while unwinding without the count following it, because the count is
+/// part of what a task IS — which is what makes
+/// [`wait_for_connection_cleanups`] a total answer rather than a hopeful one.
+struct ConnectionCleanupTask {
+    run: Box<dyn FnOnce() + Send + 'static>,
+    /// Held, never read: its `Drop` is the decrement.
+    _outstanding: OutstandingConnectionCleanup,
+}
+
+impl ConnectionCleanupTask {
+    fn new(task: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            run: Box::new(task),
+            _outstanding: OutstandingConnectionCleanup::begin(),
+        }
+    }
+
+    /// Run it. The count is released when this value goes, which is after the
+    /// work has finished — including when it finishes by panicking.
+    fn run(self) {
+        let Self {
+            run,
+            _outstanding: outstanding,
+        } = self;
+        run();
+        drop(outstanding);
+    }
+}
+
+/// The outstanding-cleanup count, with a `Condvar` so a caller can wait for it
+/// to reach zero instead of polling.
+///
+/// Deliberately NOT tracked by the lock-order detector, for the same reason
+/// [`crate::db::lock_order::names::CONNECTION_TRANSITIONS`] is not: it is
+/// handed to a `Condvar`, which releases the mutex while it waits, so a
+/// held-scope around it would describe a lock that is not held. It is a leaf —
+/// nothing else is taken under it.
+static OUTSTANDING_CONNECTION_CLEANUPS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+
+fn outstanding_connection_cleanups() -> &'static (Mutex<usize>, Condvar) {
+    OUTSTANDING_CONNECTION_CLEANUPS.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+fn lock_outstanding_connection_cleanups() -> MutexGuard<'static, usize> {
+    outstanding_connection_cleanups()
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            logging::log_warning(
+                "db::connection",
+                "outstanding connection cleanup count lock was poisoned; recovering",
+            );
+            poisoned.into_inner()
+        })
+}
+
+/// One connection cleanup that has not finished. See [`ConnectionCleanupTask`].
+struct OutstandingConnectionCleanup;
+
+impl OutstandingConnectionCleanup {
+    fn begin() -> Self {
+        *lock_outstanding_connection_cleanups() += 1;
+        Self
+    }
+}
+
+impl Drop for OutstandingConnectionCleanup {
+    fn drop(&mut self) {
+        let mut outstanding = lock_outstanding_connection_cleanups();
+        *outstanding = outstanding.saturating_sub(1);
+        if *outstanding == 0 {
+            outstanding_connection_cleanups().1.notify_all();
+        }
+    }
+}
+
+/// Wait, up to `deadline`, for the connection teardown already handed to the
+/// cleanup worker to actually reach the server. Answers how many are still
+/// outstanding.
+///
+/// The app's one way to turn "this connection was disconnected" into "its
+/// sessions were logged off", and it exists for application EXIT: every other
+/// caller can leave the worker to it, because the process is still there when
+/// it finishes and the status tick will start anything a failed spawn parked.
+/// Exit cannot — `app::quit()` is followed by the process ending, and a worker
+/// mid-logoff ends with it.
+///
+/// Anything a failed spawn parked is started first, so a task is never waited
+/// for while nothing is running it. The wait itself is bounded, because a
+/// cleanup that is wedged on a dead server must not stop the app from
+/// quitting; what it costs is stated by the answer rather than hidden.
+///
+/// Runs the wait on the CALLER's thread and nothing else, so it is safe from a
+/// caller holding no connection mutex — which is exactly what exit is once its
+/// disconnect loop has released each guard. (The tasks themselves must never
+/// run on a caller's thread: see [`start_pending_connection_cleanups`].)
+pub fn wait_for_connection_cleanups(deadline: Instant) -> usize {
+    // Nothing merely PARKED: a task no worker has been started for would
+    // otherwise be waited out in full and still not have run.
+    start_pending_connection_cleanups();
+    let (mutex, finished) = outstanding_connection_cleanups();
+    let mut outstanding = mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while *outstanding > 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let (next, _timeout) = finished
+            .wait_timeout(outstanding, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        outstanding = next;
+    }
+    *outstanding
+}
 
 /// Connection incarnations are numbered process-wide, so a generation names
 /// one incarnation of one connection. Zero is reserved for "never connected".
@@ -436,7 +567,7 @@ fn run_connection_cleanup_task(task: Arc<Mutex<Option<ConnectionCleanupTask>>>) 
     let Some(task) = task else {
         return;
     };
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).is_err() {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || task.run())).is_err() {
         logging::log_error("db::connection", "Connection cleanup worker panicked");
     }
 }
@@ -462,7 +593,14 @@ where
 }
 
 fn spawn_connection_cleanup(task: impl FnOnce() + Send + 'static) {
-    lock_pending_connection_cleanups().push(Box::new(task) as ConnectionCleanupTask);
+    // Built BEFORE the queue lock is taken. A method call evaluates its
+    // receiver first, so writing this as one expression would count the task
+    // while holding `PENDING_CLEANUPS` -- and this runs with the CONNECTION
+    // MUTEX already held, which would make the outstanding count the third lock
+    // of a chain, under one the detector cannot see (it is deliberately
+    // untracked, being handed to a `Condvar`). Nothing needs the two together.
+    let task = ConnectionCleanupTask::new(task);
+    lock_pending_connection_cleanups().push(task);
     start_pending_connection_cleanups();
 }
 
@@ -9458,6 +9596,29 @@ pub struct DbActivitySnapshot {
     /// Whether this activity carries a canceler, so the UI can offer a cancel
     /// for it rather than leaving the user with a status entry they cannot end.
     pub cancelable: bool,
+    /// Whether this work runs on one of the app's connections — that is,
+    /// whether a session-ending action has anything here to end.
+    ///
+    /// A row that NAMES a connection does. So does one bound to a connection's
+    /// LIFETIME, which is how a row says "these sessions are gone" even before
+    /// it has an id: the acquire door and the connection-lock door both bind it
+    /// (`DbPoolSessionContext::acquire_session_at_the_one_door`,
+    /// `DbActivityGuard::bind_connection_lock`).
+    ///
+    /// A row with NEITHER is work that no connection of the app's carries: the
+    /// connection dialog's "Testing connection" probe, which opens a session on
+    /// a connection the app does not manage, is the production case. A pool
+    /// rebuild cannot end such work, so being refused by it left the user with
+    /// a refusal naming an entry the cancel button will not offer either (the
+    /// probe has no canceler) and nothing to do but wait out the connect
+    /// timeout.
+    ///
+    /// It is safe for a gate to ignore such a row precisely because the gate is
+    /// not the only protection: if that work then goes to take a session on a
+    /// real connection, [`PoolSessionHandoutHold`] refuses it at the one door.
+    /// The gate refuses on work a teardown would BREAK; the hold stops new work
+    /// from starting after the gate has answered.
+    pub runs_on_a_connection: bool,
 }
 
 #[derive(Clone)]
@@ -10035,6 +10196,7 @@ impl TrackedDbActivity {
             connection_id: self.connection_id,
             progress: self.progress,
             cancelable: !self.cancelers.is_empty(),
+            runs_on_a_connection: self.connection_id.is_some() || self.lifetime.is_some(),
         }
     }
 
@@ -10334,17 +10496,75 @@ fn spawn_force_cancel_watchdog(dispatched: Vec<DispatchedCancel>, force_timeout:
     }
 }
 
+/// The work a cancel has ENDED, so a caller can wait for it to have STOPPED.
+///
+/// A cancel is DISPATCHED, not delivered: the breaks run on the watchdog
+/// thread, and on the MySQL family the first one has to open a control
+/// connection before it can say anything at all. The registry entry goes at
+/// dispatch — which is right, the screen must not go on showing work the user
+/// has ended — and that is exactly why the registry cannot answer the next
+/// question. After a cancel, "is it still running?" has no asker: the row is
+/// gone, and the only thing still tied to the work is its own activity GUARD,
+/// which lives until the frame holding the session ends.
+///
+/// Nothing needed to ask while the process was still there: a cancelled read
+/// lets go a moment later, gives its session back, and the pool logs it off.
+/// Application EXIT is the one caller for which a moment later is never — it
+/// disconnects, retires the pool and quits while the worker is still unwinding,
+/// and the session goes with the process, leaving the server to reap it from a
+/// dropped socket. Measured on all four backends by
+/// `verify_session_leak_live` T16.
+#[must_use = "a cancel that is never waited for leaves the caller unable to say whether the work               it ended has actually stopped"]
+pub struct CancelledDbWork {
+    retired: usize,
+    /// The guard of every cancelled row that had a SESSION published under it,
+    /// and only those.
+    ///
+    /// A row with no canceler was holding no session, so there is nothing about
+    /// it a teardown could be too early for — and waiting on it would be
+    /// waiting on whoever happens to hold the guard, which for a status row is
+    /// the SCREEN. That is how a wait meant for the work would come to be spent
+    /// on the UI's own bookkeeping.
+    holding_a_session: Vec<Weak<DbActivityGuardInner>>,
+}
+
+impl CancelledDbWork {
+    /// How many registry entries this cancel retired.
+    pub fn retired(&self) -> usize {
+        self.retired
+    }
+
+    /// How much of that work is still running on the session it was holding.
+    pub fn still_holding_a_session(&self) -> usize {
+        self.holding_a_session
+            .iter()
+            .filter(|guard| guard.strong_count() > 0)
+            .count()
+    }
+
+    /// Wait, up to `timeout`, for the work this cancel ended to let go of its
+    /// sessions. Answers how much of it is still holding one.
+    ///
+    /// The same shape every other wait in the app uses
+    /// ([`wait_for_graceful_cancel`]): the question is asked FIRST on every
+    /// pass, so an already elapsed deadline is never an answer on its own.
+    pub fn wait_until_the_work_let_go(&self, timeout: Duration) -> usize {
+        wait_for_graceful_cancel(timeout, || self.still_holding_a_session() > 0);
+        self.still_holding_a_session()
+    }
+}
+
 /// Cancel every tracked activity matching `select`, removing their entries.
-/// Returns how many were retired.
 fn cancel_db_activities_where(
     force_timeout: Duration,
     select: impl Fn(&TrackedDbActivity) -> bool,
-) -> usize {
+) -> CancelledDbWork {
     // Nothing that can block or re-enter runs while the registry lock is held:
     // `interrupt` makes a network call (MySQL cancels over a second
     // connection), and a cancel hook calls back into the owner, which may touch
     // the registry itself. Both happen after the lock is released.
     let mut selected = Vec::new();
+    let mut holding_a_session = Vec::new();
     let mut retired = 0usize;
     {
         let mut activities = lock_db_activities();
@@ -10357,6 +10577,11 @@ fn cancel_db_activities_where(
                 return true;
             }
             retired += 1;
+            // A row with a canceler is a row with a SESSION published under it,
+            // which is the only kind a caller can be too early for.
+            if !tracked.cancelers.is_empty() {
+                holding_a_session.push(tracked.guard.clone());
+            }
             selected.push((
                 tracked.on_cancel.take(),
                 std::mem::take(&mut tracked.cancelers),
@@ -10398,13 +10623,16 @@ fn cancel_db_activities_where(
         }
     }
     spawn_force_cancel_watchdog(dispatched, force_timeout);
-    retired
+    CancelledDbWork {
+        retired,
+        holding_a_session,
+    }
 }
 
 /// Cancel one activity by id. Used by the cancel button for work that has no
 /// query tab behind it.
 pub fn cancel_db_activity(id: u64, force_timeout: Duration) -> bool {
-    cancel_db_activities_where(force_timeout, |tracked| tracked.id == id) > 0
+    cancel_db_activities_where(force_timeout, |tracked| tracked.id == id).retired() > 0
 }
 
 /// Retire every activity whose connection is gone.
@@ -10413,7 +10641,7 @@ pub fn cancel_db_activity(id: u64, force_timeout: Duration) -> bool {
 /// on the status bar tick, so a disconnect clears within one UI frame no matter
 /// which code path started the work.
 pub fn sweep_stale_db_activities(force_timeout: Duration) -> usize {
-    cancel_db_activities_where(force_timeout, TrackedDbActivity::is_stale)
+    cancel_db_activities_where(force_timeout, TrackedDbActivity::is_stale).retired()
 }
 
 /// Retire every activity belonging to a connection that is being closed.
@@ -10424,6 +10652,7 @@ pub fn cancel_db_activities_for_connection(
     cancel_db_activities_where(force_timeout, |tracked| {
         tracked.connection_id == Some(connection_id)
     })
+    .retired()
 }
 
 /// Retire every activity in the app, because the app itself is ending.
@@ -10438,7 +10667,7 @@ pub fn cancel_db_activities_for_connection(
 /// breaking anything. That was done on the FORCED exit path too, the one
 /// reached only because the work would not stop, so the one mechanism able to
 /// end those sessions was destroyed a statement before they needed ending.
-pub fn cancel_all_db_activities(force_timeout: Duration) -> usize {
+pub fn cancel_all_db_activities(force_timeout: Duration) -> CancelledDbWork {
     cancel_db_activities_where(force_timeout, |_| true)
 }
 
@@ -12314,9 +12543,9 @@ mod tests {
         let ran_in_task = Arc::clone(&ran);
         // Parked exactly as a failed spawn parks it: in the queue, with no
         // worker of its own.
-        lock_pending_connection_cleanups().push(Box::new(move || {
+        lock_pending_connection_cleanups().push(ConnectionCleanupTask::new(move || {
             ran_in_task.store(true, Ordering::Release);
-        }) as ConnectionCleanupTask);
+        }));
 
         assert!(
             !ran.load(Ordering::Acquire),
@@ -12333,6 +12562,112 @@ mod tests {
             ran.load(Ordering::Acquire),
             "the parked cleanup must be started again, or the sessions a retired connection \
              left behind are never released"
+        );
+    }
+
+    /// How many connection cleanups have not finished yet.
+    ///
+    /// Lives in the tests module rather than beside the count itself: two
+    /// guards read "the production half" of this file as everything before its
+    /// first `#[cfg(test)]`, so a test-only item among the production
+    /// definitions empties the half they are counting. Production asks the
+    /// question through `wait_for_connection_cleanups`, which answers it as
+    /// part of waiting.
+    fn outstanding_connection_cleanup_count() -> usize {
+        *lock_outstanding_connection_cleanups()
+    }
+
+    /// A cleanup that has been handed out is OUTSTANDING until it has run, and
+    /// the wait ends when it has — not when the deadline does.
+    ///
+    /// This is what turns "this connection was disconnected" into "its sessions
+    /// were logged off" at application exit. Every road that ends a connection
+    /// hands the logoff to this worker, so before there was anything to wait
+    /// for, `app::quit()` could follow a `disconnect()` whose logoff had not
+    /// left the process yet.
+    #[test]
+    fn a_connection_cleanup_is_outstanding_until_it_has_actually_run() {
+        let release = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let release_in_task = Arc::clone(&release);
+        let done_in_task = Arc::clone(&done);
+        spawn_connection_cleanup(move || {
+            while !release_in_task.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            done_in_task.store(true, Ordering::Release);
+        });
+
+        let outstanding = wait_for_connection_cleanups(Instant::now() + Duration::from_millis(80));
+        assert!(
+            outstanding > 0,
+            "a cleanup that has not finished is outstanding, so exit knows what it is leaving"
+        );
+        assert!(
+            !done.load(Ordering::Acquire),
+            "and the bounded wait really did give up rather than block for ever"
+        );
+
+        release.store(true, Ordering::Release);
+        wait_for_connection_cleanups(Instant::now() + Duration::from_secs(10));
+        assert!(
+            done.load(Ordering::Acquire),
+            "the wait must end because the cleanup finished, not because time passed"
+        );
+    }
+
+    /// A task nothing could start is STARTED by the wait, not merely waited
+    /// out.
+    ///
+    /// A failed thread spawn parks its task in the queue. Waiting for a parked
+    /// task without starting it spends the whole deadline and still leaves the
+    /// sessions open — the one case where the answer would be wrong in the
+    /// direction that costs a session.
+    #[test]
+    fn waiting_for_connection_cleanups_starts_what_a_failed_spawn_parked() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_task = Arc::clone(&ran);
+        lock_pending_connection_cleanups().push(ConnectionCleanupTask::new(move || {
+            ran_in_task.store(true, Ordering::Release);
+        }));
+
+        assert!(
+            !ran.load(Ordering::Acquire),
+            "the task is parked with no worker, which is the state being recovered from"
+        );
+
+        wait_for_connection_cleanups(Instant::now() + Duration::from_secs(10));
+
+        assert!(
+            ran.load(Ordering::Acquire),
+            "a parked cleanup must be started by the wait, or exit waits out its whole \
+             deadline for work nothing is running"
+        );
+    }
+
+    /// The count is part of the TASK, so a task that is lost before it runs
+    /// releases it.
+    ///
+    /// Maintained by the two call sites instead, a task dropped while unwinding
+    /// — or taken back by a failed spawn and never re-queued — would leave the
+    /// app waiting at exit for work that no longer exists. Retried because the
+    /// count is process-wide and the suite is multi-threaded: with the release
+    /// in place at least one attempt is uninterrupted, and without it NO
+    /// attempt can end where it started.
+    #[test]
+    fn a_cleanup_task_carries_its_own_place_in_the_outstanding_count() {
+        let measured_cleanly = (0..40).any(|_| {
+            let before = outstanding_connection_cleanup_count();
+            let task = ConnectionCleanupTask::new(|| {});
+            let held = outstanding_connection_cleanup_count();
+            drop(task);
+            let after = outstanding_connection_cleanup_count();
+            held == before + 1 && after == before
+        });
+        assert!(
+            measured_cleanly,
+            "making a task must count it and dropping one must release it, or exit waits for \
+             work that will never finish"
         );
     }
 
@@ -12502,7 +12837,7 @@ mod tests {
     fn cleanup_task_is_recovered_when_worker_start_fails() {
         let executed = Arc::new(AtomicBool::new(false));
         let executed_for_task = Arc::clone(&executed);
-        let task: ConnectionCleanupTask = Box::new(move || {
+        let task = ConnectionCleanupTask::new(move || {
             executed_for_task.store(true, Ordering::Release);
         });
 
@@ -12517,13 +12852,13 @@ mod tests {
         assert_eq!(err, "simulated worker start failure");
         assert!(!executed.load(Ordering::Acquire));
         let pending_task = pending_task.expect("failed start must return cleanup ownership");
-        pending_task();
+        pending_task.run();
         assert!(executed.load(Ordering::Acquire));
     }
 
     #[test]
     fn cleanup_task_panic_is_contained() {
-        let task: ConnectionCleanupTask = Box::new(|| panic!("simulated cleanup panic"));
+        let task = ConnectionCleanupTask::new(|| panic!("simulated cleanup panic"));
         let task = Arc::new(Mutex::new(Some(task)));
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -14262,6 +14597,88 @@ mod tests {
         }
     }
 
+    /// A cancel ENDS work; it does not STOP it. What it answers with is what
+    /// lets a caller wait for the difference.
+    ///
+    /// The registry entry goes at DISPATCH — which is right, the screen must not
+    /// go on showing work the user ended — so after a cancel nothing but the
+    /// work's own activity guard is still tied to it. Application exit is the
+    /// caller that has to know: it disconnects, retires the pool and quits, and
+    /// a session a cancelled job is still holding goes with the process.
+    #[test]
+    fn a_cancel_answers_with_the_work_it_ended_so_a_caller_can_wait_for_it_to_stop() {
+        // The registry is process-wide and the tests that reach for it EMPTY it
+        // (`reset_tracked_db_activities_for_probe`), so every one of them takes
+        // this lock. Without it a reset landing between the row being published
+        // and its canceler being attached makes the attach answer
+        // `ActivityRetired` — which is what made this test intermittently red.
+        let _test_guard = db_activity_test_lock();
+        let activity = track_db_activity("a job holding a session", None);
+        let registration = activity
+            .attach_canceler(Arc::new(TestCanceler::default()))
+            .attached()
+            .expect("the canceler should attach");
+        let id = activity.id();
+
+        let cancelled = cancel_db_activity_for_test(id);
+        assert_eq!(cancelled.retired(), 1, "the row is retired at dispatch");
+        assert!(
+            !activity_is_registered(id),
+            "and it leaves the registry there, which is why the registry cannot answer next"
+        );
+        assert_eq!(
+            cancelled.still_holding_a_session(),
+            1,
+            "but the work is still running on the session it was holding, and the answer says so"
+        );
+        // A bounded wait that cannot succeed still ANSWERS, rather than
+        // pretending the work stopped.
+        assert_eq!(
+            cancelled.wait_until_the_work_let_go(Duration::from_millis(50)),
+            1,
+            "a wait that runs out reports what is still holding on"
+        );
+
+        // The worker's frame ends: its registration goes, then its guard.
+        drop(registration);
+        drop(activity);
+        assert_eq!(
+            cancelled.wait_until_the_work_let_go(Duration::from_secs(5)),
+            0,
+            "and the wait ends the moment the work has let go"
+        );
+    }
+
+    /// The wait is for work that was holding a SESSION, and for nothing else.
+    ///
+    /// A row with no canceler had no session published under it, so there is
+    /// nothing about it a teardown could be too early for — and its guard may
+    /// be held by the SCREEN (`StatusActivity::Owned`), which does not let go
+    /// until the app is gone. Waiting on that would spend exit's budget on the
+    /// UI's own bookkeeping on every quit.
+    #[test]
+    fn a_cancelled_row_that_was_holding_no_session_is_not_waited_for() {
+        let _test_guard = db_activity_test_lock();
+        let activity = track_db_activity("a row the screen owns", None);
+        let id = activity.id();
+
+        let cancelled = cancel_db_activity_for_test(id);
+        assert_eq!(cancelled.retired(), 1, "the row is still retired");
+        assert_eq!(
+            cancelled.still_holding_a_session(),
+            0,
+            "but nothing here is holding a session, so there is nothing to wait for"
+        );
+        // Still held, and deliberately: this is the shape that would otherwise
+        // make every exit wait out its whole budget.
+        assert_eq!(
+            cancelled.wait_until_the_work_let_go(Duration::from_secs(5)),
+            0,
+            "so the wait returns at once even though the guard is still alive"
+        );
+        drop(activity);
+    }
+
     /// The registry retires an activity synchronously but performs the break on
     /// the watchdog thread, so tests wait for it rather than assuming it landed
     /// before `cancel_db_activity` returned.
@@ -14290,6 +14707,17 @@ mod tests {
 
     fn activity_is_registered(id: u64) -> bool {
         activity_row(id).is_some()
+    }
+
+    /// Cancel ONE row and keep what the cancel answered with.
+    ///
+    /// `cancel_db_activity` throws that answer away for its `bool`, and the
+    /// answer is what the tests below are about. Scoped to one id for the same
+    /// reason `activity_row` is: the registry is process-wide and the suite is
+    /// multi-threaded, so `cancel_all_db_activities` here would end whatever
+    /// else is running.
+    fn cancel_db_activity_for_test(id: u64) -> CancelledDbWork {
+        cancel_db_activities_where(Duration::from_secs(60), |tracked| tracked.id == id)
     }
 
     fn activity_is_cancelable(id: u64) -> bool {

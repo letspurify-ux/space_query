@@ -85,13 +85,48 @@ const APPLICATION_EXIT_POLL_SECONDS: f64 = 0.2;
 const APPLICATION_EXIT_CANCEL_GRACE: Duration = Duration::from_secs(5);
 // How long the whole exit teardown will wait for calls the exit cancel has just
 // broken to let go of their connections, so each one gets a real logoff instead
-// of the process dropping its socket. ONE budget for every connection, like the
-// cancel watchdog's own: the cancels were all dispatched at the same moment, so
-// they have all had the same grace, and a per-connection budget would make exit
-// take N times as long. It only elapses when something really is wedged — each
-// wait ends the instant the connection lock is free.
+// of the process dropping its socket. ONE budget for every connection, so exit
+// stays bounded no matter how many are open — but SHARED OUT, not consumed
+// first-come-first-served (`exit_teardown_share_for_connection`).
+//
+// It used to be a single deadline every connection raced for, defended by an
+// analogy to the cancel watchdog's one batch deadline. The analogy does not
+// hold, and the difference is the whole point: the watchdog's deadline decides
+// only WHEN a session is escalated to the tier that cannot be taken back, and
+// every session is still acted on; this one decides WHETHER a connection is
+// waited for at all. A connection that reached it with nothing left was
+// skipped, and its sessions went the way this budget exists to prevent — the
+// process dropping the socket. With two wedged connections that is not a corner
+// case: `try_lock_connection` also answers "busy" while a transition is in
+// flight, so quitting during a reconnect or a pool rebuild puts every
+// connection in that state, and the MySQL family's graceful break opens a
+// control connection per session on one watchdog thread, so the first wait is
+// the one that lasts. A share keeps the same bound and gives every connection a
+// real chance.
 const APPLICATION_EXIT_SESSION_TEARDOWN_GRACE: Duration = Duration::from_secs(3);
 const APPLICATION_EXIT_SESSION_TEARDOWN_POLL: Duration = Duration::from_millis(25);
+// How long exit gives the work it just cancelled to LET GO of the sessions it
+// was holding, before the connections are taken away from under it.
+//
+// The middle of exit's three bounded phases: stop the work, take the
+// connections, let the logoffs land. It is a phase of its own because a cancel
+// is dispatched rather than delivered — the breaks run on the watchdog thread,
+// and on the MySQL family the first one opens a control connection before it
+// can say anything — while a pooled worker holds no connection mutex, so
+// nothing in the connection walk waits for it. Exit therefore used to retire
+// the pool out from under a cancelled read and quit while it was still
+// unwinding, and the session went with the process. Every phase ends the
+// instant its work is done, so a quiet exit spends none of this.
+const APPLICATION_EXIT_WORK_STOP_GRACE: Duration = Duration::from_secs(3);
+// How long exit waits for the teardown it has already DECIDED to actually reach
+// the server. Every road that ends a connection hands the logoff itself to the
+// connection cleanup worker (`retire_connection_resources_in_background`), so
+// `disconnect()` returning means decided, not done — and for exit the
+// difference is permanent, because `app::quit()` is followed by the process
+// ending and a worker still on the wire ends with it. See
+// `crate::db::wait_for_connection_cleanups`. Bounded for the same reason as the
+// grace above: a cleanup wedged on a dead server must not stop the app quitting.
+const APPLICATION_EXIT_SESSION_CLOSE_GRACE: Duration = Duration::from_secs(3);
 const MAX_TOP_LEVEL_WINDOWS_TO_HIDE: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,6 +134,28 @@ enum ApplicationExitWaitDecision {
     Continue,
     Retry,
     Force,
+}
+
+/// How long ONE connection may be waited for, out of what is left of the whole
+/// teardown's budget.
+///
+/// An equal share of what remains, recomputed per connection, so a connection
+/// that lets go at once hands the rest of its share to the connections behind
+/// it while the TOTAL stays bounded by
+/// [`APPLICATION_EXIT_SESSION_TEARDOWN_GRACE`]. The alternative the exit loop
+/// used to have — one deadline everybody raced for — is not a smaller version
+/// of this: it gives the connections after the first wedged one exactly zero,
+/// which is the same as not waiting for them at all.
+fn exit_teardown_share_for_connection(remaining: Duration, connections_left: usize) -> Duration {
+    // `checked_div`, not `/`: raw division is banned project-wide
+    // (`source_does_not_use_raw_div_or_rem_outside_arithmetic_helpers`), and
+    // `Duration` has no `safe_div`. `max(1)` already makes the divisor
+    // non-zero, so the fallback is unreachable by construction and answers the
+    // same thing the caller would want anyway — an empty list gets everything
+    // that is left.
+    remaining
+        .checked_div(connections_left.max(1) as u32)
+        .unwrap_or(remaining)
 }
 
 fn application_exit_wait_decision(
@@ -3034,7 +3091,7 @@ impl AppState {
     ) -> Option<String> {
         let mut labels = crate::db::active_db_activity_snapshots()
             .into_iter()
-            .filter(|activity| scope.covers(activity.connection_id))
+            .filter(|activity| scope.covers(activity))
             .map(|activity| activity.activity)
             .collect::<Vec<_>>();
         labels.sort();
@@ -3621,10 +3678,18 @@ impl AppState {
             })
     }
 
+    /// Give back every tab's retained session that has nothing left to
+    /// resolve.
+    ///
+    /// Asks `editors_that_can_own_db_work` and nothing else. `AppState::
+    /// sql_editor` is a CLONE sharing the active tab's state (or a detached
+    /// widget while no tab exists), so asking it as well was a sixth owner in a
+    /// list the app has one answer for — harmless only because the second ask
+    /// found the work already done.
     fn release_all_resolved_pooled_db_sessions(&self) -> Result<bool, String> {
-        let mut released_any = self.sql_editor.release_pooled_db_session_if_resolved()?;
-        for tab in &self.editor_tabs {
-            released_any |= tab.sql_editor.release_pooled_db_session_if_resolved()?;
+        let mut released_any = false;
+        for editor in self.editors_that_can_own_db_work() {
+            released_any |= editor.release_pooled_db_session_if_resolved()?;
         }
         Ok(released_any)
     }
@@ -5362,11 +5427,22 @@ pub(crate) enum SessionTeardownScope {
 }
 
 impl SessionTeardownScope {
-    /// Whether work tagged with `connection_id` is in this scope.
-    fn covers(self, connection_id: Option<ConnectionId>) -> bool {
+    /// Whether a session-ending action on this scope would tear `activity`
+    /// down.
+    ///
+    /// Asked of the whole row, not of its connection id alone. `EveryConnection`
+    /// used to answer yes to everything, including a row that runs on NO
+    /// connection of the app's — the connection dialog's "Testing connection"
+    /// probe. A pool rebuild has nothing to end there, so refusing it named an
+    /// entry the user could not act on: the probe carries no canceler, so the
+    /// status bar's cancel button does not offer it either, and the only way
+    /// out was to wait out the connect timeout. See
+    /// [`crate::db::DbActivitySnapshot::runs_on_a_connection`] for why ignoring
+    /// such a row does not widen what a teardown may destroy.
+    fn covers(self, activity: &crate::db::DbActivitySnapshot) -> bool {
         match self {
-            Self::EveryConnection => true,
-            Self::Connection(id) => connection_id == Some(id),
+            Self::EveryConnection => activity.runs_on_a_connection,
+            Self::Connection(id) => activity.connection_id == Some(id),
         }
     }
 
@@ -5404,7 +5480,7 @@ impl SessionTeardownScope {
 
     fn cancel_background_db_work(self, force_timeout: Duration) -> usize {
         match self {
-            Self::EveryConnection => crate::db::cancel_all_db_activities(force_timeout),
+            Self::EveryConnection => crate::db::cancel_all_db_activities(force_timeout).retired(),
             Self::Connection(id) => {
                 crate::db::cancel_db_activities_for_connection(id, force_timeout)
             }
@@ -7844,11 +7920,19 @@ impl MainWindow {
         rollback_button: &str,
         action_description: &str,
     ) -> bool {
+        // The same list every gate refuses on and every cancel road offers,
+        // and for the same reason: this is what a pool rebuild and application
+        // exit ask before they COMMIT OR ROLL BACK a tab's transaction, so a
+        // tab it does not name is a tab whose work is destroyed without being
+        // asked about. It used to walk the tab STRIP's entries — a third list,
+        // maintained beside `editor_tabs` — while `tabs_that_can_own_db_work`
+        // is the one source the rest of the app agrees on.
         let tab_ids = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .query_tabs
-            .tab_ids();
+            .tabs_that_can_own_db_work()
+            .map(|tab| tab.tab_id)
+            .collect::<Vec<_>>();
         let outcome = Self::resolve_pooled_sessions_for_tabs(
             state,
             tab_ids,
@@ -16246,7 +16330,19 @@ impl MainWindow {
         }
     }
 
-    fn continue_application_exit(state: Arc<Mutex<AppState>>, window: Window, check_dirty: bool) {
+    /// Continue an exit that has not been decided yet: every refusal is still
+    /// available here, so nothing may be ended and no pool may be held shut.
+    ///
+    /// `decided` carries the hold once the user has answered the question that
+    /// makes exit irreversible — "cancel the running query and quit?" — so the
+    /// deferred wait that follows it keeps the door shut rather than re-opening
+    /// it every poll.
+    fn continue_application_exit(
+        state: Arc<Mutex<AppState>>,
+        window: Window,
+        check_dirty: bool,
+        decided: Option<crate::db::PoolSessionHandoutHold>,
+    ) {
         if check_dirty && !Self::confirm_save_for_all_dirty_tabs(&state) {
             return;
         }
@@ -16257,12 +16353,36 @@ impl MainWindow {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             s.has_running_query_or_lazy_fetch()
         };
+        if has_running_work && !Self::confirm_cancel_running_query_for_exit(&state) {
+            return;
+        }
+
+        // DECIDED here, in ONE place, once every refusal that abandons the exit
+        // WITHOUT touching anything has been spent — and before the two things
+        // that do touch something: `cancel_all_running_queries` below, and the
+        // per-tab prompts, which perform real COMMIT/ROLLBACKs.
+        //
+        // The hold is what closes the window those prompts open. They are
+        // modal, a modal runs a nested `app::wait()`, and the progress events
+        // and UI timers dispatched inside it are what start the object
+        // browser's and IntelliSense's metadata reads: work begun there walks
+        // past a gate that has already answered, and exit then force-cancels a
+        // session it never needed to hand out — and cannot log it off either,
+        // because it is acquired after the connections have been walked. Exit
+        // was the one session-ending action of the four that left this open.
+        // The prompts cannot be broken by it: they resolve the tabs' RETAINED
+        // sessions and never acquire from the pool.
+        //
+        // A user Cancel inside the prompts still abandons the exit, and the
+        // hold going with it is right — the door must re-open for an action
+        // that is not happening.
+        let decided = decided.unwrap_or_else(|| {
+            SessionTeardownScope::EveryConnection.hold_pool_session_handout(&state)
+        });
+
         if has_running_work {
-            if !Self::confirm_cancel_running_query_for_exit(&state) {
-                return;
-            }
             Self::cancel_all_running_queries(&state);
-            Self::defer_application_exit_until_idle(state, window, Instant::now());
+            Self::defer_application_exit_until_idle(state, window, Instant::now(), decided);
             return;
         }
 
@@ -16270,13 +16390,21 @@ impl MainWindow {
             return;
         }
 
-        Self::finish_application_exit(&state, window);
+        Self::finish_application_exit(&state, window, decided);
     }
 
+    /// Wait for a decided exit's work to stop, holding the pools shut the whole
+    /// way.
+    ///
+    /// `decided` rides through every re-arm and into both endings, so the door
+    /// this action closed when the user answered stays closed until the app is
+    /// actually gone. Dropping it per poll and re-taking it would leave a gap
+    /// on every tick.
     fn defer_application_exit_until_idle(
         state: Arc<Mutex<AppState>>,
         window: Window,
         started_at: Instant,
+        decided: crate::db::PoolSessionHandoutHold,
     ) {
         crate::ui::ui_timeout::schedule(APPLICATION_EXIT_POLL_SECONDS, move || {
             let running_work = match state.try_lock() {
@@ -16292,18 +16420,24 @@ impl MainWindow {
                 Err(std::sync::TryLockError::WouldBlock) => None,
             };
             let Some(has_running_work) = running_work else {
-                Self::defer_application_exit_until_idle(state, window, started_at);
+                Self::defer_application_exit_until_idle(state, window, started_at, decided);
                 return;
             };
             match application_exit_wait_decision(has_running_work, started_at.elapsed()) {
                 ApplicationExitWaitDecision::Continue => {
-                    Self::continue_application_exit(state.clone(), window.clone(), false);
+                    Self::continue_application_exit(
+                        state.clone(),
+                        window.clone(),
+                        false,
+                        Some(decided),
+                    );
                 }
                 ApplicationExitWaitDecision::Retry => {
                     Self::defer_application_exit_until_idle(
                         state.clone(),
                         window.clone(),
                         started_at,
+                        decided,
                     );
                 }
                 ApplicationExitWaitDecision::Force => {
@@ -16315,7 +16449,7 @@ impl MainWindow {
                     // the session that will not stop cannot be committed
                     // either — but the work must not go in silence.
                     Self::report_unresolved_sessions_before_forced_exit(&state);
-                    Self::finish_application_exit(&state, window.clone());
+                    Self::finish_application_exit(&state, window.clone(), decided);
                 }
             }
         });
@@ -16361,7 +16495,17 @@ impl MainWindow {
         }
     }
 
-    fn finish_application_exit(state: &Arc<Mutex<AppState>>, mut window: Window) {
+    /// End every session the app has, and only then quit.
+    ///
+    /// Takes the hold rather than assuming one: exit is a session-ending action
+    /// like the other three, and this is the half that runs once it is decided.
+    /// A caller cannot reach it without having closed the pool door first,
+    /// because the door IS the argument.
+    fn finish_application_exit(
+        state: &Arc<Mutex<AppState>>,
+        mut window: Window,
+        decided: crate::db::PoolSessionHandoutHold,
+    ) {
         // FLTK's event loop returns only after every native top-level window is
         // hidden. Establish that exit condition before any resource cleanup
         // that could be delayed by a database driver or worker state.
@@ -16390,7 +16534,7 @@ impl MainWindow {
         // what this used to do — threw away every session canceler and every
         // hook without breaking anything, and it did so on the FORCED exit
         // path too, the one reached only because the work would not stop.
-        crate::db::cancel_all_db_activities(force_timeout);
+        let cancelled = crate::db::cancel_all_db_activities(force_timeout);
         {
             let mut popups = popups
                 .lock()
@@ -16406,12 +16550,37 @@ impl MainWindow {
         for mut tab in editor_tabs {
             tab.sql_editor.cleanup_for_close();
         }
+        // A cancel ENDS work; it does not stop it. The registry entry goes at
+        // dispatch, so after this point nothing but the work's own activity
+        // guard can say whether it has let go — and until it has, its session is
+        // still checked out of a pool this loop is about to retire. Waited for
+        // HERE, before the connections are taken away, so the sessions go back
+        // to pools that are still open and the close below logs them off.
+        let still_holding = cancelled.wait_until_the_work_let_go(APPLICATION_EXIT_WORK_STOP_GRACE);
+        if still_holding > 0 {
+            crate::utils::logging::log_warning(
+                "app",
+                &format!(
+                    "{still_holding} cancelled DB job(s) were still holding a session when the \
+                     application exited; the server was left to reap them"
+                ),
+            );
+        }
         let teardown_deadline = Instant::now() + APPLICATION_EXIT_SESSION_TEARDOWN_GRACE;
+        let mut connections_left = runtimes.len();
         for runtime in runtimes {
+            // An equal share of what is LEFT, so the first wedged connection
+            // cannot spend the budget the others need. A connection that lets
+            // go at once returns the rest of its share to the ones behind it.
+            let share = exit_teardown_share_for_connection(
+                teardown_deadline.saturating_duration_since(Instant::now()),
+                connections_left,
+            );
+            connections_left = connections_left.saturating_sub(1);
             let connection = runtime.connection();
             crate::db::clear_pool_session_context_for_shared_connection(&connection);
             if let Some(mut db_conn) =
-                Self::lock_connection_for_exit(&connection, teardown_deadline)
+                Self::lock_connection_for_exit(&connection, Instant::now() + share)
             {
                 db_conn.disconnect();
                 db_conn.refresh_tracked_connection();
@@ -16426,8 +16595,40 @@ impl MainWindow {
                 );
             };
         }
+        // `disconnect()` DECIDES the teardown; the logoff itself is handed to
+        // the connection cleanup worker, because every other caller of it holds
+        // the connection mutex while it hands off. Exit is the one caller for
+        // which "decided" is not enough: `app::quit()` below is followed by the
+        // process ending, and a worker still on the wire ends with it — the
+        // server left to reap sessions from a dropped socket, and on Oracle
+        // thin the pool's IDLE sessions, whose only logoff is
+        // `DbConnectionPool::close`. This thread holds no connection mutex here,
+        // which is what makes waiting for it safe.
+        let still_running = crate::db::wait_for_connection_cleanups(
+            Instant::now() + APPLICATION_EXIT_SESSION_CLOSE_GRACE,
+        );
+        if still_running > 0 {
+            crate::utils::logging::log_warning(
+                "app",
+                &format!(
+                    "{still_running} connection teardown task(s) had not finished when the \
+                     application exited; their sessions were left to the server to reap"
+                ),
+            );
+        }
         result_tabs.clear();
+        // The column-load workers are the last thing in the app that can ask
+        // for a pooled session, and shutting them down does not JOIN them: it
+        // sends each a Shutdown and hands the joins to a reaper thread. So the
+        // hold stays until after this — a worker that starts one more task here
+        // is refused at the acquire door instead of being handed a session
+        // nothing is left to log off. Nothing hangs on it either: the door
+        // ANSWERS a held pool, it does not block on one.
         crate::ui::sql_editor::SqlEditorWidget::shutdown_column_load_workers();
+        // Held to the very end, which is what the comment above needs to be
+        // true: a hold released before the app is gone re-opens the pool door
+        // for whatever is still on the UI thread's queue.
+        drop(decided);
         app::quit();
     }
 
@@ -16442,7 +16643,10 @@ impl MainWindow {
         let weak_state_for_close = Arc::downgrade(&state);
         window.set_callback(move |w| {
             if let Some(state) = weak_state_for_close.upgrade() {
-                MainWindow::continue_application_exit(state, w.clone(), true);
+                // No hold yet: the window-close road has every refusal still
+                // ahead of it (unsaved tabs, a running query), and a hold is
+                // what a DECIDED action takes.
+                MainWindow::continue_application_exit(state, w.clone(), true, None);
             } else {
                 crate::ui::sql_editor::SqlEditorWidget::shutdown_column_load_workers();
                 w.hide();
@@ -17773,6 +17977,7 @@ mod tests {
                 connection_id: Some(first_connection_id),
                 progress: crate::db::DbActivityProgress::Indeterminate,
                 cancelable: false,
+                runs_on_a_connection: true,
             },
             crate::db::DbActivitySnapshot {
                 id: 11,
@@ -17782,6 +17987,7 @@ mod tests {
                 connection_id: Some(second_connection_id),
                 progress: crate::db::DbActivityProgress::Indeterminate,
                 cancelable: false,
+                runs_on_a_connection: true,
             },
         ];
 
@@ -17843,6 +18049,7 @@ mod tests {
                 connection_id: None,
                 progress: crate::db::DbActivityProgress::Indeterminate,
                 cancelable: false,
+                runs_on_a_connection: true,
             },
             crate::db::DbActivitySnapshot {
                 id: 43,
@@ -17852,6 +18059,7 @@ mod tests {
                 connection_id: None,
                 progress: crate::db::DbActivityProgress::Indeterminate,
                 cancelable: false,
+                runs_on_a_connection: true,
             },
         ];
 
@@ -18081,6 +18289,117 @@ mod tests {
             application_exit_wait_decision(true, APPLICATION_EXIT_CANCEL_GRACE),
             ApplicationExitWaitDecision::Force
         );
+    }
+
+    /// Every connection gets a share of the exit budget, and the first one
+    /// cannot spend it all.
+    ///
+    /// The loop used to give every connection the SAME deadline, so a
+    /// connection that was busy for the whole grace left the ones behind it
+    /// with nothing: they were skipped, and their sessions went the way the
+    /// budget exists to prevent — the process dropping the socket. Two busy
+    /// connections is all it takes, and `try_lock_connection` also answers
+    /// "busy" while a transition is in flight, so quitting during a reconnect
+    /// or a pool rebuild puts every connection in that state.
+    #[test]
+    fn every_connection_gets_a_share_of_the_exit_teardown_budget() {
+        let whole = APPLICATION_EXIT_SESSION_TEARDOWN_GRACE;
+
+        assert_eq!(
+            exit_teardown_share_for_connection(whole, 3),
+            whole / 3,
+            "three connections share the budget rather than racing for it"
+        );
+        assert!(
+            exit_teardown_share_for_connection(whole, 3) < whole,
+            "so the first connection cannot leave the others with nothing"
+        );
+        assert_eq!(
+            exit_teardown_share_for_connection(whole, 1),
+            whole,
+            "the last connection may use everything that is left"
+        );
+    }
+
+    /// A share is never negative, never divides by zero, and hands the unused
+    /// part of one connection's share on to the next.
+    #[test]
+    fn an_exhausted_exit_budget_still_answers_and_an_unused_one_is_handed_on() {
+        assert_eq!(
+            exit_teardown_share_for_connection(Duration::ZERO, 4),
+            Duration::ZERO,
+            "a budget already spent gives nothing, without underflowing"
+        );
+        assert_eq!(
+            exit_teardown_share_for_connection(Duration::from_secs(2), 0),
+            Duration::from_secs(2),
+            "an empty list is not a division by zero"
+        );
+        // What is LEFT is what gets shared, so a connection that let go at once
+        // leaves more for each of the rest than an equal split of the whole.
+        let whole = Duration::from_secs(3);
+        assert!(
+            exit_teardown_share_for_connection(whole, 2)
+                > exit_teardown_share_for_connection(whole, 3),
+            "the share is recomputed against the remaining budget and the remaining connections"
+        );
+    }
+
+    /// A teardown is refused only by work it could actually end.
+    ///
+    /// `EveryConnection` used to answer yes to every row, including one that
+    /// runs on no connection of the app's — the connection dialog's "Testing
+    /// connection" probe. A pool rebuild has nothing to end there, so refusing
+    /// it named an entry the user could not act on: the probe carries no
+    /// canceler, so the status bar's cancel button does not offer it either.
+    #[test]
+    fn a_teardown_of_every_connection_is_refused_only_by_work_on_a_connection() {
+        let connection_id = ConnectionId::for_test(7);
+        let on_a_connection = crate::db::DbActivitySnapshot {
+            id: 1,
+            activity: "Loading object browser metadata".to_string(),
+            started_at: Instant::now(),
+            db_type: Some(DatabaseType::Oracle),
+            connection_id: Some(connection_id),
+            progress: crate::db::DbActivityProgress::Indeterminate,
+            cancelable: true,
+            runs_on_a_connection: true,
+        };
+        // No id yet, but bound to a connection's lifetime: an operation row
+        // between its creation and its acquire. A rebuild DOES end this.
+        let bound_to_a_lifetime = crate::db::DbActivitySnapshot {
+            id: 2,
+            activity: "Executing query".to_string(),
+            connection_id: None,
+            runs_on_a_connection: true,
+            ..on_a_connection.clone()
+        };
+        let on_no_connection = crate::db::DbActivitySnapshot {
+            id: 3,
+            activity: "Testing connection to probe".to_string(),
+            connection_id: None,
+            cancelable: false,
+            runs_on_a_connection: false,
+            ..on_a_connection.clone()
+        };
+
+        assert!(SessionTeardownScope::EveryConnection.covers(&on_a_connection));
+        assert!(
+            SessionTeardownScope::EveryConnection.covers(&bound_to_a_lifetime),
+            "work bound to a connection's lifetime is ended by a rebuild even before it names one"
+        );
+        assert!(
+            !SessionTeardownScope::EveryConnection.covers(&on_no_connection),
+            "a probe on a connection the app does not manage must not refuse a rebuild it \
+             cannot be harmed by"
+        );
+
+        assert!(SessionTeardownScope::Connection(connection_id).covers(&on_a_connection));
+        assert!(
+            !SessionTeardownScope::Connection(connection_id).covers(&bound_to_a_lifetime),
+            "and a per-connection teardown still names only what it can match"
+        );
+        assert!(!SessionTeardownScope::Connection(connection_id).covers(&on_no_connection));
     }
 
     #[test]
