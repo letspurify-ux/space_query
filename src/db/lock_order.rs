@@ -294,7 +294,13 @@ pub mod names {
     /// nothing.
     pub const PENDING_CLEANUPS: &str = "PENDING_CLEANUPS";
 
-    pub const ALL: [&str; 11] = [
+    /// Work the app has ENDED but which has not STOPPED, listed by connection.
+    /// A leaf, taken from the cancel dispatch (holding nothing) and from under
+    /// the connection registry when a transient connection is asked whether
+    /// anything can still reach it.
+    pub const CANCELLED_WORK: &str = "CANCELLED_WORK";
+
+    pub const ALL: [&str; 12] = [
         ACTIVITY_REGISTRY,
         DB_CONNECTION,
         POOL_CONTEXT_CACHE,
@@ -306,6 +312,7 @@ pub mod names {
         RUNTIME_STATE,
         RETAINED_LEASES,
         PENDING_CLEANUPS,
+        CANCELLED_WORK,
     ];
 }
 

@@ -41,6 +41,10 @@
 //   T16 a cancel ENDS work but does not STOP it: the registry entry goes at
 //      dispatch, so exit has to wait for the cancelled job to let go of the
 //      session it was holding before it takes the connection away and quits
+//   T17 ...and the same fact seen from the other side: a connection is still
+//      NAMED by work that was cancelled and has not let go, so the removal
+//      that ENDS a transient connection cannot pull it out from under a
+//      metadata load the tab close just cancelled
 //
 // A POOL REBUILD is the third road a session dies down, and the only one where
 // the CONNECTION stays up: the preferences dialog replaces the pool, bumps the
@@ -1134,6 +1138,125 @@ fn verify(target: Target) -> Result<bool, String> {
     drop(runtime);
     drop(script_connection);
 
+    // T17: a connection is still NAMED by work the app has ended but which has
+    // not stopped.
+    //
+    // `remove_transient_if_idle` does not forget a connection, it DISCONNECTS
+    // it, and the question it asks is the activity registry's. But a cancel
+    // removes the registry entry at DISPATCH — right for the screen, and fatal
+    // for this question: closing a query tab cancels that tab's object-browser
+    // card (`remove_entry_widget` -> `cancel_metadata_refresh`) and asks this
+    // in the same UI-thread frame, so a metadata load that had just been ended
+    // was named by nothing and had its connection pulled out from under it.
+    // Round 13's defect, one road along.
+    println!("  --- T17 a cancelled read keeps its connection until it has let go ---");
+    let cancelled_read_connection = {
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(target.probe_connection_info(&probe_user, &probe_service))
+            .map_err(|err| format!("T17 connect: {err}"))?;
+        Arc::new(Mutex::new(connection))
+    };
+    let cancelled_read_registry = ConnectionRegistry::new();
+    let (cancelled_read_runtime, cancelled_read_claim) =
+        cancelled_read_registry.register_transient(Arc::clone(&cancelled_read_connection));
+    let cancelled_read_runtime_id = cancelled_read_runtime.id();
+    // No tab and no claim: the registry's answer is the ONLY thing standing
+    // between this connection and being disconnected.
+    drop(cancelled_read_claim);
+    let read_running = Arc::new(AtomicBool::new(false));
+    let read_done = Arc::new(AtomicBool::new(false));
+    let read_running_in_thread = Arc::clone(&read_running);
+    let read_done_in_thread = Arc::clone(&read_done);
+    let read_connection_for_thread = Arc::clone(&cancelled_read_connection);
+    let read_sql = target.slow_sql();
+    let read_worker = std::thread::spawn(move || {
+        let context = match pool_session_context_for_shared_connection(
+            &read_connection_for_thread,
+            Some("T17 metadata read"),
+        ) {
+            Ok(context) => context,
+            Err(_) => return,
+        };
+        let activity = context.track_activity("T17 metadata read");
+        let Ok(mut acquired) = context.acquire_session_for_current_scope(&activity) else {
+            return;
+        };
+        read_running_in_thread.store(true, Ordering::Release);
+        if let Some(session) = acquired.session_mut() {
+            let _ = probe_pool_session_runs(session, read_sql);
+        }
+        drop(acquired);
+        drop(activity);
+        drop(context);
+        read_done_in_thread.store(true, Ordering::Release);
+    });
+    report.check_flag(
+        "T17 the read acquired its session",
+        wait_until(Duration::from_secs(20), || {
+            read_running.load(Ordering::Acquire)
+        }),
+    );
+    report.check_flag(
+        "T17 a connection with a read running on it does not leave the registry",
+        !cancelled_read_registry.remove_transient_if_idle(cancelled_read_runtime_id),
+    );
+
+    // The cancel: the row leaves the registry HERE, while the read goes on
+    // holding its session.
+    space_query::db::cancel_db_activities_for_connection(
+        cancelled_read_runtime_id,
+        Duration::from_secs(60),
+    );
+    report.check_flag(
+        "T17 a connection whose read was CANCELLED but has not let go still does not leave",
+        !cancelled_read_registry.remove_transient_if_idle(cancelled_read_runtime_id)
+            && cancelled_read_registry
+                .get(cancelled_read_runtime_id)
+                .is_some(),
+    );
+    report.check_flag(
+        "T17 so the connection it is still running on is still connected",
+        cancelled_read_connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_connected(),
+    );
+
+    // Once it has let go, the connection is endable again — and ending it
+    // really ends it.
+    report.check_flag(
+        "T17 the cancelled read does let go",
+        wait_until(Duration::from_secs(30), || {
+            read_done.load(Ordering::Acquire)
+        }),
+    );
+    let _ = read_worker.join();
+    report.check_flag(
+        "T17 and then the connection leaves the registry",
+        cancelled_read_registry.remove_transient_if_idle(cancelled_read_runtime_id)
+            && cancelled_read_registry
+                .get(cancelled_read_runtime_id)
+                .is_none(),
+    );
+    report.check_flag(
+        "T17 leaving it ENDED the connection",
+        wait_until(Duration::from_secs(20), || {
+            !cancelled_read_connection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_connected()
+        }),
+    );
+    drop(cancelled_read_runtime);
+    drop(cancelled_read_connection);
+    let observed = settled_count(&mut census, connected_baseline)?;
+    report.check(
+        "T17 and nothing it held is left on the server",
+        observed,
+        connected_baseline,
+    );
+
     // T15: a teardown that has been DECIDED is not a teardown that has
     // HAPPENED.
     //
@@ -1210,20 +1333,26 @@ fn verify(target: Target) -> Result<bool, String> {
         still_outstanding,
         0,
     );
-    // ONE sample, deliberately: `settled_count` polls, and polling is exactly
-    // what this scenario must not need. It is a weaker statement than the count
-    // above -- the census query itself takes long enough for a LOCAL server to
-    // have finished either way -- so it stands as confirmation that the wait
-    // ends in the right place, not as the proof that waiting was needed.
+    // The one-sample number is REPORTED, not required, and the reason is a
+    // fact about the SERVER rather than about the app: closing a session does
+    // not wait for the server to acknowledge it (the MySQL family sends
+    // `COM_QUIT` and closes the socket), so `information_schema.processlist`
+    // can still show the row for a few milliseconds after the app has finished.
+    // Requiring one sample therefore asserted the server's bookkeeping latency,
+    // which this harness cannot control — measured intermittent on MySQL, 1 run
+    // in 3, with every app-side check green. What this scenario is about is
+    // proved by `still_outstanding` above: the app's own teardown had finished
+    // before it would have quit.
     let immediately_after = census.count()?;
     println!(
         "    server sessions immediately after the wait: {immediately_after} \
          (waited {:?})",
         cleanup_started_at.elapsed()
     );
+    let observed = settled_count(&mut census, connected_baseline)?;
     report.check(
-        "T15 and the sessions are gone from the SERVER without waiting any longer",
-        immediately_after,
+        "T15 and the sessions really are gone from the server",
+        observed,
         connected_baseline,
     );
     drop(closing_connection);
@@ -1312,20 +1441,29 @@ fn verify(target: Target) -> Result<bool, String> {
         outstanding,
         0,
     );
-    // The moment exit would call `app::quit()`. ONE sample: a session the
-    // worker is still holding would be dropped with the process here.
+    // The moment exit would call `app::quit()`. The teeth are the WORKER's own
+    // state, not the census: a job still running here is a session the process
+    // takes with it, and that is a difference of seconds. The census is the
+    // confirmation, and it is polled — after everything has been closed, the
+    // server may still show a row for a few milliseconds, which is a fact about
+    // the server rather than about the app (see T15).
     let immediately_after = census.count()?;
     println!(
         "    server sessions the moment exit would quit: {immediately_after} \
          (worker finished: {})",
         worker_done.load(Ordering::Acquire)
     );
-    report.check(
-        "T16 no session a cancelled background job was holding is left for the server to reap",
-        immediately_after,
-        connected_baseline,
+    report.check_flag(
+        "T16 no cancelled background job is still running when exit would quit",
+        worker_done.load(Ordering::Acquire),
     );
     let _ = worker.join();
+    let observed = settled_count(&mut census, connected_baseline)?;
+    report.check(
+        "T16 and nothing it was holding is left on the server",
+        observed,
+        connected_baseline,
+    );
     drop(worker_connection);
 
     // P1: a POOL REBUILD is the road where the connection stays up. Three tabs

@@ -10906,6 +10906,37 @@ fn a_connection_leaves_the_registry_only_when_it_has_been_ended() {
         "and it answers from the row's own connection, exactly like \
          `cancel_db_activities_for_connection`: {names}"
     );
+    // ...and from work the app has already ENDED but which has not STOPPED.
+    // The registry drops such a row at DISPATCH, so asking it alone answers
+    // "nothing can reach this connection" while a cancelled read is still
+    // unwinding on it — and closing a query tab cancels that tab's
+    // object-browser card and asks this question in the same UI-thread frame.
+    assert!(
+        compact_for_pattern(names)
+            .contains("cancelled_work_still_holds_a_session_on(connection_id)"),
+        "and from work that was cancelled and has not let go, or a cancel makes this answer \
+         stale in the one place where it disconnects a live session: {names}"
+    );
+    assert!(
+        connection_source.contains("static CANCELLED_WORK_STILL_HOLDING_A_SESSION"),
+        "the ledger that answers it must exist"
+    );
+    let dispatch = connection_source
+        .find("fn cancel_db_activities_where(")
+        .map(|offset| slice_to_end_of_fn(&connection_source, offset))
+        .expect("the cancel dispatch should exist");
+    assert!(
+        compact_for_pattern(dispatch)
+            .contains("remember_cancelled_work_still_holding_a_session(still_holding);"),
+        "and the cancel must be what fills it, so no road can end work without the connection \
+         going on being named until it has let go: {dispatch}"
+    );
+    assert!(
+        compact_for_pattern(dispatch).contains("if!tracked.cancelers.is_empty(){"),
+        "for rows that were holding a session and no others -- a row with none may be the \
+         SCREEN's own, and that would keep a connection un-endable for as long as the app is \
+         up: {dispatch}"
+    );
 
     // A tab that detaches keeps NAMING the runtime, counted by a value rather
     // than by each of the five writers of the field.

@@ -10247,9 +10247,21 @@ pub fn active_db_activity_snapshots() -> Vec<DbActivitySnapshot> {
 /// `background_work_blocking_session_teardown` does not count one: work that
 /// cannot be attributed to a connection must not refuse an action on one.
 pub(crate) fn db_activity_names_connection(connection_id: ConnectionId) -> bool {
-    lock_db_activities()
-        .iter()
-        .any(|tracked| tracked.connection_id == Some(connection_id))
+    // Bound to a block so the registry lock is RELEASED before the ledger is
+    // taken: a temporary in an `if` condition lives to the end of the whole
+    // `if`, which would hold a leaf lock while taking another.
+    let a_row_names_it = {
+        lock_db_activities()
+            .iter()
+            .any(|tracked| tracked.connection_id == Some(connection_id))
+    };
+    // ...and work this connection carries that the app has already ENDED but
+    // which has not STOPPED. The registry drops such a row at dispatch, so
+    // asking it alone answers "nothing can reach this connection" while a
+    // cancelled read is still unwinding on it -- and the one caller of this
+    // does not merely forget a connection, it disconnects it. See
+    // [`CANCELLED_WORK_STILL_HOLDING_A_SESSION`].
+    a_row_names_it || cancelled_work_still_holds_a_session_on(connection_id)
 }
 
 /// Wait out the graceful tier of a two-tier cancel.
@@ -10554,6 +10566,74 @@ impl CancelledDbWork {
     }
 }
 
+/// Work the app has ENDED but which has not STOPPED, listed by the connection
+/// it is still holding a session on.
+///
+/// `cancel_db_activities_where` removes the registry entry at DISPATCH, and
+/// that is right — the screen must not go on showing work the user ended. It
+/// also means the registry stops NAMING that work the instant it is cancelled,
+/// while the worker goes on holding its session for as long as its unwind
+/// takes: the breaks run on the watchdog thread, and on the MySQL family the
+/// first one opens a control connection before it can say anything at all.
+///
+/// For every question in the app but one, that is harmless: the work is over
+/// either way and its session goes back a moment later. The exception is the
+/// question that ENDS a connection.
+/// [`crate::db::ConnectionRuntime::is_idle`] asks whether anything can still
+/// reach a transient connection, and `remove_transient_if_idle` does not merely
+/// forget one — it disconnects it. Closing a query tab cancels that tab's
+/// object-browser card (`remove_entry_widget` -> `cancel_metadata_refresh`) and
+/// then asks that question in the same UI-thread frame, so a metadata load that
+/// had just been ended was no longer named by anything, and its connection was
+/// pulled out from under it. That is round 13's defect reopened one road along:
+/// there the registry was not asked at all, here it is asked a question a
+/// cancel has already made stale.
+static CANCELLED_WORK_STILL_HOLDING_A_SESSION: OnceLock<
+    Mutex<Vec<(Option<ConnectionId>, Weak<DbActivityGuardInner>)>>,
+> = OnceLock::new();
+
+fn lock_cancelled_work_still_holding_a_session(
+) -> TrackedGuard<'static, Vec<(Option<ConnectionId>, Weak<DbActivityGuardInner>)>> {
+    TrackedGuard::take(
+        crate::db::lock_order::names::CANCELLED_WORK,
+        CANCELLED_WORK_STILL_HOLDING_A_SESSION.get_or_init(|| Mutex::new(Vec::new())),
+    )
+}
+
+/// Remember what a cancel ended, until it has actually stopped.
+///
+/// Pruned on every write and every read, so it holds only work that is still
+/// running: a `Weak` whose guard is gone is work whose frame has ended, and
+/// with it the session it was holding.
+fn remember_cancelled_work_still_holding_a_session(
+    work: Vec<(Option<ConnectionId>, Weak<DbActivityGuardInner>)>,
+) {
+    // Only what can be ATTRIBUTED to a connection. Work that names none cannot
+    // answer a question about one — the same rule
+    // [`db_activity_names_connection`] and [`pool_session_handout_is_held`]
+    // already state — so parking it here would only be something to prune.
+    // Note the difference from [`CancelledDbWork::holding_a_session`], which
+    // deliberately keeps ALL of it: application exit waits for every job it
+    // ended, whether or not the app can say which connection it was on.
+    let mut work = work
+        .into_iter()
+        .filter(|(connection_id, _)| connection_id.is_some())
+        .peekable();
+    if work.peek().is_none() {
+        return;
+    }
+    let mut ledger = lock_cancelled_work_still_holding_a_session();
+    ledger.retain(|(_, guard)| guard.strong_count() > 0);
+    ledger.extend(work);
+}
+
+/// Whether work this connection carries was ended but has not let go yet.
+fn cancelled_work_still_holds_a_session_on(connection_id: ConnectionId) -> bool {
+    let mut ledger = lock_cancelled_work_still_holding_a_session();
+    ledger.retain(|(_, guard)| guard.strong_count() > 0);
+    ledger.iter().any(|(on, _)| *on == Some(connection_id))
+}
+
 /// Cancel every tracked activity matching `select`, removing their entries.
 fn cancel_db_activities_where(
     force_timeout: Duration,
@@ -10564,7 +10644,7 @@ fn cancel_db_activities_where(
     // connection), and a cancel hook calls back into the owner, which may touch
     // the registry itself. Both happen after the lock is released.
     let mut selected = Vec::new();
-    let mut holding_a_session = Vec::new();
+    let mut still_holding = Vec::new();
     let mut retired = 0usize;
     {
         let mut activities = lock_db_activities();
@@ -10578,9 +10658,11 @@ fn cancel_db_activities_where(
             }
             retired += 1;
             // A row with a canceler is a row with a SESSION published under it,
-            // which is the only kind a caller can be too early for.
+            // which is the only kind a caller can be too early for -- and the
+            // only kind whose connection must go on being named until it has
+            // let go.
             if !tracked.cancelers.is_empty() {
-                holding_a_session.push(tracked.guard.clone());
+                still_holding.push((tracked.connection_id, tracked.guard.clone()));
             }
             selected.push((
                 tracked.on_cancel.take(),
@@ -10623,6 +10705,14 @@ fn cancel_db_activities_where(
         }
     }
     spawn_force_cancel_watchdog(dispatched, force_timeout);
+    let holding_a_session = still_holding
+        .iter()
+        .map(|(_, guard)| guard.clone())
+        .collect();
+    // Outside the registry lock, like everything else this function does with
+    // what it took out of it: the registry is a leaf and nothing may be taken
+    // under it.
+    remember_cancelled_work_still_holding_a_session(still_holding);
     CancelledDbWork {
         retired,
         holding_a_session,
@@ -14647,6 +14737,74 @@ mod tests {
             0,
             "and the wait ends the moment the work has let go"
         );
+    }
+
+    /// A connection goes on being NAMED by work the app has ended until that
+    /// work has actually stopped.
+    ///
+    /// The registry drops the row at dispatch, so asking it alone answers
+    /// "nothing can reach this connection" while a cancelled read is still
+    /// unwinding on it — and the one caller of that question,
+    /// `ConnectionRegistry::remove_transient_if_idle`, does not forget a
+    /// connection, it DISCONNECTS it. Closing a query tab cancels that tab's
+    /// object-browser card and asks the question in the same UI-thread frame.
+    #[test]
+    fn a_connection_is_still_named_by_work_that_was_cancelled_but_has_not_let_go() {
+        let _test_guard = db_activity_test_lock();
+        let connection_id = ConnectionId::for_test(4242);
+        let activity = track_db_activity_for_connection("a metadata read", None, connection_id);
+        let registration = activity
+            .attach_canceler(Arc::new(TestCanceler::default()))
+            .attached()
+            .expect("the canceler should attach");
+
+        assert!(
+            db_activity_names_connection(connection_id),
+            "a running read names its connection"
+        );
+
+        let cancelled = cancel_db_activity_for_test(activity.id());
+        assert_eq!(cancelled.retired(), 1);
+        assert!(
+            !activity_is_registered(activity.id()),
+            "the row leaves the registry at dispatch, which is what makes the next answer hard"
+        );
+        assert!(
+            db_activity_names_connection(connection_id),
+            "but the work has not let go, so its connection must still be named -- ending it \
+             here disconnects a live session out from under a worker"
+        );
+
+        // The worker's frame ends.
+        drop(registration);
+        drop(activity);
+        assert!(
+            !db_activity_names_connection(connection_id),
+            "and once it has let go, nothing names the connection any more"
+        );
+    }
+
+    /// A cancelled row that was holding NO session does not keep its connection
+    /// named.
+    ///
+    /// The same rule as the wait: a row with no canceler had no session, so
+    /// there is nothing a teardown could be too early for — and its guard may
+    /// be the screen's own, which would keep a connection un-endable for as
+    /// long as the app is up.
+    #[test]
+    fn a_cancelled_row_that_was_holding_no_session_stops_naming_its_connection() {
+        let _test_guard = db_activity_test_lock();
+        let connection_id = ConnectionId::for_test(4243);
+        let activity =
+            track_db_activity_for_connection("a row with no session", None, connection_id);
+
+        let cancelled = cancel_db_activity_for_test(activity.id());
+        assert_eq!(cancelled.retired(), 1);
+        assert!(
+            !db_activity_names_connection(connection_id),
+            "nothing here was holding a session, so nothing keeps the connection named"
+        );
+        drop(activity);
     }
 
     /// The wait is for work that was holding a SESSION, and for nothing else.
