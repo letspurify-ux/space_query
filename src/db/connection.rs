@@ -135,18 +135,15 @@ fn next_connection_generation() -> u64 {
     NEXT_CONNECTION_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
-fn lock_retained_pool_session_leases() -> MutexGuard<'static, Vec<Weak<Mutex<DbSessionLeaseSlot>>>>
+/// Tracked like every other shared ledger in this file: it is taken while a
+/// query tab is created and while a connection incarnation is being reclaimed,
+/// so leaving it out left both orders invisible to the detector.
+fn lock_retained_pool_session_leases() -> TrackedGuard<'static, Vec<Weak<Mutex<DbSessionLeaseSlot>>>>
 {
-    RETAINED_POOL_SESSION_LEASES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| {
-            logging::log_warning(
-                "db::connection",
-                "retained session registry lock was poisoned; recovering",
-            );
-            poisoned.into_inner()
-        })
+    TrackedGuard::take(
+        crate::db::lock_order::names::RETAINED_LEASES,
+        RETAINED_POOL_SESSION_LEASES.get_or_init(|| Mutex::new(Vec::new())),
+    )
 }
 
 /// Release, physically, every retained session left over from a connection
@@ -422,17 +419,13 @@ where
     }
 }
 
-fn lock_pending_connection_cleanups() -> MutexGuard<'static, Vec<ConnectionCleanupTask>> {
-    PENDING_CONNECTION_CLEANUPS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| {
-            logging::log_warning(
-                "db::connection",
-                "pending connection cleanup lock was poisoned; recovering",
-            );
-            poisoned.into_inner()
-        })
+/// Tracked: `bump_connection_generation` pushes onto this WITH THE CONNECTION
+/// MUTEX HELD, and the status tick drains it holding nothing.
+fn lock_pending_connection_cleanups() -> TrackedGuard<'static, Vec<ConnectionCleanupTask>> {
+    TrackedGuard::take(
+        crate::db::lock_order::names::PENDING_CLEANUPS,
+        PENDING_CONNECTION_CLEANUPS.get_or_init(|| Mutex::new(Vec::new())),
+    )
 }
 
 fn run_connection_cleanup_task(task: Arc<Mutex<Option<ConnectionCleanupTask>>>) {
@@ -2105,9 +2098,18 @@ struct DbSessionLeaseSlot {
 /// Oracle and MySQL/MariaDB both use this same lifecycle: take the lease for
 /// execution, retain it in the tab slot after cleanup, and clear it on close,
 /// disconnect, cancel, or stale connection generation.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SharedDbSessionLease {
     inner: Arc<Mutex<DbSessionLeaseSlot>>,
+}
+
+impl Default for SharedDbSessionLease {
+    /// Through [`Self::new`], never derived: a derived `Default` would build a
+    /// slot the connection-teardown sweep cannot see. See
+    /// [`Self::register_for_connection_teardown`].
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2317,6 +2319,25 @@ impl DbPoolSessionContext {
         self.track_activity_for_connection(activity, self.connection_id)
     }
 
+    /// [`Self::track_activity`] for work that is an OPERATION rather than a
+    /// pooled read: a toolbar or menu action on the tab's RETAINED session.
+    ///
+    /// The same two facts stated at creation, for the same reason. These
+    /// actions publish a REAL session canceler over the tab's session
+    /// (`TakenDbSessionLease::track_under`) and used to do it under a row built
+    /// by the raw `track_db_activity`: it named no connection, so
+    /// `cancel_db_activities_for_connection` could not retire it and a
+    /// disconnect broke the call instead of cancelling it; and it carried no
+    /// lifetime, so `TrackedDbActivity::is_stale` could never say yes and the
+    /// stale sweep could not retire it either.
+    ///
+    /// The KIND stays `Operation`. A tab's retained session is already listed
+    /// as that tab's own in the pooled-session view, so publishing this as a
+    /// pooled row would show one session twice.
+    pub fn track_operation_activity(&self, activity: impl Into<String>) -> DbActivityGuard {
+        self.track_activity_of_kind(activity, self.connection_id, DbActivityKind::Operation)
+    }
+
     /// [`Self::track_activity`] for a caller that already knows the connection
     /// this work belongs to.
     ///
@@ -2331,14 +2352,25 @@ impl DbPoolSessionContext {
         activity: impl Into<String>,
         connection_id: Option<ConnectionId>,
     ) -> DbActivityGuard {
-        let guard = match connection_id {
-            Some(connection_id) => track_pool_db_activity_for_connection(
-                activity,
-                self.connection_info.db_type,
-                connection_id,
-            ),
-            None => track_pool_db_activity(activity, self.connection_info.db_type),
-        };
+        self.track_activity_of_kind(activity, connection_id, DbActivityKind::PoolSession)
+    }
+
+    /// The one place a context publishes a row, whatever kind it is: the
+    /// connection is named when the row is CREATED and the lifetime is bound in
+    /// the same breath, so neither can be left out by a caller that only wanted
+    /// the other kind.
+    fn track_activity_of_kind(
+        &self,
+        activity: impl Into<String>,
+        connection_id: Option<ConnectionId>,
+        kind: DbActivityKind,
+    ) -> DbActivityGuard {
+        let guard = track_db_activity_entry(
+            activity.into(),
+            Some(self.connection_info.db_type),
+            connection_id,
+            kind,
+        );
         guard.bind_lifetime(self.activity_lifetime());
         guard
     }
@@ -3341,6 +3373,7 @@ impl AcquiredPoolSession {
                 conn,
                 self.reach.take(),
                 self.usability.clone(),
+                |conn| DbSessionLease::Oracle(conn).discard_physical("db::pool_session"),
             )),
             session @ (Some(DbPoolSession::OracleThin(_))
             | Some(DbPoolSession::MySQL { .. })
@@ -3360,6 +3393,9 @@ impl AcquiredPoolSession {
                 *conn,
                 self.reach.take(),
                 self.usability.clone(),
+                |conn| {
+                    DbSessionLease::OracleThin(Box::new(conn)).discard_physical("db::pool_session")
+                },
             )),
             session @ (Some(DbPoolSession::Oracle(_))
             | Some(DbPoolSession::MySQL { .. })
@@ -3383,6 +3419,7 @@ impl AcquiredPoolSession {
                     conn,
                     self.reach.take(),
                     self.usability.clone(),
+                    discard_mysql_pooled_connection,
                 ))
             }
             session @ (Some(DbPoolSession::MySQL { .. })
@@ -3446,6 +3483,17 @@ pub struct HeldSession<H> {
     /// it costs nothing to carry, and carrying it means the answer is always
     /// written where the value that decides this session's fate can ask.
     usability: PoolSessionUsability,
+    /// How THIS family of session is closed, decided by the narrowing that knew
+    /// the family, not by whichever caller happens to close it.
+    ///
+    /// It used to be an argument to `discard_with`, so every closing site
+    /// restated it — and getting it wrong is a whole bug class rather than a
+    /// typo: a `mysql::PooledConn` closed by anything but
+    /// [`discard_mysql_pooled_connection`] leaks the pool's slot accounting
+    /// until the pool is permanently "full" of ghosts. A plain `fn` pointer, so
+    /// carrying it costs nothing and it cannot capture state that outlives the
+    /// session.
+    close: fn(H),
     handle: H,
 }
 
@@ -3454,10 +3502,12 @@ impl<H> HeldSession<H> {
         handle: H,
         reach: Option<DbSessionCancelRegistration>,
         usability: PoolSessionUsability,
+        close: fn(H),
     ) -> Self {
         Self {
             reach: SessionReachGuard::new(reach),
             usability,
+            close,
             handle,
         }
     }
@@ -3494,6 +3544,7 @@ impl<H> HeldSession<H> {
         let Self {
             reach,
             usability: _,
+            close: _,
             handle,
         } = self;
         reach.hand_to(holder);
@@ -3514,6 +3565,7 @@ impl<H> HeldSession<H> {
         let Self {
             reach,
             usability: _,
+            close: _,
             handle,
         } = self;
         drop(reach);
@@ -3522,19 +3574,44 @@ impl<H> HeldSession<H> {
 
     /// This session cannot be handed over: close it, reach first.
     ///
-    /// `close` says how, because only the caller knows the family — a
-    /// `mysql::PooledConn` goes through `discard_mysql_pooled_connection`,
-    /// which also keeps the pool's slot accounting straight.
-    /// Closing IS what the borrower's say asks for, so there is nothing left
-    /// for it to decide: named and dropped with the session it condemned.
-    pub fn discard_with(self, close: impl FnOnce(H)) {
+    /// HOW is carried by the value (see the `close` field) and not passed in,
+    /// because the family was known at the narrowing and restating it at every
+    /// closing site is what lets a site state it wrongly. Closing IS what the
+    /// borrower's say asks for, so there is nothing left for it to decide:
+    /// named and dropped with the session it condemned.
+    pub fn discard(self) {
         let Self {
             reach,
             usability: _,
+            close,
             handle,
         } = self;
         drop(reach);
         close(handle);
+    }
+
+    /// This frame is done with the session: reach first, then wherever the
+    /// session belongs.
+    ///
+    /// The NAMED road out for the exits that used to be spelled by letting the
+    /// value fall out of scope — a `?`, a `return Err`, a `return None`.
+    /// Dropping it ends the reach (that is the field order) and then returns
+    /// the handle to its pool, which is right only while nothing has said
+    /// otherwise: a BORROWER that discovered the session carries state nobody
+    /// has accounted for says so through
+    /// [`PoolSessionUsability::mark_unusable`], and an implicit drop cannot
+    /// read that answer.
+    ///
+    /// `HeldSession` deliberately has no `Drop` — a value with one cannot be
+    /// taken apart, and taking this one apart is how [`Self::take_for`] hands
+    /// the session on without an unreachable panic in the middle of the DB
+    /// core — so the road is NAMED here instead of being made automatic.
+    pub fn release(self) {
+        if self.may_be_pooled() {
+            drop(self);
+            return;
+        }
+        self.discard();
     }
 }
 
@@ -4302,9 +4379,11 @@ impl SharedDbSessionLease {
     }
 
     pub fn new() -> Self {
-        Self {
+        let lease = Self {
             inner: Arc::new(Mutex::new(DbSessionLeaseSlot::default())),
-        }
+        };
+        lease.register_for_connection_teardown();
+        lease
     }
 
     fn from_inner(inner: Arc<Mutex<DbSessionLeaseSlot>>) -> Self {
@@ -4313,8 +4392,26 @@ impl SharedDbSessionLease {
 
     /// Publish this slot to the retained-session registry.
     ///
-    /// Called from the one place a session becomes retained, so a connection
-    /// teardown can reclaim it without the owner having to take part.
+    /// At CREATION, and that is the whole point. It used to be called from
+    /// `file_into_slot`, the one place a session becomes retained -- but in a
+    /// SECOND acquisition, after the slot lock that wrote the entry had been
+    /// released. So a slot that had never retained a session before was invisible
+    /// to [`release_retained_sessions_for_retired_connection`] for the moment
+    /// between the write and the publication, and
+    /// [`reclaim_retired_connection_sessions_in_background`]'s guarantee -- a
+    /// hand-back is either swept or refused, never neither -- had a fourth
+    /// moment in it:
+    ///
+    /// > `filing_decision` answers `Allowed` and writes the entry -> the
+    /// > retirement is recorded AND its sweep runs over a registry this slot is
+    /// > not in yet -> the publication lands too late, and a live session from a
+    /// > dead incarnation is parked where nothing revisits it.
+    ///
+    /// [`DbSessionLeaseSlot::filing_decision`] closed the gap between the
+    /// DECISION and the WRITE by asking under the slot lock; this closes the one
+    /// between the write and the slot being VISIBLE, by removing it: a slot the
+    /// sweep cannot see cannot exist. Costs one `Weak` per query tab, and every
+    /// call prunes the ones whose owners have gone.
     fn register_for_connection_teardown(&self) {
         let handle = Arc::downgrade(&self.inner);
         let mut registry = lock_retained_pool_session_leases();
@@ -4322,6 +4419,18 @@ impl SharedDbSessionLease {
         if !registry.iter().any(|lease| lease.ptr_eq(&handle)) {
             registry.push(handle);
         }
+    }
+
+    /// Whether the connection-teardown sweep can see this slot at all.
+    ///
+    /// `#[cfg(test)]`: production has no reason to ask, because the answer is
+    /// unconditionally yes -- which is exactly what the tests below assert.
+    #[cfg(test)]
+    fn is_registered_for_connection_teardown(&self) -> bool {
+        let handle = Arc::downgrade(&self.inner);
+        lock_retained_pool_session_leases()
+            .iter()
+            .any(|lease| lease.ptr_eq(&handle))
     }
 
     /// Take the retained session if it belongs to the given (ended) connection
@@ -4778,7 +4887,6 @@ impl SharedDbSessionLease {
     ) -> RetainedSessionStore {
         let lease_db_type = lease_to_store.db_type();
         let mut lease_to_store = Some(lease_to_store);
-        let mut stored = false;
         let mut closed_work = false;
         let (filing, old_lease_to_drop) = {
             let mut lease = self.lock_inner();
@@ -4852,7 +4960,6 @@ impl SharedDbSessionLease {
                             retained_state,
                             current_scope,
                         ));
-                        stored = true;
                     }
                     (filing, old_lease)
                 } else {
@@ -4860,11 +4967,6 @@ impl SharedDbSessionLease {
                 }
             }
         };
-        if stored {
-            // The one place a session becomes retained is the one place the
-            // teardown paths have to learn about it.
-            self.register_for_connection_teardown();
-        }
         if let Some(entry) = old_lease_to_drop {
             // The slot held a session from ANOTHER incarnation of this
             // connection (or another backend), so making room for this one
@@ -9468,12 +9570,54 @@ impl DbActivityGuard {
         }
     }
 
-    /// Not `pub`: outside this module the three facts below are stated
-    /// TOGETHER, through [`Self::bind_to_connection`]. Only the connection-lock
-    /// and pool-context helpers in this file, which publish a row and its
-    /// binding in the same breath, reach the pieces.
-    fn set_connection_id(&self, connection_id: ConnectionId) {
-        set_db_activity_connection_id(self.inner.id, connection_id);
+    /// State which connection a CONNECTION-LOCK row is on -- both facts the
+    /// registry keeps about such a row, in ONE acquisition.
+    ///
+    /// A connection-lock row has two of the three facts and not three: it
+    /// carries no cancel hook, because the caller IS the owner and is blocked
+    /// inside the very call the row describes, so there is nobody to notify.
+    /// The pair is still one fact, and writing them one at a time left a window
+    /// in which a sweep could see the row carrying a lifetime while naming no
+    /// connection -- which is exactly the state
+    /// [`cancel_db_activities_for_connection`] cannot match, on a row created
+    /// BEFORE the wait for the mutex. See [`Self::bind_to_connection`] for the
+    /// operation-row twin.
+    fn bind_connection_lock(
+        &self,
+        connection_id: Option<ConnectionId>,
+        lifetime: DbActivityLifetime,
+    ) {
+        let mut activities = lock_db_activities();
+        if let Some(tracked) = activities
+            .iter_mut()
+            .find(|tracked| tracked.id == self.inner.id)
+        {
+            if let Some(connection_id) = connection_id {
+                tracked.connection_id = Some(connection_id);
+            }
+            tracked.lifetime = Some(lifetime);
+        }
+    }
+
+    /// Fill in the connection of a row that does not name one yet, for a helper
+    /// that has ONE of the three facts and no right to the others.
+    ///
+    /// [`try_lock_connection_for_activity`] publishes a main-connection call
+    /// under an OPERATION's own row, and that row was bound when the operation
+    /// was published -- and moves as a whole through [`Self::bind_to_connection`]
+    /// when a script `CONNECT` takes the work to another connection. Writing the
+    /// id from here could therefore contradict the lifetime beside it: a row
+    /// naming connection A while its lifetime says B is round 10's defect with
+    /// the pieces swapped. So this can only ADD what is missing; a row that
+    /// already names a connection keeps its whole binding.
+    fn note_connection_lock_on(&self, connection_id: ConnectionId) {
+        let mut activities = lock_db_activities();
+        if let Some(tracked) = activities
+            .iter_mut()
+            .find(|tracked| tracked.id == self.inner.id && tracked.connection_id.is_none())
+        {
+            tracked.connection_id = Some(connection_id);
+        }
     }
 
     /// Bind this activity to the pool context it runs on, so the registry can
@@ -9783,15 +9927,6 @@ fn set_db_activity_progress(id: u64, progress: DbActivityProgress) {
         .find(|tracked| tracked.id == id)
     {
         tracked.progress = progress;
-    }
-}
-
-fn set_db_activity_connection_id(id: u64, connection_id: ConnectionId) {
-    if let Some(tracked) = lock_db_activities()
-        .iter_mut()
-        .find(|tracked| tracked.id == id)
-    {
-        tracked.connection_id = Some(connection_id);
     }
 }
 
@@ -10585,10 +10720,8 @@ impl<'a> ConnectionLockGuard<'a> {
                 None,
                 DbActivityKind::ConnectionLock,
             );
-            activity_guard.bind_lifetime(self.guard.activity_lifetime());
-            if let Some(connection_id) = self.guard.connection_id() {
-                activity_guard.set_connection_id(connection_id);
-            }
+            activity_guard
+                .bind_connection_lock(self.guard.connection_id(), self.guard.activity_lifetime());
             let (registration, reach) =
                 publish_connection_lock_canceler(&self.guard, &activity_guard);
             self.cancel_registration = registration;
@@ -10756,6 +10889,48 @@ pub(crate) fn stamp_connection_id(connection: &SharedConnection, connection_id: 
     lock_database_connection_raw(connection).connection_id = Some(connection_id);
 }
 
+/// End a connection the app is giving up, from a caller that must not block.
+///
+/// The twin of [`stamp_connection_id`], and the reason it exists is the same:
+/// the connection REGISTRY is the list every session-ending action walks --
+/// application exit, Disconnect All, Reconnect, the pool rebuild. So a
+/// connection the app stops keeping there must already be OVER. Forgetting a
+/// live one leaves its server sessions with nothing in the app able to name
+/// them, and exit walks exactly that list, so they are never logged off at all:
+/// a script `CONNECT` followed by a script `DISCONNECT` left its whole
+/// connection -- main session and pool -- logged in until the process died.
+///
+/// The two roads that get here, both script `CONNECT`'s:
+///
+/// * a CANDIDATE the app built and then rejected, because the tab it was for
+///   moved on while the connect was authenticating; and
+/// * a transient connection leaving the registry, which
+///   [`crate::db::ConnectionRuntime::is_idle`] has just answered nothing can
+///   reach -- no bound tab, no detached tab, no running work.
+///
+/// [`DatabaseConnection::disconnect`] is the raw state reset, and reaching it
+/// from a worker is banned everywhere else because it is connection-WIDE and
+/// tells nobody. Here there is nobody to tell: on both roads this connection is
+/// one the app opened for a single tab and is giving up in the same breath, and
+/// no other tab has ever been on it.
+///
+/// Never blocks the caller -- one road is the UI thread and the other is a
+/// script worker. A connection nothing can reach has nobody holding its mutex
+/// in the ordinary case; where it is momentarily busy, the connection-cleanup
+/// worker finishes the job -- the same road every other connection teardown
+/// takes, and the one place where blocking on the mutex and talking to the
+/// server is allowed. The hand-written `try_lock` + `disconnect` this replaced
+/// simply gave up when the mutex was busy.
+pub(crate) fn end_connection_leaving_the_app(connection: SharedConnection) {
+    if let Some(mut connection_guard) = try_lock_connection(&connection) {
+        connection_guard.disconnect();
+        return;
+    }
+    spawn_connection_cleanup(move || {
+        lock_connection(&connection).disconnect();
+    });
+}
+
 pub fn lock_connection(connection: &SharedConnection) -> ConnectionLockGuard<'_> {
     loop {
         wait_for_connection_transition(connection);
@@ -10783,12 +10958,15 @@ pub fn lock_connection_with_activity(
         track_db_activity_entry(activity, None, None, DbActivityKind::ConnectionLock);
     let mut connection_guard = lock_connection(connection);
     activity_guard.set_db_type(connection_guard.db_type());
-    // Bound to the connection generation so a disconnect retires this entry
-    // even if the call it is tracking never returns.
-    activity_guard.bind_lifetime(connection_guard.activity_lifetime());
-    if let Some(connection_id) = connection_guard.connection_id() {
-        activity_guard.set_connection_id(connection_id);
-    }
+    // Which connection this row is on, WHOLE: the id a teardown matches on and
+    // the lifetime that retires the entry if the call it is tracking never
+    // returns, in one acquisition. Written one at a time, a sweep could see the
+    // row with a lifetime and no connection -- and this row is created BEFORE
+    // the wait for the mutex, so that window is as long as the wait.
+    activity_guard.bind_connection_lock(
+        connection_guard.connection_id(),
+        connection_guard.activity_lifetime(),
+    );
     // The row above was created BEFORE the wait for the mutex, so this is the
     // one lock helper whose activity can be gone by the time it gets here.
     let (registration, reach) =
@@ -10860,7 +11038,10 @@ pub fn try_lock_connection_for_activity<'a>(
 ) -> Option<ConnectionLockGuard<'a>> {
     let mut guard = try_lock_connection(connection)?;
     if let Some(connection_id) = guard.connection_id() {
-        activity.set_connection_id(connection_id);
+        // FILL IN only: this row is the operation's, bound when the operation
+        // was published and moved as a whole when a script `CONNECT` takes the
+        // work elsewhere. See `DbActivityGuard::note_connection_lock_on`.
+        activity.note_connection_lock_on(connection_id);
     }
     // The activity here is the OPERATION's, not one this helper made, so it can
     // have been retired by a cancel or a teardown before this lock was taken —
@@ -10884,10 +11065,7 @@ pub fn try_lock_connection_with_activity(
         None,
         DbActivityKind::ConnectionLock,
     );
-    activity_guard.bind_lifetime(guard.activity_lifetime());
-    if let Some(connection_id) = guard.connection_id() {
-        activity_guard.set_connection_id(connection_id);
-    }
+    activity_guard.bind_connection_lock(guard.connection_id(), guard.activity_lifetime());
     let (registration, reach) = publish_connection_lock_canceler(&guard, &activity_guard);
     guard.cancel_registration = registration;
     guard.reach = reach;
@@ -11459,6 +11637,7 @@ mod tests {
             },
             Some(registration),
             PoolSessionUsability::default(),
+            drop,
         );
         // The activity guard is deliberately leaked into the returned tuple's
         // lifetime by keeping the ROW alive: the row is what `cancelable` is
@@ -11466,6 +11645,230 @@ mod tests {
         // answer below `false` for the wrong reason.
         std::mem::forget(activity);
         (held, activity_id, reach_at_release)
+    }
+
+    /// A lease slot is visible to the connection-teardown sweep from the moment
+    /// it EXISTS, not from the moment it first holds a session.
+    ///
+    /// `reclaim_retired_connection_sessions_in_background` promises that a
+    /// hand-back is either swept or refused, never neither, and
+    /// `DbSessionLeaseSlot::filing_decision` made the DECISION and the WRITE one
+    /// step to keep it. There was still a gap after the write: the slot was
+    /// published to the sweep's registry in a SECOND acquisition, so a slot that
+    /// had never retained a session before was invisible for exactly that
+    /// window — long enough for the retirement to be recorded and its sweep to
+    /// run over a registry the slot was not in yet, leaving a live session from
+    /// a dead incarnation parked where nothing revisits it.
+    #[test]
+    fn a_lease_slot_is_visible_to_the_teardown_sweep_before_it_holds_a_session() {
+        let lease = SharedDbSessionLease::new();
+        assert!(
+            lease.is_registered_for_connection_teardown(),
+            "a slot the sweep cannot see must not be able to exist, so it is published \
+             when it is created rather than when it first retains a session"
+        );
+    }
+
+    /// And `default()` is the same road: a derived `Default` would build one
+    /// around the constructor.
+    #[test]
+    fn every_way_to_make_a_lease_slot_publishes_it() {
+        let lease = SharedDbSessionLease::default();
+        assert!(
+            lease.is_registered_for_connection_teardown(),
+            "`default()` must go through the constructor that publishes the slot"
+        );
+    }
+
+    /// A row a pool context publishes NAMES its connection and carries its
+    /// lifetime, whichever kind it is.
+    ///
+    /// The two facts a teardown needs: the connection id
+    /// `cancel_db_activities_for_connection` matches on, and the lifetime
+    /// `TrackedDbActivity::is_stale` asks. A UI-thread action on the tab's
+    /// retained session published a real session canceler under a row built by
+    /// the raw `track_db_activity`, which had neither — so a disconnect broke
+    /// the call instead of cancelling it, and the stale sweep could not retire
+    /// it at all.
+    #[test]
+    fn a_row_a_context_publishes_names_its_connection_and_its_lifetime() {
+        let _test_guard = db_activity_test_lock();
+        let epoch_token = Arc::new(AtomicU64::new(7));
+        let mut context = mysql_pool_session_context_for_cache_test(7, epoch_token);
+        let connection_id = ConnectionId::for_test(4242);
+        context.connection_id = Some(connection_id);
+        // The builder's connection generation and its token agree at 1; moving
+        // the TOKEN is what a disconnect/reconnect/pool rebuild does.
+
+        for activity in [
+            context.track_activity("pooled read"),
+            context.track_operation_activity("retained session action"),
+        ] {
+            let id = activity.id();
+            assert_eq!(
+                activity_row(id).and_then(|row| row.connection_id),
+                Some(connection_id),
+                "a teardown of this connection has to be able to find the row"
+            );
+            assert!(
+                activity_is_stale_for_test(id) == Some(false),
+                "and the row must carry a lifetime, or `is_stale` can never say yes"
+            );
+            // Move the connection on: the lifetime is what makes the sweep able
+            // to retire this row by itself.
+            context
+                .connection_generation_token
+                .store(2, Ordering::Release);
+            assert_eq!(
+                activity_is_stale_for_test(id),
+                Some(true),
+                "once the connection's sessions are gone the sweep must see it"
+            );
+            context
+                .connection_generation_token
+                .store(1, Ordering::Release);
+        }
+    }
+
+    /// Filling in the connection of somebody else's row can only ADD.
+    ///
+    /// `try_lock_connection_for_activity` publishes a main-connection call under
+    /// an OPERATION's own row, and that row was bound when the operation was
+    /// published — and moves as a whole when a script `CONNECT` takes the work
+    /// to another connection. Writing the id from there could contradict the
+    /// lifetime beside it: a row naming connection A while its lifetime says B
+    /// is round 10's defect with the pieces swapped.
+    #[test]
+    fn filling_in_a_rows_connection_never_contradicts_the_binding_it_has() {
+        let _test_guard = db_activity_test_lock();
+        let activity = track_db_activity("operation", None);
+        let id = activity.id();
+        let bound = ConnectionId::for_test(1);
+        let other = ConnectionId::for_test(2);
+        activity.bind_to_connection(DbActivityConnectionBinding {
+            connection_id: Some(bound),
+            lifetime: DbActivityLifetime {
+                epoch_token: Arc::new(AtomicU64::new(3)),
+                epoch: 3,
+            },
+            on_cancel: Arc::new(|| {}),
+        });
+
+        activity.note_connection_lock_on(other);
+
+        assert_eq!(
+            activity_row(id).and_then(|row| row.connection_id),
+            Some(bound),
+            "a row that already names a connection keeps its WHOLE binding: the id and \
+             the lifetime beside it are one fact"
+        );
+        drop(activity);
+    }
+
+    /// A row that names no connection yet is the one this may answer for.
+    #[test]
+    fn filling_in_a_rows_connection_states_the_one_it_did_not_have() {
+        let _test_guard = db_activity_test_lock();
+        let activity = track_db_activity("operation", None);
+        let id = activity.id();
+        let connection_id = ConnectionId::for_test(9);
+
+        activity.note_connection_lock_on(connection_id);
+
+        assert_eq!(
+            activity_row(id).and_then(|row| row.connection_id),
+            Some(connection_id),
+            "an unbound row still has to become reachable by a teardown of the connection \
+             the lock was taken on"
+        );
+        drop(activity);
+    }
+
+    /// A connection-lock row states BOTH of its facts in one acquisition.
+    ///
+    /// The row is created BEFORE the wait for the connection mutex, so a
+    /// half-written binding is observable for as long as that wait: a sweep that
+    /// looked then saw a row carrying a lifetime and naming no connection, which
+    /// is the one state `cancel_db_activities_for_connection` cannot match.
+    #[test]
+    fn a_connection_lock_row_states_its_connection_and_lifetime_together() {
+        let _test_guard = db_activity_test_lock();
+        let activity = track_db_activity_entry(
+            "lock".to_string(),
+            None,
+            None,
+            DbActivityKind::ConnectionLock,
+        );
+        let id = activity.id();
+        let connection_id = ConnectionId::for_test(5);
+        let token = Arc::new(AtomicU64::new(2));
+
+        activity.bind_connection_lock(
+            Some(connection_id),
+            DbActivityLifetime {
+                epoch_token: Arc::clone(&token),
+                epoch: 2,
+            },
+        );
+
+        assert_eq!(
+            activity_row(id).and_then(|row| row.connection_id),
+            Some(connection_id)
+        );
+        assert_eq!(activity_is_stale_for_test(id), Some(false));
+        token.store(3, Ordering::Release);
+        assert_eq!(
+            activity_is_stale_for_test(id),
+            Some(true),
+            "both facts are written, so the sweep can retire the row on its own"
+        );
+        drop(activity);
+    }
+
+    /// The road a frame gives a narrowed session up by asks the borrower's say.
+    ///
+    /// `AcquiredPoolSession`'s drop reads it; `HeldSession` deliberately has no
+    /// drop, so the road has to be NAMED — and until it was, a `?` or a
+    /// `return Err` put a session a borrower had condemned back in the pool for
+    /// the next tab.
+    #[test]
+    fn releasing_a_narrowed_session_a_borrower_condemned_closes_it() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let usability = PoolSessionUsability::default();
+        let held = HeldSession::new(Arc::clone(&closed), None, usability.clone(), |flag| {
+            flag.store(true, Ordering::Release);
+        });
+
+        usability.mark_unusable();
+        held.release();
+
+        assert!(
+            closed.load(Ordering::Acquire),
+            "a session the borrower said must not be pooled is CLOSED by the road that \
+             gives it up"
+        );
+    }
+
+    /// And a session nothing condemned goes back to its pool, which is what an
+    /// ordinary release means.
+    #[test]
+    fn releasing_a_narrowed_session_nothing_condemned_returns_it_to_the_pool() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let held = HeldSession::new(
+            Arc::clone(&closed),
+            None,
+            PoolSessionUsability::default(),
+            |flag| {
+                flag.store(true, Ordering::Release);
+            },
+        );
+
+        held.release();
+
+        assert!(
+            !closed.load(Ordering::Acquire),
+            "an ordinary release is a return to the pool, not a close"
+        );
     }
 
     /// Dropping the pair ends the reach BEFORE the session goes.
@@ -11494,7 +11897,7 @@ mod tests {
     fn closing_a_held_session_ends_its_reach_first_too() {
         let _test_guard = db_activity_test_lock();
         let (held, activity_id, reach_at_release) = held_session_recording_its_release();
-        held.discard_with(drop);
+        held.discard();
         assert_eq!(
             *reach_at_release
                 .lock()
@@ -11598,7 +12001,7 @@ mod tests {
         // A real `DbPoolSession` needs a live server, so this drives
         // `HeldSession` on the same stand-in handle the reach tests use.
         let owners_flag = PoolSessionUsability::default();
-        let held = HeldSession::new((), None, owners_flag.clone());
+        let held = HeldSession::new((), None, owners_flag.clone(), drop);
         assert!(
             held.may_be_pooled(),
             "nothing has been said about this session yet"
@@ -11612,7 +12015,7 @@ mod tests {
             owners_flag.is_unusable(),
             "and it must be the SAME cell the acquire door was holding, not a copy of it"
         );
-        held.discard_with(drop);
+        held.discard();
 
         // And every narrowing hands that cell on rather than dropping it. The
         // three of them are the only way an `AcquiredPoolSession` becomes a
@@ -13757,6 +14160,15 @@ mod tests {
         active_db_activity_snapshots()
             .into_iter()
             .find(|snapshot| snapshot.id == id)
+    }
+
+    /// Whether the registry can say this row is over on its own, i.e. whether
+    /// it carries a lifetime at all. `None` means the row is gone.
+    fn activity_is_stale_for_test(id: u64) -> Option<bool> {
+        lock_db_activities()
+            .iter()
+            .find(|tracked| tracked.id == id)
+            .map(|tracked| tracked.lifetime.is_some() && tracked.is_stale())
     }
 
     fn activity_is_registered(id: u64) -> bool {

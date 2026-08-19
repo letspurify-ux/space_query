@@ -283,8 +283,18 @@ pub mod names {
     /// (application exit publishes `Disconnected` while it still holds the
     /// guard), so leaving it out left that order invisible.
     pub const RUNTIME_STATE: &str = "RUNTIME_STATE";
+    /// The registry of every lease slot that can hold a retained session, which
+    /// a connection teardown sweeps. A leaf, but it is taken on the retained
+    /// hand-back path and at every query tab's creation, so leaving it out left
+    /// those orders invisible.
+    pub const RETAINED_LEASES: &str = "RETAINED_LEASES";
+    /// The queue of connection cleanup a worker thread still has to run. Taken
+    /// from under the connection mutex (`bump_connection_generation` hands its
+    /// sweep off while holding it) and from the status tick, which holds
+    /// nothing.
+    pub const PENDING_CLEANUPS: &str = "PENDING_CLEANUPS";
 
-    pub const ALL: [&str; 9] = [
+    pub const ALL: [&str; 11] = [
         ACTIVITY_REGISTRY,
         DB_CONNECTION,
         POOL_CONTEXT_CACHE,
@@ -294,6 +304,8 @@ pub mod names {
         RETIRED_GENERATIONS,
         POOL_HANDOUT_HOLDS,
         RUNTIME_STATE,
+        RETAINED_LEASES,
+        PENDING_CLEANUPS,
     ];
 }
 

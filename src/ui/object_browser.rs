@@ -4701,10 +4701,17 @@ impl ObjectBrowserWidget {
             }
         };
 
+        // Preparing this session is SEVERAL steps -- the database, then the
+        // connection encoding -- so a failure between them leaves state nobody
+        // has accounted for. `return None` on its own DROPPED the `HeldSession`,
+        // which puts exactly that session back in the pool for the next tab;
+        // the same rule the DB layer's own `acquire_session_with_scope_context`
+        // states for the same multi-step premise.
         if let Err(err) = mysql_conn.as_mut().select_db(selected_scope) {
             eprintln!(
                 "Warning: failed to select {display_name} object-browser metadata database `{selected_scope}`: {err}"
             );
+            mysql_conn.discard();
             return None;
         }
 
@@ -4718,6 +4725,7 @@ impl ObjectBrowserWidget {
             eprintln!(
                 "Warning: failed to refresh {display_name} object-browser metadata encoding: {err}"
             );
+            mysql_conn.discard();
             return None;
         }
 

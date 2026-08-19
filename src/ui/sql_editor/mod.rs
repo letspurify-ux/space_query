@@ -4402,18 +4402,31 @@ impl SqlEditorWidget {
             return RetainedSessionMutationOutcome::NoSession;
         }
 
-        let scope_activity = crate::db::track_db_activity(
-            format!("Applying scope to retained {db_type} session"),
-            Some(db_type),
-        );
-        let scope_connection_info = self
+        // Row and connection info from ONE resolution of the pool context: this
+        // action publishes a real session canceler over the tab's session, and
+        // the row it publishes under has to say which connection that is (a
+        // disconnect matches on it) and when the connection's sessions are gone
+        // (`is_stale` cannot answer without it). Both used to be left out here.
+        let (scope_activity, scope_connection_info) = match self
             .bound_connection()
             .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
             .and_then(|connection| {
                 crate::db::pool_session_context_for_shared_connection(&connection, None)
-            })
-            .map(|context| context.connection_info)
-            .unwrap_or_default();
+            }) {
+            Ok(context) => (
+                context.track_operation_activity(format!(
+                    "Applying scope to retained {db_type} session"
+                )),
+                context.connection_info,
+            ),
+            Err(_) => (
+                crate::db::track_db_activity(
+                    format!("Applying scope to retained {db_type} session"),
+                    Some(db_type),
+                ),
+                crate::db::ConnectionInfo::default(),
+            ),
+        };
         // Same rule as the auto-commit and transaction-mode pushes: a take that
         // could not reach the tab's session closed it, and saying `NoSession`
         // about that loses the user's work in silence.

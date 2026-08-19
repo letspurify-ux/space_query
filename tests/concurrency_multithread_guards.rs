@@ -3029,16 +3029,57 @@ fn an_operations_registry_row_moves_with_the_connection_its_work_moved_to() {
     );
 
     // The pieces are not reachable from outside this module any more: an
-    // operation states its connection through the door or not at all.
+    // operation states its connection through the door or not at all. The
+    // bare id setter is GONE entirely -- writing one of the three facts on a
+    // row is the half-move, whoever does it, and the two callers that used to
+    // are named below.
+    assert!(
+        !connection.contains("fn set_connection_id(&self, connection_id: ConnectionId)"),
+        "the bare id setter must not exist: writing one fact of the binding IS the half-move"
+    );
     for private in [
-        "    fn set_connection_id(&self, connection_id: ConnectionId) {",
         "    fn bind_lifetime(&self, lifetime: DbActivityLifetime) {",
+        // A CONNECTION-LOCK row has two of the three facts (no cancel hook --
+        // the caller is the owner and is blocked inside the call the row
+        // describes), and its helpers write BOTH under one registry lock. They
+        // used to write them one at a time, and the row was created BEFORE the
+        // wait for the mutex, so a sweep could see it carrying a lifetime while
+        // naming no connection -- the one state
+        // `cancel_db_activities_for_connection` cannot match.
+        "    fn bind_connection_lock(",
+        // And the helper that has only the ID, on a row that is somebody
+        // else's, may only FILL IN: a row that already names a connection keeps
+        // its whole binding, so this can never contradict the lifetime beside
+        // it.
+        "    fn note_connection_lock_on(&self, connection_id: ConnectionId) {",
     ] {
         assert!(
             connection.contains(private),
             "`{private}` must stay private to the DB module, or the half-move is one call away"
         );
     }
+    let fill_in = connection
+        .find("    fn note_connection_lock_on(&self, connection_id: ConnectionId) {")
+        .map(|offset| slice_to_end_of_fn(&connection, offset))
+        .expect("the fill-in door should exist");
+    assert!(
+        compact_for_pattern(fill_in).contains("tracked.connection_id.is_none()"),
+        "the fill-in door must refuse a row that already names a connection: {fill_in}"
+    );
+    // Every lock helper that publishes a row states BOTH facts through the
+    // pair door; none of them writes a piece.
+    // The PRODUCTION half only: the units below drive the door directly.
+    let production = connection
+        .find("\n#[cfg(test)]\n")
+        .map_or(connection.as_str(), |end| &connection[..end]);
+    assert_eq!(
+        production.matches("bind_connection_lock(").count(),
+        // The definition, plus the THREE helpers that publish a row of their
+        // own. The fourth, `try_lock_connection_for_activity`, publishes under
+        // the OPERATION's row and so may only fill in (above).
+        4,
+        "every connection-lock helper states its row's connection and lifetime as one"
+    );
 
     // The tab publishes its row through the same door...
     let begin = editor
@@ -4889,19 +4930,42 @@ fn discarded_db_sessions_release_their_pool_slots_structurally() {
         "a dropped connection must release its retained sessions and retire its resources"
     );
 
-    // And the release must find them, which means the one place a session
-    // becomes retained is the place that registers the slot.
+    // And the release must FIND them. The slot is published to the sweep's
+    // registry when it is CREATED, not when it first retains a session -- which
+    // is stronger than it sounds, and is the fourth moment
+    // `reclaim_retired_connection_sessions_in_background`'s "swept or refused,
+    // never neither" used to have in it. `file_into_slot` published the slot in
+    // a SECOND acquisition, after the slot lock that wrote the entry had been
+    // released, so a slot that had never retained a session before was
+    // invisible to the sweep for exactly that gap: the retirement could be
+    // recorded and its sweep run over a registry the slot was not in yet, and
+    // the entry it had just written was then parked where nothing revisits it.
+    // A slot the sweep cannot see must not be able to exist.
+    let lease_impl = connection
+        .find("impl SharedDbSessionLease {")
+        .expect("the lease slot should have an impl block");
+    let new_start = lease_impl
+        + connection[lease_impl..]
+            .find("    pub fn new() -> Self {")
+            .expect("the lease slot constructor should exist");
+    let new_body = slice_to_end_of_fn(&connection, new_start);
+    assert!(
+        new_body.contains("register_for_connection_teardown()"),
+        "a lease slot must be published to the teardown registry when it is created: {new_body}"
+    );
     let store_start = connection
         .find("fn file_into_slot(")
         .expect("the retain choke point should exist");
-    let store_end = connection[store_start..]
-        .find("\n    }\n")
-        .map(|offset| store_start + offset)
-        .expect("the retain choke point should close");
-    let store_body = &connection[store_start..store_end];
+    let store_body = slice_to_end_of_fn(&connection, store_start);
     assert!(
-        store_body.contains("register_for_connection_teardown()"),
-        "retaining a session must register its slot, or a teardown cannot reclaim it"
+        !store_body.contains("register_for_connection_teardown()"),
+        "and NOT when it first retains one, which is the ordering that had a gap: {store_body}"
+    );
+    // A derived `Default` would build a slot around the constructor.
+    assert!(
+        connection.contains("impl Default for SharedDbSessionLease {")
+            && !connection.contains("#[derive(Clone, Default)]\npub struct SharedDbSessionLease"),
+        "every way to make a lease slot must go through the constructor that publishes it"
     );
 
     // The thin pool's discard-on-drop branch itself must decrement.
@@ -8840,8 +8904,28 @@ fn a_pooled_session_is_never_held_apart_from_its_cancel_reach() {
         connection.contains("pub fn take_for(")
             && connection.contains("holder: &dyn HoldsSessionCancelRegistration")
             && connection.contains("pub fn take_ending_reach(")
-            && connection.contains("pub fn discard_with("),
+            // `discard_with(close)` used to take the closer as an argument, so
+            // every closing site restated which family it was closing -- and a
+            // `mysql::PooledConn` closed by anything but
+            // `discard_mysql_pooled_connection` leaks the pool's slot
+            // accounting. The closer now travels with the value, decided by the
+            // narrowing that knew the family.
+            && connection.contains("pub fn discard(self) {")
+            && !connection.contains("pub fn discard_with(")
+            // And the road that used to be spelled by letting the value fall
+            // out of scope is NAMED, so it can ask the borrower's say.
+            && connection.contains("pub fn release(self) {"),
         "every way of giving the session up must state what happens to the reach"
+    );
+    let held_close = connection
+        .find("    close: fn(H),")
+        .expect("HeldSession must carry its family's closer, not take one per call");
+    assert!(
+        held_close
+            > connection
+                .find("pub struct HeldSession<H> {")
+                .unwrap_or(usize::MAX),
+        "the closer belongs to the held session"
     );
 
     // And the ORDER is the value's business. `HeldSession` says it as a field
@@ -9439,9 +9523,10 @@ fn every_road_a_pooled_session_leaves_a_frame_ends_the_reach_first() {
          {oracle_body}"
     );
     assert_eq!(
-        oracle_body
-            .matches("Self::discard_oracle_pool_session(held, \"oracle pool session\");")
-            .count(),
+        // `held.discard()` and not a helper taking a closer: the family's
+        // closer travels with the value now, so no closing site can name the
+        // wrong one.
+        oracle_body.matches("held.discard();").count(),
         3,
         "a retired connection incarnation and a session the driver called stale are both \
          CLOSED, never returned to the pool for the next tab"
@@ -9452,7 +9537,10 @@ fn every_road_a_pooled_session_leaves_a_frame_ends_the_reach_first() {
     let prepare = execution
         .find("fn prepare_mysql_pooled_session_or_retry_once(")
         .expect("the MySQL-family session preparation should exist");
-    let prepare_body = slice_from(&execution, prepare, 2600);
+    // Bounded by the FUNCTION and not by a byte count -- round 9's lesson: a
+    // window measured in bytes stops reaching what it asserts as soon as the
+    // body grows.
+    let prepare_body = slice_to_end_of_fn(&execution, prepare);
     assert!(
         prepare_body.contains("mut held: crate::db::HeldSession<mysql::PooledConn>,")
             && prepare_body.contains(
@@ -9461,8 +9549,33 @@ fn every_road_a_pooled_session_leaves_a_frame_ends_the_reach_first() {
         "MySQL-family preparation must carry the pair, not a bare connection: {prepare_body}"
     );
     assert!(
-        prepare_body.contains("Self::discard_mysql_pool_session(held);"),
+        prepare_body.contains("held.discard();"),
         "and close it through the door that ends the reach first: {prepare_body}"
+    );
+    // A preparation that failed part way must not put that session back in the
+    // pool. It is SEVERAL steps on this family, so a failure between them
+    // leaves state nobody has accounted for -- and a `?` on a borrow DROPPED
+    // the `HeldSession`, which is exactly "back to the pool for the next tab".
+    // Both roads out of the retry now name what becomes of the session.
+    assert!(
+        prepare_body.contains("Err(message) => {\n                        held.discard();"),
+        "the retry's own failure closes the session instead of pooling it: {prepare_body}"
+    );
+    assert!(
+        prepare_body.contains("held.release();"),
+        "and the arm that decided the session MAY be reused says so by name, so the \
+         borrower's say is asked on that road too: {prepare_body}"
+    );
+    let settings = execution
+        .find("fn prepare_mysql_pooled_execution_session(")
+        .expect("the MySQL-family execution-settings preparation should hand back or close");
+    let settings_body = slice_to_end_of_fn(&execution, settings);
+    assert!(
+        settings_body.contains("mut held: crate::db::HeldSession<mysql::PooledConn>,")
+            && settings_body.contains("Result<crate::db::HeldSession<mysql::PooledConn>, String>")
+            && settings_body.contains("held.discard();"),
+        "applying the execution settings must CONSUME the session and hand it back or end \
+         it, so a half-applied one cannot be returned to the pool by a `?`: {settings_body}"
     );
 
     // The MySQL family's fresh acquire parks the reach in the holder the caller
@@ -9549,7 +9662,7 @@ fn a_pooled_session_returns_to_the_pool_only_when_it_is_known_usable() {
          {final_arm}"
     );
     assert!(
-        final_arm.contains("Self::discard_oracle_pool_session(held, \"oracle pool session\");"),
+        final_arm.contains("held.discard();"),
         "and close it when the answer is no: {final_arm}"
     );
 }
@@ -10285,5 +10398,217 @@ fn a_session_ending_action_ends_nothing_until_every_refusal_is_spent() {
         password < preflight,
         "a reconnect that refuses for a missing password must not already have cancelled this \
          connection's background reads: {reconnect_body}"
+    );
+}
+
+/// A connection leaves the registry only when it has been ENDED, and it may
+/// not leave while a tab can still reach it.
+///
+/// The connection registry is the list every session-ending action walks:
+/// application exit disconnects `connection_registry.runtimes()`, and so do
+/// Disconnect All, Reconnect and the pool rebuild. A connection that leaves
+/// that list can therefore no longer be named by any of them — so it must
+/// already be over.
+///
+/// It was not. A script `CONNECT` registers a transient runtime; a script
+/// `DISCONNECT` is tab-local and does NOT disconnect the connection, it detaches
+/// the tab and parks the runtime as the tab's `detached_runtime`. `is_idle`
+/// counted bound tabs and running work only, so the runtime was removed from the
+/// registry while its connection was still logged in AND still serving that
+/// tab's metadata reads (`metadata_connection` falls back to the detached
+/// runtime) — and application exit, which walks the registry, never logged it
+/// off.
+#[test]
+fn a_connection_leaves_the_registry_only_when_it_has_been_ended() {
+    let runtime = read_source("src/db/runtime.rs");
+
+    // "Nothing can still reach this connection" names every way, not most.
+    let idle = runtime
+        .find("pub fn is_idle(&self) -> bool {")
+        .map(|offset| slice_to_end_of_fn(&runtime, offset))
+        .expect("the removal's one question should exist");
+    let idle = compact_for_pattern(idle);
+    for counted in [
+        "bound_tab_count()==0",
+        "detached_tab_count()==0",
+        "active_work_count()==0",
+    ] {
+        assert!(
+            idle.contains(counted),
+            "`is_idle` must count {counted}, or a connection something can still reach \
+             leaves the list every session-ending action walks: {idle}"
+        );
+    }
+
+    // A tab that detaches keeps NAMING the runtime, counted by a value rather
+    // than by each of the five writers of the field.
+    assert!(
+        runtime.contains("struct DetachedRuntime {")
+            && runtime.contains("impl Drop for DetachedRuntime {")
+            && runtime.contains("impl Clone for DetachedRuntime {")
+            && runtime.contains("detached_runtime: Option<DetachedRuntime>,"),
+        "the detached reference must be a counted VALUE, or the count and the field \
+         can disagree"
+    );
+    let detach = runtime
+        .find("fn detach_locked(")
+        .map(|offset| slice_to_end_of_fn(&runtime, offset))
+        .expect("the detach door should exist");
+    assert!(
+        compact_for_pattern(detach).contains("Some(DetachedRuntime::new(runtime))"),
+        "detaching must state that the tab still names the runtime: {detach}"
+    );
+    // A SNAPSHOT is a reader: looking at a binding must not change the answer.
+    let snapshot = runtime
+        .find("pub fn snapshot(&self) -> TabConnectionSnapshot {")
+        .map(|offset| slice_to_end_of_fn(&runtime, offset))
+        .expect("the binding snapshot should exist");
+    assert!(
+        compact_for_pattern(snapshot).contains("Arc::clone(detached.runtime())"),
+        "a snapshot hands out the plain Arc, so reading the binding cannot count as \
+         naming it: {snapshot}"
+    );
+
+    // And the removal ENDS the connection rather than forgetting it.
+    let remove = runtime
+        .find("pub fn remove_transient_if_idle(&self, id: ConnectionId) -> bool {")
+        .map(|offset| slice_to_end_of_fn(&runtime, offset))
+        .expect("the transient removal should exist");
+    assert!(
+        compact_for_pattern(remove)
+            .contains("crate::db::connection::end_connection_leaving_the_app("),
+        "a connection that leaves the registry must be ended, not merely forgotten: {remove}"
+    );
+
+    // One door, and the script CONNECT's rejected candidates go through it too
+    // rather than each spelling `try_lock` + `disconnect` and giving up when the
+    // mutex is busy.
+    let connection = read_source("src/db/connection.rs");
+    let door = connection
+        .find("pub(crate) fn end_connection_leaving_the_app(connection: SharedConnection) {")
+        .map(|offset| slice_to_end_of_fn(&connection, offset))
+        .expect("the one teardown door for a connection the app gives up should exist");
+    assert!(
+        door.contains("try_lock_connection(&connection)")
+            && door.contains("spawn_connection_cleanup("),
+        "the door must never block its caller and must still finish the job: {door}"
+    );
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    assert_eq!(
+        execution
+            .matches("crate::db::end_connection_leaving_the_app(")
+            .count(),
+        3,
+        "all three script-CONNECT roads that reject a candidate connection use the door"
+    );
+    assert!(
+        !compact_for_pattern(&execution).contains("{ guard.disconnect(); }"),
+        "and none of them keeps a hand-written `try_lock` + `disconnect`, which simply \
+         gave up when the mutex was busy"
+    );
+
+    // The list this is all about really is the one exit walks.
+    let main_window = read_source("src/ui/main_window.rs");
+    let exit = main_window
+        .find("fn finish_application_exit(")
+        .map(|offset| slice_to_end_of_fn(&main_window, offset))
+        .expect("application exit should exist");
+    assert!(
+        compact_for_pattern(exit).contains("s.connection_registry.runtimes(),"),
+        "application exit closes exactly the connections the registry names, which is why \
+         leaving it early is a leak: {exit}"
+    );
+}
+
+/// Every action that runs on a tab's RETAINED session says which connection it
+/// is on.
+///
+/// These are the UI-thread roads — the scope apply, and the MySQL family's
+/// auto-commit and transaction-mode pushes — and each of them publishes a REAL
+/// session canceler over the tab's session (`TakenDbSessionLease::track_under`).
+/// They built their registry row with the raw `track_db_activity`, so the row
+/// named NO connection (`cancel_db_activities_for_connection` could not retire
+/// it, so a disconnect broke the call instead of cancelling it) and carried NO
+/// lifetime (`is_stale` cannot say yes without one, so the stale sweep could not
+/// retire it either). Round 1's A4/C5 shape, on the roads it had not reached.
+#[test]
+fn every_action_on_a_retained_session_says_which_connection_it_is_on() {
+    let connection = read_source("src/db/connection.rs");
+
+    // The context is the one place that knows both facts, and it states them
+    // together whichever KIND of row it publishes.
+    let publish = connection
+        .find("fn track_activity_of_kind(")
+        .map(|offset| slice_to_end_of_fn(&connection, offset))
+        .expect("a context should publish its rows in one place");
+    let publish = compact_for_pattern(publish);
+    assert!(
+        publish.contains("track_db_activity_entry(")
+            && publish.contains("connection_id,")
+            && publish.contains("guard.bind_lifetime(self.activity_lifetime());"),
+        "a row a context publishes names its connection when it is CREATED and carries its \
+         lifetime in the same breath: {publish}"
+    );
+    for door in [
+        "pub fn track_activity(&self, activity: impl Into<String>) -> DbActivityGuard {",
+        "pub fn track_operation_activity(&self, activity: impl Into<String>) -> DbActivityGuard {",
+    ] {
+        assert!(
+            connection.contains(door),
+            "`{door}` should be one of the context's publishing doors"
+        );
+    }
+
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let begin = execution
+        .find("fn begin_retained_session_action(")
+        .map(|offset| slice_to_end_of_fn(&execution, offset))
+        .expect("the retained-session action door should exist");
+    assert!(
+        compact_for_pattern(begin).contains("context.track_operation_activity("),
+        "the row and the connection info come from ONE resolution of the pool context, \
+         because they are one fact: {begin}"
+    );
+    for road in [
+        "pub(super) fn apply_mysql_autocommit_to_reusable_pooled_session(",
+        "pub(super) fn apply_mysql_transaction_mode_to_reusable_pooled_session(",
+    ] {
+        let body = execution
+            .find(road)
+            .map(|offset| slice_to_end_of_fn(&execution, offset))
+            .unwrap_or_else(|| panic!("{road} should exist"));
+        assert!(
+            compact_for_pattern(body).contains("Self::begin_retained_session_action("),
+            "{road} must publish its row through the door that names its connection"
+        );
+        assert!(
+            !compact_for_pattern(body).contains("crate::db::track_db_activity(db_activity,"),
+            "{road} must not build a row that names no connection and carries no lifetime"
+        );
+    }
+
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let scope = editor
+        .find("pub fn apply_current_scope_to_retained_session(")
+        .map(|offset| slice_to_end_of_fn(&editor, offset))
+        .expect("the retained-session scope apply should exist");
+    assert!(
+        compact_for_pattern(scope).contains("context.track_operation_activity("),
+        "the scope apply publishes a session canceler too, so its row states its \
+         connection: {scope}"
+    );
+
+    // And the bind-parameter probe, which HAS a context and reached for the raw
+    // helper beside it — the same shape round 4's F8 fixed for the schema
+    // metadata loader.
+    let probe = execution
+        .find("fn load_routine_arguments_for_bind_prompt(")
+        .map(|offset| slice_to_end_of_fn(&execution, offset))
+        .expect("the bind-parameter probe should exist");
+    let probe = compact_for_pattern(probe);
+    assert!(
+        probe.contains("context.track_activity(activity.clone())")
+            && !probe.contains("crate::db::track_pool_db_activity("),
+        "a caller that has a context has both facts, so it publishes through it: {probe}"
     );
 }

@@ -230,6 +230,16 @@ pub struct ConnectionRuntime {
     connection_generation: AtomicU64,
     pool_context_epoch: AtomicU64,
     bound_tabs: AtomicUsize,
+    /// Tabs that are no longer BOUND to this runtime but still name it.
+    ///
+    /// A detached tab is not a passive record. `TabConnectionBinding::
+    /// metadata_connection` falls back to the detached runtime, so IntelliSense,
+    /// the bind-parameter probes and the column loads go on acquiring pooled
+    /// sessions on that connection long after the tab detached from it. It is a
+    /// reacher of the connection, and [`Self::is_idle`] -- which decides whether
+    /// a transient connection may be taken out of the registry every
+    /// session-ending action walks -- has to count it. See [`DetachedRuntime`].
+    detached_tabs: AtomicUsize,
     active_work: AtomicUsize,
 }
 
@@ -241,6 +251,7 @@ impl fmt::Debug for ConnectionRuntime {
             .field("origin", &self.origin)
             .field("state", &self.state())
             .field("bound_tabs", &self.bound_tab_count())
+            .field("detached_tabs", &self.detached_tab_count())
             .field("active_work", &self.active_work_count())
             .finish_non_exhaustive()
     }
@@ -266,6 +277,7 @@ impl ConnectionRuntime {
             connection_generation: AtomicU64::new(connection_generation),
             pool_context_epoch: AtomicU64::new(pool_context_epoch),
             bound_tabs: AtomicUsize::new(0),
+            detached_tabs: AtomicUsize::new(0),
             active_work: AtomicUsize::new(0),
         }
     }
@@ -552,12 +564,31 @@ impl ConnectionRuntime {
         self.bound_tabs.load(Ordering::Acquire)
     }
 
+    /// How many tabs still NAME this runtime after detaching from it.
+    /// See [`Self::detached_tabs`].
+    pub fn detached_tab_count(&self) -> usize {
+        self.detached_tabs.load(Ordering::Acquire)
+    }
+
     pub fn active_work_count(&self) -> usize {
         self.active_work.load(Ordering::Acquire)
     }
 
+    /// Whether NOTHING in the app can still reach this connection.
+    ///
+    /// The one question [`ConnectionRegistry::remove_transient_if_idle`] asks
+    /// before taking a connection out of the list every session-ending action
+    /// walks, so it has to name every way a connection is still reachable, not
+    /// most of them. It used to ask about bound tabs and running work only,
+    /// while a DETACHED tab goes on reading metadata through the very same
+    /// connection -- so a script `CONNECT` followed by a script `DISCONNECT`
+    /// left a live, still-used connection that application exit, Disconnect
+    /// All, Reconnect and the pool rebuild could no longer name, and whose
+    /// server sessions were therefore never logged off.
     pub fn is_idle(&self) -> bool {
-        self.bound_tab_count() == 0 && self.active_work_count() == 0
+        self.bound_tab_count() == 0
+            && self.detached_tab_count() == 0
+            && self.active_work_count() == 0
     }
 
     fn attach_tab(&self) {
@@ -566,6 +597,14 @@ impl ConnectionRuntime {
 
     fn detach_tab(&self) {
         decrement_if_positive(&self.bound_tabs);
+    }
+
+    fn attach_detached_tab(&self) {
+        self.detached_tabs.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn detach_detached_tab(&self) {
+        decrement_if_positive(&self.detached_tabs);
     }
 
     pub fn begin_work(self: &Arc<Self>) -> ConnectionWorkGuard {
@@ -745,15 +784,38 @@ impl ConnectionRegistry {
         runtimes
     }
 
+    /// Take a script-created connection out of the registry, ENDED.
+    ///
+    /// Removal and teardown are ONE step. This list is what every
+    /// session-ending action walks, so a connection that leaves it can no
+    /// longer be named by any of them -- and it used to leave while still
+    /// logged in, still serving the detached tab's metadata reads, and
+    /// therefore never logged off at all (application exit walks exactly this
+    /// list). See [`crate::db::end_connection_leaving_the_app`].
+    ///
+    /// The decision and the removal stay in ONE acquisition of the registry
+    /// lock, as they always were: after the removal nothing can obtain this
+    /// runtime any more -- [`ConnectionRuntime::is_idle`] has just said no tab
+    /// names it, bound or detached, and no work is running on it -- so the
+    /// teardown that follows cannot be racing a new user of the connection.
+    /// It happens outside the lock because it talks to the server.
     pub fn remove_transient_if_idle(&self, id: ConnectionId) -> bool {
-        let mut inner = self.lock_inner();
-        let removable = inner.runtimes.get(&id).is_some_and(|runtime| {
-            matches!(runtime.origin(), ConnectionOrigin::TransientScript) && runtime.is_idle()
-        });
-        if removable {
-            inner.runtimes.remove(&id);
-        }
-        removable
+        let removed = {
+            let mut inner = self.lock_inner();
+            let removable = inner.runtimes.get(&id).is_some_and(|runtime| {
+                matches!(runtime.origin(), ConnectionOrigin::TransientScript) && runtime.is_idle()
+            });
+            if removable {
+                inner.runtimes.remove(&id)
+            } else {
+                None
+            }
+        };
+        let Some(runtime) = removed else {
+            return false;
+        };
+        crate::db::connection::end_connection_leaving_the_app(runtime.connection());
+        true
     }
 
     pub fn remove_all_idle_transients(&self) -> usize {
@@ -812,10 +874,49 @@ pub enum TabConnectionState {
     Unbound,
 }
 
-#[derive(Clone)]
+/// A runtime a tab still NAMES although it is no longer bound to it.
+///
+/// Counted by a VALUE and not by each writer, for the reason
+/// [`ConnectionRuntime::detached_tabs`] gives: the field below is set in two
+/// places (a detach, and a fork of an already-detached binding) and cleared in
+/// three (two rebinds, and the binding simply going away) -- and the last of
+/// those, the one that matters most, is not a write anybody would remember to
+/// make. Constructing this is the only way to name a detached runtime and
+/// dropping it is the only way to stop, so the count and the field cannot
+/// disagree.
+struct DetachedRuntime {
+    runtime: Arc<ConnectionRuntime>,
+}
+
+impl DetachedRuntime {
+    fn new(runtime: Arc<ConnectionRuntime>) -> Self {
+        runtime.attach_detached_tab();
+        Self { runtime }
+    }
+
+    fn runtime(&self) -> &Arc<ConnectionRuntime> {
+        &self.runtime
+    }
+}
+
+impl Clone for DetachedRuntime {
+    /// A second tab naming the same detached runtime counts a second time --
+    /// `fork_for_new_tab` copies a detached binding, and that new tab reads
+    /// metadata through it exactly like the tab it was forked from.
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.runtime))
+    }
+}
+
+impl Drop for DetachedRuntime {
+    fn drop(&mut self) {
+        self.runtime.detach_detached_tab();
+    }
+}
+
 struct TabConnectionBindingState {
     runtime: Option<Arc<ConnectionRuntime>>,
-    detached_runtime: Option<Arc<ConnectionRuntime>>,
+    detached_runtime: Option<DetachedRuntime>,
     scope: Option<String>,
     revision: u64,
 }
@@ -835,6 +936,12 @@ impl Drop for TabConnectionBindingInner {
         if let Some(runtime) = state.runtime.as_ref() {
             runtime.detach_tab();
         }
+        // The DETACHED half needs nothing here, and that is the point of
+        // [`DetachedRuntime`] being a value: the field drops with this struct
+        // and releases its own count. Written by hand it would be a fourth
+        // place that has to remember, beside the two that set the field and the
+        // three that clear it — and the one that used to be missing was exactly
+        // this one.
     }
 }
 
@@ -958,14 +1065,20 @@ impl TabConnectionBinding {
         let tab_state = if let Some(runtime) = state.runtime.as_ref() {
             TabConnectionState::Bound(runtime.id())
         } else if let Some(runtime) = state.detached_runtime.as_ref() {
-            TabConnectionState::Detached(runtime.id())
+            TabConnectionState::Detached(runtime.runtime().id())
         } else {
             TabConnectionState::Unbound
         };
         TabConnectionSnapshot {
             state: tab_state,
             runtime: state.runtime.clone(),
-            detached_runtime: state.detached_runtime.clone(),
+            // A SNAPSHOT is a reader, not a namer: it hands out the plain
+            // `Arc` so looking at the binding cannot change what
+            // `ConnectionRuntime::is_idle` answers.
+            detached_runtime: state
+                .detached_runtime
+                .as_ref()
+                .map(|detached| Arc::clone(detached.runtime())),
             scope: state.scope.clone(),
             revision: state.revision,
         }
@@ -1143,7 +1256,7 @@ impl TabConnectionBinding {
     fn detach_locked(session: &mut SessionState, state: &mut TabConnectionBindingState) -> u64 {
         if let Some(runtime) = state.runtime.take() {
             runtime.detach_tab();
-            state.detached_runtime = Some(runtime);
+            state.detached_runtime = Some(DetachedRuntime::new(runtime));
         }
         state.scope = None;
         state.revision = state.revision.wrapping_add(1);
@@ -2150,5 +2263,106 @@ mod tests {
         drop(work);
         assert!(registry.remove_transient_if_idle(runtime.id()));
         assert!(registry.get(runtime.id()).is_none());
+    }
+
+    /// The THIRD way a connection is still reachable, and the one the answer
+    /// above used to leave out: a tab that DETACHED from it still names it.
+    ///
+    /// `TabConnectionBinding::metadata_connection` falls back to the detached
+    /// runtime, so IntelliSense, the bind-parameter probes and the column loads
+    /// go on acquiring pooled sessions through that very connection. Leaving it
+    /// out meant a script `CONNECT` followed by a script `DISCONNECT` took a
+    /// live, still-used connection out of the list every session-ending action
+    /// walks — application exit among them, so its server sessions were never
+    /// logged off at all.
+    #[test]
+    fn a_tab_that_detached_from_a_runtime_still_names_it() {
+        let registry = ConnectionRegistry::new();
+        let runtime = registry.register_transient(connection());
+        let id = runtime.id();
+        let binding =
+            TabConnectionBinding::bound_in_registry(registry.clone(), runtime.clone(), None);
+
+        let revision = binding.snapshot().revision;
+        assert!(binding.detach_if_revision(revision).is_ok());
+        assert_eq!(
+            runtime.bound_tab_count(),
+            0,
+            "the tab is no longer BOUND to it"
+        );
+        assert_eq!(
+            runtime.detached_tab_count(),
+            1,
+            "but it still names it, and reads its metadata through it"
+        );
+        assert!(!runtime.is_idle());
+        assert!(!registry.remove_transient_if_idle(id));
+        assert!(
+            registry.get(id).is_some(),
+            "a connection a tab can still reach must stay in the list every session-ending \
+             action walks"
+        );
+
+        drop(binding);
+        assert_eq!(runtime.detached_tab_count(), 0);
+        assert!(runtime.is_idle());
+        assert!(registry.remove_transient_if_idle(id));
+        assert!(registry.get(id).is_none());
+    }
+
+    /// A tab forked from a detached one names the runtime as well: it reads
+    /// metadata through the same connection.
+    #[test]
+    fn forking_a_detached_binding_names_the_runtime_a_second_time() {
+        let registry = ConnectionRegistry::new();
+        let runtime = registry.register_transient(connection());
+        let binding =
+            TabConnectionBinding::bound_in_registry(registry.clone(), runtime.clone(), None);
+        let revision = binding.snapshot().revision;
+        assert!(binding.detach_if_revision(revision).is_ok());
+
+        let forked = binding.fork_for_new_tab();
+        assert_eq!(runtime.detached_tab_count(), 2);
+        assert_eq!(
+            forked
+                .snapshot()
+                .detached_runtime
+                .map(|runtime| runtime.id()),
+            Some(runtime.id())
+        );
+
+        drop(binding);
+        assert_eq!(
+            runtime.detached_tab_count(),
+            1,
+            "the fork still names it after the tab it was forked from is gone"
+        );
+        assert!(!runtime.is_idle());
+        drop(forked);
+        assert!(runtime.is_idle());
+    }
+
+    /// Binding a tab elsewhere gives the name back, so a runtime nothing names
+    /// becomes removable again.
+    #[test]
+    fn binding_a_tab_elsewhere_gives_up_the_runtime_it_detached_from() {
+        let registry = ConnectionRegistry::new();
+        let detached = registry.register_transient(connection());
+        let next = registry.register_transient(connection());
+        let binding =
+            TabConnectionBinding::bound_in_registry(registry.clone(), detached.clone(), None);
+        let revision = binding.snapshot().revision;
+        assert!(binding.detach_if_revision(revision).is_ok());
+        assert_eq!(detached.detached_tab_count(), 1);
+
+        binding.bind(next.clone(), None);
+
+        assert_eq!(
+            detached.detached_tab_count(),
+            0,
+            "the tab stopped naming the connection it had detached from"
+        );
+        assert!(detached.is_idle());
+        assert_eq!(next.bound_tab_count(), 1);
     }
 }

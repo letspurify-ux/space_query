@@ -359,6 +359,14 @@ struct OracleThinConnectedCandidate {
     work_guard: crate::db::ConnectionWorkGuard,
 }
 
+/// A UI-thread action on the tab's retained session, published.
+///
+/// See [`SqlEditorWidget::begin_retained_session_action`].
+struct RetainedSessionAction {
+    activity: crate::db::DbActivityGuard,
+    connection_info: crate::db::ConnectionInfo,
+}
+
 struct OracleThinConnectionTransitionContext<'a> {
     connection_binding: &'a crate::db::TabConnectionBinding,
     pooled_db_session: &'a SharedDbSessionLease,
@@ -4256,12 +4264,35 @@ impl SqlEditorWidget {
     /// The connection info a retained-session canceler needs. MySQL cancels over
     /// a separate control connection, so it needs the credential-bearing copy
     /// from the pool context rather than the sanitized one.
-    fn retained_session_connection_info(
+    /// What a UI-thread action on the tab's RETAINED session publishes itself
+    /// as: the registry row, and the connection info that row's session
+    /// canceler needs.
+    ///
+    /// ONE resolution of the connection's pool context answers both, because
+    /// they are one fact. Resolved apart, the info came from the context and
+    /// the row was built with the raw `track_db_activity` -- so the row these
+    /// actions publish a real session canceler under named NO connection and
+    /// carried NO lifetime. See
+    /// [`crate::db::DbPoolSessionContext::track_operation_activity`] for what
+    /// each of those costs.
+    fn begin_retained_session_action(
         shared_connection: &crate::db::SharedConnection,
-    ) -> crate::db::ConnectionInfo {
-        crate::db::pool_session_context_for_shared_connection(shared_connection, None)
-            .map(|context| context.connection_info)
-            .unwrap_or_default()
+        db_activity: &str,
+        db_type: DatabaseType,
+    ) -> RetainedSessionAction {
+        match crate::db::pool_session_context_for_shared_connection(shared_connection, None) {
+            Ok(context) => RetainedSessionAction {
+                activity: context.track_operation_activity(db_activity.to_string()),
+                connection_info: context.connection_info,
+            },
+            // The connection could not be resolved at all, so there is no
+            // connection to name and no lifetime to bind: the row says exactly
+            // what is known, and the action below fails on the same fact.
+            Err(_) => RetainedSessionAction {
+                activity: crate::db::track_db_activity(db_activity.to_string(), Some(db_type)),
+                connection_info: crate::db::ConnectionInfo::default(),
+            },
+        }
     }
 
     /// A fresh MySQL-family pooled session, held together with the cancel
@@ -4717,7 +4748,7 @@ impl SqlEditorWidget {
                 // CLOSED rather than dropped back into a pool nothing revisits
                 // -- the same answer `DbPoolSessionContext::discard_stale_session`
                 // gives, and the reach ends first either way.
-                Self::discard_oracle_pool_session(held, "oracle pool session");
+                held.discard();
                 return (
                     conn_guard,
                     Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
@@ -4747,7 +4778,7 @@ impl SqlEditorWidget {
                     pool_context = match conn_guard.pool_session_context() {
                         Ok(context) => context,
                         Err(_) => {
-                            Self::discard_oracle_pool_session(held, "oracle pool session");
+                            held.discard();
                             return (
                                 conn_guard,
                                 Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
@@ -4763,7 +4794,7 @@ impl SqlEditorWidget {
                     // The error CLASSIFIED this session as stale, so it is
                     // closed instead of handed to the next tab -- and its reach
                     // ends here, before the retry publishes another.
-                    Self::discard_oracle_pool_session(held, "oracle pool session");
+                    held.discard();
                     drop(conn_guard);
                     let retry_result = Self::acquire_fresh_pool_session(
                         &pool_context,
@@ -4813,23 +4844,12 @@ impl SqlEditorWidget {
                         // drop ends the reach first.
                         drop(held);
                     } else {
-                        Self::discard_oracle_pool_session(held, "oracle pool session");
+                        held.discard();
                     }
                     return (conn_guard, Err(message));
                 }
             }
         }
-    }
-
-    /// Close a pooled Oracle session, reach first.
-    ///
-    /// One helper so every road that must CLOSE such a session (rather than let
-    /// it return to the pool) says the same thing.
-    fn discard_oracle_pool_session(
-        held: crate::db::HeldSession<Arc<Connection>>,
-        log_context: &'static str,
-    ) {
-        held.discard_with(|conn| DbSessionLease::Oracle(conn).discard_physical(log_context));
     }
 
     fn register_lazy_fetch_handle(
@@ -10888,10 +10908,12 @@ impl SqlEditorWidget {
                         &connection,
                         Some(&activity),
                     )?;
-                    let activity_guard = crate::db::track_pool_db_activity(
-                        activity.clone(),
-                        context.connection_info.db_type,
-                    );
+                    // Through the CONTEXT, so the row names its connection and
+                    // carries its lifetime: built with the raw
+                    // `track_pool_db_activity` it named neither, and a
+                    // disconnect's deliberate cancel of the background work it
+                    // covers could not reach this probe at all.
+                    let activity_guard = context.track_activity(activity.clone());
                     // Session and cancel reach as one value -- see
                     // `AcquiredPoolSession`.
                     let mut acquired =
@@ -13698,13 +13720,9 @@ impl SqlEditorWidget {
                                                         None,
                                                     )
                                                 else {
-                                                    if let Some(mut guard) =
-                                                        crate::db::try_lock_connection(
-                                                            &candidate_connection,
-                                                        )
-                                                    {
-                                                        guard.disconnect();
-                                                    }
+                                                    crate::db::end_connection_leaving_the_app(
+                                                        candidate_connection.clone(),
+                                                    );
                                                     drop(candidate_work_guard);
                                                     let _ = connection_binding_for_worker
                                                         .remove_transient_if_idle(
@@ -19066,26 +19084,38 @@ impl SqlEditorWidget {
                 ))
             }
         };
+        // Every road out of this frame from here NAMES what becomes of the
+        // session, rather than letting it fall out of scope: an implicit drop
+        // returns it to the candidate's pool, which cannot read a borrower's
+        // "close this, do not pool it". See `HeldSession::release`.
         if !Self::connection_candidate_commit_allowed(
             current_operation_id,
             operation_id,
             cancel_flag,
         ) {
+            session.release();
             return Err(
                 "CONNECT was cancelled before the candidate connection was committed".to_string(),
             );
         }
-        session
-            .set_call_timeout(query_timeout)
-            .map_err(|err| format!("Failed to apply query timeout before CONNECT: {err}"))?;
-        Self::ensure_oracle_thin_runtime(&mut session).map_err(|message| {
-            format!("Failed to initialize Oracle Thin session before CONNECT: {message}")
-        })?;
+        if let Err(err) = session.set_call_timeout(query_timeout) {
+            session.release();
+            return Err(format!(
+                "Failed to apply query timeout before CONNECT: {err}"
+            ));
+        }
+        if let Err(message) = Self::ensure_oracle_thin_runtime(&mut session) {
+            session.release();
+            return Err(format!(
+                "Failed to initialize Oracle Thin session before CONNECT: {message}"
+            ));
+        }
         if !Self::connection_candidate_commit_allowed(
             current_operation_id,
             operation_id,
             cancel_flag,
         ) {
+            session.release();
             return Err(
                 "CONNECT was cancelled before the candidate connection was committed".to_string(),
             );
@@ -19102,9 +19132,8 @@ impl SqlEditorWidget {
         ) {
             Ok(revision) => revision,
             Err(_) => {
-                if let Some(mut guard) = crate::db::try_lock_connection(&candidate_connection) {
-                    guard.disconnect();
-                }
+                session.release();
+                crate::db::end_connection_leaving_the_app(candidate_connection.clone());
                 drop(candidate_work_guard);
                 let _ = connection_binding.remove_transient_if_idle(candidate_runtime_id);
                 return Err(
@@ -20129,11 +20158,9 @@ impl SqlEditorWidget {
                                         let _ = context
                                             .connection_binding
                                             .detach_if_revision(candidate.binding_revision);
-                                        if let Some(mut guard) =
-                                            crate::db::try_lock_connection(&candidate.connection)
-                                        {
-                                            guard.disconnect();
-                                        }
+                                        crate::db::end_connection_leaving_the_app(
+                                            candidate.connection.clone(),
+                                        );
                                         drop(candidate.work_guard);
                                         let _ = context
                                             .connection_binding
@@ -25143,35 +25170,44 @@ impl SqlEditorWidget {
             // matters.
             Ok((session_scope, _)) => Ok((held, session_scope)),
             Err(message) if !Self::mysql_error_allows_session_reuse(&message) => {
-                Self::discard_mysql_pool_session(held);
+                held.discard();
                 let mut held =
                     Self::acquire_fresh_mysql_pool_session(context, session_pool_sender, activity)?;
-                // The `?` below gives this session up: `HeldSession`'s drop is
-                // what ends the cancel reach BEFORE it goes back to the pool.
-                let (session_scope, _) = Self::prepare_mysql_pooled_session_database(
+                // Closed, not dropped. The database prepare is SEVERAL steps
+                // (reset-or-`USE`, session settings, transaction options), so a
+                // failure between them leaves a session whose state nobody has
+                // accounted for -- and a `?` here dropped the `HeldSession`,
+                // which puts exactly that session back in the POOL. This is the
+                // second retry: there is nothing left to try, so what it
+                // carries can only be closed.
+                match Self::prepare_mysql_pooled_session_database(
                     &mut held,
                     &context.current_service_name,
                     &context.connection_info.advanced,
                     context.connection_info.db_type,
                     false,
                     None,
-                )?;
-                Ok((held, session_scope))
+                ) {
+                    Ok((session_scope, _)) => Ok((held, session_scope)),
+                    Err(message) => {
+                        held.discard();
+                        Err(message)
+                    }
+                }
             }
             // The error says this session may be REUSED, so it goes back to the
-            // pool -- and `held`'s drop ends the reach first. Split into a bare
+            // pool -- `release` ends the reach first and asks the borrower's
+            // say, and NAMING the road is the point: split into a bare
             // `mysql::PooledConn` plus a registration parked in the operation's
             // sender, this `Err` returned a live session to the pool with a
-            // canceler still naming it: a cancel or a disconnect on this tab
+            // canceler still naming it, and a cancel or a disconnect on this tab
             // then issued `KILL QUERY`/`KILL CONNECTION` against whichever tab
             // had picked that session up.
-            Err(message) => Err(message),
+            Err(message) => {
+                held.release();
+                Err(message)
+            }
         }
-    }
-
-    /// Close a pooled MySQL-family session, reach first.
-    fn discard_mysql_pool_session(held: crate::db::HeldSession<mysql::PooledConn>) {
-        held.discard_with(crate::db::discard_mysql_pooled_connection);
     }
 
     /// A fresh MySQL-family pooled session, prepared for this connection's
@@ -25572,21 +25608,21 @@ impl SqlEditorWidget {
                     );
                         hand_back.end_reach_before_release();
                         Self::discard_mysql_pooled_connection(conn);
-                        let (mut fresh_held, fresh_scope) =
+                        let (fresh_held, fresh_scope) =
                             Self::acquire_prepared_fresh_mysql_pool_session(
                                 &context,
                                 session_pool_sender,
                                 &activity,
                             )?;
-                        // Still a `HeldSession`, so this `?` ends the reach
-                        // before the session goes back to the pool.
-                        Self::apply_mysql_pooled_execution_session_settings(
-                            &mut fresh_held,
+                        // Handed back or closed: a `?` on a borrow used to
+                        // drop the `HeldSession`, which returns a half-applied
+                        // session to the POOL.
+                        let fresh_held = Self::prepare_mysql_pooled_execution_session(
+                            fresh_held,
                             context.connection_info.db_type,
                             auto_commit,
                             context.transaction_mode,
                             context.default_transaction_isolation,
-                            false,
                             statement_requires_transaction_boundary,
                         )?;
                         return Ok(AcquiredMySqlPooledSession {
@@ -25642,21 +25678,20 @@ impl SqlEditorWidget {
                 );
                 hand_back.end_reach_before_release();
                 Self::discard_mysql_pooled_connection(conn);
-                let (mut fresh_held, fresh_scope) =
-                    Self::acquire_prepared_fresh_mysql_pool_session(
-                        &context,
-                        session_pool_sender,
-                        &activity,
-                    )?;
-                // Still a `HeldSession`, so this `?` ends the reach before the
-                // session goes back to the pool.
-                Self::apply_mysql_pooled_execution_session_settings(
-                    &mut fresh_held,
+                let (fresh_held, fresh_scope) = Self::acquire_prepared_fresh_mysql_pool_session(
+                    &context,
+                    session_pool_sender,
+                    &activity,
+                )?;
+                // Handed back or closed, for the same reason as its twin
+                // above: a `?` on a borrow returns a half-applied session to
+                // the pool.
+                let fresh_held = Self::prepare_mysql_pooled_execution_session(
+                    fresh_held,
                     context.connection_info.db_type,
                     auto_commit,
                     context.transaction_mode,
                     context.default_transaction_isolation,
-                    false,
                     statement_requires_transaction_boundary,
                 )?;
                 return Ok(AcquiredMySqlPooledSession {
@@ -25756,6 +25791,45 @@ impl SqlEditorWidget {
             }
         }
         Ok(true)
+    }
+
+    /// Put a freshly acquired MySQL-family session into the state this execution
+    /// needs, and answer with the session or with nothing.
+    ///
+    /// The session is CONSUMED and handed back, which is what makes a
+    /// half-applied one unrepresentable here.
+    /// `apply_mysql_pooled_execution_session_settings` walks several statements
+    /// (`SET autocommit`, `SET SESSION TRANSACTION ...`), so a failure between
+    /// them leaves state nobody has accounted for -- and the error is often the
+    /// session itself going away. Both callers used to spell this as a `?` on a
+    /// BORROW, and a `?` drops the `HeldSession`, which returns that session to
+    /// the POOL for the next tab to pick up. This is round 5b's rule on the two
+    /// paths it had not reached: a pooled session goes back to the pool only
+    /// when what it carries is known. Same premise as the DB layer's own
+    /// `acquire_session_with_scope_context`, and the same answer.
+    fn prepare_mysql_pooled_execution_session(
+        mut held: crate::db::HeldSession<mysql::PooledConn>,
+        db_type: crate::db::DatabaseType,
+        auto_commit: bool,
+        transaction_mode: crate::db::TransactionMode,
+        default_transaction_isolation: crate::db::TransactionIsolation,
+        statement_requires_transaction_boundary: bool,
+    ) -> Result<crate::db::HeldSession<mysql::PooledConn>, String> {
+        match Self::apply_mysql_pooled_execution_session_settings(
+            &mut held,
+            db_type,
+            auto_commit,
+            transaction_mode,
+            default_transaction_isolation,
+            false,
+            statement_requires_transaction_boundary,
+        ) {
+            Ok(()) => Ok(held),
+            Err(message) => {
+                held.discard();
+                Err(message)
+            }
+        }
     }
 
     fn apply_mysql_pooled_execution_session_settings(
@@ -26170,8 +26244,10 @@ impl SqlEditorWidget {
         ) else {
             return crate::db::RetainedSessionMutationOutcome::NoSession;
         };
-        let mutation_activity = crate::db::track_db_activity(db_activity, Some(db_type));
-        let mutation_connection_info = Self::retained_session_connection_info(shared_connection);
+        let RetainedSessionAction {
+            activity: mutation_activity,
+            connection_info: mutation_connection_info,
+        } = Self::begin_retained_session_action(shared_connection, db_activity, db_type);
         // The option change runs on the session inside this function, so its
         // cancel reach begins and ends here.
 
@@ -26316,8 +26392,10 @@ impl SqlEditorWidget {
         }) else {
             return crate::db::RetainedSessionMutationOutcome::NoSession;
         };
-        let mutation_activity = crate::db::track_db_activity(db_activity, Some(db_type));
-        let mutation_connection_info = Self::retained_session_connection_info(shared_connection);
+        let RetainedSessionAction {
+            activity: mutation_activity,
+            connection_info: mutation_connection_info,
+        } = Self::begin_retained_session_action(shared_connection, db_activity, db_type);
         // The option change runs on the session inside this function, so its
         // cancel reach begins and ends here.
 

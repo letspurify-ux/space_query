@@ -27,6 +27,10 @@
 //   T12 a script DISCONNECT is TAB-LOCAL: the tab gives its own session back
 //      and its next statement says it is not connected, while every other tab
 //      on the same connection keeps its session and keeps working
+//   T13 a connection leaves the connection REGISTRY only when it has been
+//      ended -- the registry is the list every session-ending action walks,
+//      application exit included, so a live connection that leaves it early
+//      can never be logged off again
 //
 // A POOL REBUILD is the third road a session dies down, and the only one where
 // the CONNECTION stays up: the preferences dialog replaces the pool, bumps the
@@ -59,7 +63,10 @@
 
 use fltk::{app, input::IntInput};
 use mysql::prelude::Queryable;
-use space_query::db::{ConnectionInfo, DatabaseConnection, DatabaseType, OracleDriverMode};
+use space_query::db::{
+    ConnectionInfo, ConnectionRegistry, DatabaseConnection, DatabaseType, OracleDriverMode,
+    TabConnectionBinding,
+};
 use space_query::ui::sql_editor::{LazyFetchRequest, QueryProgress, SqlEditorWidget};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -928,6 +935,84 @@ fn verify(target: Target) -> Result<bool, String> {
     // legitimately still hold an idle session of its own. What a tab-local
     // disconnect must not leave behind is a session with an OWNER that is gone,
     // and T1-T11 are what prove that.
+
+    // T13: a connection leaves the REGISTRY only when it has been ENDED.
+    //
+    // A script `CONNECT` opens a connection of its own and registers a
+    // transient runtime for it; a script `DISCONNECT` is tab-local (T12) and
+    // does NOT disconnect that connection -- it detaches the tab, which goes on
+    // reading its metadata through the runtime it detached from
+    // (`TabConnectionBinding::metadata_connection` falls back to it).
+    // `ConnectionRuntime::is_idle` counted bound tabs and running work only, so
+    // the runtime was taken out of the registry while its connection was still
+    // logged in and still in use -- and the registry is the list every
+    // session-ending action walks, application exit included, so from that
+    // moment nothing in the app could ever log those sessions off.
+    //
+    // Two halves, and this is the one a census can see: leaving the registry
+    // must END the connection. The other half -- that a tab which still names
+    // it keeps it IN the registry -- is asserted here as a flag, because no
+    // harness drives `MainWindow`'s menus (rounds 8, 9 and 11 split the same
+    // way).
+    println!("  --- T13 a connection leaves the registry only when it has been ended ---");
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    let _ = settled_count(&mut census, connected_baseline)?;
+    let registry = ConnectionRegistry::new();
+    let mut script_connection = DatabaseConnection::new();
+    script_connection
+        .connect(target.probe_connection_info(&probe_user, &probe_service))
+        .map_err(|err| format!("T13 script CONNECT: {err}"))?;
+    // Held by the HARNESS for the whole scenario: without it, dropping the last
+    // reference would end the connection by itself and the census could not
+    // tell "the removal ended it" from "the last Arc happened to go".
+    let script_connection = Arc::new(Mutex::new(script_connection));
+    let runtime = registry.register_transient(Arc::clone(&script_connection));
+    let runtime_id = runtime.id();
+    let with_script_connection = stable_count(&mut census)?;
+    println!("    server sessions with the script connection open: {with_script_connection}");
+    report.check_flag(
+        "T13 the script-created connection really opened sessions",
+        with_script_connection > connected_baseline,
+    );
+
+    // The script DISCONNECT: tab-local, so the tab detaches and keeps naming it.
+    let binding = TabConnectionBinding::bound_in_registry(registry.clone(), runtime.clone(), None);
+    let revision = binding.snapshot().revision;
+    binding
+        .detach_if_revision(revision)
+        .map_err(|_| "T13 the detach must hold the revision it resolved".to_string())?;
+    report.check_flag(
+        "T13 a tab that detached still keeps the connection reachable",
+        !registry.remove_transient_if_idle(runtime_id) && registry.get(runtime_id).is_some(),
+    );
+    report.check_flag(
+        "T13 and its sessions are still open, which is why it must stay reachable",
+        stable_count(&mut census)? > connected_baseline,
+    );
+
+    // The tab closed: nothing names it now.
+    drop(binding);
+    report.check_flag(
+        "T13 a connection nothing can reach leaves the registry",
+        registry.remove_transient_if_idle(runtime_id) && registry.get(runtime_id).is_none(),
+    );
+    report.check_flag(
+        "T13 leaving the registry ENDED the connection instead of forgetting it",
+        wait_until(Duration::from_secs(20), || {
+            !script_connection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_connected()
+        }),
+    );
+    let observed = settled_count(&mut census, connected_baseline)?;
+    report.check(
+        "T13 the script-created connection's sessions are gone",
+        observed,
+        connected_baseline,
+    );
+    drop(runtime);
+    drop(script_connection);
 
     // P1: a POOL REBUILD is the road where the connection stays up. Three tabs
     // are each holding a retained session of the pool that is about to be
