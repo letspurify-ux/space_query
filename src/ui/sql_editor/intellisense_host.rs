@@ -321,6 +321,10 @@ impl SqlEditorWidget {
 
     pub fn cleanup_for_close(&mut self) {
         let query_was_running = self.is_query_running();
+        // A statement this tab accepted but never started must not start into a
+        // tab that no longer exists. The close road already asks the cancel
+        // road first; this is the backstop for every other way a tab goes away.
+        self.abandon_deferred_executions();
         self.cancel_active_lazy_fetch(false);
         // Close, not clear: a statement that outlives this tab (a cancel that
         // never landed) hands its session back later, and a closed slot is

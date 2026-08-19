@@ -67,7 +67,9 @@ use space_query::db::{
     OracleDriverMode, SessionCancelDelivery,
 };
 use space_query::ui::main_window::MainWindow;
-use space_query::ui::sql_editor::{HandBackForceProbe, QueryProgress, SqlEditorWidget};
+use space_query::ui::sql_editor::{
+    HandBackForceProbe, MainSessionTargetAtLockRelease, QueryProgress, SqlEditorWidget,
+};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -880,6 +882,76 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                     editor.transcript()
                 ));
             }
+        }
+        let _ = editor.wait_done(Duration::from_secs(10));
+    }
+
+    // A15: a cancel target naming the connection's OWN session ends with the
+    // LOCK that makes that session exclusively this tab's.
+    //
+    // A pooled session is given up at a hand-back door, and A11 above proves
+    // that door ends the reach first. The connection's own session has no such
+    // door -- what makes it one caller's is the connection MUTEX -- so the
+    // mutex is the door. It was not: the Oracle explain plan publishes the main
+    // session on both drivers and cleared the tab's target only AFTER its guard
+    // had been dropped. In that window (the mutex free, the target still
+    // naming the session) another tab takes the connection and starts its own
+    // main-connection call, and a cancel of the FINISHED explain breaks THAT
+    // call -- `break_execution` on the shared Oracle session, `KILL QUERY` on
+    // the shared MySQL-family one. The MySQL family escaped it only because its
+    // one main-connection execution path happened to clear its context before
+    // returning; happening to is not a rule, and it did not survive a panic.
+    //
+    // Driven directly for the same reason A10 and A11 are: the window is a
+    // handful of instructions wide and cannot be reached by waiting.
+    {
+        reset_tracked_db_activities_for_probe();
+        let label = target.label();
+        println!(
+            "   A15 ({label}): a main-session cancel target must end with the lock that owns it"
+        );
+        let harness = Harness::connect(target)?;
+        let mut editor = EditorHarness::new(&harness);
+        // A fresh tab does metadata work on the MAIN connection; let it finish
+        // so the probe's own lock is not refused as busy.
+        editor.pump_until(Duration::from_secs(20), || {
+            space_query::db::try_lock_connection(&harness.connection).map(|_| ())
+        });
+        match editor
+            .editor
+            .main_session_cancel_target_at_lock_release_for_probe(&harness.connection)
+        {
+            MainSessionTargetAtLockRelease::WithdrawnWithTheLock => {
+                println!(
+                    "   A15 ({label}) the lock ended the target it published over its own session"
+                );
+            }
+            answer => failures.push(format!(
+                "A15 ({label}): the tab's cancel still named the connection's own session after \
+                 the lock was released: {answer:?}"
+            )),
+        }
+
+        // THE ASSERTION, asked of the server: the connection every other tab is
+        // on still works. Asked with an EXPLAIN, like A10, because an ordinary
+        // statement runs on a pooled session and would answer happily over a
+        // main connection that had just been broken.
+        let mut alive = false;
+        for _ in 0..5 {
+            if editor.explain(target.trivial_sql(), Duration::from_secs(20)) {
+                alive = true;
+                break;
+            }
+            editor.pump_until(Duration::from_millis(500), || None::<()>);
+        }
+        if alive {
+            println!("   A15 ({label}) and the connection it named is untouched");
+        } else {
+            failures.push(format!(
+                "A15 ({label}): publishing and withdrawing a main-session target broke the \
+                 connection (transcript: {:?})",
+                editor.transcript()
+            ));
         }
         let _ = editor.wait_done(Duration::from_secs(10));
     }

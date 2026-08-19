@@ -3352,24 +3352,90 @@ fn lazy_fetch_all_timeout_for_fetch_all(
     timeout
 }
 
+/// The executions a query tab has ACCEPTED but not started.
+///
+/// Two roads park a statement here — the pool-slot road (cancel the oldest lazy
+/// fetch, run 0.2s later) and the lazy-cancel retry — and in that window the
+/// tab reads perfectly idle: no query running, no batch begun. Counting them is
+/// what stops a session-ending action from walking past a tab with a statement
+/// still coming.
+///
+/// Counting is not enough on its own, and that was the hole. Every gate could
+/// SEE the wait; nothing could END it. The tab-close road asks "cancel the
+/// running query and close?", calls the tab cancel — whose arms are a lazy
+/// fetch and a running query, neither of which this is — and then waits for the
+/// tab to go idle, so the timer fired, the statement started in a tab that was
+/// being closed, took a pooled session and possibly opened a transaction, and
+/// only then was cancelled. The cancel button did the same thing: it killed the
+/// lazy fetch the wait was waiting for, which made the queued statement start
+/// SOONER.
+///
+/// So "accepted" and "still wanted" are one value. [`Self::abandon`] is what a
+/// cancel calls, and every deferred road asks
+/// [`DeferredExecutionGuard::still_wanted`] before it starts anything.
+#[derive(Clone, Default)]
+pub(crate) struct DeferredExecutions {
+    inner: Arc<DeferredExecutionsInner>,
+}
+
+#[derive(Default)]
+struct DeferredExecutionsInner {
+    outstanding: AtomicUsize,
+    /// Bumped by [`DeferredExecutions::abandon`]. A guard taken before the bump
+    /// is no longer wanted; one taken after it is a NEW acceptance and is.
+    /// A generation rather than a flag, so a tab that is asked to cancel twice
+    /// does not have to be reset before it can accept work again.
+    abandon_generation: AtomicU64,
+}
+
+impl DeferredExecutions {
+    pub(crate) fn has_outstanding(&self) -> bool {
+        self.inner.outstanding.load(Ordering::Acquire) > 0
+    }
+
+    /// Give up every execution accepted so far. Answers whether there was one.
+    pub(crate) fn abandon(&self) -> bool {
+        let had_outstanding = self.has_outstanding();
+        self.inner.abandon_generation.fetch_add(1, Ordering::AcqRel);
+        had_outstanding
+    }
+
+    fn defer(&self) -> DeferredExecutionGuard {
+        self.inner.outstanding.fetch_add(1, Ordering::AcqRel);
+        DeferredExecutionGuard {
+            executions: self.clone(),
+            accepted_generation: self.inner.abandon_generation.load(Ordering::Acquire),
+        }
+    }
+}
+
 /// Keeps an execution counted as deferred — accepted by the editor but not
-/// started yet — for as long as it lives.
+/// started yet — for as long as it lives, and says whether it is still wanted.
 pub(crate) struct DeferredExecutionGuard {
-    deferred_executions: Arc<AtomicUsize>,
+    executions: DeferredExecutions,
+    accepted_generation: u64,
 }
 
 impl DeferredExecutionGuard {
-    fn new(deferred_executions: Arc<AtomicUsize>) -> Self {
-        deferred_executions.fetch_add(1, Ordering::AcqRel);
-        Self {
-            deferred_executions,
-        }
+    /// Whether the execution this guard stands for should still be started.
+    ///
+    /// Asked by the timer that would start it, which is the last moment at
+    /// which the answer can still change anything.
+    pub(crate) fn still_wanted(&self) -> bool {
+        self.executions
+            .inner
+            .abandon_generation
+            .load(Ordering::Acquire)
+            == self.accepted_generation
     }
 }
 
 impl Drop for DeferredExecutionGuard {
     fn drop(&mut self) {
-        self.deferred_executions.fetch_sub(1, Ordering::AcqRel);
+        self.executions
+            .inner
+            .outstanding
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -10559,7 +10625,16 @@ impl SqlEditorWidget {
     /// batch has begun — but a statement is still coming, so what it reserved
     /// must be left alone.
     pub(crate) fn has_deferred_execution(&self) -> bool {
-        self.deferred_executions.load(Ordering::Acquire) > 0
+        self.deferred_executions.has_outstanding()
+    }
+
+    /// Give up every execution this tab has accepted but not started.
+    ///
+    /// The third thing a cancel has to be able to end, beside a running
+    /// statement and a live lazy fetch. Answers whether there was one, so the
+    /// cancel road can report that it did something.
+    pub(crate) fn abandon_deferred_executions(&self) -> bool {
+        self.deferred_executions.abandon()
     }
 
     /// Count one execution as deferred, from the moment it is scheduled until
@@ -10572,7 +10647,7 @@ impl SqlEditorWidget {
     /// session-ending gate — which is the same window `has_deferred_execution`
     /// exists to close.
     pub(crate) fn defer_execution(&self) -> DeferredExecutionGuard {
-        DeferredExecutionGuard::new(self.deferred_executions.clone())
+        self.deferred_executions.defer()
     }
 
     /// Retry an execution that was deferred until the previous lazy fetch
@@ -10589,7 +10664,23 @@ impl SqlEditorWidget {
         initial_mysql_delimiter: Option<String>,
         lazy_cancel_session_id: u64,
         lazy_cancel_retry_attempt: u32,
+        deferred: &DeferredExecutionGuard,
     ) {
+        // The user asked for this queued statement to be given up. Reported
+        // through the SAME event a retry that ran out of attempts uses, so the
+        // reservation this execution was told it had — a table page's
+        // result-grid routing, the browse tab it left loading — is released
+        // exactly once, whichever way it ends.
+        if !deferred.still_wanted() {
+            let _ = self
+                .progress_sender
+                .send(QueryProgress::ExecutionAbandoned {
+                    sql: sql.to_string(),
+                    message: crate::db::query::result_messages::QUEUED_QUERY_CANCELLED.to_string(),
+                });
+            app::awake();
+            return;
+        }
         if self.execute_sql_with_mysql_delimiter_after_lazy_cancel(
             sql,
             script_mode,
@@ -11171,6 +11262,7 @@ impl SqlEditorWidget {
                                     initial_mysql_delimiter_for_retry.clone(),
                                     session_id,
                                     next_retry_attempt,
+                                    &deferred,
                                 );
                                 drop(deferred);
                             },
@@ -11197,6 +11289,7 @@ impl SqlEditorWidget {
                                 initial_mysql_delimiter_for_retry.clone(),
                                 session_id,
                                 next_retry_attempt,
+                                &deferred,
                             );
                             drop(deferred);
                         },
@@ -27279,8 +27372,7 @@ impl SqlEditorWidget {
     pub(super) fn run_mysql_action_with_timeout<T, F>(
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         scope: Option<&str>,
-        current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
+        cancel_slots: &crate::ui::sql_editor::MainSessionCancelSlots,
         cancel_flag: &Arc<Mutex<bool>>,
         query_timeout: Option<Duration>,
         log_context: &str,
@@ -27306,26 +27398,26 @@ impl SqlEditorWidget {
         // main-connection execution path. A cancel may `KILL QUERY` it; it may
         // never `KILL CONNECTION` it, or one tab's explain would take down the
         // connection every other tab is working on.
-        Self::set_current_mysql_cancel_context(
-            current_mysql_cancel_context,
-            current_query_cancel_handle,
-            Some((
+        //
+        // Published through the one door, so the GUARD withdraws it when the
+        // lock ends. This path used to clear the context by hand on each of
+        // its four exits — which was right for those four and silently wrong
+        // for the fifth (a panic unwinding past them) and for both Oracle
+        // drivers, which had no such clear at all.
+        Self::publish_main_session_cancel_target(
+            conn_guard,
+            cancel_slots.clone(),
+            crate::ui::sql_editor::MainSessionCancelTarget::MySql(Box::new(
                 MySqlQueryCancelContext {
                     connection_info,
                     connection_id,
                 },
-                CanceledSession::Main,
             )),
         );
 
         let timeout_restore;
         {
             let Some(mysql_conn) = conn_guard.get_mysql_connection_mut() else {
-                Self::set_current_mysql_cancel_context(
-                    current_mysql_cancel_context,
-                    current_query_cancel_handle,
-                    None,
-                );
                 return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string());
             };
             timeout_restore = match crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout_with_restore_for_db(
@@ -27340,11 +27432,6 @@ impl SqlEditorWidget {
                             Self::MAIN_SESSION_TIMEOUT_SETTINGS_UNKNOWN,
                         )
                     });
-                    Self::set_current_mysql_cancel_context(
-                        current_mysql_cancel_context,
-                        current_query_cancel_handle,
-                        None,
-                    );
                     return Err(Self::with_main_session_teardown(
                         SqlEditorWidget::mysql_timeout_apply_error_message(
                             &err,
@@ -27361,11 +27448,6 @@ impl SqlEditorWidget {
                     db_type,
                     timeout_restore.as_ref(),
                     log_context,
-                );
-                Self::set_current_mysql_cancel_context(
-                    current_mysql_cancel_context,
-                    current_query_cancel_handle,
-                    None,
                 );
                 let teardown = (!timeout_restore_ok).then(|| {
                     conn_guard.disconnect_untrusted_main_session(
@@ -27392,11 +27474,6 @@ impl SqlEditorWidget {
                     )
                 },
             );
-        Self::set_current_mysql_cancel_context(
-            current_mysql_cancel_context,
-            current_query_cancel_handle,
-            None,
-        );
         match result {
             Ok(Err(_)) if load_mutex_bool(cancel_flag) => Err(Self::with_main_session_teardown(
                 Self::cancel_message(),
@@ -31452,7 +31529,7 @@ mod query_execution_cleanup_tests {
         let cancel_flag = Arc::new(Mutex::new(true));
         let query_running = Arc::new(Mutex::new(true));
         let current_query_cancel_handle =
-            Arc::new(Mutex::new(super::OperationCancelTarget::Published(
+            Arc::new(Mutex::new(super::OperationCancelTarget::newly_published(
                 QueryCancelHandle::Test(Arc::new(AtomicBool::new(false))),
             )));
         let current_operation_id = Arc::new(AtomicU64::new(43));
@@ -31490,7 +31567,7 @@ mod query_execution_cleanup_tests {
         assert_eq!(last_completed_operation_id.load(Ordering::Relaxed), 0);
         assert!(matches!(
             *current_query_cancel_handle.lock().unwrap(),
-            super::OperationCancelTarget::Published(_)
+            super::OperationCancelTarget::Published { .. }
         ));
         assert!(
             receiver
@@ -32152,6 +32229,55 @@ mod query_execution_cleanup_tests {
             41,
             &cancel_flag,
         ));
+    }
+
+    /// An execution the tab ACCEPTED but has not started can be given up.
+    ///
+    /// Counting the wait made it visible to every session-ending gate; nothing
+    /// could END it. The tab-close road asks "cancel the running query and
+    /// close?", calls the tab cancel — whose arms are a lazy fetch and a
+    /// running query, and this is neither — and then waits for the tab to go
+    /// idle. So the timer fired, the statement started in a tab that was being
+    /// closed, took a pooled session and possibly opened a transaction, and was
+    /// only then cancelled.
+    #[test]
+    fn an_execution_accepted_but_not_started_can_be_given_up() {
+        let executions = super::DeferredExecutions::default();
+        assert!(!executions.has_outstanding());
+        assert!(
+            !executions.abandon(),
+            "nothing was accepted, so nothing was given up"
+        );
+
+        let accepted = executions.defer();
+        assert!(executions.has_outstanding());
+        assert!(
+            accepted.still_wanted(),
+            "an accepted execution is wanted until something says otherwise"
+        );
+
+        assert!(executions.abandon(), "and giving it up says it had one");
+        assert!(
+            !accepted.still_wanted(),
+            "the timer that would start it must find out before it starts anything"
+        );
+        assert!(
+            executions.has_outstanding(),
+            "it is still counted until its attempt has resolved it: a gate must not read the \
+             tab as idle while the timer is still on its way"
+        );
+
+        // A LATER acceptance is a new statement, not the one that was given up.
+        let accepted_again = executions.defer();
+        assert!(accepted_again.still_wanted());
+        assert!(
+            !accepted.still_wanted(),
+            "and the abandoned one stays abandoned"
+        );
+
+        drop(accepted);
+        drop(accepted_again);
+        assert!(!executions.has_outstanding());
     }
 
     #[test]
@@ -45453,10 +45579,12 @@ mod tab_scope_live_tests {
             sql,
             scope,
             None,
-            &Arc::new(Mutex::new(None)),
-            &Arc::new(Mutex::new(None)),
-            &Arc::new(Mutex::new(super::OperationCancelTarget::default())),
-            &Arc::new(Mutex::new(None)),
+            &crate::ui::sql_editor::MainSessionCancelSlots::new(
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(super::OperationCancelTarget::default())),
+            ),
             &Arc::new(Mutex::new(false)),
         )
     }

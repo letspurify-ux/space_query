@@ -2712,12 +2712,15 @@ impl AppState {
     }
 
     fn has_cancelable_query_activity(&self) -> bool {
-        self.editor_tabs.iter().any(|tab| {
-            tab.sql_editor.is_query_running()
-                || tab.sql_editor.active_lazy_fetch_session().is_some()
-        }) || crate::db::active_db_activity_snapshots()
+        // The same three things `tab_has_unfinished_db_work` counts: what the
+        // button OFFERS and what a session-ending gate REFUSES on must be the
+        // same list, or the app blocks on work it will not let the user stop.
+        self.editor_tabs
             .iter()
-            .any(|activity| activity.cancelable)
+            .any(|tab| Self::tab_has_unfinished_db_work(&tab.sql_editor))
+            || crate::db::active_db_activity_snapshots()
+                .iter()
+                .any(|activity| activity.cancelable)
     }
 
     fn active_connection_id(&self) -> Option<ConnectionId> {
@@ -5850,8 +5853,20 @@ fn execute_sql_request_with_session_pool_slot(
         // The binding was done before the wait; re-doing it here would bind
         // whichever tab is active NOW, which is not the one that asked.
         let AcceptedPoolSlotExecution { tab_id, deferred } = accepted;
-        if let Some(editor) = acquire_tab_sql_editor_if_idle(&state_for_execute, tab_id) {
-            run_sql_execution_request_on(&editor, request);
+        // Asked at the last moment at which the answer can still change
+        // anything: a cancel or a tab close that landed during the wait gave
+        // this statement up, and starting it anyway would take a pooled
+        // session — and possibly open a transaction — in a tab the user has
+        // already asked to stop.
+        if deferred.still_wanted() {
+            if let Some(editor) = acquire_tab_sql_editor_if_idle(&state_for_execute, tab_id) {
+                run_sql_execution_request_on(&editor, request);
+            }
+        } else {
+            crate::utils::logging::log_info(
+                "sql_editor::cancel",
+                crate::db::query::result_messages::QUEUED_QUERY_CANCELLED,
+            );
         }
         // Released only now: until an attempt has started it or given up on it,
         // the tab still has a statement coming.
@@ -6886,6 +6901,24 @@ impl MainWindow {
     }
 
     fn cancel_all_running_queries(state: &Arc<Mutex<AppState>>) {
+        // The queued half first, and for every tab: an execution that has been
+        // accepted but not started has no operation snapshot and no lazy-fetch
+        // session, so neither list below can name it, and "cancel everything"
+        // used to leave it to start afterwards.
+        let abandoned_queued = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Collected first, not short-circuited: EVERY tab's queued
+            // statement has to be given up, not just the first one that had
+            // any.
+            s.editor_tabs
+                .iter()
+                .map(|tab| tab.sql_editor.abandon_deferred_executions())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .any(|abandoned| abandoned)
+        };
         let (running_query_targets, lazy_fetch_sessions) = {
             let s = state
                 .lock()
@@ -6925,6 +6958,12 @@ impl MainWindow {
             .collect::<Vec<_>>();
 
         if running_query_targets.is_empty() && lazy_fetch_requests.is_empty() {
+            if abandoned_queued {
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .set_status_message(crate::db::query::result_messages::QUEUED_QUERY_CANCELLED);
+            }
             return;
         }
 
@@ -6971,7 +7010,14 @@ impl MainWindow {
         // operation is not missed by the same button click.
         for _ in 0..2 {
             let target = latest_query_cancel_target(editors.iter().filter_map(|editor| {
-                if editor.is_query_running() || editor.active_lazy_fetch_session().is_some() {
+                // A tab whose only DB work is an execution it has ACCEPTED but
+                // not started belongs here too: it is exactly as unstoppable
+                // from the registry road as a running statement is, and
+                // `cancel_query_editor_target` is what can end it.
+                if editor.is_query_running()
+                    || editor.active_lazy_fetch_session().is_some()
+                    || editor.has_deferred_execution()
+                {
                     Some(editor.cancel_target_snapshot())
                 } else {
                     None
@@ -7061,6 +7107,20 @@ impl MainWindow {
         }) else {
             return false;
         };
+        // FIRST, and outside the pending-cancel guard below: an execution this
+        // tab ACCEPTED but has not started is the THIRD thing a cancel has to
+        // be able to end, and it is the one that has no session yet — so no
+        // dispatched cancel can be pending for it, and a cancel already in
+        // flight for the lazy fetch it is waiting on must not swallow it.
+        //
+        // Without this the two arms below were the whole vocabulary: a queued
+        // statement could only be stopped by letting it start. Worse, the lazy
+        // arm CANCELS the very fetch the queue is waiting for, so pressing
+        // Cancel made the queued statement start sooner, and the tab-close
+        // road — which asks "cancel the running query and close?" — started it
+        // in a tab that was already being closed.
+        let mut requested = editor.abandon_deferred_executions();
+
         let target_is_pending = {
             let s = state
                 .lock()
@@ -7075,7 +7135,6 @@ impl MainWindow {
             return true;
         }
 
-        let mut requested = false;
         if !matches!(
             snapshot.lazy_state,
             crate::db::session_policy::LazyFetchState::None
@@ -14225,6 +14284,33 @@ impl MainWindow {
                     // connections claiming they are transitioning for the life
                     // of the process — and their pools shut — with reconnect,
                     // Disconnect All and preferences all refusing them.
+                    //
+                    // The LIST is re-read here, not reused from before the
+                    // settings dialog. That dialog is modal, a modal pumps the
+                    // event loop, and a connection attempt that completes
+                    // inside it registers a runtime the stale list does not
+                    // name — so that connection was neither held, nor
+                    // announced, nor resized, and was left running a pool of
+                    // the old size while the preference said otherwise. Reading
+                    // it HERE is still before the prompts, so nothing has been
+                    // committed yet and the same busy refusal is still
+                    // available.
+                    let runtimes = {
+                        let s = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        s.connection_registry.runtimes()
+                    };
+                    if let Some((runtime, activity)) = runtimes.iter().find_map(|runtime| {
+                        connection_transition_activity(&runtime.connection())
+                            .map(|activity| (runtime.clone(), activity))
+                    }) {
+                        crate::ui::alert_on_main(&format!(
+                            "Connection '{}' is busy. Current DB activity: {activity}",
+                            runtime.display_name()
+                        ));
+                        return true;
+                    }
                     let mut transition = ConnectionRuntime::announce_transition(runtimes);
                     {
                         let mut s = state

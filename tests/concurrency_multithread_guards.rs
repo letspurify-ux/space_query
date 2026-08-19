@@ -47,6 +47,43 @@ fn slice_from(text: &str, start: usize, len: usize) -> &str {
     &text[start..end]
 }
 
+/// The rest of the item that starts at `start`, bounded by the next top-level
+/// `}` rather than by a byte count.
+///
+/// A byte count makes a guard assertion fail when a comment is added to the
+/// code it is guarding, which is the opposite of what these tests are for:
+/// they must fail when the ORDER or the SHAPE changes, never when the file
+/// grows. Everything inside a Rust item is indented, so a `}` in column 0 is
+/// where the item ends.
+fn slice_to_end_of_item(text: &str, start: usize) -> &str {
+    let end = text[start..]
+        .find("\n}\n")
+        .map_or(text.len(), |offset| start + offset + 2);
+    &text[start..end]
+}
+
+/// The body of ONE method, bounded by the next item at the same indentation.
+///
+/// [`slice_to_end_of_item`] bounds by the next `}` in column 0, which for a
+/// method is the end of its whole `impl` block — too wide to say anything
+/// about one function.
+fn slice_to_end_of_fn(text: &str, start: usize) -> &str {
+    let rest = &text[start + 1..];
+    let end = [
+        "\n    fn ",
+        "\n    pub fn ",
+        "\n    pub(",
+        "\n    ///",
+        "\n    #[",
+        "\n}\n",
+    ]
+    .iter()
+    .filter_map(|marker| rest.find(marker))
+    .min()
+    .map_or(text.len(), |offset| start + 1 + offset);
+    &text[start..end]
+}
+
 fn read_source(relative_path: &str) -> String {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
     fs::read_to_string(&file)
@@ -8121,8 +8158,10 @@ fn every_force_tier_asks_one_rule_before_it_destroys_a_session() {
         "the tear-down must not be reachable around the rule"
     );
 
-    // And the MAIN-connection publishers must say so. All three explain-plan
-    // branches run on the connection's own session.
+    // And the MAIN-connection publishers must go through the ONE door. All
+    // three explain-plan branches run on the connection's own session, and the
+    // door is what states the kind — so a new backend cannot publish a main
+    // session without saying it is one.
     let execution = read_source("src/ui/sql_editor/execution.rs");
     for (source, marker) in [
         (&editor, "Ok(DbConnection::Oracle(db_conn)) => {"),
@@ -8132,13 +8171,33 @@ fn every_force_tier_asks_one_rule_before_it_destroys_a_session() {
         let start = source
             .find(marker)
             .unwrap_or_else(|| panic!("an explain-plan main-session publisher should exist: {marker}"));
-        let window = slice_from(source, start, 1000);
+        let window = slice_from(source, start, 1400);
         assert!(
-            window.contains("CanceledSession::Main"),
-            "an explain plan runs on the connection's OWN session and has to publish it as \
-             such: {window}"
+            window.contains("publish_main_session_cancel_target(")
+                && window.contains("conn_guard,"),
+            "an explain plan runs on the connection's OWN session and has to publish it \
+             through the door that names the lock: {window}"
         );
     }
+    let door = editor
+        .find("fn publish_main_session_cancel_target(")
+        .expect("the one main-session publish door should exist");
+    let door_body = slice_to_end_of_fn(&editor, door);
+    for arm in [
+        "MainSessionCancelTarget::Oracle(conn) => Self::set_current_query_connection(",
+        "MainSessionCancelTarget::OracleThin(handle) => {",
+        "MainSessionCancelTarget::MySql(context) => Self::set_current_mysql_cancel_context(",
+    ] {
+        assert!(
+            door_body.contains(arm),
+            "the door must be exhaustive over backends; missing {arm}: {door_body}"
+        );
+    }
+    assert_eq!(
+        door_body.matches("CanceledSession::Main").count(),
+        3,
+        "and it is the door, not its callers, that says which session this is: {door_body}"
+    );
 }
 
 #[test]
@@ -8691,7 +8750,7 @@ fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
     let watchdog = editor
         .find("fn start_query_cancel_watchdog(")
         .expect("the tab's force tier should exist");
-    let watchdog_body = slice_from(&editor, watchdog, 6000);
+    let watchdog_body = slice_to_end_of_fn(&editor, watchdog);
     assert!(
         watchdog_body.contains("let handle = QueryCancelHandle::OperationSlot(Arc::clone("),
         "the force tier must hold the slot while it acts: {watchdog_body}"
@@ -8712,7 +8771,7 @@ fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
     let graceful = editor
         .find("let cancel_handle =\n                    QueryCancelHandle::OperationSlot(Arc::clone(&current_query_cancel_handle));")
         .expect("the graceful tier must read through the slot too");
-    let graceful_body = slice_from(&editor, graceful, 2400);
+    let graceful_body = slice_from(&editor, graceful, 3200);
     assert!(
         graceful_body.contains("Ok(SessionCancelDelivery::Withdrawn) => {")
             && graceful_body.contains("QueryCancelOutcome::PendingInitialization"),
@@ -8949,7 +9008,7 @@ fn a_connection_lock_under_a_retired_activity_hands_out_nothing() {
     let guard_impl_start = connection
         .find("impl<'a> ConnectionLockGuard<'a> {")
         .expect("the guard's impl block should exist");
-    let guard_impl = slice_from(&connection, guard_impl_start, 4200);
+    let guard_impl = slice_to_end_of_item(&connection, guard_impl_start);
     for accessor in [
         "pub fn require_live_connection(&mut self) -> Result<Arc<Connection>, String> {",
         "pub fn require_live_db_connection(&mut self) -> Result<DbConnection, String> {",
@@ -9241,5 +9300,319 @@ fn a_decided_session_ending_action_holds_the_pool_before_it_prompts() {
         resize < prompt,
         "the rebuild must hold the door BEFORE it prompts: the prompts are modal, and a modal \
          pumps the event loop that starts metadata reads"
+    );
+}
+
+/// A cancel target naming the connection's OWN session ends with the LOCK that
+/// makes that session exclusively this caller's.
+///
+/// A pooled session has a hand-back door, and `SessionCancelReach` makes that
+/// door end every reach before the session stops being the work's. The
+/// connection's own session has no such door -- what makes it one caller's is
+/// the connection MUTEX -- so the mutex is the door, and `ConnectionLockGuard`
+/// is what closes it.
+///
+/// It was not. The Oracle explain plan publishes the main session on BOTH
+/// drivers and cleared the tab's target only after the guard had been dropped:
+/// after the mutex was free, after another tab could take it and start its own
+/// main-connection call. A cancel of the finished explain landing in that
+/// window broke THAT call -- `break_execution` on the shared OCI/thin session,
+/// `KILL QUERY` on the shared MySQL-family one. The MySQL family escaped it
+/// only because its one main-connection execution path happened to clear its
+/// context before returning; happening to is not a rule.
+#[test]
+fn a_main_session_cancel_target_ends_with_the_lock_that_owns_the_session() {
+    let connection = read_source("src/db/connection.rs");
+    let guard_drop = connection
+        .find("impl Drop for ConnectionLockGuard<'_> {")
+        .expect("the connection lock guard must take its own drop");
+    let guard_drop_body = slice_to_end_of_item(&connection, guard_drop);
+    let withdraw = guard_drop_body
+        .find("reach.withdraw_session_cancel_reach();")
+        .expect("the guard must end what the caller published over the connection's own session");
+    let release = guard_drop_body
+        .find("registration.release_reach();")
+        .expect("the guard must end the DB layer's reach too");
+    assert!(
+        withdraw < release,
+        "both end before the mutex, and the caller's target goes first: {guard_drop_body}"
+    );
+    assert!(
+        !guard_drop_body.contains("lock_db_activities")
+            && !guard_drop_body.contains("activity_registry"),
+        "neither may wait on the activity registry: the UI status tick holds it and the mutex is \
+         still held here ({guard_drop_body})"
+    );
+
+    // The publish side is ONE door, and it is the door that names the guard.
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let door = editor
+        .find("fn publish_main_session_cancel_target(")
+        .expect("the one main-session publish door should exist");
+    let door_body = slice_to_end_of_fn(&editor, door);
+    assert!(
+        door_body.contains("conn_guard: &mut crate::db::ConnectionLockGuard<'_>,"),
+        "the door must name the lock that will take the target back: {door_body}"
+    );
+    assert!(
+        door_body.contains("conn_guard.publish_main_session_cancel_reach(Arc::new(slots));"),
+        "and it must register the withdrawal on it: {door_body}"
+    );
+
+    // Nothing else may publish a main session into the tab's slot. The three
+    // setters are how a cancel target gets there at all, so a
+    // `CanceledSession::Main` outside the door is a road around the lock.
+    //
+    // ONE exemption, and it is exempt because it is not a lock's to take back:
+    // the Oracle OCI script `CONNECT` promotes the candidate connection's own
+    // session and the rest of the BATCH runs on it, across many locks. Its
+    // withdrawal belongs to the batch, which states it as its
+    // `WorkerSessionCancelReach` and gives it up at a hand-back door.
+    const PUBLISHED_FOR_A_WHOLE_BATCH: (&str, &str) = (
+        "Some((prepared_conn, CanceledSession::Main)),",
+        "a script CONNECT's session outlives every single lock, so the batch's hand-back door \
+         ends it instead",
+    );
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    for (name, source) in [("mod.rs", &editor), ("execution.rs", &execution)] {
+        // Test doubles publish handles freely; the rule is about production.
+        let production = source
+            .find("\n#[cfg(test)]\n")
+            .map_or(&source[..], |end| &source[..end]);
+        for (line_number, line) in production.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // The publication SHAPE the three setters take, so a `match` arm
+            // that merely reads the kind back is not mistaken for one.
+            if !trimmed.contains(", CanceledSession::Main))") || trimmed.starts_with("//") {
+                continue;
+            }
+            assert!(
+                door_body.contains(line) || trimmed.starts_with(PUBLISHED_FOR_A_WHOLE_BATCH.0),
+                "{name}:{} publishes the connection's own session outside the one door, so the \
+                 lock cannot take it back ({}): {line}",
+                line_number + 1,
+                PUBLISHED_FOR_A_WHOLE_BATCH.1
+            );
+        }
+    }
+
+    // And the explain worker must not get its guard back: releasing it inside
+    // the call is what puts the withdrawal on the right side of the mutex.
+    assert!(
+        editor.contains(
+            "fn get_explain_plan_for_locked_connection(
+        mut conn_guard: crate::db::ConnectionLockGuard<'_>,"
+        ),
+        "the explain plan must take the connection lock BY VALUE, so it is released -- and its \
+         main-session targets withdrawn -- before the worker does anything else"
+    );
+    // The MySQL family's one main-connection path no longer clears the tab's
+    // context by hand: one mechanism, not two, and this one also survives the
+    // panic path that the hand-written clears skipped.
+    let mysql_action = execution
+        .find("pub(super) fn run_mysql_action_with_timeout<T, F>(")
+        .expect("the MySQL family's main-connection execution path should exist");
+    let mysql_action_body = slice_to_end_of_fn(&execution, mysql_action);
+    assert!(
+        !mysql_action_body.contains("Self::set_current_mysql_cancel_context("),
+        "the guard withdraws it now, on every exit including a panic: {mysql_action_body}"
+    );
+}
+
+/// An execution the app has ACCEPTED but not started is the THIRD thing a
+/// cancel has to be able to end.
+///
+/// Two roads park one: the pool-slot road (cancel the oldest lazy fetch, run
+/// 0.2s later) and the lazy-cancel retry. Round 7 made the wait visible to
+/// every session-ending gate; nothing could END it. The tab-close road asks
+/// "cancel the running query and close?", calls the tab cancel -- whose arms
+/// were a lazy fetch and a running query, and this is neither -- and then waits
+/// for the tab to go idle. So the timer fired, the statement started in a tab
+/// that was already being closed, took a pooled session and possibly opened a
+/// transaction, and was only then cancelled. Pressing Cancel was worse: it
+/// killed the lazy fetch the queue was waiting for, which made the queued
+/// statement start SOONER.
+#[test]
+fn an_accepted_execution_can_be_given_up_before_it_starts() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let deferred = execution
+        .find("impl DeferredExecutionGuard {")
+        .expect("the deferred-execution guard should exist");
+    let deferred_body = slice_to_end_of_item(&execution, deferred);
+    assert!(
+        deferred_body.contains("pub(crate) fn still_wanted(&self) -> bool {"),
+        "an accepted execution must be able to say whether it is still wanted: {deferred_body}"
+    );
+
+    // Every road that would START a deferred execution asks first.
+    let retry = execution
+        .find("fn run_deferred_execution_retry(")
+        .expect("the lazy-cancel retry road should exist");
+    let retry_body = slice_to_end_of_fn(&execution, retry);
+    let asked = retry_body
+        .find("if !deferred.still_wanted() {")
+        .expect("the retry must ask before it starts anything");
+    let started = retry_body
+        .find("self.execute_sql_with_mysql_delimiter_after_lazy_cancel(")
+        .expect("the retry must be the thing that starts it");
+    assert!(
+        asked < started,
+        "and it must ask BEFORE it starts: {retry_body}"
+    );
+    assert!(
+        retry_body.contains("QUEUED_QUERY_CANCELLED"),
+        "a queued statement that is given up is reported through the same event that releases \
+         what it reserved: {retry_body}"
+    );
+
+    let main_window = read_source("src/ui/main_window.rs");
+    let pool_slot = main_window
+        .find("fn execute_sql_request_with_session_pool_slot(")
+        .expect("the pool-slot execution road should exist");
+    let pool_slot_body = slice_to_end_of_item(&main_window, pool_slot);
+    let pool_asked = pool_slot_body
+        .find("if deferred.still_wanted() {")
+        .expect("the pool-slot road must ask before it starts anything");
+    let pool_started = pool_slot_body
+        .find("run_sql_execution_request_on(&editor, request);")
+        .expect("the pool-slot road must be the thing that starts it");
+    assert!(
+        pool_asked < pool_started,
+        "and it must ask BEFORE it starts: {pool_slot_body}"
+    );
+
+    // The cancel road ends it, and does so BEFORE the pending-cancel guard: a
+    // cancel already in flight for the lazy fetch this statement is waiting on
+    // must not swallow the request to give the statement up.
+    let cancel = main_window
+        .find("fn cancel_query_editor_target(")
+        .expect("the tab cancel road should exist");
+    let cancel_body = slice_to_end_of_fn(&main_window, cancel);
+    let abandon = cancel_body
+        .find("editor.abandon_deferred_executions()")
+        .expect("the tab cancel must be able to end an accepted execution");
+    let pending = cancel_body
+        .find("if target_is_pending {")
+        .expect("the tab cancel should still short-circuit a cancel already in flight");
+    assert!(
+        abandon < pending,
+        "the queued statement has no session, so no dispatched cancel can be pending for it: \
+         {cancel_body}"
+    );
+
+    // Cancel All and the tab teardown reach it too.
+    let cancel_all = main_window
+        .find("fn cancel_all_running_queries(")
+        .expect("the cancel-all road should exist");
+    assert!(
+        slice_to_end_of_fn(&main_window, cancel_all).contains("abandon_deferred_executions()"),
+        "cancelling everything must include the statements that have not started"
+    );
+    let host = read_source("src/ui/sql_editor/intellisense_host.rs");
+    let cleanup = host
+        .find("pub fn cleanup_for_close(&mut self) {")
+        .expect("the tab teardown should exist");
+    assert!(
+        slice_to_end_of_fn(&host, cleanup).contains("self.abandon_deferred_executions();"),
+        "a statement accepted by a tab that is going away must not start into it"
+    );
+
+    // What the cancel button OFFERS and what a session-ending gate REFUSES on
+    // are the same list, or the app blocks on work it will not let you stop.
+    let offered = main_window
+        .find("fn has_cancelable_query_activity(&self) -> bool {")
+        .expect("the cancel button's own question should exist");
+    assert!(
+        slice_to_end_of_fn(&main_window, offered).contains("Self::tab_has_unfinished_db_work("),
+        "the button must offer exactly the work the gates refuse on"
+    );
+}
+
+/// The tear-down is never the first thing a session sees.
+///
+/// The two tiers were bounded differently: the graceful tier waited a
+/// hard-coded ~2s for a session to be published and then reported
+/// `PendingInitialization`, while the force tier waits the configured cancel
+/// timeout (1-120s, 60s by default). A session published between those two
+/// moments -- which is what an acquire queued behind another tab's work on the
+/// same connection looks like -- was never asked to stop at all, and the first
+/// thing that reached it was an Oracle drop-close, a thin socket close or a
+/// `KILL CONNECTION`. The lazy-fetch road never had this: its handle exists
+/// from the moment the fetch is registered, so its watchdog always breaks
+/// before it forces.
+#[test]
+fn the_force_tier_is_never_the_first_thing_a_session_sees() {
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+
+    // The state is a property of the PUBLICATION, not of the cancel: one
+    // operation publishes several sessions (the MySQL family re-acquires per
+    // statement, a script CONNECT replaces it mid-batch), so each has to be
+    // asked on its own.
+    assert!(
+        editor.contains("graceful_break_sent: bool,"),
+        "a published session must record whether anything has asked it to stop"
+    );
+    let claim = editor
+        .find("fn claim_graceful_break(")
+        .expect("the claim on a publication should exist");
+    let claim_body = slice_to_end_of_fn(&editor, claim);
+    assert!(
+        claim_body.contains("*graceful_break_sent = true;"),
+        "the claim must be taken under the slot lock, so exactly one tier sends the break: \
+         {claim_body}"
+    );
+
+    // Both senders claim BEFORE they act. A claim taken afterwards would let
+    // the other thread send a second break while the first is still opening a
+    // control connection.
+    let graceful = editor
+        .find("if !SqlEditorWidget::claim_graceful_break(&current_query_cancel_handle) {")
+        .expect("the cancel thread must claim the break it is about to send");
+    let graceful_send = editor[graceful..]
+        .find("cancel_handle.cancel_interrupt(")
+        .expect("the cancel thread must then send it");
+    assert!(graceful_send > 0, "claimed before sent");
+
+    let watchdog = editor
+        .find("fn start_query_cancel_watchdog(")
+        .expect("the tab's force tier should exist");
+    let watchdog_body = slice_to_end_of_fn(&editor, watchdog);
+    let fallback = watchdog_body
+        .find("if target.needs_graceful_break()")
+        .expect("the watchdog must be able to send the break the cancel thread could not");
+    let force = watchdog_body
+        .find("outcome: QueryCancelOutcome::ForceStarted,")
+        .expect("the watchdog must still force");
+    assert!(
+        fallback < force,
+        "and it must ask before it tears down, never after: {watchdog_body}"
+    );
+    assert!(
+        watchdog_body.contains("force_deadline = Instant::now() + timeout;"),
+        "a session asked to stop late gets the same grace every other session gets: \
+         {watchdog_body}"
+    );
+}
+
+/// A connection-wide change acts on the connections that exist when it is
+/// DECIDED, not on the ones that existed when the dialog opened.
+#[test]
+fn a_pool_rebuild_names_the_connections_it_is_about_to_change() {
+    let main_window = read_source("src/ui/main_window.rs");
+    let announce = main_window
+        .find("let mut transition = ConnectionRuntime::announce_transition(runtimes);")
+        .expect("the pool rebuild should announce its transition");
+    let before = &main_window[..announce];
+    let read_back = before
+        .rfind("s.connection_registry.runtimes()")
+        .expect("the rebuild must read the connection list itself");
+    let dialog = before
+        .rfind("if let Some(settings) = show_settings_dialog(&config_snapshot) {")
+        .expect("the settings dialog should come before the rebuild");
+    assert!(
+        read_back > dialog,
+        "the settings dialog is MODAL and a modal pumps the event loop, so a connection attempt \
+         that completes inside it registers a runtime the pre-dialog list does not name -- and \
+         that connection is then neither held, nor announced, nor resized"
     );
 }

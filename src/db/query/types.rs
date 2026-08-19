@@ -96,6 +96,13 @@ pub mod result_messages {
     pub const PLSQL_BLOCK_EXECUTED: &str = "PL/SQL block executed successfully";
     pub const STATEMENT_EXECUTED: &str = "Statement executed successfully";
     pub const QUERY_CANCELLED: &str = "Query cancelled";
+    /// An execution the app had ACCEPTED but had not started yet — it was
+    /// waiting for a previous lazy fetch to be cancelled — was given up
+    /// because the user cancelled or closed the tab.
+    ///
+    /// Its own message rather than [`QUERY_CANCELLED`]: nothing reached the
+    /// server, so there is no statement whose outcome is in doubt.
+    pub const QUEUED_QUERY_CANCELLED: &str = "The queued query was cancelled before it started.";
     pub const NO_STATEMENTS: &str = "No statements to execute";
     pub const AUTO_COMMIT_APPLIED: &str = "Auto-commit applied";
     pub const COMMIT_REQUIRED: &str = "Commit required";

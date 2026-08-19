@@ -10122,6 +10122,10 @@ pub struct ConnectionLockGuard<'a> {
     /// Detaches when the lock is released, so a cancel cannot land on the
     /// connection after this operation stopped using it.
     cancel_registration: Option<DbSessionCancelRegistration>,
+    /// What the CALLER published over this connection's OWN session, so it
+    /// stops speaking for it before the mutex is released. See
+    /// [`Self::publish_main_session_cancel_reach`].
+    main_session_reach: Vec<Arc<dyn WithdrawsSessionCancelReach>>,
     /// Whether this lock's work may still start. See [`ConnectionLockReach`].
     reach: ConnectionLockReach,
 }
@@ -10151,6 +10155,14 @@ pub struct ConnectionLockGuard<'a> {
 /// anything.
 impl Drop for ConnectionLockGuard<'_> {
     fn drop(&mut self) {
+        // The CALLER's own targets go first, for the same reason and in the
+        // same breath as the registration below: exclusive use of this
+        // connection ends with the mutex, so anything naming its session has
+        // to stop naming it before that. Neither of these touches the activity
+        // registry, so both stay on the right side of the lock order.
+        for reach in std::mem::take(&mut self.main_session_reach) {
+            reach.withdraw_session_cancel_reach();
+        }
         if let Some(registration) = self.cancel_registration.as_mut() {
             registration.release_reach();
         }
@@ -10161,6 +10173,35 @@ impl Drop for ConnectionLockGuard<'_> {
 
 impl<'a> ConnectionLockGuard<'a> {
     pub fn refresh_tracked_connection(&self) {}
+
+    /// Say that the caller has published a cancel target naming this
+    /// connection's OWN session, so this guard ends it when the lock does.
+    ///
+    /// A pooled session has a hand-back door, and
+    /// [`SessionCancelReach`] makes that door end every reach before the
+    /// session stops being the work's. The connection's own session has no
+    /// such door: what makes it exclusively this caller's is the MUTEX, and
+    /// nothing else. So the mutex is the door, and the withdrawal belongs to
+    /// this guard rather than to whatever the caller remembers to do after it.
+    ///
+    /// It was not. The Oracle explain plan publishes the main session on both
+    /// drivers and cleared the tab's target only after the guard had been
+    /// dropped — i.e. after the mutex was free, after another tab could take
+    /// it and start its own main-connection call. A cancel of the finished
+    /// explain landing in that window broke THAT call. The MySQL family
+    /// escaped it only because its one main-connection execution path happens
+    /// to clear its context before returning.
+    ///
+    /// The withdrawal must not touch the activity registry — the UI status
+    /// tick holds it — which is why this takes the same
+    /// [`WithdrawsSessionCancelReach`] the hand-back doors take and why the
+    /// UI's implementation for a main session touches only its own leaf slots.
+    pub fn publish_main_session_cancel_reach(
+        &mut self,
+        reach: Arc<dyn WithdrawsSessionCancelReach>,
+    ) {
+        self.main_session_reach.push(reach);
+    }
 
     /// Whether work may still start under this lock.
     ///
@@ -10433,6 +10474,7 @@ pub fn lock_connection(connection: &SharedConnection) -> ConnectionLockGuard<'_>
             guard,
             activity_guard: None,
             cancel_registration: None,
+            main_session_reach: Vec::new(),
             reach: ConnectionLockReach::Held,
         };
     }
@@ -10494,6 +10536,7 @@ pub fn try_lock_connection(connection: &SharedConnection) -> Option<ConnectionLo
         guard,
         activity_guard: None,
         cancel_registration: None,
+        main_session_reach: Vec::new(),
         reach: ConnectionLockReach::Held,
     })
 }
@@ -10986,6 +11029,77 @@ mod tests {
         assert!(
             withdraw < currency && withdraw < filing,
             "the reach ends before the session moves, on every road out of the door"
+        );
+    }
+
+    /// The MAIN session's twin of the rule above, and the reason it needed a
+    /// door of its own.
+    ///
+    /// A pooled session is given up at a hand-back door, which withdraws the
+    /// reach first. The connection's OWN session has no such door: what makes
+    /// it exclusively one caller's is the MUTEX, so the mutex is the door. The
+    /// Oracle explain plan published the main session on both drivers and
+    /// cleared the tab's target only AFTER its guard had been dropped — after
+    /// the mutex was free, after another tab could take it and start its own
+    /// main-connection call. A cancel of the finished explain landing there
+    /// broke THAT call.
+    ///
+    /// Proven at runtime rather than in the source: the withdrawal tries to
+    /// take the connection mutex and records whether it was still held. It must
+    /// be — anything else means the target outlived the exclusivity it named.
+    #[test]
+    fn a_main_session_cancel_target_ends_before_the_lock_that_owns_the_session() {
+        struct RecordsWhetherTheLockWasStillHeld {
+            connection: SharedConnection,
+            mutex_was_held: Arc<AtomicBool>,
+            withdrawn: Arc<AtomicBool>,
+        }
+        impl WithdrawsSessionCancelReach for RecordsWhetherTheLockWasStillHeld {
+            fn withdraw_session_cancel_reach(&self) {
+                self.mutex_was_held
+                    .store(self.connection.try_lock().is_err(), Ordering::Release);
+                self.withdrawn.store(true, Ordering::Release);
+            }
+        }
+
+        let connection = create_shared_connection();
+        let mutex_was_held = Arc::new(AtomicBool::new(false));
+        let withdrawn = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = lock_connection(&connection);
+            guard.publish_main_session_cancel_reach(Arc::new(RecordsWhetherTheLockWasStillHeld {
+                connection: Arc::clone(&connection),
+                mutex_was_held: Arc::clone(&mutex_was_held),
+                withdrawn: Arc::clone(&withdrawn),
+            }));
+            assert!(
+                !withdrawn.load(Ordering::Acquire),
+                "the target speaks for the session for as long as the lock does"
+            );
+        }
+        assert!(
+            withdrawn.load(Ordering::Acquire),
+            "releasing the lock must end every target published over the connection's own session"
+        );
+        assert!(
+            mutex_was_held.load(Ordering::Acquire),
+            "and it must end BEFORE the mutex is released: in the window between the two, the \
+             next tab's main-connection call starts and a cancel aimed at the operation that \
+             is ENDING breaks it instead"
+        );
+
+        // The probe can tell the two apart, so the assertion above is not
+        // vacuous: withdrawing where the OLD code did — with the lock already
+        // gone — records the opposite.
+        let late = RecordsWhetherTheLockWasStillHeld {
+            connection: Arc::clone(&connection),
+            mutex_was_held: Arc::new(AtomicBool::new(true)),
+            withdrawn: Arc::new(AtomicBool::new(false)),
+        };
+        late.withdraw_session_cancel_reach();
+        assert!(
+            !late.mutex_was_held.load(Ordering::Acquire),
+            "a withdraw that happens after the lock is released must be observable as such"
         );
     }
 
