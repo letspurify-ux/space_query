@@ -2986,6 +2986,122 @@ fn script_connect_transfers_runtime_work_tracking_before_old_guard_is_dropped() 
     assert!(execution.contains("drop(candidate_work_guard);"));
 }
 
+/// An operation's registry row follows the connection its work is on.
+///
+/// The registry keeps THREE facts about which connection a row belongs to: the
+/// id `cancel_db_activities_for_connection` matches on, the lifetime
+/// `sweep_stale_db_activities` asks, and the generation the cancel hook filters
+/// for. A script `CONNECT` moves a running batch to another connection on both
+/// Oracle drivers (the MySQL family refuses `CONNECT`), and only the ID moved
+/// with it. So the row went on naming the connection the batch had LEFT — and
+/// that connection's own teardown gate no longer refuses, because the tab is
+/// bound elsewhere now, so disconnecting it made the row stale and the sweep a
+/// disconnect runs on the spot cancelled the batch running somewhere else.
+/// From the other side, the connection the batch moved TO could retire the row
+/// and break nothing.
+///
+/// Three setters were three chances to move one. Now they are one value.
+#[test]
+fn an_operations_registry_row_moves_with_the_connection_its_work_moved_to() {
+    let connection = read_source("src/db/connection.rs");
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    // ONE door in the registry, and it takes the three facts as one value so a
+    // caller cannot supply two of them.
+    let door = connection
+        .find("pub fn bind_to_connection(&self, binding: DbActivityConnectionBinding) {")
+        .map(|offset| slice_to_end_of_fn(&connection, offset))
+        .expect("the registry needs one door for a row's connection");
+    for stated in [
+        "tracked.connection_id = connection_id;",
+        "tracked.lifetime = Some(lifetime);",
+        "tracked.on_cancel.replace(on_cancel)",
+    ] {
+        assert!(
+            door.contains(stated),
+            "all three facts move together, or the row describes two connections: {door}"
+        );
+    }
+    assert!(
+        door.contains("let mut activities = lock_db_activities();"),
+        "and under ONE registry lock, so a sweep cannot observe the row half-moved: {door}"
+    );
+
+    // The pieces are not reachable from outside this module any more: an
+    // operation states its connection through the door or not at all.
+    for private in [
+        "    fn set_connection_id(&self, connection_id: ConnectionId) {",
+        "    fn bind_lifetime(&self, lifetime: DbActivityLifetime) {",
+    ] {
+        assert!(
+            connection.contains(private),
+            "`{private}` must stay private to the DB module, or the half-move is one call away"
+        );
+    }
+
+    // The tab publishes its row through the same door...
+    let begin = editor
+        .find("fn begin_operation_activity(")
+        .map(|offset| slice_to_end_of_fn(&editor, offset))
+        .expect("the tab publishes its operation rows in one place");
+    assert!(
+        compact_for_pattern(begin).contains("activity.bind_to_connection(binder("),
+        "the initial publish uses the same door the move does: {begin}"
+    );
+
+    // ...and hands the means to MOVE it on with the row, because the road that
+    // moves it runs on a worker with no widget to ask.
+    let with_status = editor
+        .find("fn with_status_activity(mut self, status_activity: OperationActivity) -> Self {")
+        .map(|offset| slice_to_end_of_fn(&editor, offset))
+        .expect("a sender takes the row as one value");
+    assert!(
+        with_status.contains("self.status_activity = Some(activity);")
+            && with_status.contains("self.status_activity_binder = Some(binder);"),
+        "a row without its binder is a batch that can move and leave the row behind: \
+         {with_status}"
+    );
+    let mover = editor
+        .find("pub(crate) fn move_status_activity_to_connection(")
+        .map(|offset| slice_to_end_of_fn(&editor, offset))
+        .expect("moving the row must have one door too");
+    assert!(
+        compact_for_pattern(mover).contains(
+            "activity.bind_to_connection(binder(Some(connection_id),lifetime,connection_generation));"
+        ),
+        "and it states all three: {mover}"
+    );
+
+    // No road may state a row's connection by itself any more.
+    assert!(
+        !editor.contains("set_status_connection_id"),
+        "the partial door is what let only the id move; it must not come back"
+    );
+    assert!(
+        !execution.contains("set_status_connection_id"),
+        "the partial door is what let only the id move; it must not come back"
+    );
+
+    // Every script CONNECT that re-publishes where the work is running moves
+    // the row in the same breath. Both Oracle drivers, all three sites.
+    let compact = compact_for_pattern(&execution);
+    assert_eq!(
+        compact
+            .matches("sender.set_execution_origin(Some(ExecutionOrigin{")
+            .count(),
+        3,
+        "the three places a batch changes the connection it runs on"
+    );
+    assert_eq!(
+        compact
+            .matches("sender.move_status_activity_to_connection(")
+            .count(),
+        3,
+        "and each of them moves the registry row with it"
+    );
+}
+
 #[test]
 fn scope_synchronization_is_connection_id_scoped_for_oracle_mysql_and_mariadb() {
     let content = read_source("src/ui/main_window.rs");
@@ -5815,7 +5931,7 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
             .unwrap_or_else(|| panic!("{gate_fn} should exist"));
         let body = slice_from(&content, start, 700);
         assert!(
-            body.contains("Self::tab_has_unfinished_db_work("),
+            body.contains("Self::tab_has_unfinished_db_work"),
             "{gate_fn} must ask the one per-tab predicate instead of re-listing the two \
              kinds of work it happens to remember"
         );
@@ -7993,25 +8109,61 @@ fn the_session_slot_refuses_a_hand_back_from_a_connection_incarnation_that_ended
         "an ended connection incarnation must refuse the filing outright: {decision}"
     );
 
-    // ...and the one filing door asks it.
+    // ...and the one filing door asks it WITH THE SLOT LOCK HELD.
+    //
+    // This assertion used to say the opposite, with a reason that sounded
+    // right and was not: "the ledger is a leaf lock and the question is not
+    // about the slot, so it is asked outside the slot lock". The sweep that
+    // makes the ledger mean anything meets the filing at the SLOT LOCK and
+    // nowhere else, so a decision taken before that lock leaves a third moment
+    // — read "not retired", let the mark AND its sweep pass over an empty
+    // slot, then file a live session from a dead incarnation. The question and
+    // the write have to be one acquisition.
     let filing = connection
         .find("fn file_into_slot(")
-        .map(|offset| slice_from(&connection, offset, 2000))
+        .map(|offset| slice_to_end_of_fn(&connection, offset))
         .expect("the slot filing step should exist");
-    let asks = filing
-        .find("connection_generation_is_retired(connection_generation)")
-        .expect("the filing door must ask whether this incarnation is over");
     let takes_lock = filing
         .find("let mut lease = self.lock_inner();")
         .expect("the filing door takes the slot lock");
+    let asks = filing
+        .find("lease.filing_decision(connection_generation)")
+        .expect("the filing door must ask whether this incarnation is over, through the slot");
     assert!(
-        asks < takes_lock,
-        "the ledger is a leaf lock and the question is not about the slot, so it is asked \
-         outside the slot lock: {filing}"
+        takes_lock < asks,
+        "the decision must be taken in the same acquisition as the write, or the reclaim \
+         sweep can pass between them: {filing}"
     );
     assert!(
-        filing.contains("retained_session_filing(connection_is_retired, lease.closed)"),
-        "the door must fold BOTH refusals through the one decision: {filing}"
+        !filing.contains("connection_generation_is_retired("),
+        "and never by asking the ledger straight from the door, which is what put the \
+         question outside the lock: {filing}"
+    );
+
+    // The question cannot be asked without the guard that owns the answer:
+    // `filing_decision` takes `&DbSessionLeaseSlot`, so a caller has to be
+    // holding the slot lock to reach it at all.
+    let decision_door = connection
+        .find("fn filing_decision(&self, connection_generation: u64) -> RetainedSessionFiling {")
+        .map(|offset| slice_to_end_of_fn(&connection, offset))
+        .expect("the locked filing decision should exist");
+    assert!(
+        decision_door.contains("connection_generation_is_retired(connection_generation)")
+            && decision_door.contains("self.closed"),
+        "and it is the one place BOTH facts are read together: {decision_door}"
+    );
+    // And nothing in production asks it anywhere else: exactly its own
+    // definition and the one locked door. A second call site is how the
+    // question drifts back outside the lock.
+    let production = connection
+        .find("\n#[cfg(test)]\n")
+        .map_or(&connection[..], |end| &connection[..end]);
+    assert_eq!(
+        production
+            .matches("connection_generation_is_retired(")
+            .count(),
+        2,
+        "the ledger has one definition and one caller, and that caller holds the slot lock"
     );
 
     // The retirement is recorded synchronously, before the sweep is handed to a
@@ -8552,39 +8704,70 @@ fn every_session_ending_action_asks_the_one_preflight() {
     // then force-cancelled by the stale sweep. Two of them had no busy probe at
     // all and went straight to a WAITING lock on the UI thread.
     let content = read_source("src/ui/main_window.rs");
-    let preflight = content
-        .find("fn prepare_session_teardown(")
-        .expect("the disconnect family's shared preflight should exist");
-    let body = slice_from(&content, preflight, 1600);
-    let refuse = body
+    let ask = slice_to_end_of_fn(
+        &content,
+        content
+            .find("fn ask(")
+            .expect("the disconnect family's shared preflight should exist"),
+    );
+    let refuse = ask
         .find("s.tab_work_blocking_session_teardown(")
         .expect("the preflight must refuse a query tab's own work");
-    let cancel = body
-        .find(".cancel_background_db_work(force_timeout)")
-        .expect("the preflight must end the background work deliberately");
-    let probe = body
+    let probe = ask
         .find("try_lock_connection_with_activity(connection")
         .expect("the preflight must probe the connection before anything waits on it");
     assert!(
-        refuse < cancel && cancel < probe,
-        "refuse the tab's work, then end the background work while its sessions are still \
-         reachable, then probe: {body}"
+        refuse < probe,
+        "the cheap refusal comes before the one that takes a lock: {ask}"
+    );
+
+    // The background half is ENDED, not refused on, and that difference is the
+    // whole reason the disconnect family's preflight is not the pool
+    // rebuild's: the rebuild refuses when the registry has anything on the
+    // connection, the disconnect family cancels it deliberately while those
+    // sessions are still reachable, instead of leaving them to run into the
+    // generation bump and be force-cancelled by the stale sweep.
+    //
+    // It lives in the COMMIT half. This assertion used to require
+    // `cancel < probe` inside one function, and that ordering WAS the defect:
+    // the probe can refuse, so the connection's object-browser and
+    // IntelliSense reads were ended for an action that never happened. It also
+    // bought the probe nothing, because a cancel is dispatched on the watchdog
+    // thread and the mutex holder is still holding it microseconds later.
+    let commit = slice_to_end_of_fn(
+        &content,
+        content
+            .find("fn commit(self, state: &Arc<Mutex<AppState>>)")
+            .expect("the decided half of the preflight should exist"),
+    );
+    assert!(
+        commit.contains(".cancel_background_db_work(self.force_timeout)"),
+        "the preflight must end the background work deliberately: {commit}"
+    );
+    assert!(
+        !ask.contains("cancel_background_db_work"),
+        "and not from the half that can still refuse: {ask}"
     );
 
     // All three of the disconnect family ask it, and BEFORE the prompts — a
     // prompt performs a real COMMIT/ROLLBACK, so refusing after one leaves the
     // user's transaction committed for an action that never happened.
-    for (action, prompt) in [
+    for (action, preflight_call, prompt) in [
         (
             "\"File/Disconnect\" | \"File/Disconnect Active Connection\" => {",
+            "Self::prepare_session_teardown(",
             "Self::resolve_pooled_sessions_before_runtime_disconnect(state, connection_id)",
         ),
         (
+            // Disconnect All uses the two halves separately, because it has to
+            // ask about EVERY connection before it commits any of them.
             "\"File/Disconnect All\" => {",
+            "DecidedSessionTeardown::ask(",
             "let plan = Self::resolve_pooled_sessions_for_tabs(",
         ),
         (
             "\"File/Reconnect Active Connection\" => {",
+            "Self::prepare_session_teardown(",
             "Self::resolve_pooled_sessions_before_runtime_disconnect(state, runtime.id())",
         ),
     ] {
@@ -8593,7 +8776,7 @@ fn every_session_ending_action_asks_the_one_preflight() {
             .unwrap_or_else(|| panic!("{action} should exist"));
         let window = &content[start..];
         let asked = window
-            .find("Self::prepare_session_teardown(")
+            .find(preflight_call)
             .unwrap_or_else(|| panic!("{action} must ask the shared preflight"));
         let prompted = window
             .find(prompt)
@@ -8667,7 +8850,10 @@ fn a_pooled_session_is_never_held_apart_from_its_cancel_reach() {
     let held = connection
         .find("pub struct HeldSession<H> {")
         .expect("the driver-handle half of the pair should exist");
-    let held_fields = slice_from(&connection, held, 200);
+    // Bounded by the struct itself, not by a byte count: a field (or the
+    // comment explaining one) added between the two used to push the second
+    // out of the window and make this assertion pass for the wrong reason.
+    let held_fields = slice_to_end_of_item(&connection, held);
     let reach_field = held_fields
         .find("reach: SessionReachGuard,")
         .expect("HeldSession must own the reach");
@@ -8768,10 +8954,16 @@ fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
 
     // The graceful tier reads through the slot as well, and answers a withdraw
     // the way it answers a session that has not arrived: keep waiting.
-    let graceful = editor
+    let road = slice_to_end_of_fn(
+        &editor,
+        editor
+            .find("pub(crate) fn cancel_snapshot(")
+            .expect("the query tab's cancel road should exist"),
+    );
+    let graceful = road
         .find("let cancel_handle =\n                    QueryCancelHandle::OperationSlot(Arc::clone(&current_query_cancel_handle));")
         .expect("the graceful tier must read through the slot too");
-    let graceful_body = slice_from(&editor, graceful, 3200);
+    let graceful_body = &road[graceful..];
     assert!(
         graceful_body.contains("Ok(SessionCancelDelivery::Withdrawn) => {")
             && graceful_body.contains("QueryCancelOutcome::PendingInitialization"),
@@ -8946,9 +9138,38 @@ fn every_connection_wide_state_change_is_announced_and_taken_back_as_one_value()
         window
             .matches("ConnectionRuntime::announce_transition(")
             .count(),
-        3,
-        "the three connection-wide actions -- pool resize, Disconnect All, reconnect -- must \
-         each announce through it"
+        4,
+        "the four connection-wide actions -- pool resize, Disconnect All, reconnect and the \
+         SINGLE File/Disconnect -- must each announce through it. The single disconnect was \
+         the one that did not: it published `Disconnected` by hand at the end and said nothing \
+         in between, so for the whole span -- which contains its modal prompts and a WAITING \
+         lock -- the connection read `Connected` to every gate that refuses on `Transitioning`"
+    );
+
+    // ...and no road may assert the END of a connection's life by hand either.
+    //
+    // `Disconnected` is one of the two states the connection itself answers,
+    // so an action that has announced hands the state back by ASKING it
+    // (`ConnectionTransition::finished`). Application exit is the single
+    // exemption and it is a real one: it runs after every window is hidden,
+    // there is no event loop left to observe a `Transitioning` gate, and an
+    // announcement whose promise is "this comes back" has nothing to come back
+    // to.
+    let disconnect_writes = window
+        .matches("set_state(ConnectionRuntimeState::Disconnected)")
+        .count();
+    assert_eq!(
+        disconnect_writes, 1,
+        "only application exit may publish `Disconnected` by hand; every other road announces \
+         its transition and lets `finished` read the connection back"
+    );
+    let exit = window
+        .find("fn finish_application_exit(")
+        .expect("application exit should exist");
+    assert!(
+        slice_to_end_of_fn(&window, exit)
+            .contains("set_state(ConnectionRuntimeState::Disconnected)"),
+        "and that one write is application exit's"
     );
 
     let runtime = read_source("src/db/runtime.rs");
@@ -8964,12 +9185,131 @@ fn every_connection_wide_state_change_is_announced_and_taken_back_as_one_value()
     let drop_impl = runtime
         .find("impl Drop for ConnectionTransition {")
         .expect("the promise must be kept by a Drop impl");
-    let drop_body = slice_from(&runtime, drop_impl, 320);
+    let drop_body = slice_to_end_of_item(&runtime, drop_impl);
     assert!(
-        drop_body.contains("refresh_state_from_connection()"),
-        "whatever the action never reached is read back from the connection, which is the \
-         only place the truth was ever kept: {drop_body}"
+        drop_body.contains("finish_announced_transition()"),
+        "whatever the action never reached must end its announcement: {drop_body}"
     );
+    let finish = runtime
+        .find("fn finish_announced_transition(")
+        .expect("ending an announcement is what hands the state back");
+    let finish_body = slice_to_end_of_fn(&runtime, finish);
+    assert!(
+        finish_body.contains("read_identity_from_connection()"),
+        "and what it publishes is read back from the connection, which is the only place the \
+         truth was ever kept: {finish_body}"
+    );
+}
+
+/// While a connection-wide action is announced, the announcement is the only
+/// writer of that connection's state.
+///
+/// `Transitioning` is a GATE, not a label: `File/Disconnect All` refuses on it
+/// and the connect road reads it as "already changing connection state". The
+/// announcement guaranteed the state would come BACK and nothing kept it there
+/// while it was in, so any of the ordinary writers -- a connect result, a
+/// script `CONNECT`'s `ConnectionChanged`, a worker reading its runtime back
+/// when it finishes -- published `Connected` over an action that was still
+/// running, and a second session-ending action stopped being refused. All of
+/// those writers are dispatched from the UI event loop, and the pool rebuild
+/// announces its transition and THEN opens a modal (the per-tab
+/// commit/rollback prompts), which pumps exactly that loop.
+///
+/// One choke point, because every writer already went through one.
+#[test]
+fn an_announced_transition_is_the_only_writer_of_the_state_while_it_lasts() {
+    let runtime = read_source("src/db/runtime.rs");
+
+    let set_state = runtime
+        .find("pub fn set_state(&self, state: ConnectionRuntimeState) {")
+        .expect("the one state writer should exist");
+    let set_state_body = slice_to_end_of_fn(&runtime, set_state);
+    let refusal = set_state_body
+        .find("if cell.announced_transitions > 0 {")
+        .expect("the writer must ask whether an action owns the state");
+    let publish = set_state_body
+        .find("cell.published = state;")
+        .expect("the writer must publish when nobody owns it");
+    assert!(
+        refusal < publish,
+        "asked BEFORE the write, or the announcement is already over: {set_state_body}"
+    );
+
+    // Held back, not thrown away. "A dropped write is never information lost"
+    // is true only of the two states the connection can be asked for; a
+    // `Failed(why)` or a `Connecting` dropped here is gone — the first costs
+    // the user the reason a connect failed, the second un-says an attempt that
+    // is still running, which is the state `Disconnect All` refuses on.
+    assert!(
+        set_state_body.contains("cell.write_during_transition = Some(state);"),
+        "a write an announcement refuses to publish must be REMEMBERED, or the states the \
+         connection cannot restate are lost: {set_state_body}"
+    );
+    let decides = runtime
+        .find("fn state_after_announced_transition(")
+        .map(|offset| slice_to_end_of_fn(&runtime, offset))
+        .expect("the end-of-announcement decision should exist");
+    assert!(
+        decides.contains("is_answered_by_the_connection()"),
+        "and which writes those are is ONE classification, not a list repeated per state: \
+         {decides}"
+    );
+
+    // The count is what makes two actions covering one connection safe, the
+    // same reason `PoolSessionHandoutHold` counts rather than flags.
+    let begin = runtime
+        .find("fn begin_announced_transition(&self) {")
+        .expect("taking the state must have its own door");
+    let begin_body = slice_to_end_of_fn(&runtime, begin);
+    assert!(
+        begin_body.contains("cell.announced_transitions += 1;"),
+        "the announcement is counted, not flagged: {begin_body}"
+    );
+    let finish_body = slice_to_end_of_fn(
+        &runtime,
+        runtime
+            .find("fn finish_announced_transition(&self)")
+            .expect("giving the state back must have its own door"),
+    );
+    assert!(
+        finish_body
+            .contains("cell.announced_transitions = cell.announced_transitions.saturating_sub(1);")
+            && finish_body.contains("if cell.announced_transitions == 0 {"),
+        "and only the LAST action to end may publish: {finish_body}"
+    );
+    assert!(
+        finish_body.contains("state_after_announced_transition(")
+            && finish_body.contains("cell.write_during_transition.take()"),
+        "and what it publishes is the connection's answer weighed against the news it held \
+         back, not the connection's answer alone: {finish_body}"
+    );
+
+    // Nothing else may put a connection into transition, on any road: that is
+    // what makes the count the whole truth about who owns the state.
+    for (name, source) in [
+        ("src/db/runtime.rs", &runtime),
+        (
+            "src/ui/main_window.rs",
+            &read_source("src/ui/main_window.rs"),
+        ),
+        ("src/db/connection.rs", &read_source("src/db/connection.rs")),
+    ] {
+        let production = source
+            .find("\n#[cfg(test)]\n")
+            .map_or(&source[..], |end| &source[..end]);
+        for (line_number, line) in production.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            assert!(
+                !trimmed.contains("set_state(ConnectionRuntimeState::Transitioning)"),
+                "{name}:{} announces a transition by hand, so nothing takes it back and \
+                 nothing keeps it: {line}",
+                line_number + 1
+            );
+        }
+    }
 }
 
 /// The connection lock refuses to hand out a connection under an activity that
@@ -9246,15 +9586,31 @@ fn a_decided_session_ending_action_holds_the_pool_before_it_prompts() {
     let preflight = main_window
         .find("fn prepare_session_teardown(")
         .expect("the disconnect family's shared preflight should exist");
-    let preflight_body = slice_from(&main_window, preflight, 2200);
+    let preflight_body = slice_to_end_of_fn(&main_window, preflight);
     assert!(
         preflight_body.contains("-> Result<crate::db::PoolSessionHandoutHold, String>"),
         "the preflight must answer with the hold: {preflight_body}"
     );
-    assert!(
-        preflight_body.contains("hold_pool_session_handout(state)"),
-        "and take it for the connections its scope covers: {preflight_body}"
+    // The hold is taken by the DECIDED half and by nothing else, so there is
+    // no way to reach it without having spent every refusal first.
+    assert_eq!(
+        main_window
+            .matches("hold_pool_session_handout(state)")
+            .count(),
+        1,
+        "only the decided half of the preflight may take the hold"
     );
+    let commit_body = slice_to_end_of_fn(
+        &main_window,
+        main_window
+            .find("fn commit(self, state: &Arc<Mutex<AppState>>)")
+            .expect("the decided half of the preflight should exist"),
+    );
+    assert!(
+        commit_body.contains("hold_pool_session_handout(state)"),
+        "and it takes it for the connections its scope covers: {commit_body}"
+    );
+
     // Every caller keeps it. `if let Err(..) = preflight(..)` compiles and
     // drops the hold on the spot, which is the shape this is here to ban.
     assert!(
@@ -9266,8 +9622,24 @@ fn a_decided_session_ending_action_holds_the_pool_before_it_prompts() {
         main_window
             .matches("match Self::prepare_session_teardown(")
             .count(),
-        3,
-        "the reconnect, the disconnect and Disconnect All all keep what the preflight gave them"
+        2,
+        "the disconnect and the reconnect keep what the one-step preflight gave them"
+    );
+    // Disconnect All asks and commits separately (it must ask about every
+    // connection before committing any), so it keeps a LIST -- and keeps it in
+    // a named binding, which is what makes the holds live to the end of the
+    // action instead of being dropped where they are produced.
+    let disconnect_all = main_window
+        .find("\"File/Disconnect All\" => {")
+        .expect("the Disconnect All handler should exist");
+    let disconnect_all_body = main_window[disconnect_all..]
+        .find("\n            \"File/Exit\"")
+        .map_or(&main_window[disconnect_all..], |end| {
+            &main_window[disconnect_all..disconnect_all + end]
+        });
+    assert!(
+        compact_for_pattern(disconnect_all_body).contains("let_handout_holds=decided.into_iter()"),
+        "Disconnect All must keep every hold its commits produced: {disconnect_all_body}"
     );
 
     // The pool rebuild carries the hold in the value that already says these
@@ -9284,10 +9656,16 @@ fn a_decided_session_ending_action_holds_the_pool_before_it_prompts() {
     let finished = runtime
         .find("pub fn finished(&mut self, runtime: &Arc<ConnectionRuntime>)")
         .expect("the transition must be able to finish one connection at a time");
-    let finished_body = slice_from(&runtime, finished, 700);
+    let finished_body = slice_to_end_of_fn(&runtime, finished);
     assert!(
         finished_body.contains("self.handout_hold.release(runtime.id());"),
         "and a rebuild that walks several must re-open each as it finishes: {finished_body}"
+    );
+    assert!(
+        compact_for_pattern(finished_body)
+            .contains("if!self.pending.iter().any(|pending|Arc::ptr_eq(pending,runtime)){"),
+        "and only for a connection THIS transition still holds: releasing twice hands back a \
+         hold that, on a connection two actions cover, belongs to the other one: {finished_body}"
     );
 
     let resize = main_window
@@ -9419,6 +9797,172 @@ fn a_main_session_cancel_target_ends_with_the_lock_that_owns_the_session() {
     );
 }
 
+/// What a session-ending gate refuses on, what the cancel button offers, and
+/// what "cancel everything" acts on are ONE list of editors.
+///
+/// `AppState::sql_editor` is the ACTIVE TAB's editor -- a clone sharing its
+/// state -- or, while no tab exists, a fresh detached widget nothing can route
+/// an execution to. The gates counted it as a fifth possible owner of DB work
+/// and no cancel road could reach it: every one of them resolves its target by
+/// TAB ID, and `cancel_query_editor_target` returns false for a snapshot whose
+/// tab is not in `editor_tabs` -- so `cancel_all_running_queries` collected a
+/// target that was then silently dropped. Application exit asks the gate in a
+/// POLL LOOP and cancels between polls, so a "yes" that nothing can act on is
+/// an exit that never completes.
+#[test]
+fn what_a_gate_refuses_on_and_what_a_cancel_offers_is_one_list_of_editors() {
+    let window = read_source("src/ui/main_window.rs");
+
+    let list = window
+        .find("fn editors_that_can_own_db_work(&self)")
+        .expect("the one list of editors that can own DB work should exist");
+    let list_body = slice_to_end_of_fn(&window, list);
+    assert!(
+        list_body.contains("self.tabs_that_can_own_db_work().map(|tab| &tab.sql_editor)"),
+        "the editor view is derived from the tab view, so the two cannot disagree about which \
+         tabs exist: {list_body}"
+    );
+    let tab_list = window
+        .find("fn tabs_that_can_own_db_work(&self)")
+        .expect("the one list of tabs that can own DB work should exist");
+    assert!(
+        slice_to_end_of_fn(&window, tab_list).contains("self.editor_tabs.iter()"),
+        "and the list itself is the query tabs, and only them"
+    );
+
+    // Every question about "is there DB work in a tab" asks that list, and
+    // none of them reaches for the active-tab mirror on its own.
+    //
+    // The lazy-fetch four are here because checking only the three gates was
+    // not enough: `has_running_query_or_lazy_fetch` satisfied this guard while
+    // calling `has_active_lazy_fetches` -> `lazy_fetch_sessions_for_abort`,
+    // which pushed the mirror as a fifth owner one level down where the rule
+    // could not see it. That list is what the pool-resize gate and
+    // application exit's poll loop read.
+    for name in [
+        "fn is_any_query_running(&self)",
+        "fn has_running_query_or_lazy_fetch(&self)",
+        "fn has_cancelable_query_activity(&self)",
+        "fn lazy_fetch_sessions_for_abort(&self)",
+        "fn lazy_fetch_session_is_active_in_editor(&self, session_id: u64)",
+        "fn active_lazy_fetch_tab_id(&self, session_id: u64)",
+        "fn request_lazy_fetch_on_editors(",
+    ] {
+        let body = slice_to_end_of_fn(
+            &window,
+            window
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} should exist")),
+        );
+        assert!(
+            body.contains("editors_that_can_own_db_work()")
+                || body.contains("tabs_that_can_own_db_work()"),
+            "{name} must ask the one list, through either of its two views: {body}"
+        );
+        assert!(
+            !body.contains("self.sql_editor"),
+            "{name} must not ask the active-tab mirror as if it were a separate owner: {body}"
+        );
+    }
+
+    let cancel_all = slice_to_end_of_fn(
+        &window,
+        window
+            .find("fn cancel_all_running_queries(state: &Arc<Mutex<AppState>>)")
+            .expect("cancel-all should exist"),
+    );
+    assert_eq!(
+        cancel_all.matches("editors_that_can_own_db_work()").count(),
+        2,
+        "both halves of cancel-all -- the queued executions and the running statements -- act on \
+         the same list the gates ask: {cancel_all}"
+    );
+    assert!(
+        !cancel_all.contains("s.sql_editor"),
+        "and neither of them names a target no cancel road can resolve: {cancel_all}"
+    );
+}
+
+/// A cancel that never reached a session is never recorded as one that did.
+///
+/// The graceful tier is driven from two threads — the cancel thread, which is
+/// first when the session is already published, and the watchdog, which is the
+/// only one still watching when the session arrives later — so whoever CLAIMS
+/// the break sends it. The claim answered a bool, and `false` meant two
+/// different things: "the other tier already sent this break" and "there is
+/// nothing published to send it to", the second being a hand-back that landed
+/// between the caller's read of the slot and its claim. Both were reported as
+/// `InterruptSent`, so a cancel that sent nothing was recorded as dispatched —
+/// while the SAME fact observed a few lines later, as a `Withdrawn` delivery,
+/// is reported as `PendingInitialization`.
+#[test]
+fn a_cancel_that_never_reached_a_session_is_never_reported_as_sent() {
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+
+    let claim = editor
+        .find("fn claim_graceful_break(")
+        .expect("the graceful-break claim should exist");
+    let claim_body = slice_to_end_of_fn(&editor, claim);
+    assert!(
+        claim_body.contains("-> GracefulBreakClaim {"),
+        "the claim must STATE what it found, not answer a bool that collapses two facts: \
+         {claim_body}"
+    );
+    for answer in [
+        "GracefulBreakClaim::Claimed",
+        "GracefulBreakClaim::AlreadySent",
+        "GracefulBreakClaim::NoSession",
+    ] {
+        assert!(
+            claim_body.contains(answer),
+            "the claim must be able to answer {answer}: {claim_body}"
+        );
+    }
+    // Every variant of the slot is named, so a new one cannot fall into
+    // "somebody already sent it" by default.
+    assert!(
+        claim_body
+            .contains("OperationCancelTarget::NotPublished | OperationCancelTarget::Withdrawn"),
+        "a target with no session must be named rather than caught by a wildcard: {claim_body}"
+    );
+
+    let road = slice_to_end_of_fn(
+        &editor,
+        editor
+            .find("pub(crate) fn cancel_snapshot(")
+            .expect("the query tab's cancel road should exist"),
+    );
+    let no_session = road
+        .find("GracefulBreakClaim::NoSession => {")
+        .expect("the cancel road must answer the no-session claim");
+    let no_session_arm = slice_from(road, no_session, 400);
+    assert!(
+        no_session_arm.contains("QueryCancelOutcome::PendingInitialization"),
+        "nothing was sent, so the cancel stays requested and the watchdog breaks whatever this \
+         operation publishes next: {no_session_arm}"
+    );
+    let already_sent = road
+        .find("GracefulBreakClaim::AlreadySent => {")
+        .expect("the cancel road must answer the already-sent claim");
+    let already_sent_arm = slice_from(road, already_sent, 400);
+    assert!(
+        already_sent_arm.contains("QueryCancelOutcome::InterruptSent"),
+        "the other tier DID send it, which is the one case that may be reported as sent: \
+         {already_sent_arm}"
+    );
+
+    // ...and the delivery half of the same road answers the same fact the same
+    // way, which is the whole point of separating the two.
+    assert!(
+        road.contains(
+            "Ok(SessionCancelDelivery::Withdrawn) => {
+                        QueryCancelOutcome::PendingInitialization
+                    }"
+        ),
+        "a withdraw seen at delivery time and one seen at claim time are the same fact: {road}"
+    );
+}
+
 /// An execution the app has ACCEPTED but not started is the THIRD thing a
 /// cancel has to be able to end.
 ///
@@ -9504,9 +10048,16 @@ fn an_accepted_execution_can_be_given_up_before_it_starts() {
     let cancel_all = main_window
         .find("fn cancel_all_running_queries(")
         .expect("the cancel-all road should exist");
+    let cancel_all_body = slice_to_end_of_fn(&main_window, cancel_all);
     assert!(
-        slice_to_end_of_fn(&main_window, cancel_all).contains("abandon_deferred_executions()"),
-        "cancelling everything must include the statements that have not started"
+        cancel_all_body.contains("abandon_deferred_executions"),
+        "cancelling everything must include the statements that have not started: \
+         {cancel_all_body}"
+    );
+    assert!(
+        cancel_all_body.contains("editors_that_can_own_db_work()"),
+        "...and for every editor a session-ending gate counts, which is the same list: \
+         {cancel_all_body}"
     );
     let host = read_source("src/ui/sql_editor/intellisense_host.rs");
     let cleanup = host
@@ -9522,9 +10073,15 @@ fn an_accepted_execution_can_be_given_up_before_it_starts() {
     let offered = main_window
         .find("fn has_cancelable_query_activity(&self) -> bool {")
         .expect("the cancel button's own question should exist");
+    let offered_body = slice_to_end_of_fn(&main_window, offered);
     assert!(
-        slice_to_end_of_fn(&main_window, offered).contains("Self::tab_has_unfinished_db_work("),
-        "the button must offer exactly the work the gates refuse on"
+        offered_body.contains("Self::tab_has_unfinished_db_work"),
+        "the button must offer exactly the work the gates refuse on: {offered_body}"
+    );
+    assert!(
+        offered_body.contains("editors_that_can_own_db_work()"),
+        "...asked of the same editors, which is the other half of being the same list: \
+         {offered_body}"
     );
 }
 
@@ -9566,7 +10123,7 @@ fn the_force_tier_is_never_the_first_thing_a_session_sees() {
     // the other thread send a second break while the first is still opening a
     // control connection.
     let graceful = editor
-        .find("if !SqlEditorWidget::claim_graceful_break(&current_query_cancel_handle) {")
+        .find("match SqlEditorWidget::claim_graceful_break(&current_query_cancel_handle) {")
         .expect("the cancel thread must claim the break it is about to send");
     let graceful_send = editor[graceful..]
         .find("cancel_handle.cancel_interrupt(")
@@ -9614,5 +10171,119 @@ fn a_pool_rebuild_names_the_connections_it_is_about_to_change() {
         "the settings dialog is MODAL and a modal pumps the event loop, so a connection attempt \
          that completes inside it registers a runtime the pre-dialog list does not name -- and \
          that connection is then neither held, nor announced, nor resized"
+    );
+}
+
+/// The half of a session-ending action that cannot be taken back runs only
+/// after every reason to refuse it has been spent.
+///
+/// The disconnect family's preflight used to be ONE function in the order
+/// ask -> CANCEL the connection's background work -> ask again. The second ask
+/// can refuse, and by then this connection's object-browser refresh,
+/// IntelliSense loads and bind probes had been ended for an action that never
+/// happened. It was not a trade either: the cancel is DISPATCHED on the
+/// watchdog thread, so whatever holds the connection mutex is still holding it
+/// when the probe runs microseconds later.
+///
+/// The same rule the prompts already obey ("refusing halfway must not leave
+/// the earlier connections changed"), applied to the half that ENDS WORK
+/// rather than the half that commits transactions -- which is why Disconnect
+/// All has to ask about every connection before committing any, and why the
+/// reconnect reads its stored password before the preflight rather than after.
+#[test]
+fn a_session_ending_action_ends_nothing_until_every_refusal_is_spent() {
+    let window = read_source("src/ui/main_window.rs");
+
+    let ask = slice_to_end_of_fn(
+        &window,
+        window
+            .find("fn ask(")
+            .expect("the refusable half of a session teardown should exist"),
+    );
+    for irreversible in ["cancel_background_db_work", "hold_pool_session_handout"] {
+        assert!(
+            !ask.contains(irreversible),
+            "the half that can refuse must not reach `{irreversible}`: {ask}"
+        );
+    }
+    assert!(
+        ask.contains("tab_work_blocking_session_teardown")
+            && ask.contains("try_lock_connection_with_activity"),
+        "and it must put BOTH refusable questions -- the tab's work and the connection \
+         itself: {ask}"
+    );
+
+    let commit = slice_to_end_of_fn(
+        &window,
+        window
+            .find("fn commit(self, state: &Arc<Mutex<AppState>>)")
+            .expect("the decided half of a session teardown should exist"),
+    );
+    for irreversible in ["cancel_background_db_work", "hold_pool_session_handout"] {
+        assert!(
+            commit.contains(irreversible),
+            "the decided half is where `{irreversible}` belongs: {commit}"
+        );
+    }
+
+    // Disconnect All asks about EVERY connection before it commits ANY.
+    let disconnect_all = window
+        .find("\"File/Disconnect All\"")
+        .expect("the Disconnect All handler should exist");
+    let disconnect_all_body = window[disconnect_all..]
+        .find("\n            \"File/Exit\"")
+        .map_or(&window[disconnect_all..], |end| {
+            &window[disconnect_all..disconnect_all + end]
+        });
+    let asked = disconnect_all_body
+        .find("DecidedSessionTeardown::ask(")
+        .expect("Disconnect All must ask through the two-phase preflight");
+    let collected = disconnect_all_body[asked..]
+        .find("push(decision)")
+        .map(|offset| asked + offset)
+        .expect("what the loop asks for is what it collects");
+    // What the loop COLLECTS is what the ask answered, untouched. Asserting
+    // "an ask appears before a commit" is not enough: committing inside the
+    // loop -- which is the shape that let a refusal on the third connection
+    // end the first two's work -- still reads that way.
+    assert!(
+        !disconnect_all_body[asked..collected].contains("commit"),
+        "a decision may not be committed on its way into the list; every connection is asked \
+         before ANY of them is committed: {disconnect_all_body}"
+    );
+    let committed = disconnect_all_body[collected..]
+        .find(".commit(state)")
+        .map(|offset| collected + offset)
+        .expect("Disconnect All must commit what it asked for");
+    assert!(
+        asked < committed,
+        "and the commit comes after the whole list: {disconnect_all_body}"
+    );
+    assert!(
+        !disconnect_all_body.contains("prepare_session_teardown"),
+        "the one-step preflight asks and commits per connection, which is the shape that let a \
+         refusal on the third connection end the first two's work: {disconnect_all_body}"
+    );
+
+    // The reconnect's own reason to refuse -- a password it does not have --
+    // is spent BEFORE the preflight, not merely before the prompts.
+    let reconnect = window
+        .find("\"File/Reconnect Active Connection\"")
+        .expect("the reconnect handler should exist");
+    let reconnect_body = window[reconnect..]
+        .find("\n            \"File/Disconnect\"")
+        .map_or(&window[reconnect..], |end| {
+            &window[reconnect..reconnect + end]
+        });
+    let password = reconnect_body
+        .find("get_password_for_connection")
+        .expect("the reconnect reads the stored password");
+    let preflight = reconnect_body
+        .find("prepare_session_teardown")
+        .expect("the reconnect asks the shared preflight");
+    assert!(
+        password < preflight,
+        "a reconnect that refuses for a missing password must not already have cancelled this \
+         connection's background reads: {reconnect_body}"
     );
 }

@@ -55,6 +55,13 @@
 //       from the pool). Driven directly for the same reason A10 is, and the
 //       assertion is asked of the SERVER: the tab's transaction must still be
 //       there afterwards.
+//   A16 (Oracle only — the MySQL family refuses `CONNECT`) a script `CONNECT`
+//       moves the operation's REGISTRY ROW to the connection the batch moved
+//       to. Only the row's connection ID used to move; its lifetime kept
+//       naming the connection the batch had LEFT, and that connection's own
+//       teardown gate no longer refuses (the tab is bound elsewhere now), so
+//       ending it made the row stale and the stale sweep — which a disconnect
+//       runs on the spot — cancelled the batch running somewhere else.
 //
 // Usage: verify_activity_cancel_live <thin|oci|mysql|mariadb|all>
 
@@ -62,9 +69,9 @@ use fltk::prelude::InputExt;
 use fltk::{app, input::IntInput};
 use space_query::db::{
     active_db_activity_snapshots, active_pool_db_activity_snapshots, cancel_db_activity,
-    reset_tracked_db_activities_for_probe, sweep_stale_db_activities, track_pool_db_activity,
-    ConnectionInfo, ConnectionRegistry, DatabaseConnection, DatabaseType, DbPoolSession,
-    OracleDriverMode, SessionCancelDelivery,
+    reset_tracked_db_activities_for_probe, resize_shared_connection_pool,
+    sweep_stale_db_activities, track_pool_db_activity, ConnectionInfo, ConnectionRegistry,
+    DatabaseConnection, DatabaseType, DbPoolSession, OracleDriverMode, SessionCancelDelivery,
 };
 use space_query::ui::main_window::MainWindow;
 use space_query::ui::sql_editor::{
@@ -1383,6 +1390,100 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
             }
         }
         let _ = editor.wait_done(Duration::from_secs(10));
+    }
+
+    // A16: a script CONNECT moves the operation's REGISTRY ROW with it.
+    //
+    // The registry keeps three facts about which connection a row belongs to:
+    // the id a teardown matches on, the lifetime the stale sweep asks, and the
+    // generation the cancel hook filters for. Only the id used to move, so the
+    // row went on naming the connection the batch had LEFT. That connection's
+    // own teardown gate no longer refuses -- the tab is bound elsewhere now --
+    // so ending it made the row stale, and the stale sweep a disconnect runs on
+    // the spot cancelled the batch running on the connection it moved TO.
+    //
+    // Oracle only: the MySQL family refuses `CONNECT` outright, so it has no
+    // road that moves a running batch between connections.
+    if target.is_oracle() {
+        let label = target.label();
+        println!(
+            "   A16 ({label}): ending the connection a script LEFT does not cancel the batch \
+             it moved to"
+        );
+        let harness = Harness::connect(target)?;
+        let mut editor = EditorHarness::new(&harness);
+        let info = target.connection_info();
+        let script = format!(
+            "CONNECT {}/{}@{}:{}/{}\n{};",
+            info.username,
+            info.password,
+            info.host,
+            info.port,
+            info.service_name,
+            target.slow_sql()
+        );
+        editor.start_script(&script);
+
+        // Wait for the batch to be PAST the CONNECT: from here it is running on
+        // the candidate connection, and the row must have come with it.
+        let connected = editor
+            .pump_until(Duration::from_secs(60), || {
+                editor
+                    .transcript()
+                    .iter()
+                    .any(|line| line.contains("Connected to"))
+                    .then_some(())
+            })
+            .is_some();
+        if !connected {
+            failures.push(format!(
+                "A16 ({label}): the script never reported a CONNECT, so there is no move to \
+                 probe (transcript: {:?})",
+                editor.transcript()
+            ));
+        } else if editor.is_done() {
+            failures.push(format!(
+                "A16 ({label}): the batch ended before the probe could run (transcript: {:?})",
+                editor.transcript()
+            ));
+        } else {
+            // End the incarnation of the connection the batch LEFT. A pool
+            // rebuild is the production road that does exactly this while the
+            // connection itself stays up, and it is the one the harness can
+            // drive.
+            if let Err(err) = resize_shared_connection_pool(&harness.connection, 6, 30) {
+                failures.push(format!(
+                    "A16 ({label}): could not retire the connection the script left: {err}"
+                ));
+            }
+            // The sweep a disconnect runs on the spot, and the UI tick runs
+            // every frame.
+            sweep_stale_db_activities(PROBE_CANCEL_TIMEOUT);
+            let ended = editor
+                .pump_until(Duration::from_secs(10), || editor.is_done().then_some(()))
+                .is_some();
+            let transcript = editor.transcript().join(" | ");
+            if ended {
+                failures.push(format!(
+                    "A16 ({label}): the batch was ended by a teardown of the connection it had \
+                     already left (transcript: {transcript})"
+                ));
+            } else {
+                println!("   A16 ({label}) the batch kept running on the connection it moved to");
+            }
+
+            // Clean up: stop the statement, and prove the session it is on can
+            // still be reached -- the other half of the same defect, where the
+            // row named a connection whose teardown could break nothing.
+            editor.editor.cancel_current();
+            if !editor.wait_done(cancel_deadline()) {
+                failures.push(format!(
+                    "A16 ({label}): the batch could not be cancelled afterwards, so its row no \
+                     longer reaches the session it runs on (transcript: {})",
+                    editor.transcript().join(" | ")
+                ));
+            }
+        }
     }
 
     reset_tracked_db_activities_for_probe();

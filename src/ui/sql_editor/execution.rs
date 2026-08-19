@@ -350,6 +350,12 @@ struct OracleThinConnectedCandidate {
     /// was replaced.
     default_transaction_isolation: crate::db::TransactionIsolation,
     connection_id: crate::db::ConnectionId,
+    /// When work on THIS connection is over, for the operation's registry row.
+    ///
+    /// Read here, where the candidate's lock is already held, because the row
+    /// has to move to this connection the moment the batch does — see
+    /// `QueryProgressSender::move_status_activity_to_connection`.
+    activity_lifetime: crate::db::DbActivityLifetime,
     work_guard: crate::db::ConnectionWorkGuard,
 }
 
@@ -1564,7 +1570,14 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             };
             *runtime_work_guard = Some(candidate.work_guard);
             conn_name = candidate.sanitized_info.name.clone();
-            sender.set_status_connection_id(candidate.connection_id);
+            // The registry row moves with the work: id, lifetime and cancel
+            // hook together, or the row goes on describing the connection this
+            // batch has just left.
+            sender.move_status_activity_to_connection(
+                candidate.connection_id,
+                candidate.activity_lifetime.clone(),
+                candidate.connection_generation,
+            );
             sender.set_execution_origin(Some(ExecutionOrigin {
                 connection_id: candidate.connection_id,
                 connection_generation: candidate.connection_generation,
@@ -13438,6 +13451,7 @@ impl SqlEditorWidget {
                                                     next_auto_commit,
                                                     next_transaction_mode,
                                                     next_default_transaction_isolation,
+                                                    next_activity_lifetime,
                                                 ) = {
                                                     let mut conn_guard =
                                                         lock_connection_with_activity(
@@ -13454,6 +13468,13 @@ impl SqlEditorWidget {
                                                         conn_guard.auto_commit(),
                                                         conn_guard.transaction_mode(),
                                                         conn_guard.default_transaction_isolation(),
+                                                        // Read where the lock is
+                                                        // already held: the
+                                                        // operation's registry row
+                                                        // moves to this connection
+                                                        // the moment the batch
+                                                        // does.
+                                                        conn_guard.activity_lifetime(),
                                                     )
                                                 };
                                                 // Like the thin CONNECT path: the
@@ -13699,8 +13720,15 @@ impl SqlEditorWidget {
                                                 };
                                                 runtime_work_guard = Some(candidate_work_guard);
                                                 binding_revision = next_binding_revision;
-                                                sender.set_status_connection_id(
+                                                // The row moves with the work,
+                                                // whole: id, lifetime and cancel
+                                                // hook. Moving only the id left it
+                                                // naming the connection this batch
+                                                // had already left.
+                                                sender.move_status_activity_to_connection(
                                                     candidate_runtime_id,
+                                                    next_activity_lifetime.clone(),
+                                                    next_connection_generation,
                                                 );
                                                 sender.set_execution_origin(Some(ExecutionOrigin {
                                                     connection_id: candidate_runtime_id,
@@ -19004,6 +19032,7 @@ impl SqlEditorWidget {
             auto_commit,
             transaction_mode,
             default_transaction_isolation,
+            candidate_activity_lifetime,
             activity_guard,
         ) = {
             let mut guard = lock_connection_with_activity(&candidate_connection, db_activity);
@@ -19016,6 +19045,7 @@ impl SqlEditorWidget {
                 guard.auto_commit(),
                 guard.transaction_mode(),
                 guard.default_transaction_isolation(),
+                guard.activity_lifetime(),
                 activity_guard,
             )
         };
@@ -19103,6 +19133,7 @@ impl SqlEditorWidget {
             transaction_mode,
             default_transaction_isolation,
             connection_id: candidate_runtime_id,
+            activity_lifetime: candidate_activity_lifetime,
             work_guard: candidate_work_guard,
         })
     }
@@ -20110,7 +20141,13 @@ impl SqlEditorWidget {
                                         command_error = Some(message);
                                         break 'connect_command;
                                     }
-                                    sender.set_status_connection_id(candidate.connection_id);
+                                    // Same as every other road the work moves
+                                    // by: the row goes with it, whole.
+                                    sender.move_status_activity_to_connection(
+                                        candidate.connection_id,
+                                        candidate.activity_lifetime.clone(),
+                                        candidate.connection_generation,
+                                    );
                                     sender.set_execution_origin(Some(ExecutionOrigin {
                                         connection_id: candidate.connection_id,
                                         connection_generation: candidate.connection_generation,

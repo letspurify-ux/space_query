@@ -55,6 +55,86 @@ pub enum ConnectionRuntimeState {
     Failed(String),
 }
 
+impl ConnectionRuntimeState {
+    /// Whether asking the CONNECTION can produce this state.
+    ///
+    /// `runtime_metadata` answers `Connected` or `Disconnected` and nothing
+    /// else, so those two are the only states the connection itself can be
+    /// asked for. The other three are the APP's: `Transitioning` says an
+    /// action owns this connection, `Connecting` says an attempt is in flight,
+    /// and `Failed` carries why the last one did not succeed.
+    ///
+    /// The distinction is what makes an announced transition's rule safe. While
+    /// one is running the announcement owns the state and other writers are
+    /// dropped — sound only because the transition ends by reading the
+    /// connection back, which reproduces exactly the states below. A write the
+    /// connection cannot reproduce is information the app would lose instead:
+    /// the user reads "Disconnected" where a connect had failed and said why,
+    /// and `Disconnect All`'s `Connecting|Transitioning` refusal stops seeing a
+    /// connection that is actively connecting. See
+    /// [`state_after_announced_transition`].
+    fn is_answered_by_the_connection(&self) -> bool {
+        match self {
+            Self::Connected | Self::Disconnected => true,
+            Self::Connecting | Self::Transitioning | Self::Failed(_) => false,
+        }
+    }
+}
+
+/// What a connection's state is once the last announced transition over it
+/// ends.
+///
+/// `connection_says` is what the connection itself answers, which is the
+/// authority for everything it can express. `dropped_write` is the LAST write
+/// an announcement refused to publish, kept because two of the five states are
+/// not the connection's to answer:
+///
+/// * `Failed(why)` — a connect attempt that failed, and the reason with it.
+///   Kept only while the connection agrees it is down: if it came up in the
+///   meantime, the failure is stale and the connection wins.
+/// * `Connecting` — an attempt in flight. Nothing the connection can say
+///   contradicts that, and it is the state `Disconnect All` refuses on.
+///
+/// A `Connected`/`Disconnected` write is still dropped exactly as before: the
+/// connection is the better authority for the states it can answer, and that
+/// is what keeps an announcement from being ended by an unrelated event.
+/// `Transitioning` is never remembered either — a write of it would be a second
+/// announcement by hand, which is banned.
+fn state_after_announced_transition(
+    connection_says: ConnectionRuntimeState,
+    dropped_write: Option<ConnectionRuntimeState>,
+) -> ConnectionRuntimeState {
+    let Some(dropped_write) = dropped_write else {
+        return connection_says;
+    };
+    // The connection is the authority for everything it can answer, which is
+    // round 9's rule and stays: a `Connected` landing mid-action must not end
+    // the action, and the action asks the connection anyway.
+    if dropped_write.is_answered_by_the_connection() {
+        return connection_says;
+    }
+    match dropped_write {
+        // Held back above; named so a new state cannot join by falling through.
+        ConnectionRuntimeState::Connected | ConnectionRuntimeState::Disconnected => connection_says,
+        // A failure the connection has since contradicted is stale news.
+        ConnectionRuntimeState::Failed(why) => {
+            if connection_says == ConnectionRuntimeState::Disconnected {
+                ConnectionRuntimeState::Failed(why)
+            } else {
+                connection_says
+            }
+        }
+        // An attempt still in flight. The connection can be either up (a
+        // reconnect over a live one) or down, so neither answer contradicts it.
+        ConnectionRuntimeState::Connecting => ConnectionRuntimeState::Connecting,
+        // Announcing a transition by hand is banned
+        // (`every_connection_wide_state_change_is_announced_and_taken_back_as_one_value`),
+        // so this can only be stale: the announcement that owned the state has
+        // just ended.
+        ConnectionRuntimeState::Transitioning => connection_says,
+    }
+}
+
 /// Whether a tab bound to a runtime has a connection behind it, answered
 /// WITHOUT the connection mutex.
 ///
@@ -89,12 +169,64 @@ impl ConnectionRuntimeState {
     }
 }
 
+/// The connection state the screen and the gates read, and who is allowed to
+/// write it right now.
+///
+/// [`ConnectionRuntime::announce_transition`] promised that a connection put
+/// into [`ConnectionRuntimeState::Transitioning`] would come back out of it —
+/// and nothing kept it there while it was in. Every writer reached the same
+/// bare `set_state`, so an event landing mid-action (a connect result, a
+/// script `CONNECT`'s `ConnectionChanged`, a worker reading its runtime back
+/// when it finishes) published `Connected` over an announcement that was still
+/// running. `Transitioning` is not a label: `File/Disconnect All` refuses on
+/// it and the connect road reads it as "already changing state", so a
+/// connection that stopped saying it mid-rebuild stopped being refused.
+///
+/// So the announcement OWNS the state while it lasts. A write that arrives in
+/// that window is not published — the transition ends by reading the connection
+/// itself, which is where the truth was always kept.
+///
+/// It is REMEMBERED, though, and that is the second half. "A dropped write is
+/// never information lost" is true only of the states the connection can be
+/// asked for: `Connected` and `Disconnected`. `Failed(why)` and `Connecting`
+/// are the app's own, so dropping them outright loses the connect failure's
+/// reason and un-says an attempt that is still running — the second of which
+/// re-opens, from the other side, the very gate this cell exists to keep shut.
+/// So the last such write waits here and
+/// [`state_after_announced_transition`] decides between it and the connection's
+/// own answer when the last announcement ends.
+///
+/// Counted, not a flag, for the same reason [`crate::db::PoolSessionHandoutHold`]
+/// is counted: two session-ending actions may cover the same connection, and
+/// the first one to finish must not hand the state back while the second is
+/// still running.
+struct RuntimeStateCell {
+    published: ConnectionRuntimeState,
+    announced_transitions: usize,
+    /// The last write an announcement refused to publish, whatever it was.
+    ///
+    /// The LAST one and not the last interesting one: a `Failed` followed by a
+    /// `Connected` has been overtaken, and keeping only the states the
+    /// connection cannot answer would resurrect the failure.
+    write_during_transition: Option<ConnectionRuntimeState>,
+}
+
+impl RuntimeStateCell {
+    fn new(state: ConnectionRuntimeState) -> Self {
+        Self {
+            published: state,
+            announced_transitions: 0,
+            write_during_transition: None,
+        }
+    }
+}
+
 pub struct ConnectionRuntime {
     id: ConnectionId,
     origin: ConnectionOrigin,
     connection: SharedConnection,
     sanitized_info: Mutex<ConnectionInfo>,
-    state: Mutex<ConnectionRuntimeState>,
+    state: Mutex<RuntimeStateCell>,
     connection_generation: AtomicU64,
     pool_context_epoch: AtomicU64,
     bound_tabs: AtomicUsize,
@@ -130,7 +262,7 @@ impl ConnectionRuntime {
             origin,
             connection,
             sanitized_info: Mutex::new(info),
-            state: Mutex::new(state),
+            state: Mutex::new(RuntimeStateCell::new(state)),
             connection_generation: AtomicU64::new(connection_generation),
             pool_context_epoch: AtomicU64::new(pool_context_epoch),
             bound_tabs: AtomicUsize::new(0),
@@ -205,17 +337,92 @@ impl ConnectionRuntime {
     }
 
     pub fn state(&self) -> ConnectionRuntimeState {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.lock_state().published.clone()
     }
 
+    /// Publish this connection's state — unless an announced transition owns
+    /// it, in which case the write is held back until the action ends.
+    ///
+    /// The one choke point every writer already went through, which is why the
+    /// rule lives here rather than in each of them. See [`RuntimeStateCell`]:
+    /// while a connection-wide action is announced, what the state says is the
+    /// action's to decide, and the action ends by reading the connection
+    /// itself — so a write PUBLISHED here would end an announcement nothing
+    /// else can restart.
+    ///
+    /// Held back, not thrown away. Reading the connection back reproduces
+    /// `Connected` and `Disconnected` and nothing else, so those two really are
+    /// asked again a moment later; `Failed(why)` and `Connecting` are the app's
+    /// own and would simply be gone. The last held-back write is what
+    /// [`state_after_announced_transition`] weighs against the connection's own
+    /// answer when the last announcement ends.
     pub fn set_state(&self, state: ConnectionRuntimeState) {
-        *self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+        let mut cell = self.lock_state();
+        if cell.announced_transitions > 0 {
+            cell.write_during_transition = Some(state);
+            return;
+        }
+        cell.published = state;
+    }
+
+    /// The state cell's own mutex, tracked so the app-wide lock order is
+    /// observable.
+    ///
+    /// It is a LEAF and stays one: `finish_announced_transition` reads the
+    /// connection back BEFORE it takes this, never under it. But it is taken
+    /// from UNDER the connection mutex — application exit publishes
+    /// `Disconnected` while it still holds the guard — so an untracked lock
+    /// here left `DB_CONNECTION -> RUNTIME_STATE` invisible to the detector,
+    /// and with it any future road that took the two the other way round.
+    fn lock_state(&self) -> crate::db::connection::TrackedGuard<'_, RuntimeStateCell> {
+        crate::db::connection::TrackedGuard::take(
+            crate::db::lock_order::names::RUNTIME_STATE,
+            &self.state,
+        )
+    }
+
+    /// Take ownership of this connection's state for a connection-wide action.
+    ///
+    /// Only [`Self::announce_transition`] calls it, and only
+    /// [`Self::finish_announced_transition`] gives it back, so the pair is
+    /// what [`ConnectionTransition`] is built out of.
+    fn begin_announced_transition(&self) {
+        let mut cell = self.lock_state();
+        cell.announced_transitions += 1;
+        cell.published = ConnectionRuntimeState::Transitioning;
+        // Nothing from BEFORE this announcement is waiting: what was published
+        // when it started is the state it took over, and a held-back write is
+        // only ever news that arrived while it ran.
+        cell.write_during_transition = None;
+    }
+
+    /// Give the state back, publishing what the CONNECTION says it is — or the
+    /// news that arrived while the announcement ran and the connection cannot
+    /// restate.
+    ///
+    /// The connection is the only place the truth was ever kept about being up
+    /// or down, so a transition that ended — because its work finished, never
+    /// started, or died partway — hands the state back by asking it rather than
+    /// by remembering what it was before. A connect that FAILED while the
+    /// action ran, or one that is still running, is not a question the
+    /// connection can answer; [`state_after_announced_transition`] is where the
+    /// two are weighed. If another action is still holding this connection, the
+    /// state stays `Transitioning` for that one and the held-back write waits
+    /// for it.
+    ///
+    /// The answer is the CONNECTION's either way: callers use it to decide
+    /// about the connection, not about what the screen should say.
+    fn finish_announced_transition(&self) -> ConnectionRuntimeState {
+        let state = self.read_identity_from_connection();
+        let mut cell = self.lock_state();
+        cell.announced_transitions = cell.announced_transitions.saturating_sub(1);
+        if cell.announced_transitions == 0 {
+            cell.published = state_after_announced_transition(
+                state.clone(),
+                cell.write_during_transition.take(),
+            );
+        }
+        state
     }
 
     pub fn connection_generation(&self) -> u64 {
@@ -226,14 +433,49 @@ impl ConnectionRuntime {
         self.pool_context_epoch.load(Ordering::Acquire)
     }
 
-    pub fn update_connection_context(&self, connection_generation: u64, pool_context_epoch: u64) {
+    /// Record which incarnation of its connection this runtime is describing.
+    ///
+    /// The ONE writer of the two counters, and it only ever moves them
+    /// FORWARD. Both are monotonic at the source — the generation is a
+    /// process-wide serial (`NEXT_CONNECTION_GENERATION`) and the epoch a
+    /// per-connection `fetch_add` — and what this runtime holds is a CACHE of
+    /// them that several threads write: an execution worker reading its
+    /// runtime back when it finishes, a connect worker, and
+    /// [`Self::finish_announced_transition`].
+    ///
+    /// Those writers read the pair under the connection mutex and write it
+    /// after releasing it, so two reads that overlap can land in the wrong
+    /// order. A plain `store` then leaves the runtime naming an incarnation
+    /// the connection has already left, and everything that reads the cache
+    /// answers about that one: a retained-session option change judges the
+    /// tab's session against a generation it no longer has
+    /// (`RetainedSessionOptionChangePlan::from_runtime`), a tab's
+    /// `ExecutionOrigin` carries a stale pair into result-grid matching, and
+    /// the object browser reads a snapshot from a dead incarnation as current.
+    ///
+    /// It was `fetch_max` here and `store` in `read_identity_from_connection`:
+    /// one value, two rules, and only one of them right. There is one door
+    /// now, so a third writer cannot pick the other rule.
+    fn record_connection_context(&self, connection_generation: u64, pool_context_epoch: u64) {
         self.connection_generation
             .fetch_max(connection_generation, Ordering::AcqRel);
         self.pool_context_epoch
             .fetch_max(pool_context_epoch, Ordering::AcqRel);
     }
 
-    pub fn refresh_state_from_connection(&self) -> ConnectionRuntimeState {
+    pub fn update_connection_context(&self, connection_generation: u64, pool_context_epoch: u64) {
+        self.record_connection_context(connection_generation, pool_context_epoch);
+    }
+
+    /// Read this runtime's identity back from its connection, and answer what
+    /// the connection says its state is.
+    ///
+    /// Publishes NOTHING: [`Self::refresh_state_from_connection`] and
+    /// [`Self::finish_announced_transition`] both need the answer, and they
+    /// differ only in who is allowed to publish it. Never called with the
+    /// state lock held — `runtime_metadata` takes the shared connection mutex,
+    /// and the state cell is a leaf.
+    fn read_identity_from_connection(&self) -> ConnectionRuntimeState {
         let (info, state, connection_generation, pool_context_epoch) =
             runtime_metadata(&self.connection);
         // A runtime's IDENTITY may only come from a live connection. After a
@@ -246,10 +488,20 @@ impl ConnectionRuntime {
         if matches!(state, ConnectionRuntimeState::Connected) {
             self.update_sanitized_info(info);
         }
-        self.connection_generation
-            .store(connection_generation, Ordering::Release);
-        self.pool_context_epoch
-            .store(pool_context_epoch, Ordering::Release);
+        // Through the one door, forward only: this read happens after the
+        // connection mutex has been released, so it can land behind a newer
+        // one. See [`Self::record_connection_context`].
+        self.record_connection_context(connection_generation, pool_context_epoch);
+        state
+    }
+
+    /// Read the connection back and publish what it says.
+    ///
+    /// The answer is the CONNECTION's, so it is returned whether or not it was
+    /// published: while an announced transition owns the state, `set_state`
+    /// drops the write and the action's own end publishes instead.
+    pub fn refresh_state_from_connection(&self) -> ConnectionRuntimeState {
+        let state = self.read_identity_from_connection();
         self.set_state(state.clone());
         state
     }
@@ -278,9 +530,14 @@ impl ConnectionRuntime {
     /// action is decided until it has run. Announce it BEFORE the prompts that
     /// resolve the tabs' transactions — a modal pumps the event loop, and the
     /// metadata reads start from events.
+    ///
+    /// The announcement also OWNS the state until it ends: a write arriving
+    /// from anywhere else in that window is dropped rather than published, so
+    /// an action cannot stop being refused while it is still running. See
+    /// [`RuntimeStateCell`].
     pub fn announce_transition(runtimes: Vec<Arc<ConnectionRuntime>>) -> ConnectionTransition {
         for runtime in &runtimes {
-            runtime.set_state(ConnectionRuntimeState::Transitioning);
+            runtime.begin_announced_transition();
         }
         let handout_hold = crate::db::PoolSessionHandoutHold::take(
             runtimes.iter().map(|runtime| runtime.id()).collect(),
@@ -603,7 +860,18 @@ impl ConnectionTransition {
 
     /// This connection's work is done: read its state back and stop holding it.
     pub fn finished(&mut self, runtime: &Arc<ConnectionRuntime>) {
-        runtime.refresh_state_from_connection();
+        if !self
+            .pending
+            .iter()
+            .any(|pending| Arc::ptr_eq(pending, runtime))
+        {
+            // Already finished (or never announced by this transition). Ending
+            // the announcement again would hand back a hold this value does
+            // not own -- and on a connection two actions cover, that is
+            // another action's hold.
+            return;
+        }
+        runtime.finish_announced_transition();
         self.pending
             .retain(|pending| !Arc::ptr_eq(pending, runtime));
         // Re-opened one connection at a time, like the state above: a rebuild
@@ -616,7 +884,7 @@ impl ConnectionTransition {
 impl Drop for ConnectionTransition {
     fn drop(&mut self) {
         for runtime in self.pending.drain(..) {
-            runtime.refresh_state_from_connection();
+            runtime.finish_announced_transition();
         }
         // `handout_hold` drops with this value, releasing whatever `finished`
         // did not -- a worker that never started, or died partway.
@@ -1182,6 +1450,366 @@ mod tests {
             ConnectionRuntimeState::Transitioning,
             "a connection the work never reached must not stay in transition"
         );
+    }
+
+    /// A connection-wide action that has said it is running must not stop
+    /// saying it because an unrelated event landed.
+    ///
+    /// `Transitioning` is a GATE, not a label: `File/Disconnect All` refuses on
+    /// it, and the connect road reads it as "already changing connection
+    /// state". Every writer reached the same bare `set_state`, and the events
+    /// that write `Connected` -- a connect result, a script `CONNECT`'s
+    /// `ConnectionChanged`, a worker reading its runtime back when it finishes
+    /// -- are all dispatched from the UI event loop, which a MODAL pumps. The
+    /// pool rebuild announces its transition and then opens exactly such a
+    /// modal (the per-tab commit/rollback prompts), so the announcement could
+    /// be published over while it was still running.
+    #[test]
+    fn a_write_that_lands_during_an_announced_transition_does_not_end_it() {
+        let runtime = Arc::new(ConnectionRuntime::new(
+            next_connection_id(),
+            ConnectionOrigin::SavedProfile {
+                profile_name: "announced".to_string(),
+            },
+            connection(),
+            ConnectionInfo::default(),
+            ConnectionRuntimeState::Connected,
+            0,
+            0,
+        ));
+
+        let mut transition = ConnectionRuntime::announce_transition(vec![runtime.clone()]);
+        assert_eq!(runtime.state(), ConnectionRuntimeState::Transitioning);
+
+        // Exactly what the connection-result handler and the script CONNECT's
+        // `ConnectionChanged` do, from inside the modal the action opened.
+        runtime.set_state(ConnectionRuntimeState::Connected);
+        assert_eq!(
+            runtime.state(),
+            ConnectionRuntimeState::Transitioning,
+            "a write from outside the action must not end an announcement that is still running"
+        );
+
+        // And a worker reading its runtime back when it finishes is the same
+        // write through a different door.
+        runtime.refresh_state_from_connection();
+        assert_eq!(
+            runtime.state(),
+            ConnectionRuntimeState::Transitioning,
+            "reading the connection back is still a write, and the action still owns the state"
+        );
+
+        // Only the action itself hands it back, and what it publishes is the
+        // CONNECTION's own answer.
+        transition.finished(&runtime);
+        assert_eq!(
+            runtime.state(),
+            ConnectionRuntimeState::Disconnected,
+            "the state comes back from the connection, which is where the truth was kept"
+        );
+
+        // ...and afterwards ordinary writers are ordinary writers again.
+        runtime.set_state(ConnectionRuntimeState::Connected);
+        assert_eq!(runtime.state(), ConnectionRuntimeState::Connected);
+    }
+
+    /// A connect failure that lands inside an announced transition still
+    /// reaches the user, with its reason.
+    ///
+    /// Round 9 made the announcement own the state and DROP every other write,
+    /// on the ground that "a write dropped there is never information lost,
+    /// because the transition ends by reading the connection". That is true of
+    /// the two states the connection can be asked for and false of the three it
+    /// cannot: `Failed(why)` carries a reason no connection can restate, and
+    /// `Connecting` says an attempt is in flight — the state `Disconnect All`
+    /// refuses on, so losing it re-opens from the other side the very gate the
+    /// cell exists to keep shut.
+    ///
+    /// Reachable because the connect RESULT is a UI event: the worker has
+    /// already released its DB-layer transition when the event is queued, so a
+    /// pool rebuild can announce in that window and then pump the event inside
+    /// its own modal prompts.
+    #[test]
+    fn news_an_announced_transition_swallows_is_the_news_the_connection_cannot_repeat() {
+        // What the connection itself can answer is still the connection's to
+        // answer: this is round 9's rule and it does not move.
+        assert_eq!(
+            state_after_announced_transition(ConnectionRuntimeState::Disconnected, None),
+            ConnectionRuntimeState::Disconnected
+        );
+        assert_eq!(
+            state_after_announced_transition(
+                ConnectionRuntimeState::Disconnected,
+                Some(ConnectionRuntimeState::Connected),
+            ),
+            ConnectionRuntimeState::Disconnected,
+            "a `Connected` landing mid-action must not end the action, and the connection is \
+             asked anyway"
+        );
+
+        // What it cannot answer would otherwise be gone.
+        assert_eq!(
+            state_after_announced_transition(
+                ConnectionRuntimeState::Disconnected,
+                Some(ConnectionRuntimeState::Failed("ORA-01017".to_string())),
+            ),
+            ConnectionRuntimeState::Failed("ORA-01017".to_string()),
+            "the user must still be told why the connect failed"
+        );
+        assert_eq!(
+            state_after_announced_transition(
+                ConnectionRuntimeState::Disconnected,
+                Some(ConnectionRuntimeState::Connecting),
+            ),
+            ConnectionRuntimeState::Connecting,
+            "an attempt still in flight is what Disconnect All refuses on"
+        );
+
+        // ...but only while it is still true. A failure the connection has
+        // since contradicted is stale news, and the connection wins.
+        assert_eq!(
+            state_after_announced_transition(
+                ConnectionRuntimeState::Connected,
+                Some(ConnectionRuntimeState::Failed("ORA-01017".to_string())),
+            ),
+            ConnectionRuntimeState::Connected
+        );
+
+        // The LAST write is what waits, not the last interesting one: a failure
+        // that a later success overtook must not be resurrected.
+        assert_eq!(
+            state_after_announced_transition(
+                ConnectionRuntimeState::Connected,
+                Some(ConnectionRuntimeState::Connected),
+            ),
+            ConnectionRuntimeState::Connected
+        );
+
+        // Announcing a transition by hand is banned, so a held-back
+        // `Transitioning` can only be an announcement that has just ended.
+        assert_eq!(
+            state_after_announced_transition(
+                ConnectionRuntimeState::Connected,
+                Some(ConnectionRuntimeState::Transitioning),
+            ),
+            ConnectionRuntimeState::Connected
+        );
+    }
+
+    /// The same rule through the cell, on the road that produces it.
+    #[test]
+    fn a_connect_that_failed_inside_an_announced_transition_still_says_why() {
+        let runtime = Arc::new(ConnectionRuntime::new(
+            next_connection_id(),
+            ConnectionOrigin::SavedProfile {
+                profile_name: "failed-inside".to_string(),
+            },
+            connection(),
+            ConnectionInfo::default(),
+            ConnectionRuntimeState::Connected,
+            0,
+            0,
+        ));
+
+        let mut transition = ConnectionRuntime::announce_transition(vec![runtime.clone()]);
+        // Exactly what the connection-result handler does for an attempt that
+        // failed with the connection known dead, dispatched from inside the
+        // modal the action opened.
+        runtime.set_state(ConnectionRuntimeState::Failed("ORA-12541".to_string()));
+        assert_eq!(
+            runtime.state(),
+            ConnectionRuntimeState::Transitioning,
+            "the action still owns the state while it runs"
+        );
+
+        transition.finished(&runtime);
+        assert_eq!(
+            runtime.state(),
+            ConnectionRuntimeState::Failed("ORA-12541".to_string()),
+            "and the reason the connect failed is not the action's to throw away"
+        );
+    }
+
+    /// A held-back write waits for the LAST action, like the state itself.
+    #[test]
+    fn held_back_news_waits_for_the_last_announcement_to_end() {
+        let runtime = Arc::new(ConnectionRuntime::new(
+            next_connection_id(),
+            ConnectionOrigin::SavedProfile {
+                profile_name: "held-back".to_string(),
+            },
+            connection(),
+            ConnectionInfo::default(),
+            ConnectionRuntimeState::Connected,
+            0,
+            0,
+        ));
+
+        let outer = ConnectionRuntime::announce_transition(vec![runtime.clone()]);
+        let inner = ConnectionRuntime::announce_transition(vec![runtime.clone()]);
+        runtime.set_state(ConnectionRuntimeState::Connecting);
+
+        drop(inner);
+        assert_eq!(
+            runtime.state(),
+            ConnectionRuntimeState::Transitioning,
+            "the connection is still covered by the other action"
+        );
+        drop(outer);
+        assert_eq!(
+            runtime.state(),
+            ConnectionRuntimeState::Connecting,
+            "and the news it was holding is published by the last one to end"
+        );
+    }
+
+    /// Two session-ending actions may cover the same connection, so the
+    /// announcement is COUNTED -- exactly like the pool handout hold it
+    /// travels with. The first one to finish must not hand the state back
+    /// while the second is still running.
+    #[test]
+    fn overlapping_announcements_each_hold_the_state_until_the_last_one_ends() {
+        let runtime = Arc::new(ConnectionRuntime::new(
+            next_connection_id(),
+            ConnectionOrigin::SavedProfile {
+                profile_name: "shared".to_string(),
+            },
+            connection(),
+            ConnectionInfo::default(),
+            ConnectionRuntimeState::Connected,
+            0,
+            0,
+        ));
+
+        let outer = ConnectionRuntime::announce_transition(vec![runtime.clone()]);
+        let inner = ConnectionRuntime::announce_transition(vec![runtime.clone()]);
+        assert_eq!(runtime.state(), ConnectionRuntimeState::Transitioning);
+
+        drop(inner);
+        assert_eq!(
+            runtime.state(),
+            ConnectionRuntimeState::Transitioning,
+            "the connection is still covered by the other action"
+        );
+
+        drop(outer);
+        assert_ne!(
+            runtime.state(),
+            ConnectionRuntimeState::Transitioning,
+            "the last announcement to end is the one that hands the state back"
+        );
+    }
+
+    /// `finished` is what releases this connection's half of the announcement
+    /// AND its pool handout hold, so calling it twice for the same connection
+    /// would hand back a hold this transition does not own -- on a connection
+    /// two actions cover, that is the other action's.
+    #[test]
+    fn finishing_the_same_connection_twice_releases_only_its_own_hold() {
+        let runtime = Arc::new(ConnectionRuntime::new(
+            next_connection_id(),
+            ConnectionOrigin::SavedProfile {
+                profile_name: "twice".to_string(),
+            },
+            connection(),
+            ConnectionInfo::default(),
+            ConnectionRuntimeState::Connected,
+            0,
+            0,
+        ));
+
+        let other = ConnectionRuntime::announce_transition(vec![runtime.clone()]);
+        let mut transition = ConnectionRuntime::announce_transition(vec![runtime.clone()]);
+        transition.finished(&runtime);
+        transition.finished(&runtime);
+        drop(transition);
+
+        assert_eq!(
+            runtime.state(),
+            ConnectionRuntimeState::Transitioning,
+            "the other action still holds this connection"
+        );
+        drop(other);
+        assert_ne!(runtime.state(), ConnectionRuntimeState::Transitioning);
+    }
+
+    /// Which incarnation of its connection a runtime says it is describing
+    /// only ever moves FORWARD.
+    ///
+    /// The generation and the epoch are both monotonic at the source, and what
+    /// the runtime holds is a CACHE of them that several threads write —
+    /// `read_identity_from_connection` reads the pair under the connection
+    /// mutex and writes it after releasing it, so two reads that overlap can
+    /// land in the wrong order. That road used a plain `store` while
+    /// `update_connection_context` used `fetch_max`: one value, two rules.
+    /// A cache that goes backwards makes a retained-session option change
+    /// judge the tab's session against a generation it no longer has, and
+    /// makes the object browser read a snapshot from a dead incarnation as
+    /// current.
+    #[test]
+    fn what_incarnation_a_runtime_describes_never_goes_backwards() {
+        let runtime = Arc::new(ConnectionRuntime::new(
+            next_connection_id(),
+            ConnectionOrigin::SavedProfile {
+                profile_name: "monotonic".to_string(),
+            },
+            connection(),
+            ConnectionInfo::default(),
+            ConnectionRuntimeState::Connected,
+            4,
+            9,
+        ));
+        assert_eq!(runtime.connection_generation(), 4);
+        assert_eq!(runtime.pool_context_epoch(), 9);
+
+        runtime.record_connection_context(7, 11);
+        assert_eq!(runtime.connection_generation(), 7);
+        assert_eq!(runtime.pool_context_epoch(), 11);
+
+        // A read that was taken BEFORE the newer one but lands after it. Both
+        // writers go through the one door, so the older answer cannot win.
+        runtime.record_connection_context(5, 10);
+        assert_eq!(
+            runtime.connection_generation(),
+            7,
+            "a late-landing older read must not resurrect an incarnation the connection left"
+        );
+        assert_eq!(runtime.pool_context_epoch(), 11);
+
+        // And the public door is the same door.
+        runtime.update_connection_context(6, 10);
+        assert_eq!(runtime.connection_generation(), 7);
+        assert_eq!(runtime.pool_context_epoch(), 11);
+    }
+
+    /// Reading the connection back is one of those writers, and it goes
+    /// through the same door.
+    ///
+    /// The connection here is a fresh, never-connected `DatabaseConnection`,
+    /// so it answers generation 0 and epoch 0 — exactly the "older" answer a
+    /// `store` would have published over whatever the runtime already knew.
+    #[test]
+    fn reading_the_connection_back_cannot_take_a_runtime_to_an_older_incarnation() {
+        let runtime = Arc::new(ConnectionRuntime::new(
+            next_connection_id(),
+            ConnectionOrigin::SavedProfile {
+                profile_name: "read-back".to_string(),
+            },
+            connection(),
+            ConnectionInfo::default(),
+            ConnectionRuntimeState::Connected,
+            12,
+            3,
+        ));
+
+        runtime.refresh_state_from_connection();
+
+        assert_eq!(
+            runtime.connection_generation(),
+            12,
+            "a read that answers an older incarnation must not publish it"
+        );
+        assert_eq!(runtime.pool_context_epoch(), 3);
     }
 
     #[test]

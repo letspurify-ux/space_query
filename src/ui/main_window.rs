@@ -1066,13 +1066,6 @@ impl StatusActivity {
             Self::Observed(handle) => handle.set_progress(progress),
         }
     }
-
-    fn set_connection_id(&self, connection_id: ConnectionId) {
-        match self {
-            Self::Owned(guard) => guard.set_connection_id(connection_id),
-            Self::Observed(handle) => handle.set_connection_id(connection_id),
-        }
-    }
 }
 
 fn latest_status_activity(
@@ -1535,18 +1528,26 @@ impl QueryProgressContext {
         connection_id: Option<ConnectionId>,
         status_activity: Option<crate::db::DbActivityFinishHandle>,
     ) {
+        // A row states which connection it belongs to when it is PUBLISHED.
+        //
+        // The `Observed` arm is the operation's own row, which was bound to
+        // this connection -- id, lifetime and cancel hook together -- through
+        // `DbActivityGuard::bind_to_connection`, and which follows the work if
+        // a script `CONNECT` moves it. Writing an id over it from here would be
+        // the same half-move that let the row describe two connections at once.
         let status_activity = status_activity.map_or_else(
             || {
-                StatusActivity::Owned(crate::db::track_db_activity(
-                    &self.status_activity_label,
-                    db_type,
-                ))
+                StatusActivity::Owned(match connection_id {
+                    Some(connection_id) => crate::db::track_db_activity_for_connection(
+                        &self.status_activity_label,
+                        db_type,
+                        connection_id,
+                    ),
+                    None => crate::db::track_db_activity(&self.status_activity_label, db_type),
+                })
             },
             StatusActivity::Observed,
         );
-        if let Some(connection_id) = connection_id {
-            status_activity.set_connection_id(connection_id);
-        }
         status_activity.set_activity(&self.status_activity_label);
         if let Some(total) = total_units {
             status_activity.set_progress(crate::db::DbActivityProgress::Determinate {
@@ -2687,18 +2688,48 @@ impl AppState {
             || editor.has_deferred_execution()
     }
 
+    /// Every editor that can own DB work — the query tabs, and only them.
+    ///
+    /// `AppState::sql_editor` is the ACTIVE TAB's editor: a clone that shares
+    /// its state, replaced on every tab switch, and while no tab exists a
+    /// fresh detached widget that has never run anything and cannot be given
+    /// anything to run (every road that starts a statement resolves its editor
+    /// out of `editor_tabs`, by tab id). Counting it as a fifth owner is what
+    /// made the app's two lists disagree: the session-ending gates asked it,
+    /// and no cancel road could reach it, because every cancel road resolves
+    /// its target by TAB ID and `cancel_query_editor_target` refuses a
+    /// snapshot whose tab is not in the list. Application exit asks the gate in
+    /// a poll loop and cancels between polls, so a "yes" nothing can act on is
+    /// a loop that never ends.
+    ///
+    /// One list, asked by the gates, by the cancel button and by cancel-all.
+    fn editors_that_can_own_db_work(&self) -> impl Iterator<Item = &SqlEditorWidget> {
+        self.tabs_that_can_own_db_work().map(|tab| &tab.sql_editor)
+    }
+
+    /// The same list, for the questions whose answer is a TAB rather than an
+    /// editor — "which tab holds this lazy fetch?".
+    ///
+    /// One source, two views: an answer about a tab and an answer about an
+    /// editor must never be able to disagree about which tabs exist.
+    fn tabs_that_can_own_db_work(&self) -> impl Iterator<Item = &QueryEditorTab> {
+        self.editor_tabs.iter()
+    }
+
     fn is_any_query_running(&self) -> bool {
-        self.sql_editor.is_query_running()
-            || self
-                .editor_tabs
-                .iter()
-                .any(|tab| tab.sql_editor.is_query_running())
+        self.editors_that_can_own_db_work()
+            .any(SqlEditorWidget::is_query_running)
     }
 
     fn apply_pending_registry_cancels(&self) {
-        self.sql_editor.apply_pending_registry_cancel();
-        for tab in &self.editor_tabs {
-            tab.sql_editor.apply_pending_registry_cancel();
+        // The same list the gates refuse on and the cancel button offers.
+        // `AppState::sql_editor` was asked here as well — harmlessly, because
+        // it is a clone SHARING the active tab's flag, so the second ask always
+        // swapped a flag the first had already cleared — but a fifth owner in
+        // one of the app's four lists is exactly what
+        // `editors_that_can_own_db_work` exists to stop.
+        for editor in self.editors_that_can_own_db_work() {
+            editor.apply_pending_registry_cancel();
         }
     }
 
@@ -2712,12 +2743,12 @@ impl AppState {
     }
 
     fn has_cancelable_query_activity(&self) -> bool {
-        // The same three things `tab_has_unfinished_db_work` counts: what the
+        // The same three things `tab_has_unfinished_db_work` counts, asked of
+        // the same editors `has_running_query_or_lazy_fetch` asks: what the
         // button OFFERS and what a session-ending gate REFUSES on must be the
         // same list, or the app blocks on work it will not let the user stop.
-        self.editor_tabs
-            .iter()
-            .any(|tab| Self::tab_has_unfinished_db_work(&tab.sql_editor))
+        self.editors_that_can_own_db_work()
+            .any(Self::tab_has_unfinished_db_work)
             || crate::db::active_db_activity_snapshots()
                 .iter()
                 .any(|activity| activity.cancelable)
@@ -2929,13 +2960,10 @@ impl AppState {
     }
 
     fn has_running_query_or_lazy_fetch(&self) -> bool {
-        self.is_any_query_running()
-            || self.has_active_lazy_fetches()
-            || Self::tab_has_unfinished_db_work(&self.sql_editor)
+        self.has_active_lazy_fetches()
             || self
-                .editor_tabs
-                .iter()
-                .any(|tab| Self::tab_has_unfinished_db_work(&tab.sql_editor))
+                .editors_that_can_own_db_work()
+                .any(Self::tab_has_unfinished_db_work)
     }
 
     /// Work a QUERY TAB owns on `scope`: a running statement, a live lazy
@@ -3003,11 +3031,8 @@ impl AppState {
     }
 
     fn lazy_fetch_session_is_active_in_editor(&self, session_id: u64) -> bool {
-        self.sql_editor.active_lazy_fetch_session() == Some(session_id)
-            || self
-                .editor_tabs
-                .iter()
-                .any(|tab| tab.sql_editor.active_lazy_fetch_session() == Some(session_id))
+        self.editors_that_can_own_db_work()
+            .any(|editor| editor.active_lazy_fetch_session() == Some(session_id))
     }
 
     fn reconcile_orphaned_canceling_lazy_fetches(&mut self) -> bool {
@@ -3658,17 +3683,19 @@ impl AppState {
                 Self::push_unique_session_id(&mut session_ids, session_id);
             }
         }
+        // The ONE list of editors, like every other question about DB work.
+        //
+        // The active-tab mirror used to be pushed here as a fifth owner, and
+        // this list is what `has_active_lazy_fetches` -> the pool-resize gate
+        // and application exit's poll loop read. Round 9 took that mirror out
+        // of the gates themselves; it survived one call deeper, where the
+        // guard that bans it could not see it.
         for session_id in self
-            .editor_tabs
-            .iter()
-            .filter_map(|tab| tab.sql_editor.active_lazy_fetch_session())
+            .editors_that_can_own_db_work()
+            .filter_map(SqlEditorWidget::active_lazy_fetch_session)
         {
             Self::push_unique_session_id(&mut session_ids, session_id);
         }
-        Self::push_unique_session_id_if_some(
-            &mut session_ids,
-            self.sql_editor.active_lazy_fetch_session(),
-        );
         session_ids
     }
 
@@ -3884,12 +3911,15 @@ impl AppState {
         was_pending
     }
 
+    /// The TAB whose editor holds this lazy fetch.
+    ///
+    /// Asked of the tabs and only the tabs. The active-tab mirror used to be
+    /// tried first and answered `self.active_editor_tab_id` — which is the
+    /// same editor the scan below finds (the mirror is a clone SHARING the
+    /// active tab's state), and which names a tab that does not exist when
+    /// there are none open.
     fn active_lazy_fetch_tab_id(&self, session_id: u64) -> Option<QueryTabId> {
-        if self.sql_editor.active_lazy_fetch_session() == Some(session_id) {
-            return Some(self.active_editor_tab_id);
-        }
-        self.editor_tabs
-            .iter()
+        self.tabs_that_can_own_db_work()
             .find(|tab| tab.sql_editor.active_lazy_fetch_session() == Some(session_id))
             .map(|tab| tab.tab_id)
     }
@@ -3910,14 +3940,16 @@ impl AppState {
         session_id: u64,
         request: crate::ui::sql_editor::LazyFetchRequest,
     ) -> bool {
+        // The same list the gates refuse on, the cancel button offers and
+        // `lazy_fetch_sessions_for_abort` collects: a request aimed at an
+        // editor no gate counts is a fetch nothing will ever be waited for.
         let editors = {
             let s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut editors = Vec::with_capacity(s.editor_tabs.len().saturating_add(1));
-            editors.push(s.sql_editor.clone());
-            editors.extend(s.editor_tabs.iter().map(|tab| tab.sql_editor.clone()));
-            editors
+            s.editors_that_can_own_db_work()
+                .cloned()
+                .collect::<Vec<_>>()
         };
         for editor in editors {
             if editor.request_lazy_fetch(session_id, request) {
@@ -4116,6 +4148,14 @@ impl AppState {
         // every status tick, so a teardown clears within one frame no matter
         // which code path started the work.
         crate::db::sweep_stale_db_activities(self.configured_cancel_timeout());
+        // The other half of "nothing is left behind": releasing the sessions a
+        // RETIRED connection incarnation left in the tabs' slots is handed to a
+        // cleanup worker, and a worker that could not be started parks its task
+        // until something asks again. Nothing did except the next retire — so
+        // if there was no next retire, those sessions stayed open on the server
+        // for the life of the process. This tick is the one place that can ask
+        // holding no locks.
+        crate::db::retry_pending_connection_cleanups();
         // The sweep (and any other registry cancel) only raises a flag on the
         // affected tab, because the real cancel path is not `Send`. Running it
         // here puts a registry-initiated cancel on exactly the same path as the
@@ -5339,6 +5379,99 @@ impl SessionTeardownScope {
                 crate::db::cancel_db_activities_for_connection(id, force_timeout)
             }
         }
+    }
+}
+
+/// A session-ending action on ONE connection, once every reason to refuse it
+/// has been spent.
+///
+/// The preflight the whole disconnect family shares — File > Disconnect,
+/// Disconnect All, Reconnect — split into the two halves it always had and
+/// never distinguished:
+///
+/// * [`Self::ask`] puts every refusable question and has NO effect. A query
+///   tab's own work refuses (the user may not know it is running and its
+///   result cannot be reproduced by retrying), and so does a connection that
+///   cannot be taken at all.
+/// * [`Self::commit`] is the half that cannot be taken back. It CANCELS
+///   everything else holding a session on this connection — deliberately,
+///   while those sessions are still reachable, rather than leaving them to run
+///   into the generation bump and be force-cancelled by the stale sweep — and
+///   holds the connection's pool shut for what follows.
+///
+/// They used to be one function in the order ask → CANCEL → ask again, and the
+/// second ask can refuse. By then this connection's object-browser refresh,
+/// IntelliSense loads and bind probes had already been ended for an action
+/// that never happened. It was not even a trade: the cancel is DISPATCHED on
+/// the watchdog thread, so whatever holds the connection mutex is still
+/// holding it when the probe runs microseconds later — ending the work first
+/// bought the probe nothing.
+///
+/// Splitting it is also what lets Disconnect All ask about EVERY connection
+/// before committing any of them. Refusing halfway used to leave the earlier
+/// connections' background work cancelled for a disconnect that was then
+/// abandoned — the same rule its prompts already obey, applied to the half
+/// that ends work instead of the half that commits transactions.
+#[must_use = "a decided session teardown that is never committed ends nothing and holds nothing"]
+struct DecidedSessionTeardown {
+    connection_id: ConnectionId,
+    force_timeout: Duration,
+}
+
+impl DecidedSessionTeardown {
+    /// Put every question that can refuse this action. Nothing here has an
+    /// effect, so an `Err` leaves the app exactly as it was.
+    fn ask(
+        state: &Arc<Mutex<AppState>>,
+        connection: &crate::db::SharedConnection,
+        connection_id: ConnectionId,
+        probe_activity: &str,
+    ) -> Result<Self, String> {
+        let (tab_work, force_timeout) = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                s.tab_work_blocking_session_teardown(SessionTeardownScope::Connection(
+                    connection_id,
+                )),
+                s.configured_cancel_timeout(),
+            )
+        };
+        if tab_work {
+            return Err(
+                "A query or lazy fetch is active on this connection. Stop it before continuing."
+                    .to_string(),
+            );
+        }
+        // The connection itself, asked on the state as it IS. Only
+        // File > Disconnect used to ask at all; Disconnect All and Reconnect
+        // went straight to a waiting lock on the UI thread.
+        if try_lock_connection_with_activity(connection, probe_activity.to_string()).is_none() {
+            return Err(format_connection_busy_message());
+        }
+        Ok(Self {
+            connection_id,
+            force_timeout,
+        })
+    }
+
+    /// The action is decided: end the background work it covers and hold this
+    /// connection's pool shut. Nothing refuses from here.
+    ///
+    /// The hold matters because what follows is a MODAL — the per-tab
+    /// commit/rollback prompts. A modal runs a nested `app::wait()`, so the
+    /// progress events and UI timers that start the object browser's and
+    /// IntelliSense's metadata reads are dispatched inside it, and that work
+    /// would walk past a gate which has already answered. Re-asking the gate
+    /// afterwards is not available (a prompt performs a real COMMIT/ROLLBACK,
+    /// and refusing then would leave the user's transaction resolved for an
+    /// action that never happened), so the door is HELD instead of re-checked.
+    /// It re-opens when the caller drops the hold.
+    fn commit(self, state: &Arc<Mutex<AppState>>) -> crate::db::PoolSessionHandoutHold {
+        let scope = SessionTeardownScope::Connection(self.connection_id);
+        scope.cancel_background_db_work(self.force_timeout);
+        scope.hold_pool_session_handout(state)
     }
 }
 
@@ -6912,9 +7045,8 @@ impl MainWindow {
             // Collected first, not short-circuited: EVERY tab's queued
             // statement has to be given up, not just the first one that had
             // any.
-            s.editor_tabs
-                .iter()
-                .map(|tab| tab.sql_editor.abandon_deferred_executions())
+            s.editors_that_can_own_db_work()
+                .map(SqlEditorWidget::abandon_deferred_executions)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .any(|abandoned| abandoned)
@@ -6923,25 +7055,20 @@ impl MainWindow {
             let s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut running_query_targets = s
-                .editor_tabs
-                .iter()
-                .filter_map(|tab| {
-                    tab.sql_editor
+            // The SAME list the gates ask and the cancel button offers. It used
+            // to collect one more editor -- the detached `sql_editor` the app
+            // holds while no tab exists -- whose snapshot
+            // `cancel_query_editor_target` then refused, because it resolves
+            // every target by tab id. "Cancel everything" that names something
+            // it cannot cancel is what leaves application exit polling forever.
+            let running_query_targets = s
+                .editors_that_can_own_db_work()
+                .filter_map(|editor| {
+                    editor
                         .running_operation_cancel_target_snapshot()
                         .filter(|snapshot| snapshot.operation_id != 0)
                 })
                 .collect::<Vec<_>>();
-            if s.find_tab_index(s.active_editor_tab_id).is_none() && s.sql_editor.is_query_running()
-            {
-                if let Some(snapshot) = s
-                    .sql_editor
-                    .running_operation_cancel_target_snapshot()
-                    .filter(|snapshot| snapshot.operation_id != 0)
-                {
-                    running_query_targets.push(snapshot);
-                }
-            }
             (running_query_targets, s.lazy_fetch_sessions_for_abort())
         };
 
@@ -7705,65 +7832,23 @@ impl MainWindow {
     }
 
     /// Clear the way for a session-ending action on `scope`, or say what stands
-    /// in it.
+    /// in it — [`DecidedSessionTeardown::ask`] and
+    /// [`DecidedSessionTeardown::commit`] in one step, for the callers that
+    /// cover a single connection and have nothing left to refuse on.
     ///
-    /// The one preflight the whole disconnect family shares — File > Disconnect,
-    /// Disconnect All, Reconnect — so the three of them cannot answer the same
-    /// question three ways again:
-    ///
-    /// * a query tab's own work is REFUSED, because the user may not know it is
-    ///   running and its result cannot be reproduced by retrying;
-    /// * everything else holding a session on the scope is CANCELLED here,
-    ///   deliberately, while its sessions are still reachable. It used to be
-    ///   left to run into the generation bump and be force-cancelled by the
-    ///   stale sweep afterwards — and, until it died, to hold the very
-    ///   connection mutex the teardown then waited on;
-    /// * the connection is PROBED, so an action that would block the UI thread
-    ///   on a wedged call says so instead. Only File > Disconnect did that;
-    ///   Disconnect All and Reconnect went straight to a waiting lock.
-    ///
-    /// Called BEFORE the per-tab resolution prompts, like every other reason to
-    /// refuse: a prompt performs a real COMMIT/ROLLBACK, and refusing after it
-    /// would leave the user's transaction committed for an action that never
-    /// happened.
+    /// Disconnect All does NOT use this: it has to ask about every connection
+    /// before committing any of them, which is exactly what having the two
+    /// halves as separate steps is for.
     fn prepare_session_teardown(
         state: &Arc<Mutex<AppState>>,
         connection: &crate::db::SharedConnection,
         connection_id: ConnectionId,
         probe_activity: &str,
     ) -> Result<crate::db::PoolSessionHandoutHold, String> {
-        let (tab_work, force_timeout) = {
-            let s = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                s.tab_work_blocking_session_teardown(SessionTeardownScope::Connection(
-                    connection_id,
-                )),
-                s.configured_cancel_timeout(),
-            )
-        };
-        if tab_work {
-            return Err(
-                "A query or lazy fetch is active on this connection. Stop it before continuing."
-                    .to_string(),
-            );
-        }
-        SessionTeardownScope::Connection(connection_id).cancel_background_db_work(force_timeout);
-        if try_lock_connection_with_activity(connection, probe_activity.to_string()).is_none() {
-            return Err(format_connection_busy_message());
-        }
-        // The action is DECIDED from here, and what follows it is a modal: the
-        // per-tab commit/rollback prompts. A modal runs a nested `app::wait()`,
-        // so the progress events and UI timers that start the object browser's
-        // and IntelliSense's metadata reads are dispatched inside it — work that
-        // would walk past the gate above, which has already answered. Re-asking
-        // the gate afterwards is not available (a prompt performs a real
-        // COMMIT/ROLLBACK, and refusing then would leave the user's transaction
-        // resolved for a disconnect that never happened), so the door is HELD
-        // instead of re-checked, and handed back here rather than left to each
-        // caller to remember. It re-opens when the caller drops it.
-        Ok(SessionTeardownScope::Connection(connection_id).hold_pool_session_handout(state))
+        Ok(
+            DecidedSessionTeardown::ask(state, connection, connection_id, probe_activity)?
+                .commit(state),
+        )
     }
 
     fn resolve_pooled_sessions_before_runtime_disconnect(
@@ -10543,8 +10628,7 @@ impl MainWindow {
         // until the first session was acquired, this refresh was an entry the
         // stale sweep could not retire. The context has both, which is exactly
         // why asking it is the door.
-        let activity_guard = context.track_activity(activity);
-        activity_guard.set_connection_id(connection_id);
+        let activity_guard = context.track_activity_for_connection(activity, Some(connection_id));
         let data = schema_metadata_loader_for(db_type).load(
             context.clone(),
             requested_scope.clone(),
@@ -13175,8 +13259,27 @@ impl MainWindow {
                         ConnectionAttemptPolicy::from_config(&config),
                     )
                 };
-                // A reconnect ends every session on this connection exactly as a
-                // disconnect does, so it asks the same preflight — including
+                // The stored password is a reason to refuse the reconnect, so
+                // it is read BEFORE the preflight — not merely before the
+                // prompts. The preflight's second half cancels every
+                // background read on this connection, and a reconnect that
+                // then refuses for a missing password had already ended that
+                // work for an action which never happened.
+                match AppConfig::get_password_for_connection(&info.name) {
+                    Ok(Some(password)) => info.password = password,
+                    Ok(None) => {
+                        crate::ui::alert_on_main(
+                            "No password is stored for this saved connection. Use Connect to enter it.",
+                        );
+                        return true;
+                    }
+                    Err(err) => {
+                        crate::ui::alert_on_main(&err);
+                        return true;
+                    }
+                }
+                // A reconnect ends every session on this connection exactly as
+                // a disconnect does, so it asks the same preflight — including
                 // the busy probe it never had, which is what kept it from
                 // parking the UI thread on a wedged call below.
                 // Held, not dropped: the preflight's answer is what keeps this
@@ -13194,23 +13297,6 @@ impl MainWindow {
                         return true;
                     }
                 };
-                // The stored password is a reason to refuse the reconnect, so it
-                // is read before anything asks the user to resolve a session:
-                // otherwise a missing password aborted the reconnect after the
-                // commit it had just asked for.
-                match AppConfig::get_password_for_connection(&info.name) {
-                    Ok(Some(password)) => info.password = password,
-                    Ok(None) => {
-                        crate::ui::alert_on_main(
-                            "No password is stored for this saved connection. Use Connect to enter it.",
-                        );
-                        return true;
-                    }
-                    Err(err) => {
-                        crate::ui::alert_on_main(&err);
-                        return true;
-                    }
-                }
                 if !Self::resolve_pooled_sessions_before_runtime_disconnect(state, runtime.id()) {
                     return true;
                 }
@@ -13347,6 +13433,37 @@ impl MainWindow {
                     return true;
                 }
 
+                // Announced and taken back as ONE value, exactly like
+                // Disconnect All, Reconnect and the pool rebuild. This was the
+                // last connection-wide action that never said it was running:
+                // it published `Disconnected` by hand at the end and said
+                // nothing in between, so for the whole span — which contains
+                // the modal prompts above and a WAITING lock below — the
+                // connection went on reading `Connected` to every gate that
+                // refuses on `Transitioning`, and its tabs never showed it
+                // either. Nothing could reach that window today (the pool
+                // handout hold refuses new sessions and a modal grabs the
+                // input), but "a connection-wide change is announced" must not
+                // be true of three roads out of four.
+                let mut transition = ConnectionRuntime::announce_transition(vec![runtime.clone()]);
+                {
+                    let mut s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    s.object_browser.refresh_runtime_labels();
+                    let affected_tab_ids = s
+                        .editor_tabs
+                        .iter()
+                        .filter(|tab| {
+                            tab.connection_binding.snapshot().connection_id() == Some(connection_id)
+                        })
+                        .map(|tab| tab.tab_id)
+                        .collect::<Vec<_>>();
+                    for tab_id in affected_tab_ids {
+                        s.refresh_tab_label(tab_id);
+                    }
+                }
+
                 // WAITS for the connection rather than refusing. Every reason
                 // to refuse was spent above, before the prompts: refusing here
                 // would leave the user's transaction COMMITTED for a disconnect
@@ -13364,7 +13481,9 @@ impl MainWindow {
                 db_conn.disconnect();
                 db_conn.refresh_tracked_connection();
                 drop(db_conn);
-                runtime.set_state(ConnectionRuntimeState::Disconnected);
+                // Out of transition, with its state read back from the
+                // connection it belongs to rather than asserted by hand.
+                transition.finished(&runtime);
 
                 let mut s = state
                     .lock()
@@ -13439,22 +13558,26 @@ impl MainWindow {
                 // disconnect gets — including the busy probe it never had,
                 // which is what let this action park the UI thread on a
                 // connection whose main-session work it had not asked about.
-                // All of them are cleared before ANY of them is prompted about,
-                // for the same reason the prompts themselves are collected
-                // first: refusing halfway would leave the earlier connections'
-                // work committed for a disconnect that never happened.
-                let mut handout_holds = Vec::with_capacity(runtimes.len());
+                //
+                // ASKED about all of them first, COMMITTED for all of them
+                // after, and that split is the point. The commit half cancels
+                // the connection's background work, so asking and committing
+                // one connection at a time meant a refusal on the third left
+                // the first two's object-browser and IntelliSense reads ended
+                // for a disconnect that was then abandoned. It is the same
+                // rule the prompts already obey — refusing halfway must not
+                // leave the earlier connections changed — applied to the half
+                // that ends work rather than the half that commits
+                // transactions.
+                let mut decided = Vec::with_capacity(runtimes.len());
                 for runtime in &runtimes {
-                    match Self::prepare_session_teardown(
+                    match DecidedSessionTeardown::ask(
                         state,
                         &runtime.connection(),
                         runtime.id(),
                         "Disconnecting all connections",
                     ) {
-                        // Every connection's hold is kept until the whole
-                        // action is over, so the ones cleared first cannot
-                        // start new work while the rest are still being asked.
-                        Ok(hold) => handout_holds.push(hold),
+                        Ok(decision) => decided.push(decision),
                         Err(message) => {
                             crate::ui::alert_on_main(&format!(
                                 "'{}': {message}",
@@ -13464,6 +13587,13 @@ impl MainWindow {
                         }
                     }
                 }
+                // Every connection's hold is kept until the whole action is
+                // over, so the ones cleared first cannot start new work while
+                // the rest are still being resolved.
+                let _handout_holds = decided
+                    .into_iter()
+                    .map(|decision| decision.commit(state))
+                    .collect::<Vec<_>>();
                 // Disconnecting many connections is still a DISCONNECT, so it
                 // asks each affected tab the same question File/Disconnect
                 // does. Using the Close policy here let a session that

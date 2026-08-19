@@ -277,8 +277,14 @@ pub mod names {
     /// The ledger that says which connections a decided session-ending action
     /// is holding shut.
     pub const POOL_HANDOUT_HOLDS: &str = "POOL_HANDOUT_HOLDS";
+    /// The cell that says what a connection's state is, and who owns the right
+    /// to write it. A leaf — an announced transition reads the connection
+    /// BEFORE it takes this — but it is taken from under the connection mutex
+    /// (application exit publishes `Disconnected` while it still holds the
+    /// guard), so leaving it out left that order invisible.
+    pub const RUNTIME_STATE: &str = "RUNTIME_STATE";
 
-    pub const ALL: [&str; 8] = [
+    pub const ALL: [&str; 9] = [
         ACTIVITY_REGISTRY,
         DB_CONNECTION,
         POOL_CONTEXT_CACHE,
@@ -287,6 +293,7 @@ pub mod names {
         SENDER_REGISTRATIONS,
         RETIRED_GENERATIONS,
         POOL_HANDOUT_HOLDS,
+        RUNTIME_STATE,
     ];
 }
 

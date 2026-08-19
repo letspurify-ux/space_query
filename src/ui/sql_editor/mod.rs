@@ -322,6 +322,13 @@ pub(crate) struct QueryProgressSender {
     /// exactly the operation's lifetime, which is what makes the cancel button
     /// reach a query for its whole duration rather than only while it starts.
     session_registrations: Arc<Mutex<Vec<crate::db::DbSessionCancelRegistration>>>,
+    /// How to re-state which connection `status_activity` belongs to.
+    ///
+    /// Kept beside the row rather than passed in at the moment of need: the
+    /// only road that moves an operation to another connection is a script
+    /// `CONNECT`, which runs on a worker with no widget to ask. See
+    /// [`OperationActivity`].
+    status_activity_binder: Option<OperationActivityBinder>,
 }
 
 #[derive(Debug)]
@@ -371,6 +378,7 @@ impl QueryProgressSender {
             status_activity: None,
             execution_origin: Arc::new(Mutex::new(None)),
             session_registrations: Arc::new(Mutex::new(Vec::new())),
+            status_activity_binder: None,
         }
     }
 
@@ -388,11 +396,21 @@ impl QueryProgressSender {
             // A fresh operation gets fresh registrations; the previous
             // operation's sessions are not this one's to cancel.
             session_registrations: Arc::new(Mutex::new(Vec::new())),
+            // The binder belongs to the ROW, so it travels with it.
+            status_activity_binder: self.status_activity_binder.clone(),
         }
     }
 
-    fn with_status_activity(mut self, status_activity: crate::db::DbActivityGuard) -> Self {
-        self.status_activity = Some(status_activity);
+    /// Take an operation's registry row, and with it the means to re-state
+    /// which connection that row belongs to.
+    ///
+    /// Both halves or neither: a sender that could hold the row without the
+    /// binder is a batch that can move to another connection and leave its row
+    /// behind. See [`OperationActivity`].
+    fn with_status_activity(mut self, status_activity: OperationActivity) -> Self {
+        let (activity, binder) = status_activity.into_parts();
+        self.status_activity = Some(activity);
+        self.status_activity_binder = Some(binder);
         self
     }
 
@@ -432,10 +450,33 @@ impl QueryProgressSender {
             .map(crate::db::DbActivityGuard::finish_handle)
     }
 
-    fn set_status_connection_id(&self, connection_id: crate::db::ConnectionId) {
-        if let Some(activity) = self.status_activity.as_ref() {
-            activity.set_connection_id(connection_id);
-        }
+    /// Move this operation's registry row to the connection its work has moved
+    /// to.
+    ///
+    /// The ONE door for a script `CONNECT`, on both Oracle drivers (the MySQL
+    /// family refuses `CONNECT` outright). All three facts the registry keeps
+    /// about "which connection is this work on" go at once — see
+    /// [`crate::db::DbActivityGuard::bind_to_connection`]. Before it, only the
+    /// connection ID moved, so:
+    ///
+    /// * the row kept the OLD connection's lifetime, and a disconnect of the
+    ///   connection the batch had already left — which its own gate no longer
+    ///   refuses, because the tab is bound elsewhere — swept the row and
+    ///   cancelled the batch running on the new connection; and
+    /// * the cancel hook kept filtering for the old generation.
+    pub(crate) fn move_status_activity_to_connection(
+        &self,
+        connection_id: crate::db::ConnectionId,
+        lifetime: crate::db::DbActivityLifetime,
+        connection_generation: u64,
+    ) {
+        let (Some(activity), Some(binder)) = (
+            self.status_activity.as_ref(),
+            self.status_activity_binder.as_ref(),
+        ) else {
+            return;
+        };
+        activity.bind_to_connection(binder(Some(connection_id), lifetime, connection_generation));
     }
 
     pub(crate) fn send(&self, progress: QueryProgress) -> Result<(), QueryProgressSendError> {
@@ -1166,6 +1207,49 @@ struct StartedTabOperation {
     connection_lifetime: crate::db::DbActivityLifetime,
 }
 
+/// How a tab states which connection one of its operation rows belongs to.
+///
+/// See [`SqlEditorWidget::operation_activity_binder`].
+pub(crate) type OperationActivityBinder = Arc<
+    dyn Fn(
+            Option<crate::db::ConnectionId>,
+            crate::db::DbActivityLifetime,
+            u64,
+        ) -> crate::db::DbActivityConnectionBinding
+        + Send
+        + Sync,
+>;
+
+/// One operation's activity-registry row, and how to re-state which connection
+/// it belongs to.
+///
+/// The two travel together because the app has a road that moves the work: a
+/// script `CONNECT` takes a running batch to another connection on both Oracle
+/// drivers. Only the row's connection ID used to move with it — the LIFETIME
+/// went on naming the connection the batch had already left, so disconnecting
+/// that connection made the row stale and the stale sweep (which a disconnect
+/// runs on the spot) cancelled the batch running on the new one; and the cancel
+/// hook went on filtering for the old generation. Handing the row on without
+/// the means to re-state it is what made that possible.
+pub(crate) struct OperationActivity {
+    activity: crate::db::DbActivityGuard,
+    binder: OperationActivityBinder,
+}
+
+impl OperationActivity {
+    fn into_parts(self) -> (crate::db::DbActivityGuard, OperationActivityBinder) {
+        (self.activity, self.binder)
+    }
+}
+
+impl std::ops::Deref for OperationActivity {
+    type Target = crate::db::DbActivityGuard;
+
+    fn deref(&self) -> &Self::Target {
+        &self.activity
+    }
+}
+
 /// What one tab operation currently has published for a cancel to reach.
 ///
 /// THREE answers, not two. `Option<QueryCancelHandle>` could only say "there is
@@ -1268,6 +1352,32 @@ impl OperationCancelTarget {
     fn may_still_publish(&self) -> bool {
         matches!(self, Self::NotPublished)
     }
+}
+
+/// What a tier found when it tried to take responsibility for asking the
+/// session published RIGHT NOW to stop.
+///
+/// Three answers rather than a bool, because a bool collapsed two facts that
+/// the rest of the app already reports differently. `false` meant BOTH "the
+/// other tier already sent this break" and "there is no published session to
+/// break" — a hand-back landing between the caller's read of the slot and its
+/// claim — and the cancel thread reported both as [`QueryCancelOutcome::
+/// InterruptSent`]. So a cancel that never reached the server was recorded as
+/// dispatched, while the very same fact, observed a few lines later as
+/// [`SessionCancelDelivery::Withdrawn`], is reported as
+/// [`QueryCancelOutcome::PendingInitialization`] — the answer that keeps the
+/// cancel requested and lets the watchdog break whatever the operation
+/// publishes next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum GracefulBreakClaim {
+    /// This caller took it, and is the one that sends the break.
+    Claimed,
+    /// The other tier already sent the break for THIS publication.
+    AlreadySent,
+    /// Nothing is published to break: the session has not arrived yet, or it
+    /// was handed back. Nothing was sent, and nothing failed.
+    NoSession,
 }
 
 #[derive(Clone)]
@@ -3251,9 +3361,19 @@ impl SqlEditorWidget {
     /// tab's own cancel (the real cancel path is not `Send`), and wake a parked
     /// lazy fetch directly, because a session holding an OPEN cursor cannot be
     /// force closed by the driver and only its own worker can let go of it.
-    fn registry_cancel_hook(&self, connection_generation: u64) -> Arc<dyn Fn() + Send + Sync> {
-        let registry_cancel = self.registry_cancel_flag();
-        let lazy_fetch_for_registry_cancel = self.active_lazy_fetch.clone();
+    /// Built from the tab's own leaf state rather than from `&self`.
+    ///
+    /// A script `CONNECT` moves a running batch to another connection, and the
+    /// hook has to move with it — but it runs on a WORKER, which has no widget.
+    /// So the two things the hook needs travel as `Arc`s and the binder that
+    /// carries them is handed to the batch. See [`OperationActivity`].
+    fn registry_cancel_hook_for(
+        registry_cancel: &Arc<AtomicBool>,
+        active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
+        connection_generation: u64,
+    ) -> Arc<dyn Fn() + Send + Sync> {
+        let registry_cancel = Arc::clone(registry_cancel);
+        let lazy_fetch_for_registry_cancel = Arc::clone(active_lazy_fetch);
         Arc::new(move || {
             registry_cancel.store(true, Ordering::Release);
             let handle = lazy_fetch_for_registry_cancel
@@ -3287,19 +3407,51 @@ impl SqlEditorWidget {
         &self,
         started: &StartedTabOperation,
         activity_label: impl Into<String>,
-    ) -> crate::db::DbActivityGuard {
+    ) -> OperationActivity {
         let activity_label = activity_label.into();
-        let activity = match self.connection_binding.snapshot().runtime {
-            Some(runtime) => crate::db::track_db_activity_for_connection(
+        let connection_id = self
+            .connection_binding
+            .snapshot()
+            .runtime
+            .map(|runtime| runtime.id());
+        let activity = match connection_id {
+            Some(connection_id) => crate::db::track_db_activity_for_connection(
                 activity_label,
                 Some(started.db_type),
-                runtime.id(),
+                connection_id,
             ),
             None => crate::db::track_db_activity(activity_label, Some(started.db_type)),
         };
-        activity.bind_lifetime(started.connection_lifetime.clone());
-        activity.on_cancel(self.registry_cancel_hook(started.token.connection_generation));
-        activity
+        let binder = self.operation_activity_binder();
+        activity.bind_to_connection(binder(
+            connection_id,
+            started.connection_lifetime.clone(),
+            started.token.connection_generation,
+        ));
+        OperationActivity { activity, binder }
+    }
+
+    /// How THIS tab states which connection one of its operation rows belongs
+    /// to, as a value a worker can carry.
+    ///
+    /// It has to be a value because the work MOVES: a script `CONNECT` takes a
+    /// running batch to another connection, and the row has to go with it — id,
+    /// lifetime and cancel hook together. Only the id used to move, so the row
+    /// went on naming the connection the batch had already left.
+    fn operation_activity_binder(&self) -> OperationActivityBinder {
+        let registry_cancel = self.registry_cancel_flag();
+        let active_lazy_fetch = self.active_lazy_fetch.clone();
+        Arc::new(move |connection_id, lifetime, connection_generation| {
+            crate::db::DbActivityConnectionBinding {
+                connection_id,
+                lifetime,
+                on_cancel: Self::registry_cancel_hook_for(
+                    &registry_cancel,
+                    &active_lazy_fetch,
+                    connection_generation,
+                ),
+            }
+        })
     }
 
     fn clear_current_operation_snapshot(
@@ -7032,9 +7184,24 @@ impl SqlEditorWidget {
                 // Claimed, not just sent: the watchdog asks the same question
                 // and sends the break itself for a session that arrives after
                 // this thread has given up waiting. Whoever claims first sends.
-                if !SqlEditorWidget::claim_graceful_break(&current_query_cancel_handle) {
-                    send_outcome(QueryCancelOutcome::InterruptSent);
-                    return;
+                match SqlEditorWidget::claim_graceful_break(&current_query_cancel_handle) {
+                    GracefulBreakClaim::Claimed => {}
+                    // The other tier already broke THIS session; saying so is
+                    // the same answer that tier's own send produced.
+                    GracefulBreakClaim::AlreadySent => {
+                        send_outcome(QueryCancelOutcome::InterruptSent);
+                        return;
+                    }
+                    // The session was handed back between the read above and
+                    // this claim. Nothing was sent and nothing failed -- the
+                    // SAME fact the delivery below answers as `Withdrawn`, and
+                    // it is reported the same way: the cancel stays requested
+                    // and the watchdog breaks whatever this operation
+                    // publishes next.
+                    GracefulBreakClaim::NoSession => {
+                        send_outcome(QueryCancelOutcome::PendingInitialization);
+                        return;
+                    }
                 }
                 let interrupt_result = panic::catch_unwind(AssertUnwindSafe(|| {
                     cancel_handle.cancel_interrupt(&SessionCancelClaim::owned_outright())
@@ -7233,6 +7400,7 @@ impl SqlEditorWidget {
                     // tear-down as the first thing that ever reached it.
                     if target.needs_graceful_break()
                         && Self::claim_graceful_break(&current_query_cancel_handle)
+                            == GracefulBreakClaim::Claimed
                     {
                         // Through the SLOT, like the tear-down below: the break
                         // must see a hand-back that lands while it is on its
@@ -7566,9 +7734,13 @@ impl SqlEditorWidget {
     /// made afterwards would let the other thread send a second one in that
     /// window. A claim whose break then fails is not re-tried; escalating is
     /// what the force tier is for.
+    ///
+    /// Answers [`GracefulBreakClaim`], not a bool: "somebody else sent it" and
+    /// "there is nothing published to send it to" are different facts, and the
+    /// caller reports them differently.
     fn claim_graceful_break(
         current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
-    ) -> bool {
+    ) -> GracefulBreakClaim {
         let mut guard = current_query_cancel_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -7576,11 +7748,17 @@ impl SqlEditorWidget {
             OperationCancelTarget::Published {
                 graceful_break_sent,
                 ..
-            } if !*graceful_break_sent => {
-                *graceful_break_sent = true;
-                true
+            } => {
+                if *graceful_break_sent {
+                    GracefulBreakClaim::AlreadySent
+                } else {
+                    *graceful_break_sent = true;
+                    GracefulBreakClaim::Claimed
+                }
             }
-            _ => false,
+            OperationCancelTarget::NotPublished | OperationCancelTarget::Withdrawn => {
+                GracefulBreakClaim::NoSession
+            }
         }
     }
 
@@ -10180,12 +10358,21 @@ mod cancel_watchdog_tests {
         })))
     }
 
-    /// One publication, one break — whichever tier gets there first.
+    /// One publication, one break — whichever tier gets there first — and the
+    /// two reasons a tier does NOT send one are told apart.
+    ///
+    /// "The other tier already sent it" and "there is nothing published to
+    /// send it to" used to be the same answer (`false`), and the cancel thread
+    /// reported both as `InterruptSent`. The second one is a hand-back landing
+    /// between the caller's read of the slot and its claim — nothing reached
+    /// the server — and it is the same fact the delivery reports as
+    /// `Withdrawn`, which the same road answers with `PendingInitialization`.
     #[test]
     fn only_one_tier_sends_the_break_for_one_published_session() {
         let slot = Arc::new(Mutex::new(OperationCancelTarget::NotPublished));
-        assert!(
-            !SqlEditorWidget::claim_graceful_break(&slot),
+        assert_eq!(
+            SqlEditorWidget::claim_graceful_break(&slot),
+            GracefulBreakClaim::NoSession,
             "there is nothing to ask to stop before a session is published"
         );
 
@@ -10193,12 +10380,14 @@ mod cancel_watchdog_tests {
             &slot,
             Some(QueryCancelHandle::Test(Arc::new(AtomicBool::new(false)))),
         );
-        assert!(
+        assert_eq!(
             SqlEditorWidget::claim_graceful_break(&slot),
+            GracefulBreakClaim::Claimed,
             "the first tier to reach a fresh publication sends the break"
         );
-        assert!(
-            !SqlEditorWidget::claim_graceful_break(&slot),
+        assert_eq!(
+            SqlEditorWidget::claim_graceful_break(&slot),
+            GracefulBreakClaim::AlreadySent,
             "and the other one must not send a second"
         );
 
@@ -10210,15 +10399,17 @@ mod cancel_watchdog_tests {
             &slot,
             Some(QueryCancelHandle::Test(Arc::new(AtomicBool::new(false)))),
         );
-        assert!(
+        assert_eq!(
             SqlEditorWidget::claim_graceful_break(&slot),
+            GracefulBreakClaim::Claimed,
             "a session published later has not been asked to stop yet"
         );
 
         SqlEditorWidget::set_current_query_cancel_handle(&slot, None);
-        assert!(
-            !SqlEditorWidget::claim_graceful_break(&slot),
-            "and a withdrawn target is not something to ask at all"
+        assert_eq!(
+            SqlEditorWidget::claim_graceful_break(&slot),
+            GracefulBreakClaim::NoSession,
+            "and a withdrawn target is not something anybody sent a break to"
         );
     }
 

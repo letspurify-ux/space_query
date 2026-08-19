@@ -28,6 +28,22 @@
 //      and its next statement says it is not connected, while every other tab
 //      on the same connection keeps its session and keeps working
 //
+// A POOL REBUILD is the third road a session dies down, and the only one where
+// the CONNECTION stays up: the preferences dialog replaces the pool, bumps the
+// generation and retires the old pool underneath tabs that go on working. The
+// disconnect scenarios above cannot stand in for it -- there, everything goes
+// at once and the connection's own teardown is a second net under the pool's.
+//
+//   P1 a rebuild closes the sessions the tabs were holding, and the tabs keep
+//      working on the new pool
+//   P2 a rebuild closes the session an OPEN lazy fetch is holding -- a session
+//      that is in neither the pool nor a tab's slot, but in the fetch worker's
+//      own frame
+//   P3 rebuilding immediately after a cancel (no waiting) leaves nothing: the
+//      cancel watchdog and the rebuild race, and both must lose to neither
+//   P4 repeated shrink/grow rounds leave nothing behind -- what a single
+//      rebuild cannot show is an accounting leak that only repeats reveal
+//
 // T7 and T8 drive interleavings the app's own guards normally prevent (the
 // disconnect menu refuses while a lazy fetch is open; a close of a running tab
 // is deferred until idle). The engine guarantees must hold anyway: guards are
@@ -512,6 +528,36 @@ fn mysql_probe_database(target: Target) -> Result<Census, String> {
     })
 }
 
+/// How long a rebuild is given to find the connection free.
+const POOL_REBUILD_BUSY_RETRIES: usize = 40;
+
+/// Drive the app's REAL pool rebuild — the one the preferences dialog runs.
+///
+/// A rebuild refuses on a connection whose mutex is held (`begin_connection_
+/// transition` try-locks it), and an Oracle execution applies its tab's schema
+/// under that mutex while it starts. That is a legitimate refusal, not the
+/// answer this census is about, so it is waited out rather than reported: what
+/// the scenarios below assert is what a rebuild that RAN leaves behind.
+fn rebuild_pool(shared: &Arc<Mutex<DatabaseConnection>>, size: u32) -> Result<(), String> {
+    let mut last = String::new();
+    for _ in 0..POOL_REBUILD_BUSY_RETRIES {
+        match space_query::db::resize_shared_connection_pool(shared, size, 15) {
+            Ok(()) => {
+                // Exactly what the app does after a connection-wide change:
+                // whatever still holds a session on the retired generation is
+                // retired with it.
+                space_query::db::sweep_stale_db_activities(Duration::from_secs(2));
+                return Ok(());
+            }
+            Err(err) => {
+                last = err;
+                pump(Duration::from_millis(100));
+            }
+        }
+    }
+    Err(format!("the pool rebuild never ran: {last}"))
+}
+
 fn connection_reconnect(
     shared: &Arc<Mutex<DatabaseConnection>>,
     target: Target,
@@ -882,6 +928,112 @@ fn verify(target: Target) -> Result<bool, String> {
     // legitimately still hold an idle session of its own. What a tab-local
     // disconnect must not leave behind is a session with an OWNER that is gone,
     // and T1-T11 are what prove that.
+
+    // P1: a POOL REBUILD is the road where the connection stays up. Three tabs
+    // are each holding a retained session of the pool that is about to be
+    // replaced; the rebuild bumps the generation, and every one of those
+    // sessions has to be closed -- by a reclaim that returns them to a pool
+    // which is itself being retired. Nothing else in this census exercises
+    // that ordering: at a disconnect the connection's own teardown is a second
+    // net under it.
+    println!("  --- P1 a pool rebuild closes the sessions the tabs were holding ---");
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    let mut tabs = (0..3).map(|_| Tab::open(&shared)).collect::<Vec<_>>();
+    for tab in &mut tabs {
+        tab.run(target.trivial_sql())?;
+    }
+    let holding = stable_count(&mut census)?;
+    println!("    server sessions with three tabs holding: {holding}");
+    rebuild_pool(&shared, 4)?;
+    let observed = settled_count(&mut census, connected_baseline)?;
+    report.check(
+        "P1 a pool rebuild closes the sessions the tabs were holding",
+        observed,
+        connected_baseline,
+    );
+    // ...and the tabs are not bricked by it: the next statement takes a
+    // session from the NEW pool.
+    let tabs_still_work = tabs
+        .iter_mut()
+        .all(|tab| tab.run(target.trivial_sql()).is_ok());
+    report.check_flag(
+        "P1 every tab keeps working on the new pool",
+        tabs_still_work,
+    );
+    for tab in &mut tabs {
+        tab.close();
+    }
+
+    // P2: the session an OPEN lazy fetch holds is in neither the pool nor the
+    // tab's slot -- it lives in the fetch worker's own frame -- so a rebuild
+    // has to reach it the same way a disconnect does (T7/T11).
+    println!("  --- P2 a pool rebuild closes an open lazy fetch's session ---");
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    let mut tab = Tab::open(&shared);
+    tab.editor.set_lazy_fetch_batch_size(50);
+    tab.run(target.many_rows_sql())?;
+    let open = tab.editor.has_open_lazy_fetch();
+    println!("    lazy fetch open after the SELECT: {open}");
+    if !open {
+        println!("    (note) no lazy fetch stayed open; P2 degenerates into P1");
+    }
+    rebuild_pool(&shared, 6)?;
+    let observed = settled_count(&mut census, connected_baseline)?;
+    report.check(
+        "P2 a pool rebuild closes an open lazy fetch's session",
+        observed,
+        connected_baseline,
+    );
+    tab.close();
+
+    // P3: rebuild the instant after a cancel, without waiting for it to land.
+    // The cancel watchdog is still escalating while the pool under it is
+    // replaced; whichever finishes second must still find nothing to leak.
+    println!("  --- P3 rebuilding right after a cancel leaves nothing ---");
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    let mut tab = Tab::open(&shared);
+    tab.start(target.sleep_sql());
+    pump(Duration::from_millis(1500));
+    tab.editor.cancel_current();
+    rebuild_pool(&shared, 4)?;
+    let _ = tab.wait_for_batch(Duration::from_secs(60));
+    let observed = settled_count(&mut census, connected_baseline)?;
+    report.check(
+        "P3 rebuilding right after a cancel leaves nothing",
+        observed,
+        connected_baseline,
+    );
+    tab.close();
+
+    // P4: five shrink/grow rounds with a tab working between them. One rebuild
+    // cannot show an accounting leak -- a slot counted but never released, a
+    // pool kept alive by a session that was never given back -- because the
+    // count it leaves is within one session of the right answer either way.
+    println!("  --- P4 repeated pool rebuilds leave nothing behind ---");
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    // Every round must CHANGE the size: a rebuild to the size the connection
+    // already has answers `Ok` without replacing anything.
+    for size in [3u32, 5, 3, 5, 3] {
+        let mut tab = Tab::open(&shared);
+        tab.run(target.trivial_sql())?;
+        rebuild_pool(&shared, size)?;
+        tab.close();
+    }
+    let observed = settled_count(&mut census, connected_baseline)?;
+    report.check(
+        "P4 five pool rebuild rounds leave nothing behind",
+        observed,
+        connected_baseline,
+    );
+    // A pool the app can still hand sessions out of is the other half of "the
+    // rebuild left nothing behind": an exhausted pool leaks nothing and works
+    // for nobody.
+    let mut tab = Tab::open(&shared);
+    report.check_flag(
+        "P4 the connection still hands out sessions after five rebuilds",
+        tab.run(target.trivial_sql()).is_ok(),
+    );
+    tab.close();
 
     shared
         .lock()
