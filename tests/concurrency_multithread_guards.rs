@@ -7152,7 +7152,7 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         content
             .matches("Self::report_retained_session_lost_with_work(")
             .count(),
-        8,
+        10,
         "every site that loses a work-carrying session reports it: the two replace-and-reset \
          sites (MySQL family, Oracle OCI), the Oracle acquire window that closes the tab's \
          retained session after a setup failure it cannot reuse it through, the one door a \
@@ -7162,12 +7162,55 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
          already emptied the slot there, so a bare return left the tab believing it still had \
          a session — `stale_take_reported`, the choke point every EXECUTION take passes \
          through: a take whose session belonged to an earlier incarnation of this connection \
-         CLOSES it, and all four call sites used to read that answer as `NoSession` — and the \
+         CLOSES it, and all four call sites used to read that answer as `NoSession` — the \
          MySQL-family hand-back's own pre-check, which finds the connection incarnation gone \
-         and can only close the session. That last one is the ONE loss that never reaches the \
-         hand-back door (a disconnected connection no longer remembers which family it was, so \
-         the lease cannot be built), which is exactly why it has to report for itself; the \
-         door refuses and reports the same case for all four backends"
+         and can only close the session (the ONE loss that never reaches the hand-back door: \
+         a disconnected connection no longer remembers which family it was, so the lease \
+         cannot be built, which is exactly why it has to report for itself; the door refuses \
+         and reports the same case for all four backends) — and the three discard arms of \
+         `acquire_mysql_pooled_session` itself (the ping-dead readiness check, and its two \
+         stale-retry twins, stated even where work cannot reach them so the rule is the arm's \
+         own): the ping-dead arm used to return BEFORE the report on exactly the road that \
+         REQUIRES the tab's session — the toolbar Commit/Rollback — so the loss was swallowed \
+         on the very button the user pressed to keep that work"
+    );
+
+    // The road that REQUIRES the tab's own session (the toolbar
+    // Commit/Rollback) answers a dead session with the LOSS, through the one
+    // message helper — never with a statement about the slot the loss emptied
+    // — and the report is filed before EITHER road returns.
+    let acquire = content
+        .find("fn acquire_mysql_pooled_session(")
+        .expect("the MySQL-family acquisition should exist");
+    let acquire_body = slice_to_end_of_fn(&content, acquire);
+    let ping_dead = acquire_body
+        .find("Ok(false) => {")
+        .expect("the readiness check's dead-session arm should exist");
+    // Bounded by the next match arm rather than by a byte count.
+    let ping_dead_end = acquire_body[ping_dead..]
+        .find("Err(message)")
+        .map(|offset| ping_dead + offset)
+        .unwrap_or(acquire_body.len());
+    let ping_dead_arm = &acquire_body[ping_dead..ping_dead_end];
+    let report_at = ping_dead_arm
+        .find("Self::report_retained_session_lost_with_work(")
+        .expect("the dead-session arm must report the loss");
+    let require_return_at = ping_dead_arm
+        .find("required_session_gone_message(")
+        .expect("the require-existing road must answer the loss, not the slot state");
+    assert!(
+        report_at < require_return_at,
+        "the loss is reported before the road that requires the session returns: \
+         {ping_dead_arm}"
+    );
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let gone = editor
+        .find("pub(crate) fn required_session_gone_message(")
+        .expect("the one answer for a required session's death should exist");
+    let gone_body = slice_to_end_of_fn(&editor, gone);
+    assert!(
+        gone_body.contains("RETAINED_SESSION_LOST_WITH_WORK"),
+        "a dead session that carried work answers the loss: {gone_body}"
     );
 
     // And that choke point must be on the road, not merely present: every
@@ -8580,15 +8623,27 @@ fn a_lazy_fetch_gives_up_its_force_target_before_it_gives_back_its_session() {
     );
 
     // Every backend's lazy fetch publishes a WITHDRAWABLE target, so the reach
-    // is something its owner can take back at all.
-    assert_eq!(
-        execution
-            .matches("Some(lazy_force_target.as_handle())")
-            .count(),
-        3,
-        "Oracle OCI, Oracle thin and the MySQL family must all register a withdrawable \
-         lazy-fetch cancel target"
-    );
+    // is something its owner can take back at all. Counted inside each
+    // starter's own body rather than over the whole file: the unit tests that
+    // drive the lazy watchdog build the same shape, and a guard must not count
+    // a test as a registration (nor be emptied by an early `#[cfg(test)]`
+    // item, which is what a first-marker split does in this file).
+    for starter in [
+        "fn start_oracle_lazy_select(",
+        "fn start_oracle_thin_lazy_select(",
+        "fn start_mysql_lazy_select(",
+    ] {
+        let at = execution
+            .find(starter)
+            .unwrap_or_else(|| panic!("{starter} should exist"));
+        assert_eq!(
+            slice_to_end_of_fn(&execution, at)
+                .matches("Some(lazy_force_target.as_handle())")
+                .count(),
+            1,
+            "{starter} must register a withdrawable lazy-fetch cancel target"
+        );
+    }
 
     // And inside every backend's lazy-fetch worker, NO way of giving the
     // session back is reached except through the door.
@@ -8741,11 +8796,17 @@ fn every_worker_hand_back_ends_the_cancels_reach_before_the_session_moves() {
          the DB layer's registration: {body}"
     );
 
-    // A withdrawn target is a third answer, not "not published yet".
+    // A withdrawn target is a third answer, not "not published yet". The
+    // distinction used to be a predicate (`may_still_publish`) asked of a
+    // clone; it now lives in the watchdog's one locked decision, whose
+    // variants name both answers — the invariant is the same: a session that
+    // has not arrived keeps the watchdog waiting, one that was given back
+    // ends it quietly.
     assert!(
         editor.contains("pub(crate) enum OperationCancelTarget {")
             && editor.contains("    Withdrawn,")
-            && editor.contains("fn may_still_publish(&self) -> bool {"),
+            && editor.contains("ForcePassDecision::NotPublished")
+            && editor.contains("ForcePassDecision::Withdrawn"),
         "the tab's cancel slot must tell a session that has not arrived from one that has been \
          given back"
     );
@@ -10553,31 +10614,45 @@ fn what_a_gate_refuses_on_and_what_a_cancel_offers_is_one_list_of_editors() {
 fn a_cancel_that_never_reached_a_session_is_never_reported_as_sent() {
     let editor = read_source("src/ui/sql_editor/mod.rs");
 
-    let claim = editor
-        .find("fn claim_graceful_break(")
-        .expect("the graceful-break claim should exist");
-    let claim_body = slice_to_end_of_fn(&editor, claim);
-    assert!(
-        claim_body.contains("-> GracefulBreakClaim {"),
-        "the claim must STATE what it found, not answer a bool that collapses two facts: \
-         {claim_body}"
-    );
-    for answer in [
-        "GracefulBreakClaim::Claimed",
-        "GracefulBreakClaim::AlreadySent",
-        "GracefulBreakClaim::NoSession",
-    ] {
+    // Two claims share the name — the operation slot's and the withdrawable
+    // lazy target's — so each is anchored by what it matches on, not by being
+    // first in the file. BOTH must state all three answers.
+    let slot_claim = editor
+        .match_indices("fn claim_graceful_break(")
+        .map(|(at, _)| at)
+        .find(|&at| slice_to_end_of_fn(&editor, at).contains("OperationCancelTarget::Published"))
+        .expect("the operation slot's graceful-break claim should exist");
+    let target_claim = editor
+        .match_indices("fn claim_graceful_break(")
+        .map(|(at, _)| at)
+        .find(|&at| slice_to_end_of_fn(&editor, at).contains("state.published.is_none()"))
+        .expect("the withdrawable target's graceful-break claim should exist");
+    for claim in [slot_claim, target_claim] {
+        let claim_body = slice_to_end_of_fn(&editor, claim);
         assert!(
-            claim_body.contains(answer),
-            "the claim must be able to answer {answer}: {claim_body}"
+            claim_body.contains("-> GracefulBreakClaim {"),
+            "the claim must STATE what it found, not answer a bool that collapses two facts: \
+             {claim_body}"
         );
+        for answer in [
+            "GracefulBreakClaim::Claimed",
+            "GracefulBreakClaim::AlreadySent",
+            "GracefulBreakClaim::NoSession",
+        ] {
+            assert!(
+                claim_body.contains(answer),
+                "the claim must be able to answer {answer}: {claim_body}"
+            );
+        }
     }
     // Every variant of the slot is named, so a new one cannot fall into
     // "somebody already sent it" by default.
+    let slot_claim_body = slice_to_end_of_fn(&editor, slot_claim);
     assert!(
-        claim_body
+        slot_claim_body
             .contains("OperationCancelTarget::NotPublished | OperationCancelTarget::Withdrawn"),
-        "a target with no session must be named rather than caught by a wildcard: {claim_body}"
+        "a target with no session must be named rather than caught by a wildcard: \
+         {slot_claim_body}"
     );
 
     let road = slice_to_end_of_fn(
@@ -10767,14 +10842,16 @@ fn the_force_tier_is_never_the_first_thing_a_session_sees() {
         editor.contains("graceful_break: GracefulBreakProgress,"),
         "a published session must record how far the break that was asked for has got"
     );
-    let claim = editor
-        .find("fn claim_graceful_break(")
-        .expect("the claim on a publication should exist");
-    let claim_body = slice_to_end_of_fn(&editor, claim);
+    // The claim on a publication is taken under the slot lock, so exactly one
+    // tier sends the break. It is written in two places on purpose: the cancel
+    // thread's claim (`claim_graceful_break`) and the watchdog's one locked
+    // force-pass decision, whose `SendGracefulBreak` answer IS a claim.
     assert!(
-        claim_body.contains("*graceful_break = GracefulBreakProgress::Sending;"),
-        "the claim must be taken under the slot lock, so exactly one tier sends the break: \
-         {claim_body}"
+        editor
+            .matches("*graceful_break = GracefulBreakProgress::Sending {")
+            .count()
+            >= 2,
+        "both the claim and the force-pass decision must take the break under the slot lock"
     );
 
     // Both senders claim BEFORE they act. A claim taken afterwards would let
@@ -10792,14 +10869,17 @@ fn the_force_tier_is_never_the_first_thing_a_session_sees() {
         .find("fn start_query_cancel_watchdog(")
         .expect("the tab's force tier should exist");
     let watchdog_body = slice_to_end_of_fn(&editor, watchdog);
+    let decision = watchdog_body
+        .find("let decision = Self::force_pass_decision(&current_query_cancel_handle);")
+        .expect("the watchdog must decide its force pass in one locked look at the slot");
     let fallback = watchdog_body
-        .find("if target.needs_graceful_break()")
+        .find("if decision == ForcePassDecision::SendGracefulBreak {")
         .expect("the watchdog must be able to send the break the cancel thread could not");
     let force = watchdog_body
         .find("outcome: QueryCancelOutcome::ForceStarted,")
         .expect("the watchdog must still force");
     assert!(
-        fallback < force,
+        decision < fallback && fallback < force,
         "and it must ask before it tears down, never after: {watchdog_body}"
     );
     assert!(
@@ -10830,19 +10910,33 @@ fn the_force_tier_waits_for_a_break_it_has_not_seen_answered() {
 
     // Only the publication the sender ACTED ON may be marked answered: a
     // hand-back plus a fresh publication can land while a break travels, and
-    // that new session has never been asked at all.
-    let finish = editor
-        .find("fn finish_graceful_break(")
-        .expect("a sender must be able to record that its break has answered");
-    let finish_body = slice_to_end_of_fn(&editor, finish);
+    // that new session has never been asked at all. Both publications — the
+    // operation slot's and the withdrawable lazy target's — keep the
+    // transition narrow.
+    let slot_finish = editor
+        .match_indices("fn finish_graceful_break(")
+        .map(|(at, _)| at)
+        .find(|&at| slice_to_end_of_fn(&editor, at).contains("OperationCancelTarget::Published"))
+        .expect("the slot's sender must be able to record that its break has answered");
     assert!(
-        finish_body.contains("graceful_break @ GracefulBreakProgress::Sending"),
+        slice_to_end_of_fn(&editor, slot_finish)
+            .contains("graceful_break @ GracefulBreakProgress::Sending { .. }"),
         "only a break that was travelling becomes answered, never a publication nothing has \
-         asked: {finish_body}"
+         asked"
+    );
+    let target_finish = editor
+        .match_indices("fn finish_graceful_break(")
+        .map(|(at, _)| at)
+        .find(|&at| slice_to_end_of_fn(&editor, at).contains("state.graceful_break"))
+        .expect("the lazy target's sender must be able to record that its break has answered");
+    assert!(
+        slice_to_end_of_fn(&editor, target_finish)
+            .contains("if let GracefulBreakProgress::Sending { .. } = state.graceful_break"),
+        "the lazy target keeps the same narrow transition"
     );
 
-    // BOTH senders answer. Whoever claims, answers -- or the hold below would
-    // never end for a break that failed or was withdrawn. Counted in the
+    // BOTH slot senders answer. Whoever claims, answers -- or the hold below
+    // would never end for a break that failed or was withdrawn. Counted in the
     // PRODUCTION half only: the unit test that drives the hold answers the
     // break itself, and a guard must not be satisfied by a test.
     let production = editor
@@ -10856,13 +10950,33 @@ fn the_force_tier_waits_for_a_break_it_has_not_seen_answered() {
         2,
         "the cancel thread and the watchdog both record that their break stopped travelling"
     );
+    // And on the lazy road every graceful sender goes through the target's one
+    // delivery door, which claims before the send and answers after it —
+    // whichever thread the send runs on (the spawned cancel sender, or the
+    // MySQL-family fetch worker killing its own call).
+    assert!(
+        production.contains("target.deliver_graceful_break(claim)"),
+        "the spawned lazy cancel sender must deliver through the recording door"
+    );
+    let lazy_worker_kill = read_source("src/ui/sql_editor/execution.rs");
+    let worker_kill = lazy_worker_kill
+        .find("fn cancel_mysql_lazy_fetch_query(")
+        .expect("the MySQL-family fetch worker's own KILL QUERY road should exist");
+    assert!(
+        slice_to_end_of_fn(&lazy_worker_kill, worker_kill)
+            .contains("force_target.deliver_graceful_break("),
+        "the MySQL-family fetch worker's own KILL QUERY must deliver through the same door"
+    );
 
+    // The watchdog holds at its deadline, decided from the slot under its own
+    // lock — never from a clone taken earlier in the pass, which is how a
+    // break claimed between two reads used to escalate with no hold at all.
     let watchdog = editor
         .find("fn start_query_cancel_watchdog(")
         .expect("the tab's force tier should exist");
     let watchdog_body = slice_to_end_of_fn(&editor, watchdog);
     let hold = watchdog_body
-        .find("if target.graceful_break_in_flight() && !held_for_a_break_in_flight {")
+        .find("if decision == ForcePassDecision::HoldForBreakInFlight {")
         .expect("the watchdog must hold off while a break is on its way to the server");
     let force = watchdog_body
         .find("outcome: QueryCancelOutcome::ForceStarted,")
@@ -10871,13 +10985,60 @@ fn the_force_tier_waits_for_a_break_it_has_not_seen_answered() {
         hold < force,
         "and it must ask that BEFORE the tear-down, not after: {watchdog_body}"
     );
-    // Bounded: a sender that never answers must not postpone the tier that
-    // exists for work which will not stop.
     assert!(
-        watchdog_body.contains("held_for_a_break_in_flight = true;")
-            && watchdog_body.contains("held_for_a_break_in_flight = false;"),
-        "the hold is worth one grace period per publication, not an unbounded one: \
+        !watchdog_body.contains("clone_current_query_cancel_handle"),
+        "the watchdog's pass must hold no clone of the slot a decision could go stale against: \
          {watchdog_body}"
+    );
+    // Bounded, and the bound lives on the PUBLICATION (`Sending {
+    // force_deadline_held }`), spent as part of deciding: a watchdog-local
+    // flag survived across publications, so a later publication's travelling
+    // break got no hold at all. A sender that never answers must not postpone
+    // the tier that exists for work which will not stop.
+    assert!(
+        editor.contains("force_deadline_held: bool,"),
+        "the one-hold bound is the publication's own state"
+    );
+    assert_eq!(
+        production
+            .matches("force_deadline_held: held @ false")
+            .count(),
+        2,
+        "both roads — the operation slot's decision and the lazy target's hold — spend the \
+         bound under the lock that read it"
+    );
+
+    // The lazy road's watchdog asks the same question at its deadline: a
+    // break the sender is still delivering holds the force tier off, once,
+    // before `ForceCancel` and the tear-down land.
+    let lazy_watchdog = editor
+        .find("fn start_lazy_fetch_cancel_watchdog_with(")
+        .expect("the lazy fetch's force tier should exist");
+    let lazy_watchdog_body = slice_to_end_of_fn(&editor, lazy_watchdog);
+    assert!(
+        lazy_watchdog_body.contains("hold_force_deadline_for_break_in_flight"),
+        "the lazy watchdog must hold its deadline for a break in flight: {lazy_watchdog_body}"
+    );
+
+    // And the short thin force grace is a fact about ORACLE THIN's break
+    // mechanics, gated on the backend whose graceful break cannot interrupt a
+    // blocked call — never applied to the three backends whose break can.
+    let lazy_grace = editor
+        .find("fn lazy_fetch_cancel_watchdog_timeout_for(")
+        .expect("the lazy force-grace derivation should exist");
+    let lazy_grace_body = slice_to_end_of_fn(&editor, lazy_grace);
+    assert!(
+        lazy_grace_body.contains("graceful_break_may_not_interrupt_a_blocked_call"),
+        "the thin cap must be gated on the per-backend break fact: {lazy_grace_body}"
+    );
+    let break_fact = editor
+        .find("fn graceful_break_may_not_interrupt_a_blocked_call(&self) -> bool")
+        .expect("the per-backend break fact should exist");
+    let break_fact_body = slice_to_end_of_fn(&editor, break_fact);
+    assert!(
+        break_fact_body.contains("QueryCancelHandle::OracleThin(..) => true"),
+        "Oracle thin is the one backend whose graceful break cannot interrupt a blocked call: \
+         {break_fact_body}"
     );
 }
 

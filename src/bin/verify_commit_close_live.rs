@@ -285,8 +285,12 @@ fn verify(target: Target) -> Result<bool, String> {
     let timeout_input = IntInput::default();
     let mut editor = SqlEditorWidget::new(Arc::clone(&shared), timeout_input);
     let done = Arc::new(AtomicBool::new(false));
+    // Every progress Message the editor reports, so a scenario can assert WHAT
+    // was said — the dead-session scenario below is about the message itself.
+    let messages: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let done = Arc::clone(&done);
+        let messages = Arc::clone(&messages);
         editor.set_progress_callback(move |event| {
             if std::env::var("SQ_TRACE_EVENTS").is_ok() {
                 let name = match progress_inner(&event) {
@@ -300,6 +304,10 @@ fn verify(target: Target) -> Result<bool, String> {
             }
             if let QueryProgress::Message { lines, .. } = progress_inner(&event) {
                 println!("    (message) {}", lines.join(" / "));
+                messages
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(lines.join(" / "));
             }
             if let QueryProgress::StatementFinished { result, .. } = progress_inner(&event) {
                 println!(
@@ -509,12 +517,78 @@ fn verify(target: Target) -> Result<bool, String> {
         h.editor.clear_pooled_db_session();
     }
 
+    if !target.is_oracle() {
+        // A toolbar COMMIT pressed on a tab whose work-carrying session the
+        // server has closed must answer the LOSS
+        // (RETAINED_SESSION_LOST_WITH_WORK), never a statement about the slot
+        // the loss emptied ("No reusable DB session for this tab."). The DML
+        // leaves statement-diagnostics residue that makes the next acquisition
+        // skip its ping, so a plain SELECT follows it — that is also the shape
+        // a user's session is in: read something, then try to commit.
+        println!("  --- dead work-carrying session then COMMIT button answers the loss ---");
+        h.run(target.dml())?;
+        h.run("SELECT COUNT(*) AS C FROM SQ_TXCLOSE_T")?;
+        if let Some(sid) = h.editor.active_lazy_fetch_session() {
+            h.editor
+                .request_lazy_fetch(sid, space_query::ui::sql_editor::LazyFetchRequest::All);
+            h.pump_until("lazy fetch to drain", || {
+                h.editor.active_lazy_fetch_session().is_none()
+            })?;
+        }
+        h.report("after DML + SELECT");
+        kill_open_transaction_sessions(target)?;
+        messages.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        h.toolbar_action("commit")?;
+        let said = messages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join(" | ");
+        if said.contains(space_query::db::result_messages::RETAINED_SESSION_LOST_WITH_WORK) {
+            println!("    OK: the commit answered the loss");
+        } else {
+            println!(
+                ">>> BUG REPRODUCED: a dead work-carrying session's commit did not answer the \
+                 loss (said: {said})"
+            );
+            reproduced = true;
+        }
+        h.editor.clear_pooled_db_session();
+        let _ = h.run("COMMIT");
+    }
+
     for sql in target.teardown() {
         let _ = h.run(&sql);
     }
     let _ = h.run("COMMIT");
 
     Ok(reproduced)
+}
+
+/// Kill, from a second raw connection, every session the server reports as
+/// holding an open transaction — with one scenario running, that is exactly
+/// the tab's retained session, whose open UPDATE is what the kill takes away.
+fn kill_open_transaction_sessions(target: Target) -> Result<(), String> {
+    let info = target.connection_info();
+    let opts = mysql::OptsBuilder::new()
+        .ip_or_hostname(Some(info.host.clone()))
+        .tcp_port(info.port)
+        .user(Some(info.username.clone()))
+        .pass(Some(info.password.clone()))
+        .db_name(Some(info.service_name.clone()));
+    let mut conn = mysql::Conn::new(opts).map_err(|e| format!("raw connect: {e}"))?;
+    let ids: Vec<u64> = mysql::prelude::Queryable::query(
+        &mut conn,
+        "SELECT trx_mysql_thread_id FROM information_schema.innodb_trx",
+    )
+    .map_err(|e| format!("innodb_trx: {e}"))?;
+    if ids.is_empty() {
+        return Err("no open transaction found to kill".into());
+    }
+    for id in ids {
+        mysql::prelude::Queryable::query_drop(&mut conn, format!("KILL {id}"))
+            .map_err(|e| format!("KILL {id}: {e}"))?;
+    }
+    Ok(())
 }
 
 fn make_harness(info: ConnectionInfo) -> Result<Harness, String> {

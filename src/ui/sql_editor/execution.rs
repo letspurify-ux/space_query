@@ -8150,11 +8150,12 @@ impl SqlEditorWidget {
     ///
     /// Asked THROUGH the withdrawable target, so a graceful cancel that races
     /// with the fetch giving its session back reaches nothing instead of
-    /// `KILL QUERY`-ing whoever holds that session now.
+    /// `KILL QUERY`-ing whoever holds that session now. And through the door
+    /// that records the break's PROGRESS, so the force watchdog holds its
+    /// deadline for a break this call is still delivering instead of
+    /// `KILL CONNECTION`-ing the session it was on its way to spare.
     fn cancel_mysql_lazy_fetch_query(force_target: &QueryCancelTarget, log_context: &str) {
-        match force_target
-            .as_handle()
-            .cancel_interrupt(&crate::db::SessionCancelClaim::owned_outright())
+        match force_target.deliver_graceful_break(&crate::db::SessionCancelClaim::owned_outright())
         {
             Ok(crate::db::SessionCancelDelivery::Delivered) => {}
             // The fetch gave its session back while the `KILL QUERY` was on its
@@ -25494,14 +25495,25 @@ impl SqlEditorWidget {
                             // the session ends.
                             hand_back.end_reach_before_release();
                             Self::discard_mysql_pooled_connection(conn);
-                            if require_existing_session {
-                                return Err("No reusable DB session for this tab.".to_string());
-                            }
+                            // Reported BEFORE either road answers: what this
+                            // session was carrying died with it, and the road
+                            // that REQUIRES the tab's own session — the toolbar
+                            // Commit/Rollback — used to return first, so the
+                            // loss was never said on exactly the button the
+                            // user pressed to keep that work.
                             Self::report_retained_session_lost_with_work(
                                 session_pool_sender,
                                 prior_retained_state,
                                 db_activity,
                             );
+                            if require_existing_session {
+                                // The loss, not the slot state — the same
+                                // answer the stale-take road has always given
+                                // (`retained_session_unreachable_message`).
+                                return Err(SqlEditorWidget::required_session_gone_message(
+                                    prior_retained_state,
+                                ));
+                            }
                             let (held, session_scope) =
                                 Self::acquire_prepared_fresh_mysql_pool_session(
                                     &context,
@@ -25526,6 +25538,17 @@ impl SqlEditorWidget {
                         );
                             hand_back.end_reach_before_release();
                             Self::discard_mysql_pooled_connection(conn);
+                            // Unreachable with work today (the readiness check
+                            // runs its settings only on a session that carries
+                            // none), but stated anyway so the rule is this
+                            // arm's own rather than a fact about its caller:
+                            // a work-carrying session never leaves this
+                            // function unreported.
+                            Self::report_retained_session_lost_with_work(
+                                session_pool_sender,
+                                prior_retained_state,
+                                db_activity,
+                            );
                             if require_existing_session {
                                 return Err(message);
                             }
@@ -25687,6 +25710,15 @@ impl SqlEditorWidget {
                 if require_existing_session {
                     hand_back.end_reach_before_release();
                     Self::discard_mysql_pooled_connection(conn);
+                    // Unreachable with work today (the setup runs no statement
+                    // over a session that carries any), stated for the same
+                    // reason as the readiness-check twin above: a work-carrying
+                    // session never leaves this function unreported.
+                    Self::report_retained_session_lost_with_work(
+                        session_pool_sender,
+                        prior_retained_state,
+                        db_activity,
+                    );
                     return Err(message);
                 }
                 crate::utils::logging::log_warning(
@@ -34095,6 +34127,130 @@ mod query_execution_cleanup_tests {
         ));
     }
 
+    /// The lazy road's twin of the operation watchdog's
+    /// `the_force_tier_waits_for_a_break_that_is_still_on_its_way_to_the_server`.
+    ///
+    /// A lazy fetch's graceful break is delivered by a spawned sender — on the
+    /// MySQL family that thread spends seconds opening a control connection
+    /// before its KILL QUERY can land — while the force watchdog counts a
+    /// deadline that used to start at the REQUEST. So the watchdog could
+    /// escalate to the tier that cannot be taken back (KILL CONNECTION, which
+    /// destroys the tab's own session and the open transaction a plain Cancel
+    /// promised to retain) while the break that costs only the statement was
+    /// still travelling. The escalation is HELD, not cancelled — once per
+    /// publication, bounded by the same grace — and both halves are asserted,
+    /// because a hold that never ends would be a worse defect than the one it
+    /// fixes.
+    #[test]
+    fn the_lazy_force_tier_waits_for_a_break_that_is_still_on_its_way_to_the_server() {
+        let (command_sender, _command_receiver) = mpsc::channel();
+        let (progress_sender, _progress_receiver) = progress_channel();
+        let force_called = Arc::new(AtomicBool::new(false));
+        let lazy_force_target = QueryCancelTarget::empty();
+        lazy_force_target.publish(QueryCancelHandle::Test(force_called.clone()));
+        // The state the MySQL family sits in while its KILL QUERY opens a
+        // control connection: the break claimed, not yet answered.
+        assert_eq!(
+            lazy_force_target.claim_graceful_break(),
+            crate::ui::sql_editor::GracefulBreakClaim::Claimed
+        );
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            index: 3,
+            session_id: 42,
+            operation_id: 42,
+            connection_generation: 7,
+            connection_id: None,
+            db_type: crate::db::DatabaseType::MySQL,
+            sender: command_sender,
+            cancel_handle: Some(lazy_force_target.as_handle()),
+            cancel_requested: Arc::new(AtomicBool::new(true)),
+            retain_session_on_cancel: Arc::new(AtomicBool::new(true)),
+            db_cancel_requested: Arc::new(AtomicBool::new(true)),
+            fetch_in_progress: Arc::new(AtomicBool::new(true)),
+            cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            status_activity: None,
+        })));
+        let grace = Duration::from_millis(150);
+
+        SqlEditorWidget::start_lazy_fetch_cancel_watchdog_with(
+            active.clone(),
+            progress_sender,
+            42,
+            grace,
+        )
+        .expect("lazy fetch cancel watchdog should start");
+
+        // Past the first grace period, inside the second: with the deadline
+        // counted from the request this is where the tear-down landed.
+        std::thread::sleep(grace + Duration::from_millis(100));
+        assert!(
+            !force_called.load(Ordering::Relaxed),
+            "a break still on its way to the server must hold off the tier that cannot be \
+             taken back"
+        );
+
+        // The sender answers. The fetch still has not stopped, so the
+        // escalation the hold postponed must now happen.
+        lazy_force_target.finish_graceful_break();
+        let mut forced = false;
+        for _ in 0..100 {
+            if force_called.load(Ordering::Relaxed) {
+                forced = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            forced,
+            "once the break has answered, work that will not stop is still torn down"
+        );
+    }
+
+    /// A withdrawable target's break progress is a fact about ONE publication.
+    ///
+    /// Publishing resets it — a fresh session has never been asked to stop, and
+    /// a progress that outlived the publication it described would let the
+    /// force tier hold (or skip holding) for a break that was aimed at a
+    /// different session. And with nothing published there is nothing a
+    /// tear-down could be too early for, so neither a claim nor a hold is
+    /// granted.
+    #[test]
+    fn a_lazy_targets_break_progress_belongs_to_its_publication() {
+        use crate::ui::sql_editor::GracefulBreakClaim;
+
+        let target = QueryCancelTarget::empty();
+        assert_eq!(target.claim_graceful_break(), GracefulBreakClaim::NoSession);
+        assert!(!target.hold_force_deadline_for_break_in_flight());
+
+        target.publish(QueryCancelHandle::Test(Arc::new(AtomicBool::new(false))));
+        assert_eq!(target.claim_graceful_break(), GracefulBreakClaim::Claimed);
+        assert_eq!(
+            target.claim_graceful_break(),
+            GracefulBreakClaim::AlreadySent,
+            "one publication's break is claimed once"
+        );
+        // The force deadline holds once for the travelling break, and only
+        // once: a sender that never answers cannot postpone the force tier.
+        assert!(target.hold_force_deadline_for_break_in_flight());
+        assert!(!target.hold_force_deadline_for_break_in_flight());
+
+        // A republish while a break travels: the new session has never been
+        // asked, so nothing is travelling FOR IT — no hold, and its own break
+        // is still claimable.
+        target.publish(QueryCancelHandle::Test(Arc::new(AtomicBool::new(false))));
+        assert!(!target.hold_force_deadline_for_break_in_flight());
+        assert_eq!(target.claim_graceful_break(), GracefulBreakClaim::Claimed);
+        target.finish_graceful_break();
+        assert!(
+            !target.hold_force_deadline_for_break_in_flight(),
+            "a break that has answered holds nothing — escalation is honest from there"
+        );
+
+        target.withdraw();
+        assert_eq!(target.claim_graceful_break(), GracefulBreakClaim::NoSession);
+        assert!(!target.hold_force_deadline_for_break_in_flight());
+    }
+
     #[test]
     fn repeated_lazy_fetch_cancel_starts_only_one_force_watchdog() {
         let (command_sender, command_receiver) = mpsc::channel();
@@ -34277,17 +34433,31 @@ mod query_execution_cleanup_tests {
 
     #[test]
     fn lazy_fetch_db_cancel_uses_short_force_watchdog_timeout() {
+        // This test used to require the 1.2s cap for ANY backend (it built a
+        // handle with `cancel_handle: None` and still expected the cap). That
+        // assertion WAS the defect: the cap encodes a fact about ORACLE THIN's
+        // break mechanics — an in-band break cannot interrupt a fetch that is
+        // blocked in a read, so the force tier must come quickly — and applying
+        // it to the MySQL family made the watchdog KILL CONNECTION the tab's
+        // own session 1.2s after a cancel whose graceful KILL QUERY was still
+        // opening its control connection, whatever grace the user configured.
+        // The intent this test keeps: where the graceful break cannot be
+        // relied on, the short grace applies; everywhere else the CONFIGURED
+        // grace does.
         let (sender, _receiver) = mpsc::channel();
         let db_cancel_requested = Arc::new(AtomicBool::new(true));
+        let lazy_force_target = QueryCancelTarget::empty();
         let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
             index: 3,
             session_id: 42,
             operation_id: 42,
             connection_generation: 7,
             connection_id: None,
-            db_type: crate::db::DatabaseType::Oracle,
+            db_type: crate::db::DatabaseType::MySQL,
             sender,
-            cancel_handle: None,
+            // The production shape: the handle is the fetch's own withdrawable
+            // target, and the backend-concrete handle is what it publishes.
+            cancel_handle: Some(lazy_force_target.as_handle()),
             cancel_requested: Arc::new(AtomicBool::new(true)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(true)),
             db_cancel_requested: db_cancel_requested.clone(),
@@ -34296,21 +34466,34 @@ mod query_execution_cleanup_tests {
             status_activity: None,
         })));
 
+        // Nothing published yet (the MySQL worker publishes once it holds the
+        // session): the configured grace stands.
         assert_eq!(
             SqlEditorWidget::lazy_fetch_cancel_watchdog_timeout_for(
                 &active,
                 42,
                 Duration::from_secs(60),
             ),
-            Duration::from_millis(1_200)
+            Duration::from_secs(60)
         );
+
+        // A published MySQL-family session: KILL QUERY interrupts a blocked
+        // fetch, so the configured grace stands — this is the assertion that
+        // fails against the backend-blind cap.
+        lazy_force_target.publish(QueryCancelHandle::MySql(
+            Box::new(MySqlQueryCancelContext {
+                connection_info: crate::db::ConnectionInfo::default(),
+                connection_id: 7,
+            }),
+            crate::db::CanceledSession::Pooled,
+        ));
         assert_eq!(
             SqlEditorWidget::lazy_fetch_cancel_watchdog_timeout_for(
                 &active,
                 42,
-                Duration::from_millis(500),
+                Duration::from_secs(60),
             ),
-            Duration::from_millis(500)
+            Duration::from_secs(60)
         );
 
         db_cancel_requested.store(false, Ordering::Relaxed);
@@ -34329,6 +34512,46 @@ mod query_execution_cleanup_tests {
                 Duration::from_secs(60),
             ),
             Duration::from_secs(60)
+        );
+
+        // The thin arm cannot be built here (`OracleThinCancelHandle` has no
+        // constructor outside its driver crate), so the half the cap is FOR is
+        // pinned on the source: the per-backend fact answers `true` exactly
+        // for the thin variant, and the grace derivation asks that fact before
+        // it applies the thin cap. Compared whitespace-compacted so a rustfmt
+        // re-wrap cannot break the pin.
+        let compact =
+            |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+        let source = include_str!("mod.rs");
+        let fact = source
+            .find("fn graceful_break_may_not_interrupt_a_blocked_call(&self) -> bool")
+            .expect("the per-backend break fact must exist");
+        let fact_body = compact(&source[fact..source.len().min(fact + 900)]);
+        assert!(
+            fact_body.contains(&compact("QueryCancelHandle::OracleThin(..) => true")),
+            "Oracle thin is the backend whose graceful break cannot interrupt a blocked call"
+        );
+        assert!(
+            fact_body.contains(&compact(
+                "QueryCancelHandle::Oracle(..) | QueryCancelHandle::MySql(..) => false"
+            )),
+            "OCI and the MySQL family have graceful breaks that interrupt, so they keep the configured grace"
+        );
+        let derivation = source
+            .find("fn lazy_fetch_cancel_watchdog_timeout_for(")
+            .expect("the lazy force-grace derivation must exist");
+        let derivation_end = source[derivation..]
+            .find("\n    fn ")
+            .map(|end| derivation + end)
+            .unwrap_or(source.len());
+        let derivation_body = &source[derivation..derivation_end];
+        assert!(
+            derivation_body.contains("graceful_break_may_not_interrupt_a_blocked_call"),
+            "the thin cap must be gated on the per-backend break fact"
+        );
+        assert!(
+            derivation_body.contains("ORACLE_THIN_LAZY_FETCH_DB_CANCEL_FORCE_TIMEOUT"),
+            "the capped arm still uses the thin force grace"
         );
     }
 
