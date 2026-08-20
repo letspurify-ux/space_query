@@ -1293,6 +1293,29 @@ impl std::ops::Deref for OperationActivity {
     }
 }
 
+/// How far the graceful break for ONE published session has got.
+///
+/// THREE states, not two, for the reason [`OperationCancelTarget`] itself has
+/// three: a boolean could only say "a tier has taken responsibility for asking
+/// this session to stop", and the force tier needs the difference between a
+/// break that has been ASKED FOR and one that has ARRIVED. The DB layer's own
+/// watchdog has always had it structurally — `spawn_force_cancel_watchdog`
+/// runs every `interrupt()` to completion and only THEN starts the clock, so
+/// its grace measures time after delivery. The tab road could not, because its
+/// break is sent by a different thread from the one that watches the deadline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GracefulBreakProgress {
+    /// Nothing has asked the session published here to stop.
+    NotAsked,
+    /// A tier has claimed the break and it is on its way to the server. The
+    /// force tier may not act on the strength of "it was asked" while this
+    /// lasts; the grace this session is given starts when the break ANSWERS.
+    Sending,
+    /// The break reached an answer — delivered, withdrawn, or failed. Whatever
+    /// it was, no break is travelling any more, so escalation is honest.
+    Answered,
+}
+
 /// What one tab operation currently has published for a cancel to reach.
 ///
 /// THREE answers, not two. `Option<QueryCancelHandle>` could only say "there is
@@ -1313,7 +1336,7 @@ pub(crate) enum OperationCancelTarget {
     /// This session, and which kind it is.
     Published {
         handle: QueryCancelHandle,
-        /// Whether a tier has already asked THIS session to stop.
+        /// How far the graceful break for THIS session has got.
         ///
         /// Per publication, not per operation, and that is what makes it
         /// right: one operation publishes several sessions — the MySQL family
@@ -1330,7 +1353,7 @@ pub(crate) enum OperationCancelTarget {
         /// and the first thing that reached it was the tear-down. The lazy
         /// fetch road never had this: its handle exists from the moment the
         /// fetch is registered, so its watchdog always breaks before it forces.
-        graceful_break_sent: bool,
+        graceful_break: GracefulBreakProgress,
     },
     /// The work handed the session back. Nothing may reach it any more.
     Withdrawn,
@@ -1342,7 +1365,7 @@ impl OperationCancelTarget {
     fn newly_published(handle: QueryCancelHandle) -> Self {
         Self::Published {
             handle,
-            graceful_break_sent: false,
+            graceful_break: GracefulBreakProgress::NotAsked,
         }
     }
 
@@ -1366,7 +1389,18 @@ impl OperationCancelTarget {
     fn published_after_graceful_break(handle: QueryCancelHandle) -> Self {
         Self::Published {
             handle,
-            graceful_break_sent: true,
+            graceful_break: GracefulBreakProgress::Answered,
+        }
+    }
+
+    /// A publication whose break another thread has CLAIMED and is still
+    /// delivering — the state the MySQL family sits in for as long as its
+    /// cancel takes to open a control connection.
+    #[cfg(test)]
+    fn published_while_a_break_is_travelling(handle: QueryCancelHandle) -> Self {
+        Self::Published {
+            handle,
+            graceful_break: GracefulBreakProgress::Sending,
         }
     }
 
@@ -1376,7 +1410,32 @@ impl OperationCancelTarget {
         matches!(
             self,
             Self::Published {
-                graceful_break_sent: false,
+                graceful_break: GracefulBreakProgress::NotAsked,
+                ..
+            }
+        )
+    }
+
+    /// Whether a break for the session published here is ON ITS WAY to the
+    /// server right now.
+    ///
+    /// The force tier's second precondition, and the one the app used to be
+    /// unable to state. `needs_graceful_break` answers "was this session ever
+    /// ASKED", which the claim makes true the instant a tier takes
+    /// responsibility — *before* the break has gone anywhere. On both Oracle
+    /// drivers the two are the same moment: the break acts on a handle the app
+    /// already owns. On the MySQL family the sender must first open a CONTROL
+    /// CONNECTION (`MYSQL_CANCEL_IO_TIMEOUT`, seconds), and in that window the
+    /// watchdog saw "asked" and escalated to the tier that cannot be taken
+    /// back — issuing KILL CONNECTION, which destroys the tab's own session and
+    /// its open transaction, while the KILL QUERY that would have cost only the
+    /// statement was still being connected. The two tiers are supposed to be
+    /// ordered in EFFECT, not merely in intent.
+    fn graceful_break_in_flight(&self) -> bool {
+        matches!(
+            self,
+            Self::Published {
+                graceful_break: GracefulBreakProgress::Sending,
                 ..
             }
         )
@@ -3128,7 +3187,6 @@ pub struct SqlEditorWidget {
     undo_redo_state: Arc<Mutex<WordUndoRedoState>>,
     preferred_insert_position: Arc<Mutex<Option<i32>>>,
     lazy_fetch_batch_size: Arc<Mutex<usize>>,
-    cancel_timeout: Arc<Mutex<Duration>>,
     /// Executions handed to this editor that are waiting for a previous lazy
     /// fetch to be cancelled before they can start.
     ///
@@ -4316,9 +4374,6 @@ impl SqlEditorWidget {
         let lazy_fetch_batch_size = Arc::new(Mutex::new(
             editor_config.normalized_lazy_fetch_batch_size() as usize,
         ));
-        let cancel_timeout = Arc::new(Mutex::new(Duration::from_secs(
-            editor_config.normalized_cancel_timeout_seconds() as u64,
-        )));
         let deferred_executions = DeferredExecutions::default();
         let display_metrics_ready = Arc::new(AtomicBool::new(true));
         let snippet_session = Arc::new(Mutex::new(None));
@@ -4384,7 +4439,6 @@ impl SqlEditorWidget {
             undo_redo_state,
             preferred_insert_position,
             lazy_fetch_batch_size,
-            cancel_timeout,
             deferred_executions,
             display_metrics_ready,
             snippet_session,
@@ -4829,22 +4883,8 @@ impl SqlEditorWidget {
         AppConfig::clamp_lazy_fetch_batch_size(size as u32) as usize
     }
 
-    pub fn set_cancel_timeout_seconds(&self, seconds: u32) {
-        let seconds = AppConfig::clamp_cancel_timeout_seconds(seconds) as u64;
-        *self
-            .cancel_timeout
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Duration::from_secs(seconds);
-    }
-
     fn cancel_timeout(&self) -> Duration {
-        let timeout = *self
-            .cancel_timeout
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Duration::from_secs(
-            AppConfig::clamp_cancel_timeout_seconds(timeout.as_secs() as u32) as u64,
-        )
+        AppConfig::runtime_cancel_timeout()
     }
 
     pub fn request_lazy_fetch(&self, session_id: u64, request: LazyFetchRequest) -> bool {
@@ -7287,6 +7327,12 @@ impl SqlEditorWidget {
                         SqlEditorWidget::panic_payload_to_string(payload.as_ref())
                     ))
                 });
+                // The break has stopped travelling, whatever it answered. Until
+                // this lands the watchdog holds its force deadline open: on the
+                // MySQL family everything above is a control connection being
+                // opened, and escalating during it destroys the session a KILL
+                // QUERY was still on its way to spare.
+                SqlEditorWidget::finish_graceful_break(&current_query_cancel_handle);
                 if interrupt_result.is_err()
                     && (!load_mutex_bool(&cancel_flag)
                         || !SqlEditorWidget::is_query_running_flag(&query_running)
@@ -7438,6 +7484,11 @@ impl SqlEditorWidget {
                 // keeps meaning what it did.
                 let mut missing_context_abandon_deadline: Option<Instant> = None;
                 let mut logged_missing_context = false;
+                // Whether this watchdog has already held its deadline open for
+                // a break another thread was still delivering. See the use
+                // below: the hold is worth one grace period, not an unbounded
+                // one.
+                let mut held_for_a_break_in_flight = false;
                 loop {
                     if !load_mutex_bool(&cancel_flag)
                         || !Self::is_query_running_flag(&query_running)
@@ -7510,11 +7561,40 @@ impl SqlEditorWidget {
                                 &format!("Graceful cancel failed from the watchdog: {message}"),
                             ),
                         }
+                        // This break has stopped travelling, exactly as the
+                        // cancel thread records its own.
+                        Self::finish_graceful_break(&current_query_cancel_handle);
                         // This session has now been asked. Give it the same
                         // grace every other session gets before the tier that
                         // cannot be taken back.
                         force_deadline = Instant::now() + timeout;
                         missing_context_abandon_deadline = None;
+                        held_for_a_break_in_flight = false;
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+
+                    // A break the OTHER thread claimed is still on its way to
+                    // the server. Escalating now would make the two tiers
+                    // ordered in intent only: on the MySQL family the graceful
+                    // sender is opening a control connection (seconds), and the
+                    // tear-down below would KILL CONNECTION — destroying this
+                    // tab's own session and its open transaction — while the
+                    // KILL QUERY that costs only the statement was still being
+                    // connected. Both Oracle drivers break a handle the app
+                    // already owns, so they never sit in this state; holding
+                    // here is what makes the two tiers mean the same thing on
+                    // all four backends.
+                    //
+                    // ONCE per publication, and bounded by the same `timeout`
+                    // every other grace uses: a sender that never answers must
+                    // not be able to postpone the tier that exists for work
+                    // which will not stop. `held_for_a_break_in_flight` is
+                    // cleared whenever this watchdog sends a break itself,
+                    // which is the only way a new publication reaches here.
+                    if target.graceful_break_in_flight() && !held_for_a_break_in_flight {
+                        held_for_a_break_in_flight = true;
+                        force_deadline = Instant::now() + timeout;
                         thread::sleep(Duration::from_millis(100));
                         continue;
                     }
@@ -7820,20 +7900,43 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match &mut *guard {
-            OperationCancelTarget::Published {
-                graceful_break_sent,
-                ..
-            } => {
-                if *graceful_break_sent {
-                    GracefulBreakClaim::AlreadySent
-                } else {
-                    *graceful_break_sent = true;
+            OperationCancelTarget::Published { graceful_break, .. } => match graceful_break {
+                GracefulBreakProgress::NotAsked => {
+                    *graceful_break = GracefulBreakProgress::Sending;
                     GracefulBreakClaim::Claimed
                 }
-            }
+                GracefulBreakProgress::Sending | GracefulBreakProgress::Answered => {
+                    GracefulBreakClaim::AlreadySent
+                }
+            },
             OperationCancelTarget::NotPublished | OperationCancelTarget::Withdrawn => {
                 GracefulBreakClaim::NoSession
             }
+        }
+    }
+
+    /// Record that the break this thread claimed has ANSWERED — delivered,
+    /// withdrawn or failed — so the force tier's grace can start from here.
+    ///
+    /// **Only `Sending` becomes `Answered`.** A hand-back and a fresh
+    /// publication can both land while a break is travelling, and the new
+    /// publication starts at `NotAsked`; marking THAT one answered would tell
+    /// the force tier a session had been asked to stop when nothing had ever
+    /// reached it — the hole round 8 opened this state to close. The narrow
+    /// transition is what makes "answered" a fact about the publication the
+    /// sender actually acted on.
+    ///
+    /// Every sender calls it, both tiers' roads alike: whoever claims, answers.
+    fn finish_graceful_break(current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>) {
+        let mut guard = current_query_cancel_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let OperationCancelTarget::Published {
+            graceful_break: graceful_break @ GracefulBreakProgress::Sending,
+            ..
+        } = &mut *guard
+        {
+            *graceful_break = GracefulBreakProgress::Answered;
         }
     }
 
@@ -10557,11 +10660,12 @@ mod cancel_watchdog_tests {
             matches!(
                 *current_query_cancel_handle.lock().unwrap(),
                 OperationCancelTarget::Published {
-                    graceful_break_sent: true,
+                    graceful_break: GracefulBreakProgress::Answered,
                     ..
                 }
             ),
-            "the publication records that it has been asked, so nothing asks twice"
+            "the publication records that its break ANSWERED, so nothing asks twice and the \
+             force tier's grace starts from a break that actually landed"
         );
         assert!(
             progress_receiver
@@ -10572,6 +10676,87 @@ mod cancel_watchdog_tests {
         );
 
         // The operation stops; the watchdog leaves without forcing.
+        store_mutex_bool(&cancel_flag, false);
+        store_mutex_bool(&query_running, false);
+    }
+
+    /// The force tier waits for a break that is still TRAVELLING, not merely
+    /// for one that was asked for.
+    ///
+    /// `claim_graceful_break` takes responsibility for the break BEFORE the
+    /// send, because the two tiers must not both send one. On both Oracle
+    /// drivers the send that follows acts on a handle the app already owns, so
+    /// claim and delivery are the same moment. On the MySQL family it opens a
+    /// CONTROL CONNECTION first (`MYSQL_CANCEL_IO_TIMEOUT`, seconds), and the
+    /// watchdog used to read the claim as "this session has been asked" and
+    /// escalate — issuing KILL CONNECTION, which destroys the tab's own session
+    /// and its open transaction, while the KILL QUERY that costs only the
+    /// statement had not been sent yet. Two tiers ordered in intent only.
+    ///
+    /// The escalation is HELD, not cancelled: once the break answers, the
+    /// session that will not stop is still torn down. Both halves are asserted,
+    /// because a hold that never ends would be a worse defect than the one it
+    /// fixes.
+    #[test]
+    fn the_force_tier_waits_for_a_break_that_is_still_on_its_way_to_the_server() {
+        let broken = Arc::new(AtomicBool::new(false));
+        let current_query_cancel_handle = Arc::new(Mutex::new(
+            OperationCancelTarget::published_while_a_break_is_travelling(QueryCancelHandle::Test(
+                broken.clone(),
+            )),
+        ));
+        let current_operation_id = Arc::new(AtomicU64::new(42));
+        let (progress_sender, _progress_receiver) = mpsc::channel();
+        let progress_sender = QueryProgressSender::new(progress_sender);
+        let cancel_flag = Arc::new(Mutex::new(true));
+        let query_running = Arc::new(Mutex::new(true));
+        let token = QueryOperationToken {
+            tab_id: 7,
+            editor_id: 11,
+            operation_id: 42,
+            connection_generation: 0,
+        };
+        let grace = Duration::from_millis(150);
+
+        SqlEditorWidget::start_query_cancel_watchdog(
+            current_query_cancel_handle.clone(),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            current_operation_id.clone(),
+            cancel_operation_metadata(42, 0),
+            Arc::new(Mutex::new(crate::db::session_policy::SqlKind::SelectLike)),
+            Arc::new(Mutex::new(false)),
+            progress_sender,
+            cancel_flag.clone(),
+            query_running.clone(),
+            token,
+            42,
+            0,
+            true,
+            grace,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .expect("query cancel watchdog should start");
+
+        // Past the first grace period, inside the second: with the claim read
+        // as delivery this is where the tear-down landed.
+        thread::sleep(grace + Duration::from_millis(100));
+        assert!(
+            !broken.load(Ordering::Relaxed),
+            "a break still on its way to the server must hold off the tier that cannot be \
+             taken back"
+        );
+
+        // The sender answers. The session still has not stopped, so the
+        // escalation the hold postponed must now happen.
+        SqlEditorWidget::finish_graceful_break(&current_query_cancel_handle);
+        assert!(
+            wait_for_flag(broken.as_ref()),
+            "once the break has answered, work that will not stop is still torn down"
+        );
+
         store_mutex_bool(&cancel_flag, false);
         store_mutex_bool(&query_running, false);
     }

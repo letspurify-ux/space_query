@@ -2819,12 +2819,7 @@ impl AppState {
     }
 
     fn configured_cancel_timeout(&self) -> Duration {
-        let seconds = self
-            .config
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .normalized_cancel_timeout_seconds();
-        Duration::from_secs(seconds as u64)
+        AppConfig::runtime_cancel_timeout()
     }
 
     fn has_cancelable_query_activity(&self) -> bool {
@@ -9382,19 +9377,18 @@ impl MainWindow {
     }
 
     fn apply_lazy_fetch_settings(state: &mut AppState) {
-        let (
-            lazy_fetch_batch_size,
-            cancel_timeout_seconds,
-            context_window_kib,
-            intellisense_popup_delay_ms,
-        ) = {
+        // The cancel timeout is deliberately NOT among these. It is read
+        // from the process-local publication at the moment a cancel needs it
+        // (`AppConfig::runtime_cancel_timeout`), so there is nothing to push:
+        // a fan-out reaches only the widgets that exist when it runs, and the
+        // object-browser cards are built per tab and per preview long after.
+        let (lazy_fetch_batch_size, context_window_kib, intellisense_popup_delay_ms) = {
             let config = state
                 .config
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             (
                 config.normalized_lazy_fetch_batch_size(),
-                config.normalized_cancel_timeout_seconds(),
                 config.normalized_intellisense_context_window_kib(),
                 config.normalized_intellisense_popup_delay_ms(),
             )
@@ -9402,8 +9396,6 @@ impl MainWindow {
         for tab in &state.editor_tabs {
             tab.sql_editor
                 .set_lazy_fetch_batch_size(lazy_fetch_batch_size);
-            tab.sql_editor
-                .set_cancel_timeout_seconds(cancel_timeout_seconds);
             tab.sql_editor
                 .set_intellisense_context_window_kib(context_window_kib);
             tab.sql_editor
@@ -9414,16 +9406,10 @@ impl MainWindow {
             .set_lazy_fetch_batch_size(lazy_fetch_batch_size);
         state
             .sql_editor
-            .set_cancel_timeout_seconds(cancel_timeout_seconds);
-        state
-            .sql_editor
             .set_intellisense_context_window_kib(context_window_kib);
         state
             .sql_editor
             .set_intellisense_popup_delay_ms(intellisense_popup_delay_ms);
-        state
-            .object_browser
-            .set_cancel_timeout_seconds(cancel_timeout_seconds);
     }
 
     fn persist_settings(
@@ -9450,9 +9436,22 @@ impl MainWindow {
             config.sql_format_right_margin = settings.sql_format_right_margin;
             config.query_history_limit = settings.query_history_limit;
             config.app_log_limit = settings.app_log_limit;
+            // PUBLISHED BEFORE IT IS PERSISTED, and not only by `save`.
+            //
+            // Every runtime reader of a setting -- the cancel timeout's two
+            // tiers, the history and log limits -- reads the process-local
+            // publication. `save` republishes it too, but only when the DISK
+            // WRITE SUCCEEDED, and this function deliberately applies the
+            // user's settings either way (see the release-error comment
+            // below). Leaving the publication to `save` therefore made a
+            // failed write mean "the widgets that exist take the new value and
+            // everything that reads the publication keeps the old one" -- the
+            // settings half-applied, in the direction nobody can see.
+            // Publishing is what the RUNNING app obeys; persisting is what the
+            // next run obeys, and they are two questions.
+            AppConfig::update_runtime(&config);
             config.save().map_err(|err| err.to_string())
         };
-        // `save` republishes the runtime config, so both writers read the new limits.
         crate::ui::query_history::apply_history_limit();
         crate::utils::logging::apply_log_limit();
         // Releasing the old pool's sessions can fail on a tab that still holds

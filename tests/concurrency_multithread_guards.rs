@@ -7978,7 +7978,10 @@ fn the_transaction_option_indicators_settle_themselves() {
     let persist = main_window
         .find("fn persist_settings(")
         .expect("persist_settings should exist");
-    let persist_body = slice_from(&main_window, persist, 3000);
+    // Bounded by the FUNCTION, not by a byte count: a comment added inside it
+    // used to push what this asserts out of the window, and the guard then
+    // failed for a reason that had nothing to do with its rule.
+    let persist_body = slice_to_end_of_fn(&main_window, persist);
     let release = persist_body
         .find("release_all_resolved_pooled_db_sessions()")
         .expect("a pool-size change must release the old pool's sessions");
@@ -10756,16 +10759,20 @@ fn the_force_tier_is_never_the_first_thing_a_session_sees() {
     // operation publishes several sessions (the MySQL family re-acquires per
     // statement, a script CONNECT replaces it mid-batch), so each has to be
     // asked on its own.
+    // THREE states, not two: see
+    // `the_force_tier_waits_for_a_break_it_has_not_seen_answered`. The rule
+    // this guard states is unchanged -- a publication records what has asked it
+    // to stop -- but a bool could not tell "asked for" from "arrived".
     assert!(
-        editor.contains("graceful_break_sent: bool,"),
-        "a published session must record whether anything has asked it to stop"
+        editor.contains("graceful_break: GracefulBreakProgress,"),
+        "a published session must record how far the break that was asked for has got"
     );
     let claim = editor
         .find("fn claim_graceful_break(")
         .expect("the claim on a publication should exist");
     let claim_body = slice_to_end_of_fn(&editor, claim);
     assert!(
-        claim_body.contains("*graceful_break_sent = true;"),
+        claim_body.contains("*graceful_break = GracefulBreakProgress::Sending;"),
         "the claim must be taken under the slot lock, so exactly one tier sends the break: \
          {claim_body}"
     );
@@ -10799,6 +10806,149 @@ fn the_force_tier_is_never_the_first_thing_a_session_sees() {
         watchdog_body.contains("force_deadline = Instant::now() + timeout;"),
         "a session asked to stop late gets the same grace every other session gets: \
          {watchdog_body}"
+    );
+}
+
+/// The two tiers are ordered in EFFECT, not merely in intent: the force tier
+/// does not act on a graceful break that is still travelling.
+///
+/// The tab road's break is sent by a different thread from the one that watches
+/// the deadline, and the claim that keeps them from both sending is taken
+/// BEFORE the send. On both Oracle drivers that gap is nothing -- the break
+/// acts on a handle the app already owns -- but the MySQL family must open a
+/// control connection first (`MYSQL_CANCEL_IO_TIMEOUT`, seconds), and the
+/// watchdog read the claim as delivery and escalated inside it: KILL CONNECTION
+/// destroying the tab's own session and its open transaction while the KILL
+/// QUERY that costs only the statement had not been sent. The DB layer's
+/// watchdog has the property structurally -- it runs every `interrupt()` to
+/// completion and only THEN starts its clock -- which is the shape this makes
+/// true of the tab road too, so a cancel means the same thing on all four
+/// backends.
+#[test]
+fn the_force_tier_waits_for_a_break_it_has_not_seen_answered() {
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+
+    // Only the publication the sender ACTED ON may be marked answered: a
+    // hand-back plus a fresh publication can land while a break travels, and
+    // that new session has never been asked at all.
+    let finish = editor
+        .find("fn finish_graceful_break(")
+        .expect("a sender must be able to record that its break has answered");
+    let finish_body = slice_to_end_of_fn(&editor, finish);
+    assert!(
+        finish_body.contains("graceful_break @ GracefulBreakProgress::Sending"),
+        "only a break that was travelling becomes answered, never a publication nothing has \
+         asked: {finish_body}"
+    );
+
+    // BOTH senders answer. Whoever claims, answers -- or the hold below would
+    // never end for a break that failed or was withdrawn. Counted in the
+    // PRODUCTION half only: the unit test that drives the hold answers the
+    // break itself, and a guard must not be satisfied by a test.
+    let production = editor
+        .find("\n#[cfg(test)]\n")
+        .map(|end| &editor[..end])
+        .unwrap_or(editor.as_str());
+    assert_eq!(
+        production
+            .matches("finish_graceful_break(&current_query_cancel_handle)")
+            .count(),
+        2,
+        "the cancel thread and the watchdog both record that their break stopped travelling"
+    );
+
+    let watchdog = editor
+        .find("fn start_query_cancel_watchdog(")
+        .expect("the tab's force tier should exist");
+    let watchdog_body = slice_to_end_of_fn(&editor, watchdog);
+    let hold = watchdog_body
+        .find("if target.graceful_break_in_flight() && !held_for_a_break_in_flight {")
+        .expect("the watchdog must hold off while a break is on its way to the server");
+    let force = watchdog_body
+        .find("outcome: QueryCancelOutcome::ForceStarted,")
+        .expect("the watchdog must still force");
+    assert!(
+        hold < force,
+        "and it must ask that BEFORE the tear-down, not after: {watchdog_body}"
+    );
+    // Bounded: a sender that never answers must not postpone the tier that
+    // exists for work which will not stop.
+    assert!(
+        watchdog_body.contains("held_for_a_break_in_flight = true;")
+            && watchdog_body.contains("held_for_a_break_in_flight = false;"),
+        "the hold is worth one grace period per publication, not an unbounded one: \
+         {watchdog_body}"
+    );
+}
+
+/// The cancel timeout the two tiers obey is ONE value, read where it is used.
+///
+/// It used to be four: the config, the process-local publication, and a private
+/// `Arc<Mutex<Duration>>` inside every query editor and every object-browser
+/// card, kept in step by a fan-out from the settings dialog. A fan-out reaches
+/// only the widgets that EXIST when it runs, and browser cards are built per
+/// tab and per preview long afterwards (`create_browser_entry`), so theirs
+/// stayed at the compiled-in default: their metadata cancels forced on a grace
+/// the user never chose, while the query tabs used the configured one. A value
+/// that has to be pushed to each holder is a value that is wrong for every
+/// holder created after the push.
+#[test]
+fn the_cancel_timeout_is_one_value_that_nothing_keeps_a_copy_of() {
+    for path in [
+        "src/ui/sql_editor/mod.rs",
+        "src/ui/object_browser.rs",
+        "src/ui/main_window.rs",
+    ] {
+        let source = read_source(path);
+        assert!(
+            !source.contains("cancel_timeout: Arc<Mutex<Duration>>"),
+            "{path} must not keep its own copy of the cancel timeout"
+        );
+        assert!(
+            !source.contains("fn set_cancel_timeout_seconds("),
+            "{path} must not offer a setter for it either: the pushing is what went wrong"
+        );
+    }
+
+    // Every reader asks the one place, and that place is the publication --
+    // not `AppState`'s config, which the cancel roads' watchdog threads must
+    // not reach for.
+    let config = read_source("src/utils/config.rs");
+    let source = config
+        .find("pub fn runtime_cancel_timeout() -> Duration {")
+        .expect("the one answer should exist");
+    let source_body = slice_to_end_of_fn(&config, source);
+    assert!(
+        source_body.contains("normalized_cancel_timeout_seconds()"),
+        "and it must be clamped like every other reading of it: {source_body}"
+    );
+    for (path, readers) in [
+        ("src/ui/sql_editor/mod.rs", 1),
+        ("src/ui/object_browser.rs", 1),
+        ("src/ui/main_window.rs", 1),
+    ] {
+        let source = read_source(path);
+        assert_eq!(
+            source
+                .matches("AppConfig::runtime_cancel_timeout()")
+                .count(),
+            readers,
+            "{path} reads the one answer in one place"
+        );
+    }
+
+    // Publishing is what the RUNNING app obeys and persisting is what the next
+    // run obeys: a failed disk write must not leave them disagreeing.
+    let main_window = read_source("src/ui/main_window.rs");
+    let publish = main_window
+        .find("AppConfig::update_runtime(&config);")
+        .expect("the settings road must publish what the running app obeys");
+    let save = main_window[publish..]
+        .find("config.save().map_err(|err| err.to_string())")
+        .expect("and then persist it");
+    assert!(
+        save > 0,
+        "published before persisted, so a disk failure cannot half-apply the settings"
     );
 }
 

@@ -845,9 +845,6 @@ pub struct ObjectBrowserWidget {
     /// that doing it for every hidden card the moment a load lands freezes
     /// the UI, and nothing can see the tree until the card is shown anyway.
     tree_rebuild_pending: Arc<AtomicBool>,
-    /// How long a metadata cancel waits for the graceful break before forcing
-    /// the session closed. Same user setting as the query cancel timeout.
-    cancel_timeout: Arc<Mutex<Duration>>,
     poll_lifecycle: Arc<()>,
     refresh_request_sender: Sender<RefreshRequest>,
     action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
@@ -939,9 +936,6 @@ impl ObjectBrowserWidget {
         let in_flight_metadata_refresh = Arc::new(Mutex::new(None));
         let catalog = CardCatalogState::new();
         let tree_rebuild_pending = Arc::new(AtomicBool::new(false));
-        let cancel_timeout = Arc::new(Mutex::new(Duration::from_secs(
-            crate::utils::config::DEFAULT_CANCEL_TIMEOUT_SECONDS as u64,
-        )));
         let poll_lifecycle = Arc::new(());
 
         let (refresh_sender, refresh_receiver) = std::sync::mpsc::channel::<RefreshEvent>();
@@ -977,7 +971,6 @@ impl ObjectBrowserWidget {
             in_flight_metadata_refresh,
             catalog,
             tree_rebuild_pending,
-            cancel_timeout,
             poll_lifecycle,
             sql_callback,
             status_callback,
@@ -7640,19 +7633,8 @@ impl ObjectBrowserWidget {
         true
     }
 
-    pub fn set_cancel_timeout_seconds(&self, seconds: u32) {
-        let seconds = crate::utils::config::AppConfig::clamp_cancel_timeout_seconds(seconds);
-        *self
-            .cancel_timeout
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Duration::from_secs(seconds as u64);
-    }
-
     fn cancel_timeout(&self) -> Duration {
-        *self
-            .cancel_timeout
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::utils::config::AppConfig::runtime_cancel_timeout()
     }
 
     /// Drop the record of a refresh that the activity registry already retired,
@@ -11038,12 +11020,6 @@ impl MultiObjectBrowserWidget {
             .fold(false, |cancelled, mut browser| {
                 browser.cancel_metadata_refresh() || cancelled
             })
-    }
-
-    pub fn set_cancel_timeout_seconds(&self, seconds: u32) {
-        for browser in self.browsers() {
-            browser.set_cancel_timeout_seconds(seconds);
-        }
     }
 
     pub fn refresh_with_context(&mut self, context: crate::db::DbPoolSessionContext) -> bool {

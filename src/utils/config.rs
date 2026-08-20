@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -227,6 +228,35 @@ impl AppConfig {
 
     pub fn normalized_cancel_timeout_seconds(&self) -> u32 {
         Self::clamp_cancel_timeout_seconds(self.cancel_timeout_seconds)
+    }
+
+    /// How long a cancel waits for the graceful break before the tier that
+    /// cannot be taken back. **The one answer**, asked by every road that
+    /// cancels: the query tab's two tiers, the object-browser cards' metadata
+    /// cancels, the stale sweep and every session-ending action.
+    ///
+    /// It used to be four answers. Besides the config itself, the query editor
+    /// and every object-browser card kept a private `Arc<Mutex<Duration>>`,
+    /// synchronised by a fan-out from the settings dialog — which by
+    /// construction reaches only the widgets that already EXIST. Cards are
+    /// built per tab and per preview, long after that dialog has been and gone
+    /// (`create_browser_entry`), so theirs stayed at the compiled-in default
+    /// and their metadata cancels forced on a grace the user never chose. A
+    /// value that must be pushed to each holder is a value that is wrong for
+    /// every holder created after the push, so there is no holder any more.
+    ///
+    /// Read from the process-local publication rather than from `AppState`'s
+    /// config, for the same reason as [`Self::runtime_query_history_limit`]:
+    /// the cancel roads run on watchdog threads that must not reach for the UI
+    /// state's lock, and only one u32 is needed.
+    pub fn runtime_cancel_timeout() -> Duration {
+        Duration::from_secs(
+            RUNTIME_CONFIG
+                .get_or_init(|| RwLock::new(Self::new()))
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .normalized_cancel_timeout_seconds() as u64,
+        )
     }
 
     pub fn clamp_sql_format_right_margin(margin: u32) -> u32 {
