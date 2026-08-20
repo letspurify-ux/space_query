@@ -3490,26 +3490,11 @@ impl AppState {
             QueryProgress::CancelOutcome {
                 token: inner_token, ..
             } => return *inner_token == token,
-            // Not a report of PROGRESS but of something that already happened
-            // on the tab's own session: a `USE` or `ALTER SESSION SET
-            // CURRENT_SCHEMA` moved it, and the screen has to follow whether or
-            // not the operation was abandoned afterwards. Terminate enqueues
-            // `OperationAbandoned` from the UI thread while the worker enqueues
-            // this from its own, so whichever won that race decided whether the
-            // tab's card kept naming a schema its session had already left —
-            // while the next statement's scope assertion moved the user's open
-            // transaction back to it.
-            //
-            // Abandoned is therefore not stale. SUPERSEDED is: a force-cancelled
-            // batch keeps unwinding while the NEXT execution owns the tab, and
-            // that execution's session is the one the tab is in. Its own
-            // notices describe where the tab really is, and letting the dead
-            // batch's notice land after them named a schema this session had
-            // never been in — which the next statement's assertion would then
-            // make true, carrying the user's open transaction into it. The
-            // worker half of the same rule is
-            // `SqlEditorWidget::record_batch_scope_on_tab_binding`.
-            QueryProgress::ScopeChangedNotice { .. } => {
+            _ => {}
+        }
+        match tab_fact_delivery(progress) {
+            TabFactDelivery::FollowsTheOperation => {}
+            TabFactDelivery::UnlessSuperseded => {
                 let (current_operation_id, last_completed_operation_id) =
                     editor.operation_lifecycle_ids();
                 return !query_operation_was_superseded(
@@ -3518,7 +3503,7 @@ impl AppState {
                     last_completed_operation_id,
                 );
             }
-            _ => {}
+            TabFactDelivery::Always => return true,
         }
         if self.abandoned_query_operations.contains(&token) {
             return false;
@@ -5218,6 +5203,79 @@ fn unregistered_lazy_fetch_session_matches_context(
 /// actions and lazy cursors, so "greater" means "later" across all of them.
 /// Both ids are asked because an execution that has already finished leaves
 /// `current_operation_id` at 0 and only `last_completed_operation_id` behind.
+/// How an event's delivery is decided once its operation is no longer the
+/// tab's — because most events are the OPERATION's progress and some are facts
+/// about the TAB that outlive it.
+///
+/// The distinction is not cosmetic. A force-cancelled batch is ABANDONED rather
+/// than joined: the tab is published idle while the worker is still unwinding,
+/// so the last things such a worker says arrive after its operation has been
+/// abandoned — and everything an abandoned operation says is dropped. That is
+/// right for progress (the statement never finished, the rows are not this
+/// tab's any more) and wrong for anything the worker is REPORTING about the
+/// tab's own session, which already happened and which nothing else will ever
+/// say. Both exemptions below were found the same way, one round apart, so the
+/// rule lives here rather than as two arms an inline match happened to grow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabFactDelivery {
+    /// Ordinary progress: the operation's own currency decides.
+    FollowsTheOperation,
+    /// It already happened on the tab's session, so being abandoned does not
+    /// make it stale — but a LATER execution's own answer replaces it.
+    UnlessSuperseded,
+    /// It already happened and nothing later can answer it, so it is delivered
+    /// for as long as the tab and editor are the ones it names.
+    Always,
+}
+
+fn tab_fact_delivery(progress: &QueryProgress) -> TabFactDelivery {
+    match progress {
+        // A `USE` or `ALTER SESSION SET CURRENT_SCHEMA` moved the tab's own
+        // session, and the screen has to follow whether or not the operation
+        // was abandoned afterwards: terminate enqueues `OperationAbandoned`
+        // from the UI thread while the worker enqueues this from its own, so
+        // whichever won that race decided whether the tab's card kept naming a
+        // schema its session had already left — while the next statement's
+        // scope assertion moved the user's open transaction back to it.
+        //
+        // SUPERSEDED is stale, though: a force-cancelled batch keeps unwinding
+        // while the NEXT execution owns the tab, and that execution's session
+        // is the one the tab is in. Its own notices describe where the tab
+        // really is, and letting the dead batch's notice land after them named
+        // a schema this session had never been in. The worker half of the same
+        // rule is `SqlEditorWidget::record_batch_scope_on_tab_binding`.
+        QueryProgress::ScopeChangedNotice { .. } => TabFactDelivery::UnlessSuperseded,
+        // The tab's other two per-tab settings, and the same fact in the same
+        // shape: the user's own `SET AUTOCOMMIT` / `SET SESSION TRANSACTION`
+        // succeeded on this tab's session, and the pin the worker moved for it
+        // asks exactly this question
+        // (`crate::db::TabOperationOwnership::may_state_a_tab_fact`). They used
+        // to follow the operation while the scope did not, so a force-cancelled
+        // batch left the three disagreeing: its `USE` reached the tab (the
+        // window wrote the binding itself) while its `SET AUTOCOMMIT` did not
+        // reach the menu — and after the pins got the same rule as the scope,
+        // dropping these would have left the pin moved and the screen showing
+        // the old value with nothing to correct it.
+        QueryProgress::AutoCommitChanged { .. } | QueryProgress::TransactionModeChanged { .. } => {
+            TabFactDelivery::UnlessSuperseded
+        }
+        // The tab's DB session went away with the user's uncommitted work in
+        // it. It is discovered by the hand-back door, which a force-cancelled
+        // batch reaches only AFTER the tab has been published idle and its
+        // operation abandoned — so as an ordinary message this was dropped
+        // every time it mattered, and the door's own promise ("a session with
+        // work never disappears in silence") reached nothing but the log.
+        //
+        // Supersession does not make it stale either, and that is the
+        // difference from the scope: a newer execution's session says nothing
+        // about the work the older one's session took with it, so there is no
+        // later answer to prefer. The tab and editor identity is the whole
+        // test — the work was this tab's however far it has since moved on.
+        QueryProgress::RetainedSessionLostWithWork { .. } => TabFactDelivery::Always,
+        _ => TabFactDelivery::FollowsTheOperation,
+    }
+}
+
 fn query_operation_was_superseded(
     token: QueryOperationToken,
     current_operation_id: u64,
@@ -5700,6 +5758,7 @@ pub(crate) fn result_pane_routes_for_progress_with_script_context(
             ResultMessageKind::Info => vec![ResultPaneRoute::MessagesInfo],
             ResultMessageKind::Error => vec![ResultPaneRoute::MessagesErrors],
         },
+        QueryProgress::RetainedSessionLostWithWork { .. } => vec![ResultPaneRoute::MessagesErrors],
         QueryProgress::ExplainPlanOutput { .. } => vec![ResultPaneRoute::DataGrid],
         QueryProgress::StatementFinished { result, .. } => statement_finished_result_routes(
             result,
@@ -12303,6 +12362,16 @@ impl MainWindow {
                         result_tabs.select_messages_info();
                     }
                 }
+                QueryProgress::RetainedSessionLostWithWork { lines } => {
+                    // Shown exactly like an error message — it IS one for the
+                    // user — but it arrives through its own variant so the
+                    // abandoned-operation filter cannot drop it. See the
+                    // variant's own comment.
+                    let mut result_tabs = owning_result_tabs.clone();
+                    drop(s);
+                    result_tabs.append_message_lines(ResultMessageKind::Error, &lines);
+                    result_tabs.select_messages_errors();
+                }
                 QueryProgress::ExplainPlanOutput { result } => {
                     let mut result_tabs = owning_result_tabs.clone();
                     drop(s);
@@ -17635,6 +17704,71 @@ mod tests {
             autocommit: true,
             activity_label: "Executing SQL".to_string(),
         }
+    }
+
+    /// A worker's last words about the TAB's session must survive its
+    /// operation being abandoned.
+    ///
+    /// A force-cancelled batch is abandoned rather than joined: the tab is
+    /// published idle while the worker unwinds, and everything an abandoned
+    /// operation says is dropped. The hand-back door discovers a lost
+    /// work-carrying session exactly THEN, so as an ordinary `Message` its
+    /// report was dropped every time it mattered — the promise that "a session
+    /// with work never disappears in silence" reached nothing but the log.
+    #[test]
+    fn a_lost_session_is_delivered_even_after_its_operation_was_abandoned() {
+        assert_eq!(
+            tab_fact_delivery(&QueryProgress::RetainedSessionLostWithWork {
+                lines: vec![
+                    crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK.to_string()
+                ],
+            }),
+            TabFactDelivery::Always,
+            "the loss already happened, and no later execution can answer it"
+        );
+        assert_eq!(
+            tab_fact_delivery(&QueryProgress::ScopeChangedNotice {
+                message: "Current schema changed".to_string(),
+                selected_scope: Some("SQ_TM".to_string()),
+            }),
+            TabFactDelivery::UnlessSuperseded,
+            "a scope notice also outlives its operation, but a later execution's own              notice says where the tab really is"
+        );
+        // The tab's other two per-tab settings answer like the scope, because
+        // they ARE the same kind of fact: the worker's pin door asks
+        // `TabOperationOwnership::may_state_a_tab_fact`, which is this rule.
+        // They used to follow the operation while the scope did not, so a
+        // force-cancelled batch moved one of the three and not the other two.
+        for pin_notice in [
+            QueryProgress::AutoCommitChanged { enabled: false },
+            QueryProgress::TransactionModeChanged {
+                mode: crate::db::TransactionMode::default(),
+            },
+        ] {
+            assert_eq!(
+                tab_fact_delivery(&pin_notice),
+                TabFactDelivery::UnlessSuperseded,
+                "the pin the worker moved for this already happened on the tab's session"
+            );
+        }
+        // And the reason the loss needs a variant of its own: an error MESSAGE
+        // follows its operation, so the same text sent that way is dropped.
+        assert_eq!(
+            tab_fact_delivery(&QueryProgress::Message {
+                kind: ResultMessageKind::Error,
+                lines: vec![
+                    crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK.to_string()
+                ],
+            }),
+            TabFactDelivery::FollowsTheOperation
+        );
+        // It reaches the same pane an error message would.
+        assert_eq!(
+            result_pane_routes_for_progress(&QueryProgress::RetainedSessionLostWithWork {
+                lines: vec!["lost".to_string()],
+            }),
+            vec![ResultPaneRoute::MessagesErrors]
+        );
     }
 
     #[test]

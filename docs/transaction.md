@@ -159,6 +159,59 @@ the screen-equals-session guarantee broken by a leading `SELECT 1;`, with the
 override residue never adopted away either; its auto-commit twin left the app
 offering Commit and Rollback for work the server had already committed.
 
+A batch that adopts is not always the batch the TAB is on. A force-cancelled one
+is ABANDONED rather than joined — the tab is published idle while the worker is
+still unwinding, and abandoning it clears the cancel flag, so that worker can go
+on running the rest of its script while the user's next execution already owns
+the tab. That execution resolved its own auto-commit and transaction mode at
+startup, where the screen/session checkpoint runs, so a write from the dead
+batch is a change nothing downstream would catch.
+
+**Both pins are slots of a type that can only be written through a door.**
+`TabPin<T>` holds the slot privately; a worker's one way in is
+`record_for_batch(&TabOperationOwnership, value)`, and the UI thread's writes
+are named `set_from_ui` / `clear_from_ui` so calling one from a worker reads
+wrong. The pins were bare `Arc<Mutex<Option<_>>>` slots written with
+`store_mutex_*` from four places each, and the first attempt to close that put a
+named door in front of them and a source-text guard behind it — which counted
+ONE spelling of the bare write while the three the code actually used went
+straight past. A rule a guard has to spell is a rule the next edit can
+misspell; this one is the type.
+
+**The question a pin asks is `TabOperationOwnership::may_state_a_tab_fact`, not
+`is_current`.** They are two different questions and the type answers both:
+
+- `is_current` — "is the tab ON this execution right now?" — belongs to whatever
+  TAKES OVER the tab's live state: its session slot, its cancel reach, and the
+  auto-commit its cancel snapshot reports for the RUNNING operation (a per-tab
+  slot despite the name, and the third thing these same four call sites write).
+- `may_state_a_tab_fact` — "has a LATER execution owned this tab?" — belongs to
+  a fact the worker REPORTS about the tab. The user's own `SET AUTOCOMMIT` or
+  `SET SESSION TRANSACTION` really succeeded on this tab's session; nothing but
+  a later execution's own answer replaces that, and the tab merely being idle
+  cannot, because idle is exactly the state a force-cancelled tab is published
+  in. It reads the tab's live AND completed operation counters, mirroring
+  `query_operation_was_superseded` in the window — a value built without the
+  completed counter (which is what the session hand-backs carry, since they only
+  ask `is_current`) answers the strict question rather than guessing the loose
+  one.
+
+That is the same rule the tab's SCOPE follows, and the two used to disagree: the
+scope door asked `is_current` while the window DELIVERED the matching
+`ScopeChangedNotice` for an abandoned batch and wrote the very same binding
+itself, so which value the tab ended up with depended on which of the two
+writers ran. `QueryProgress::AutoCommitChanged` and
+`QueryProgress::TransactionModeChanged` are classified the same way
+(`TabFactDelivery::UnlessSuperseded`), so the screen follows exactly the pins
+the worker moved. All three per-tab settings now answer one question with one
+value.
+
+The pins do NOT ask the binding revision, and that is the one place they differ
+from the scope: a script `CONNECT` rebinds the tab and both pins deliberately
+survive it, while the same event resets the scope. What a refused write does not
+stop is the batch's own mode: the session really moved, so the rest of THAT
+batch runs under the new value and only the tab is left alone.
+
 **On the MySQL family the adoption is not a batch-loop step but part of ONE
 "the statement succeeded" step**, `record_successful_mysql_batch_statement()`,
 which also applies the statement's effects to the batch ledger and answers with

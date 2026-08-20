@@ -5047,7 +5047,9 @@ fn attach_tab(shared: space_query::db::SharedConnection) -> Harness {
         let done = Arc::clone(&done);
         let capture = Arc::clone(&capture);
         editor.set_progress_callback(move |event| match progress_inner(&event) {
-            QueryProgress::Message { lines, .. } | QueryProgress::ScriptOutput { lines, .. } => {
+            QueryProgress::RetainedSessionLostWithWork { lines }
+            | QueryProgress::Message { lines, .. }
+            | QueryProgress::ScriptOutput { lines, .. } => {
                 capture
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())

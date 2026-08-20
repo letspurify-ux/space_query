@@ -2354,8 +2354,17 @@ fn a_worker_moves_its_tabs_scope_only_while_it_still_owns_the_tab() {
         .map(|offset| slice_from(&execution, offset, 900))
         .expect("both drivers must share one rule for recording the scope on the binding");
     assert!(
-        helper.contains("if !session_owner.is_current()"),
-        "it must refuse once a LATER execution owns the tab"
+        // CHANGED, with its reason: this pinned `is_current()`. That question —
+        // "is the tab ON this execution right now?" — is the SESSION's, and
+        // asking it here made the worker refuse for a tab that is merely IDLE:
+        // exactly the state a force-cancelled tab is published in, and one in
+        // which no later execution has answered for the tab at all. The window
+        // meanwhile DELIVERED the matching `ScopeChangedNotice` for that case
+        // and wrote the very same binding itself, so which value the tab ended
+        // up with depended on which of the two writers ran. Both now ask the
+        // one question `TabFactDelivery::UnlessSuperseded` asks.
+        helper.contains("if !tab_owner.may_state_a_tab_fact()"),
+        "it must refuse once a LATER execution owns the tab, and only then"
     );
     assert!(
         helper.contains("set_scope_if_revision(binding_revision"),
@@ -2392,6 +2401,123 @@ fn a_worker_moves_its_tabs_scope_only_while_it_still_owns_the_tab() {
     assert!(
         door.contains("if state.revision != expected_revision") && door.contains("return Err("),
         "a stale revision must be refused, not written"
+    );
+
+    // The scope is one of THREE per-tab settings a batch can move, and the
+    // other two — the auto-commit pin and the transaction-mode pin — had no
+    // door at all: they were written with a bare `store_mutex_*` from four
+    // places each, so a batch the tab had moved on from could flip a live tab's
+    // auto-commit while the screen/session checkpoint only runs at execution
+    // startup.
+    //
+    // CHANGED, with its reason: the ban that made the door the only writer used
+    // to be a source-text count of ONE spelling
+    // (`store_mutex_bool_option(tab_auto_commit_override`), and the three
+    // spellings the bare writes actually used — `&tab_...`, `slots.tab_...`,
+    // `override_slot` — went straight past it, so the regression it existed to
+    // stop would have compiled and passed. The rule is in the TYPE now: the
+    // slot is private to `TabPin`, `store_mutex_*` cannot name it at all, and
+    // the only write a worker can reach asks the question. What this guard
+    // pins is that the type keeps that shape.
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let pin = editor
+        .find("impl<T: Copy> TabPin<T> {")
+        .map(|offset| slice_from(&editor, offset, 4000))
+        .expect("the per-tab pin needs one type");
+    assert!(
+        pin.contains("fn store(&self, value: Option<T>)") && !pin.contains("pub(crate) fn store("),
+        "the raw write must be private to the type, or a worker can go around the door"
+    );
+    assert!(
+        pin.contains("pub(crate) fn record_for_batch(")
+            && pin.contains("if !tab_owner.may_state_a_tab_fact()"),
+        "and the worker's only write must ask the same question the scope asks: {pin}"
+    );
+    assert!(
+        pin.contains("pub(crate) fn set_from_ui(") && pin.contains("pub(crate) fn clear_from_ui("),
+        "the UI thread's writes are named for the thread that owns them, so a worker \
+         calling one reads wrong"
+    );
+    assert_eq!(
+        editor.matches("slot: Arc<Mutex<Option<T>>>").count(),
+        1,
+        "one slot, held by the type"
+    );
+    // No `store_mutex_*` may name a tab pin any more — there is nothing left
+    // for it to name.
+    for spelling in [
+        "store_mutex_bool_option(tab_auto_commit_override",
+        "store_mutex_bool_option(&tab_auto_commit_override",
+        "store_mutex_bool_option(slots.tab_auto_commit_override",
+        "store_mutex_transaction_mode_option(tab_transaction_mode_override",
+        "store_mutex_transaction_mode_option(&tab_transaction_mode_override",
+        "store_mutex_transaction_mode_option(slots.tab_transaction_mode_override",
+    ] {
+        assert_eq!(
+            execution.matches(spelling).count() + editor.matches(spelling).count(),
+            0,
+            "a tab pin is not a bare mutex any more, so nothing may write it as one: {spelling}"
+        );
+    }
+
+    // The THIRD slot these same four call sites write — the auto-commit the
+    // tab's cancel snapshot reports for the RUNNING operation — is per TAB
+    // despite its name, and it was the one left without a door. It asks the
+    // stricter question on purpose: it describes the execution the tab is on,
+    // so there is nothing for an abandoned batch to describe.
+    let operation_auto_commit = editor
+        .find("impl TabOperationAutoCommit {")
+        .map(|offset| slice_from(&editor, offset, 2000))
+        .expect("the running-operation auto-commit needs one type");
+    assert!(
+        operation_auto_commit.contains("pub(crate) fn record_for_batch(")
+            && operation_auto_commit.contains("if !tab_owner.is_current()"),
+        "a worker's write must ask whether this execution is still the tab's: \
+         {operation_auto_commit}"
+    );
+    assert_eq!(
+        editor.matches("slot: Arc<Mutex<bool>>").count(),
+        1,
+        "and its slot is held by the type too"
+    );
+    let auto_commit_door = execution
+        .find("fn record_batch_auto_commit_on_tab(")
+        .map(|offset| slice_from(&execution, offset, 900))
+        .expect("the auto-commit door should exist");
+    assert!(
+        auto_commit_door.contains("tab_auto_commit_override.record_for_batch(tab_owner, enabled)")
+            && auto_commit_door
+                .contains("current_operation_autocommit.record_for_batch(tab_owner, enabled)"),
+        "one call moves both of the tab's auto-commit answers, each through its own \
+         question: {auto_commit_door}"
+    );
+
+    // The one answer all three share lives in the DB layer beside the session
+    // hand-back's, so the session and the settings cannot disagree about
+    // whether the tab has moved on.
+    let connection = read_source("src/db/connection.rs");
+    let ownership = connection
+        .find("impl TabOperationOwnership {")
+        .map(|offset| slice_from(&connection, offset, 4000))
+        .expect("the one ownership answer should exist");
+    assert!(
+        ownership.contains("pub fn is_current(&self) -> bool")
+            && ownership.contains("pub fn may_state_a_tab_fact(&self) -> bool"),
+        "the ownership value answers BOTH questions, and names which is which: {ownership}"
+    );
+    assert!(
+        ownership.contains("return self.is_current();"),
+        "and a value built without the completed counter must answer the STRICT question \
+         rather than guess the loose one: {ownership}"
+    );
+    let hand_back_owner = connection
+        .find("impl SessionHandBackOwner {")
+        .map(|offset| slice_from(&connection, offset, 3000))
+        .expect("the session hand-back owner should exist");
+    assert!(
+        hand_back_owner.contains("self.ownership.is_current()"),
+        "and the session hand-back asks the SAME value rather than a second spelling of it: \
+         {hand_back_owner}"
     );
 }
 
@@ -2444,20 +2570,66 @@ fn a_scope_change_updates_the_originating_tab_without_releasing_sessions() {
     // transaction back to it. SUPERSEDED is stale: a force-cancelled batch
     // keeps unwinding while the NEXT execution owns the tab, and that
     // execution's session is where the tab really is.
-    let notice_arm = currency_body
-        .find("QueryProgress::ScopeChangedNotice { .. } =>")
-        .map(|offset| &currency_body[offset..])
-        .expect("the currency filter must answer for a scope notice");
+    // CHANGED, with its reason: the two exemptions are no longer two arms of
+    // an inline match. A SECOND one arrived a round later — the notice that the
+    // tab's session went away with uncommitted work in it — and it needs a
+    // THIRD answer (delivered even when superseded), so the classification is a
+    // value now (`tab_fact_delivery`) and the filter dispatches on it. The
+    // clause below pins the same two facts about the scope notice, plus what
+    // makes the classification worth having.
     assert!(
-        notice_arm.contains("query_operation_was_superseded("),
-        "a scope notice is refused only when a LATER execution owns the tab"
+        currency_body.contains("match tab_fact_delivery(progress)")
+            && currency_body.contains("TabFactDelivery::UnlessSuperseded => {")
+            && currency_body.contains("query_operation_was_superseded("),
+        "the currency filter must ask the classification and refuse a superseded fact: \
+         {currency_body}"
+    );
+    let classification_at = currency_body
+        .find("match tab_fact_delivery(progress)")
+        .expect("checked above");
+    let abandoned_at = currency_body
+        .find("self.abandoned_query_operations.contains(&token)")
+        .expect("the currency filter must still drop an abandoned operation's PROGRESS");
+    assert!(
+        classification_at < abandoned_at,
+        "a fact about the tab is answered BEFORE the abandoned filter, or the answer never \
+         reaches the screen — an abandoned operation is exactly when both of these are \
+         learned: {currency_body}"
+    );
+    let classifier = content
+        .find("fn tab_fact_delivery(progress: &QueryProgress) -> TabFactDelivery {")
+        .map(|offset| slice_from(&content, offset, 6000))
+        .expect("the classification should live in one place");
+    let notice_arm = classifier
+        .find("QueryProgress::ScopeChangedNotice { .. } => TabFactDelivery::")
+        .map(|offset| &classifier[offset..])
+        .expect("the classification must answer for a scope notice");
+    assert!(
+        notice_arm.starts_with(
+            "QueryProgress::ScopeChangedNotice { .. } => TabFactDelivery::UnlessSuperseded"
+        ),
+        "a scope notice is refused only when a LATER execution owns the tab: {notice_arm}"
+    );
+    // ADDED, with its reason: the scope is one of THREE per-tab settings, and
+    // the other two used to follow the operation while it did not. A
+    // force-cancelled batch therefore left them disagreeing — its `USE` reached
+    // the tab while its `SET AUTOCOMMIT` did not — and once the pins were given
+    // the scope's own rule on the worker side, a notice the window still
+    // dropped would have left the pin moved and the screen showing the value it
+    // replaced, with nothing to correct it.
+    assert!(
+        classifier.contains(
+            "QueryProgress::AutoCommitChanged { .. } | QueryProgress::TransactionModeChanged { .. } => {\n            TabFactDelivery::UnlessSuperseded\n        }"
+        ),
+        "the two pins are the same kind of fact as the scope and must be delivered by the \
+         same rule: {classifier}"
     );
     assert!(
-        !notice_arm[..notice_arm
-            .find("            _ => {}")
-            .unwrap_or(notice_arm.len())]
-            .contains("abandoned_query_operations"),
-        "and never for an abandoned operation: what it reports already happened"
+        classifier.contains(
+            "QueryProgress::RetainedSessionLostWithWork { .. } => TabFactDelivery::Always"
+        ),
+        "and a lost work-carrying session is delivered even then: no later execution can \
+         answer what the older one's session took with it: {classifier}"
     );
     let superseded = content
         .find("fn query_operation_was_superseded(")
@@ -2467,6 +2639,20 @@ fn a_scope_change_updates_the_originating_tab_without_releasing_sessions() {
         superseded.contains("current_operation_id > token.operation_id")
             && superseded.contains("last_completed_operation_id > token.operation_id"),
         "a later execution that has already FINISHED supersedes it too"
+    );
+    // The WORKER half of the same rule reads the same two counters, or the two
+    // writers of a tab fact can disagree about whether it is stale.
+    let connection = read_source("src/db/connection.rs");
+    let may_state = connection
+        .find("pub fn may_state_a_tab_fact(&self) -> bool {")
+        .map(|offset| slice_from(&connection, offset, 1200))
+        .expect("the worker's half of the supersession rule should exist");
+    assert!(
+        may_state.contains("current_operation_id.load(Ordering::Relaxed) <= self.operation_id")
+            && may_state.contains(
+                "last_completed_operation_id.load(Ordering::Relaxed) <= self.operation_id"
+            ),
+        "the worker must mirror `query_operation_was_superseded`, both halves: {may_state}"
     );
 
     // Scope is TAB-scoped: a `USE` ran on ONE tab's session, so only that
@@ -3553,9 +3739,12 @@ fn mysql_script_autocommit_changes_are_tab_local() {
     let autocommit_branch = &content[branch_start..branch_end];
 
     assert!(
-        autocommit_branch
-            .contains("store_mutex_bool_option(tab_auto_commit_override, Some(enabled))"),
-        "MySQL/MariaDB script autocommit state should be stored on the editor tab"
+        autocommit_branch.contains("SqlEditorWidget::record_batch_auto_commit_on_tab(")
+            && autocommit_branch.contains("tab_auto_commit_override"),
+        "MySQL/MariaDB script autocommit state should be stored on the editor tab — through \
+         the tab's own door, which refuses once a LATER execution owns the tab (the pins used \
+         to be written with a bare `store_mutex_*`, so an abandoned batch could flip a live \
+         tab's auto-commit)"
     );
     assert!(
         !autocommit_branch.contains("conn_guard.set_auto_commit(enabled)"),
@@ -3838,11 +4027,34 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         .map(|offset| adopt_start + offset)
         .expect("adoption helper should be followed by another function");
     let adopt_body = &execution[adopt_start..adopt_end];
+    // CHANGED (twice), with its reason: the pin write first moved behind a
+    // named helper of this file's own, and then into the pin TYPE itself —
+    // `TabPin::record_for_batch`, whose slot no bare store call can name. The
+    // named helper was a second place the rule could be spelled, and the ban
+    // that made it the only writer only ever matched one spelling of the bare
+    // write. The three things this helper does are unchanged; how it does the
+    // middle one is what makes a batch a later execution has taken the tab from
+    // unable to repin a live tab.
     assert!(
         adopt_body.contains("session_transaction_mode_change_for_statement(")
-            && adopt_body.contains("store_mutex_transaction_mode_option(")
+            && adopt_body.contains("slot.record_for_batch(tab_owner, mode)")
             && adopt_body.contains("QueryProgress::TransactionModeChanged"),
-        "the adoption helper must parse the statement, pin the tab override, and notify the UI"
+        "the adoption helper must parse the statement, pin the tab override through the \
+         pin's own door, and notify the UI"
+    );
+    // And the SESSION half is not gated on the tab: the statement really moved
+    // the session, so the rest of THIS batch must run under the new mode even
+    // when the tab it started on has moved on.
+    let active_mode_at = adopt_body
+        .find("*active_transaction_mode = mode;")
+        .expect("the batch's own mode must follow the session");
+    let tab_pin_at = adopt_body
+        .find("slot.record_for_batch(tab_owner, mode)")
+        .expect("checked above");
+    assert!(
+        active_mode_at < tab_pin_at,
+        "the batch's own mode is not the tab's pin, and it follows the session \
+         unconditionally: {adopt_body}"
     );
     // A merged mode the database cannot express (Oracle: an explicit isolation
     // level over a READ ONLY pin) must be refused BEFORE the pin/UI writes:
@@ -3853,7 +4065,7 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         .find("transaction_mode_selection_error(")
         .expect("the adoption helper must refuse a merge the database cannot express");
     let adopt_pin_at = adopt_body
-        .find("store_mutex_transaction_mode_option(")
+        .find("slot.record_for_batch(tab_owner, mode)")
         .expect("checked above");
     assert!(
         adopt_refusal_at < adopt_pin_at,
@@ -4466,10 +4678,14 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         }
         // Assert the invariant, not the formatting: rustfmt wraps the call and
         // adds a trailing comma at some of these sites.
+        // CHANGED, with its reason: the pin is a `TabPin` now rather than a
+        // bare `Arc<Mutex<Option<_>>>`, so reading it is `.get()` instead of
+        // the free `load_mutex_*` helper. The invariant is the same one — the
+        // tab's selection is READ where it is used, never carried as a
+        // start-of-batch snapshot — and it is the type change that makes the
+        // old spelling impossible.
         assert!(
-            tail.starts_with("None,")
-                || (tail.contains("load_mutex_transaction_mode_option")
-                    && tail.contains("tab_transaction_mode_override")),
+            tail.starts_with("None,") || tail.contains("tab_transaction_mode_override"),
             "an Oracle transaction-mode application must read the tab override slot (or state None): {tail}"
         );
     }
@@ -4607,9 +4823,17 @@ fn script_autocommit_changes_are_tab_local_for_all_backends() {
             .map(|offset| offset + marker.len())
             .expect("another ToolCommand branch should follow SET AUTOCOMMIT");
         let branch = &rest[..end];
+        // CHANGED, with its reason: "stores it on the tab" is now "stores it
+        // THROUGH the tab's door". The pins were the two per-tab settings with
+        // no ownership question at all — the tab's SCOPE has asked one since
+        // the round that found it — so a batch the tab had already moved on
+        // from (a force-cancelled one keeps unwinding while the tab is idle or
+        // running the next execution) could still flip a live tab's
+        // auto-commit, and the screen/session checkpoint only runs at startup.
         assert!(
-            branch.contains("store_mutex_bool_option("),
-            "every SET AUTOCOMMIT branch must store the change as the editor tab's override: {branch}"
+            branch.contains("record_batch_auto_commit_on_tab("),
+            "every SET AUTOCOMMIT branch must store the change as the editor tab's override, \
+             through the door that refuses once a later execution owns the tab: {branch}"
         );
         assert!(
             branch.contains("_option_change_allowed"),
@@ -4683,9 +4907,14 @@ fn an_in_script_connect_adopts_the_new_connections_default_isolation() {
     // SQL spelling — keeping it would silently emit no session-level isolation
     // reset for the whole batch. It comes from the candidate, next to the
     // auto-commit and transaction mode the same branch already resolves there.
+    // CHANGED, with its reason: same type change as above — the pin reads with
+    // `.get()` now. The branch and what it must take from the candidate are
+    // unchanged.
     let anchor = compact
-        .find("candidate.transaction_mode,load_mutex_transaction_mode_option(tab_transaction_mode_override),),")
-        .expect("the disconnected-tab CONNECT branch should resolve the tab's mode over the candidate");
+        .find("candidate.transaction_mode,tab_transaction_mode_override.get(),),")
+        .expect(
+            "the disconnected-tab CONNECT branch should resolve the tab's mode over the candidate",
+        );
     let branch = &compact[anchor..(anchor + 800).min(compact.len())];
     assert!(
         branch.contains("candidate.default_transaction_isolation,"),
@@ -7148,32 +7377,59 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
             "and `NoSession` is exactly the answer that does not alert: {branch}"
         );
     }
+    // CHANGED, with its reason. This used to be a census of report SITES (10),
+    // and a census of reports cannot see the roads that never had one: while a
+    // release outside a door was two steps a caller had to remember — end the
+    // reach, then report — three of them remembered and the rest did not, so
+    // the same event (the tab's work-carrying session being closed) was
+    // reported or swallowed depending on which step of the acquisition noticed
+    // it. The count is now of the roads that report FOR themselves, and every
+    // road that CLOSES a session goes through a door that reports (pinned by
+    // `every_road_a_pooled_session_leaves_a_frame_ends_the_reach_first`).
     assert_eq!(
         content
-            .matches("Self::report_retained_session_lost_with_work(")
+            .matches("report_retained_session_lost_with_work(")
             .count(),
+        // the definition, the two DOORS that close a session outside the DB
+        // layer's own (`BatchSessionHandBack::release_without_door` and its
+        // lazy-fetch twin `discard_lazy_fetch_session`), the hand-back road's
+        // own `lost_work()` answer inside `BatchSessionHandBack::apply`, the
+        // Oracle acquire window's two hand-backs, the two sites that TOOK a
+        // lease and found it was not a MySQL session after all (batch
+        // finalization, acquisition) — the take had already emptied the slot
+        // there, so a bare return left the tab believing it still had a session
+        // — the one door a worker CLEARS the tab's slot through on the way out
+        // of a connection, and `stale_take_reported`, the choke point every
+        // EXECUTION take passes through.
         10,
-        "every site that loses a work-carrying session reports it: the two replace-and-reset \
-         sites (MySQL family, Oracle OCI), the Oracle acquire window that closes the tab's \
-         retained session after a setup failure it cannot reuse it through, the one door a \
-         worker clears the tab's slot through \
-         on the way out of a connection, the two sites that TOOK a lease and found it was \
-         not a MySQL session after all (batch finalization, scope recheck) — the take had \
-         already emptied the slot there, so a bare return left the tab believing it still had \
-         a session — `stale_take_reported`, the choke point every EXECUTION take passes \
-         through: a take whose session belonged to an earlier incarnation of this connection \
-         CLOSES it, and all four call sites used to read that answer as `NoSession` — the \
-         MySQL-family hand-back's own pre-check, which finds the connection incarnation gone \
-         and can only close the session (the ONE loss that never reaches the hand-back door: \
-         a disconnected connection no longer remembers which family it was, so the lease \
-         cannot be built, which is exactly why it has to report for itself; the door refuses \
-         and reports the same case for all four backends) — and the three discard arms of \
-         `acquire_mysql_pooled_session` itself (the ping-dead readiness check, and its two \
-         stale-retry twins, stated even where work cannot reach them so the rule is the arm's \
-         own): the ping-dead arm used to return BEFORE the report on exactly the road that \
-         REQUIRES the tab's session — the toolbar Commit/Rollback — so the loss was swallowed \
-         on the very button the user pressed to keep that work"
+        "every road that can lose a work-carrying session either reports it itself or \
+         goes through a door that does; a road that does neither is how a transaction \
+         disappeared in silence"
     );
+    // The two doors are what make that true, and neither can be given half of
+    // its job: ending the reach and answering the loss are ONE call.
+    for (door, ends_the_reach) in [
+        (
+            "fn release_without_door(&self, carried: RetainedSessionState, log_context: &str) {",
+            "end_before_release()",
+        ),
+        (
+            // The lazy fetch's twin delegates the reach half to the door it
+            // already had, and adds the half that was missing.
+            "fn discard_lazy_fetch_session<T>(",
+            "Self::release_lazy_fetch_session(cancel_reach",
+        ),
+    ] {
+        let start = content
+            .find(door)
+            .unwrap_or_else(|| panic!("{door} should exist"));
+        let body = slice_from(&content, start, 700);
+        assert!(
+            body.contains(ends_the_reach)
+                && body.contains("report_retained_session_lost_with_work("),
+            "a release that reaches no hand-back door owes BOTH answers: {door}"
+        );
+    }
 
     // The road that REQUIRES the tab's own session (the toolbar
     // Commit/Rollback) answers a dead session with the LOSS, through the one
@@ -7192,9 +7448,15 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         .map(|offset| ping_dead + offset)
         .unwrap_or(acquire_body.len());
     let ping_dead_arm = &acquire_body[ping_dead..ping_dead_end];
+    // CHANGED, with its reason: the arm no longer reports for itself, because
+    // the release it makes reports for every arm — the ORDER this clause exists
+    // for is now a property of the door (`release_without_door` reports before
+    // it returns) rather than of this arm's line ordering. What still has to be
+    // true here is that the release happens BEFORE the road that requires the
+    // session returns, which is what the arm controls.
     let report_at = ping_dead_arm
-        .find("Self::report_retained_session_lost_with_work(")
-        .expect("the dead-session arm must report the loss");
+        .find("hand_back.release_without_door(prior_retained_state")
+        .expect("the dead-session arm must release through the door that answers the loss");
     let require_return_at = ping_dead_arm
         .find("required_session_gone_message(")
         .expect("the require-existing road must answer the loss, not the slot state");
@@ -8680,9 +8942,19 @@ fn a_lazy_fetch_gives_up_its_force_target_before_it_gives_back_its_session() {
         for release in releases {
             for (offset, _) in body.match_indices(release) {
                 let before = &body[..offset];
-                let door = before
-                    .rfind("Self::release_lazy_fetch_session(&lazy_cancel_reach")
-                    .unwrap_or(0);
+                // TWO doors, and both end the reach first — `discard_lazy_fetch_session`
+                // is `release_lazy_fetch_session` plus the answer a CLOSE owes
+                // (what the session was carrying), which the hand-back road
+                // gets from `hand_back_worker_session` instead. A release that
+                // is inside neither is the shape this guard exists to refuse.
+                let door = [
+                    "Self::release_lazy_fetch_session(&lazy_cancel_reach",
+                    "Self::discard_lazy_fetch_session(",
+                ]
+                .iter()
+                .filter_map(|door| before.rfind(door))
+                .max()
+                .unwrap_or(0);
                 let opened = before[door..].matches('{').count();
                 let closed = before[door..].matches('}').count();
                 assert!(
@@ -9813,13 +10085,22 @@ fn every_road_a_pooled_session_leaves_a_frame_ends_the_reach_first() {
 
     // And the cleanup decision that CLOSES an Oracle session states the same
     // order, because it is the one arm of that applier which reaches no door.
+    //
+    // CHANGED, with its reason: that arm used to state ONLY the reach
+    // (`end_reach_before_release`), and it is reached with the user's work on
+    // the session — `decide_session_after_interrupt` answers
+    // `ReplacePhysicalSessionKeepUiConnected` for an unfinished fetch worker and
+    // for a connection error BEFORE it looks at the retained state at all — so
+    // the close was silent and the toolbar simply stopped offering the commit.
+    // The two owed answers are now one step (`release_without_door`), which
+    // cannot be given half of.
     let applier = execution
         .find("fn discard_physical_session(&mut self) {")
         .expect("the Oracle cleanup discard should exist");
-    let applier_body = slice_from(&execution, applier, 900);
+    let applier_body = slice_from(&execution, applier, 1500);
     let reach = applier_body
-        .find("self.hand_back.end_reach_before_release();")
-        .expect("the discard arm must end the reach");
+        .find("release_without_door(")
+        .expect("the discard arm must end the reach and answer what the close destroys");
     let discard = applier_body
         .find("discard_oracle_if_current_connection(")
         .expect("the discard arm must close the session");
@@ -9827,19 +10108,50 @@ fn every_road_a_pooled_session_leaves_a_frame_ends_the_reach_first() {
         reach < discard,
         "reach first, session second, on the arm that reaches no door: {applier_body}"
     );
+    assert!(
+        applier_body[reach..discard].contains("self.retained_state_a_discard_destroys()"),
+        "and it must name what the session is CARRYING — delta-or-prior — not the \
+         `reuse_state` a RETAIN would have filed, which is `Clean` on every road that \
+         reaches this arm and would make every lost transaction answer \"nothing was \
+         lost\": {applier_body}"
+    );
+    let carrying = execution
+        .find("fn retained_state_a_discard_destroys(&self) -> RetainedSessionState {")
+        .map(|offset| slice_from(&execution, offset, 700))
+        .expect("the discard's own state answer should exist");
+    assert!(
+        carrying.contains("self.session_state_delta_recorded")
+            && carrying.contains("self.prior_retained_state")
+            && !carrying.contains("self.reuse_state"),
+        "it reads what the batch left on the session, never the retain road's answer: \
+         {carrying}"
+    );
 
     // Every MySQL-family close that runs inside a statement's own frame does
     // the same. `hand_back` is the value that knows what this execution
     // published, so a close beside one must say so.
+    //
+    // CHANGED, with its reason: the two doors named here now do BOTH owed
+    // things — end the reach and answer what the close destroys — so this
+    // clause pins the loss report as well, on every road, without having to
+    // count report sites. `release_without_door` is the batch's door and
+    // `discard_lazy_fetch_session` the lazy fetch's; a close beside neither is
+    // the shape that took a user's transaction in silence.
     for (offset, _) in execution.match_indices("Self::discard_mysql_pooled_connection(conn);") {
-        let before = &execution[offset.saturating_sub(600)..offset];
+        let before = &execution[offset.saturating_sub(700)..offset];
         assert!(
-            before.contains("hand_back.end_reach_before_release();")
-                || before.contains("Self::release_lazy_fetch_session(&lazy_cancel_reach,"),
+            before.contains("hand_back.release_without_door(")
+                || before.contains("Self::discard_lazy_fetch_session("),
             "a MySQL-family session closed inside a statement's frame must end what that \
-             execution published over it first: ...{before}"
+             execution published over it first, and say what the close destroys: ...{before}"
         );
     }
+    // And there is no way left to do only the first half.
+    assert!(
+        !execution.contains("fn end_reach_before_release("),
+        "the reach-only release is gone: a caller that can release without stating what it \
+         releases is how a work-carrying session disappeared in silence"
+    );
 }
 
 /// A pooled session goes back to the pool only when what it carries is KNOWN,

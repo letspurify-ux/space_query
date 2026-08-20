@@ -381,6 +381,11 @@ struct OracleThinConnectionTransitionContext<'a> {
     current_query_cancel_handle: &'a Arc<Mutex<OperationCancelTarget>>,
     current_operation_id: &'a Arc<AtomicU64>,
     operation_id: u64,
+    /// Which execution the TAB's own settings belong to. Beside the two ids
+    /// above and not derived from them: it reads the tab's COMPLETED counter as
+    /// well, which is what the tab-FACT question needs and the session
+    /// hand-back's does not.
+    tab_ownership: crate::db::TabOperationOwnership,
     pool_size: u32,
     binding_revision: u64,
     active_connection: crate::db::SharedConnection,
@@ -628,6 +633,13 @@ impl OracleThinConnectionTransitionContext<'_> {
             ),
         )
     }
+
+    /// The same identity for a write onto the TAB rather than a session
+    /// hand-back: nothing is published over a session there, so there is no
+    /// reach to state — only whether a later execution has taken the tab.
+    fn tab_owner(&self) -> &crate::db::TabOperationOwnership {
+        &self.tab_ownership
+    }
 }
 
 struct OracleThinCursorStreamOutcome {
@@ -655,9 +667,13 @@ struct MySqlTabSessionSlots<'a> {
     /// The mode the rest of THIS batch runs under, which an adopted
     /// session-scoped statement moves.
     active_transaction_mode: &'a std::cell::Cell<crate::db::TransactionMode>,
-    tab_transaction_mode_override: &'a Arc<Mutex<Option<crate::db::TransactionMode>>>,
-    tab_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
-    current_operation_autocommit: Option<&'a Arc<Mutex<bool>>>,
+    tab_transaction_mode_override: &'a super::TabPin<crate::db::TransactionMode>,
+    tab_auto_commit_override: &'a super::TabPin<bool>,
+    current_operation_autocommit: Option<&'a super::TabOperationAutoCommit>,
+    /// Which execution these slots belong to. Carried WITH them, because the
+    /// pins are the TAB's and a batch keeps running after the tab has left it:
+    /// a worker that can reach a pin can only reach it through this answer.
+    tab_owner: crate::db::TabOperationOwnership,
 }
 
 /// Who files what a successful statement left on the session.
@@ -949,10 +965,14 @@ impl SessionScopeReport {
         let message = db_type.scope_unavailable_message(scope);
         crate::utils::logging::log_warning(log_context, &message);
         if let Some(sender) = sender {
-            // Reported the same way a lost work-carrying session is
-            // (`RETAINED_SESSION_LOST_WITH_WORK`): the statements ran, but not
-            // where the tab says they did, and that has to reach the messages
-            // pane rather than only the log.
+            // An ordinary error MESSAGE, and deliberately so: unlike a lost
+            // work-carrying session — which is learned at a hand-back door the
+            // worker reaches only AFTER its operation was abandoned, and which
+            // therefore needs its own exempt variant
+            // (`QueryProgress::RetainedSessionLostWithWork`) — this is learned
+            // while the statement it belongs to is being set up. It describes
+            // THAT statement ("it ran, but not where the tab says it did"), so
+            // an operation the tab has left has nothing left to say with it.
             let _ = sender.send(QueryProgress::Message {
                 kind: ResultMessageKind::Error,
                 lines: vec![message],
@@ -997,14 +1017,27 @@ impl<'a> BatchSessionHandBack<'a> {
         self.owner
     }
 
-    /// End what this execution published over a session it is about to CLOSE.
+    /// Give a session up WITHOUT reaching a hand-back door: end what this
+    /// execution published over it, and answer what closing it destroys.
     ///
-    /// [`Self::apply`] goes through a hand-back door, which withdraws the reach
-    /// for itself. A physical discard reaches no door at all, so it says so
-    /// here — otherwise the session stops existing while the registry still
-    /// lists a canceler that claims to speak for it.
-    fn end_reach_before_release(&self) {
+    /// The two are one step, and that is the whole point of the name. Every
+    /// road out of [`SharedDbSessionLease::hand_back_worker_session`] does both
+    /// — it withdraws the reach first and answers `lost_work()` after — so a
+    /// road that closes a session by hand owes both as well. It used to owe
+    /// only the first (`end_reach_before_release`), and the second was left to
+    /// each call site to remember: three of them did and the rest did not, so
+    /// the same event — the tab's work-carrying session being closed — was
+    /// reported or swallowed depending on which step of the acquisition noticed
+    /// it. A caller that can release without stating what it releases is the
+    /// shape that let a transaction disappear in silence.
+    ///
+    /// `carried` is the state the session was holding: nothing is reported for
+    /// a session that carried no work (`report_retained_session_lost_with_work`
+    /// asks that itself), so stating it costs a caller nothing where the loss
+    /// cannot happen — and where it can, the caller cannot forget.
+    fn release_without_door(&self, carried: RetainedSessionState, log_context: &str) {
         self.owner.cancel_reach().end_before_release();
+        SqlEditorWidget::report_retained_session_lost_with_work(self.sender, carried, log_context);
     }
 
     /// Hand the session back to the tab. Answers whether it reached the slot.
@@ -1206,8 +1239,8 @@ struct ExecutionWorkerContext<'a> {
     sql_text: &'a str,
     result_edit_request: Option<crate::db::ResultEditRequest>,
     pooled_db_session: &'a SharedDbSessionLease,
-    tab_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
-    tab_transaction_mode_override: &'a Arc<Mutex<Option<crate::db::TransactionMode>>>,
+    tab_auto_commit_override: &'a super::TabPin<bool>,
+    tab_transaction_mode_override: &'a super::TabPin<crate::db::TransactionMode>,
     active_lazy_fetch: &'a Arc<Mutex<Option<LazyFetchHandle>>>,
     next_lazy_fetch_session_id: &'a Arc<AtomicU64>,
     current_oracle_thin_cancel_context: &'a Arc<Mutex<Option<OracleThinCancelHandle>>>,
@@ -1222,7 +1255,12 @@ struct ExecutionWorkerContext<'a> {
     query_timeout: Option<Duration>,
     lazy_fetch_batch_size: usize,
     db_activity: &'a str,
-    current_operation_autocommit: &'a Arc<Mutex<bool>>,
+    current_operation_autocommit: &'a super::TabOperationAutoCommit,
+    /// Which execution the TAB's own settings belong to — its scope and its two
+    /// pins. Resolved once, from the tab's live AND completed operation
+    /// counters, so every door below asks the same value the window asks when
+    /// it decides whether to deliver the matching notice.
+    tab_ownership: crate::db::TabOperationOwnership,
     execution_scope: Option<String>,
     runtime_work_guard: &'a mut Option<crate::db::ConnectionWorkGuard>,
 }
@@ -1322,6 +1360,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             lazy_fetch_batch_size,
             db_activity,
             current_operation_autocommit,
+            tab_ownership,
             execution_scope,
             runtime_work_guard,
             ..
@@ -1613,13 +1652,13 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 // the tab override instead of adopting it verbatim.
                 SqlEditorWidget::effective_auto_commit(
                     candidate.auto_commit,
-                    load_mutex_bool_option(tab_auto_commit_override),
+                    tab_auto_commit_override.get(),
                 ),
                 // The tab's pinned transaction mode also survives CONNECT.
                 SqlEditorWidget::effective_transaction_mode(
                     crate::db::DatabaseType::Oracle,
                     candidate.transaction_mode,
-                    load_mutex_transaction_mode_option(tab_transaction_mode_override),
+                    tab_transaction_mode_override.get(),
                 ),
                 // ... but "the connection default" a tab selecting `Default`
                 // isolation is put back to belongs to the CONNECTION, not to
@@ -1778,9 +1817,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                                 // A lazily streamed SELECT is never the
                                 // user's own transaction-first statement, so
                                 // the tab's selection applies unconditionally.
-                                tab_selected: load_mutex_transaction_mode_option(
-                                    tab_transaction_mode_override,
-                                ),
+                                tab_selected: tab_transaction_mode_override.get(),
                                 default_isolation: default_transaction_isolation,
                             },
                             current_scope,
@@ -1847,6 +1884,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             current_query_cancel_handle,
             current_operation_id,
             operation_id,
+            tab_ownership: tab_ownership.clone(),
             pool_size,
             binding_revision: active_binding_revision,
             active_connection: active_connection.clone(),
@@ -1889,6 +1927,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             current_operation_autocommit,
             Some(tab_auto_commit_override),
             Some(tab_transaction_mode_override),
+            tab_ownership.clone(),
             query_timeout,
             Some((active_connection, connection_generation)),
             Some(&mut transition_context),
@@ -1918,9 +1957,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
         } else {
             false
         };
-        let final_auto_commit = *current_operation_autocommit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let final_auto_commit = current_operation_autocommit.get();
         let disposition = SqlEditorWidget::oracle_thin_execution_disposition(
             cancel_requested,
             batch_outcome.had_error,
@@ -2026,6 +2063,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             lazy_fetch_batch_size,
             db_activity,
             current_operation_autocommit,
+            tab_ownership,
             execution_scope,
             ..
         } = context;
@@ -2129,6 +2167,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             Some(current_operation_autocommit),
             Some(current_operation_id),
             operation_id,
+            tab_ownership,
             execution_scope,
         );
         if let Some(runtime) = connection_binding.snapshot().runtime {
@@ -2153,7 +2192,7 @@ struct QueryExecutionCleanupGuard {
     current_operation_id: Arc<AtomicU64>,
     last_completed_operation_id: Arc<AtomicU64>,
     current_operation_sql_kind: Arc<Mutex<crate::db::session_policy::SqlKind>>,
-    current_operation_autocommit: Arc<Mutex<bool>>,
+    current_operation_autocommit: super::TabOperationAutoCommit,
     current_cancel_operation: Arc<Mutex<Option<CancelOperationMetadata>>>,
     timeout_connection: Option<Arc<Connection>>,
     previous_timeout: Option<Duration>,
@@ -2262,6 +2301,24 @@ impl OracleCleanupSessionDecisionApplier<'_> {
         retained_state
     }
 
+    /// What the session is CARRYING right now — the state this cleanup would
+    /// file if it were retaining it, with the transaction as the batch left it.
+    ///
+    /// Not `reuse_state`: that is what a RETAIN would file, and it is `Clean` on
+    /// every road that reaches the discard (it is only ever raised inside the
+    /// reuse branch). Asking it there would make every lost transaction answer
+    /// "nothing was lost" — the discard would keep its silence while looking
+    /// like it had spoken. Delta-or-prior is the same source the reuse road's
+    /// own first branch reads (`oracle_cleanup_prior_retained_state_for_interrupt`).
+    fn retained_state_a_discard_destroys(&self) -> RetainedSessionState {
+        let carrying = if self.session_state_delta_recorded {
+            self.session_state_delta
+        } else {
+            self.prior_retained_state
+        };
+        self.retained_state_for_transaction_state(carrying.transaction_state())
+    }
+
     fn store_retained_state(&mut self, retained_state: RetainedSessionState) {
         self.hand_back.apply(
             self.pooled_db_session,
@@ -2284,9 +2341,23 @@ impl crate::db::session_policy::SessionDecisionApplier for OracleCleanupSessionD
     fn discard_physical_session(&mut self) {
         // The one road out of this applier that does NOT reach a hand-back
         // door: the session is closed rather than filed, so nothing else would
-        // end what this execution published over it. Same order as every door
-        // — reach first, session second.
-        self.hand_back.end_reach_before_release();
+        // end what this execution published over it, and nothing else would say
+        // what closing it destroys. Both go through the one release value, in
+        // the door's own order — reach first, session second.
+        //
+        // It is REACHED with work: `decide_session_after_interrupt` answers
+        // `ReplacePhysicalSessionKeepUiConnected` before it looks at the
+        // retained state at all, for an unfinished fetch worker
+        // (`!worker_done`) and for a connection error — so a tab holding an
+        // INSERT whose SELECT is cancelled had its session closed and was told
+        // nothing; the toolbar simply stopped offering the commit.
+        //
+        // The state it names is what the session is CARRYING — the batch's own
+        // delta, or the state it was taken with — and deliberately not the
+        // `reuse_state` a retain would have filed. See
+        // [`Self::retained_state_a_discard_destroys`].
+        self.hand_back
+            .release_without_door(self.retained_state_a_discard_destroys(), self.log_context);
         if !self.pooled_db_session.discard_oracle_if_current_connection(
             self.connection_generation,
             self.conn,
@@ -2342,7 +2413,7 @@ impl QueryExecutionCleanupGuard {
         current_operation_id: Arc<AtomicU64>,
         last_completed_operation_id: Arc<AtomicU64>,
         current_operation_sql_kind: Arc<Mutex<crate::db::session_policy::SqlKind>>,
-        current_operation_autocommit: Arc<Mutex<bool>>,
+        current_operation_autocommit: super::TabOperationAutoCommit,
         current_cancel_operation: Arc<Mutex<Option<CancelOperationMetadata>>>,
     ) -> Self {
         Self {
@@ -2897,10 +2968,7 @@ impl QueryExecutionCleanupGuard {
         timeout_settings_restored: bool,
         health_check_ok: bool,
     ) -> crate::db::session_policy::SessionDecision {
-        let autocommit = *self
-            .current_operation_autocommit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let autocommit = self.current_operation_autocommit.get();
         let current_operation_id = self.current_operation_id.load(Ordering::Relaxed);
 
         crate::db::session_policy::decide_session_after_interrupt(
@@ -5555,6 +5623,33 @@ impl SqlEditorWidget {
         give_the_session_back()
     }
 
+    /// CLOSE a lazy fetch's session rather than hand it back: end its reach and
+    /// answer what closing it destroys.
+    ///
+    /// The lazy-fetch twin of [`BatchSessionHandBack::release_without_door`],
+    /// and it exists for the same reason. A lazy fetch takes the TAB's session
+    /// over, so the transaction the tab opened before it is on that session;
+    /// when the fetch is cancelled, fails, or its worker panics, the session is
+    /// closed outright and the work goes with it. Only the SUCCESS case said so
+    /// (`oracle_lazy_fetch_success_loses_required_session`, which reports on the
+    /// statement) — the cancelled and failed ones, the ones a user actually
+    /// reaches, took it in silence.
+    ///
+    /// Separate from the retain road on purpose: that one goes through
+    /// `hand_back_worker_session`, which answers the same loss for itself, and
+    /// a report at this level would double it.
+    fn discard_lazy_fetch_session<T>(
+        cancel_reach: &crate::db::SessionCancelReach,
+        sender: Option<&QueryProgressSender>,
+        carried: RetainedSessionState,
+        log_context: &str,
+        close_the_session: impl FnOnce() -> T,
+    ) -> T {
+        let closed = Self::release_lazy_fetch_session(cancel_reach, close_the_session);
+        Self::report_retained_session_lost_with_work(sender, carried, log_context);
+        closed
+    }
+
     fn discard_oracle_lazy_fetch_session(
         pooled_db_session: &SharedDbSessionLease,
         connection_generation: u64,
@@ -6359,14 +6454,20 @@ impl SqlEditorWidget {
                             );
                         });
                     } else {
-                        Self::release_lazy_fetch_session(&lazy_cancel_reach, || {
-                            Self::discard_oracle_lazy_fetch_session(
-                                &pooled_db_session,
-                                connection_generation,
-                                &conn,
-                                "oracle lazy fetch cleanup",
-                            );
-                        });
+                        Self::discard_lazy_fetch_session(
+                            &lazy_cancel_reach,
+                            Some(&sender),
+                            prior_retained_state,
+                            "oracle lazy fetch cleanup",
+                            || {
+                                Self::discard_oracle_lazy_fetch_session(
+                                    &pooled_db_session,
+                                    connection_generation,
+                                    &conn,
+                                    "oracle lazy fetch cleanup",
+                                );
+                            },
+                        );
                     }
                     if error_result.is_none()
                         && Self::oracle_lazy_fetch_success_loses_required_session(
@@ -6413,14 +6514,20 @@ impl SqlEditorWidget {
                 }));
                 if let Err(payload) = worker_result {
                     let _ = conn.set_call_timeout(previous_timeout);
-                    Self::release_lazy_fetch_session(&lazy_cancel_reach, || {
-                        Self::discard_oracle_lazy_fetch_session(
-                            &pooled_db_session,
-                            connection_generation,
-                            &conn,
-                            "oracle lazy fetch panic",
-                        );
-                    });
+                    Self::discard_lazy_fetch_session(
+                        &lazy_cancel_reach,
+                        Some(&sender),
+                        prior_retained_state,
+                        "oracle lazy fetch panic",
+                        || {
+                            Self::discard_oracle_lazy_fetch_session(
+                                &pooled_db_session,
+                                connection_generation,
+                                &conn,
+                                "oracle lazy fetch panic",
+                            );
+                        },
+                    );
                     Self::clear_lazy_fetch_after_worker_panic(
                         &sender,
                         &active_lazy_fetch,
@@ -7247,10 +7354,16 @@ impl SqlEditorWidget {
                             close_error_kind = InterruptKind::UnsafeOrUnknown;
                         }
                     } else {
-                        Self::release_lazy_fetch_session(&lazy_cancel_reach, || {
-                            DbSessionLease::OracleThin(Box::new(lease_conn))
-                                .discard_physical("oracle thin lazy fetch cleanup");
-                        });
+                        Self::discard_lazy_fetch_session(
+                            &lazy_cancel_reach,
+                            Some(&sender),
+                            prior_retained_state,
+                            "oracle thin lazy fetch cleanup",
+                            || {
+                                DbSessionLease::OracleThin(Box::new(lease_conn))
+                                    .discard_physical("oracle thin lazy fetch cleanup");
+                            },
+                        );
                     }
                     if error_result.is_none()
                         && Self::oracle_lazy_fetch_success_loses_required_session(
@@ -7301,10 +7414,16 @@ impl SqlEditorWidget {
                 }));
                 if let Err(payload) = worker_result {
                     if let Some(conn) = conn_slot.take() {
-                        Self::release_lazy_fetch_session(&lazy_cancel_reach, || {
-                            DbSessionLease::OracleThin(Box::new(conn))
-                                .discard_physical("oracle thin lazy fetch panic");
-                        });
+                        Self::discard_lazy_fetch_session(
+                            &lazy_cancel_reach,
+                            Some(&sender),
+                            prior_retained_state,
+                            "oracle thin lazy fetch panic",
+                            || {
+                                DbSessionLease::OracleThin(Box::new(conn))
+                                    .discard_physical("oracle thin lazy fetch panic");
+                            },
+                        );
                     }
                     Self::clear_lazy_fetch_after_worker_panic(
                         &sender,
@@ -8071,9 +8190,15 @@ impl SqlEditorWidget {
                                     );
                                 });
                             } else {
-                                Self::release_lazy_fetch_session(&lazy_cancel_reach, || {
-                                    Self::discard_mysql_pooled_connection(conn);
-                                });
+                                Self::discard_lazy_fetch_session(
+                                    &lazy_cancel_reach,
+                                    Some(&sender),
+                                    prior_retained_state,
+                                    "mysql lazy fetch cleanup",
+                                    || {
+                                        Self::discard_mysql_pooled_connection(conn);
+                                    },
+                                );
                             }
                         } else {
                             // Nothing left to hand back, so the reach over it
@@ -8105,14 +8230,21 @@ impl SqlEditorWidget {
                         );
                     }
                     Err(payload) => {
-                        Self::release_lazy_fetch_session(&lazy_cancel_reach, || {
-                            if let Some(conn) = conn.take() {
-                                // Panic cleanup discards the physical connection;
-                                // do not run the old generic timeout reset here,
-                                // because it does not restore lock-wait variables.
-                                Self::discard_mysql_pooled_connection(conn);
-                            }
-                        });
+                        Self::discard_lazy_fetch_session(
+                            &lazy_cancel_reach,
+                            Some(&sender),
+                            prior_retained_state,
+                            "mysql lazy fetch panic",
+                            || {
+                                if let Some(conn) = conn.take() {
+                                    // Panic cleanup discards the physical
+                                    // connection; do not run the old generic
+                                    // timeout reset here, because it does not
+                                    // restore lock-wait variables.
+                                    Self::discard_mysql_pooled_connection(conn);
+                                }
+                            },
+                        );
                         Self::clear_lazy_fetch_after_worker_panic(
                             &sender,
                             &active_lazy_fetch,
@@ -8275,12 +8407,9 @@ impl SqlEditorWidget {
 
     pub(super) fn auto_commit_for_execution(
         global_auto_commit: bool,
-        tab_auto_commit_override: &Arc<Mutex<Option<bool>>>,
+        tab_auto_commit_override: &super::TabPin<bool>,
     ) -> bool {
-        Self::effective_auto_commit(
-            global_auto_commit,
-            load_mutex_bool_option(tab_auto_commit_override),
-        )
+        Self::effective_auto_commit(global_auto_commit, tab_auto_commit_override.get())
     }
 
     /// The one rule every backend's script `SET AUTOCOMMIT` obeys: a command
@@ -8709,8 +8838,8 @@ impl SqlEditorWidget {
         conn_name: &str,
         session: &Arc<Mutex<SessionState>>,
         pooled_db_session: &SharedDbSessionLease,
-        tab_auto_commit_override: &Arc<Mutex<Option<bool>>>,
-        tab_transaction_mode_override: &Arc<Mutex<Option<crate::db::TransactionMode>>>,
+        tab_auto_commit_override: &super::TabPin<bool>,
+        tab_transaction_mode_override: &super::TabPin<crate::db::TransactionMode>,
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         next_lazy_fetch_session_id: &Arc<AtomicU64>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
@@ -8724,9 +8853,14 @@ impl SqlEditorWidget {
         initial_transaction_mode: crate::db::TransactionMode,
         db_activity: &str,
         mut execution_metadata: Option<&mut crate::db::session_policy::ExecutionFinishedEvent>,
-        current_operation_autocommit: Option<&Arc<Mutex<bool>>>,
+        current_operation_autocommit: Option<&super::TabOperationAutoCommit>,
         current_operation_id: Option<&Arc<AtomicU64>>,
         operation_id: u64,
+        // Which execution the TAB's own settings belong to. Taken whole rather
+        // than rebuilt from the two ids above: it reads the tab's COMPLETED
+        // counter too, which is what tells an abandoned batch the tab is merely
+        // idle from one a later execution has taken the tab from.
+        tab_ownership: crate::db::TabOperationOwnership,
         initial_scope: Option<String>,
     ) {
         let items = Self::build_mysql_batch_items(
@@ -8808,12 +8942,14 @@ impl SqlEditorWidget {
 
         // Everything a successful statement of this batch mirrors into its TAB,
         // resolved once so every statement branch records it with one call.
+        let tab_owner = tab_ownership;
         let tab_session_slots = MySqlTabSessionSlots {
             sender,
             active_transaction_mode: &active_transaction_mode,
             tab_transaction_mode_override,
             tab_auto_commit_override,
             current_operation_autocommit,
+            tab_owner: tab_owner.clone(),
         };
         let mut mysql_batch_effects = crate::db::MySqlBatchSessionEffects::for_db_type(db_type);
         // The tab's database is asserted per statement here (the session is
@@ -9320,16 +9456,20 @@ impl SqlEditorWidget {
                                         "SET AUTOCOMMIT",
                                         SqlEditorWidget::autocommit_feedback(enabled),
                                     );
-                                    #[rustfmt::skip]
-                                    store_mutex_bool_option(tab_auto_commit_override, Some(enabled));
+                                    // Tab-scoped, and through the tab's door:
+                                    // the script changes THIS tab's
+                                    // auto-commit without touching the shared
+                                    // connection default, and a batch a later
+                                    // execution has taken the tab from may not
+                                    // move its pin. The batch's own value below
+                                    // follows the session either way.
+                                    SqlEditorWidget::record_batch_auto_commit_on_tab(
+                                        &tab_owner,
+                                        tab_auto_commit_override,
+                                        current_operation_autocommit,
+                                        enabled,
+                                    );
                                     auto_commit = enabled;
-                                    if let Some(operation_autocommit) = current_operation_autocommit
-                                    {
-                                        SqlEditorWidget::update_current_operation_autocommit(
-                                            operation_autocommit,
-                                            enabled,
-                                        );
-                                    }
                                     let _ =
                                         sender.send(QueryProgress::AutoCommitChanged { enabled });
                                     app::awake();
@@ -11695,6 +11835,18 @@ impl SqlEditorWidget {
                     return;
                 }
 
+                // Which execution the TAB's own settings belong to — its
+                // scope and its two pins — for the whole of this worker. ONE
+                // value, built from both of the tab's operation counters:
+                // `current_operation_id` alone cannot tell the tab being idle
+                // after THIS execution (which a force-cancel leaves it in, and
+                // which does not make the facts this batch reports stale) from
+                // a later execution having come and gone.
+                let tab_ownership = crate::db::TabOperationOwnership::for_operation(
+                    Some(&current_operation_id),
+                    Some(&last_completed_operation_id),
+                    cleanup.execution_metadata.operation_id,
+                );
                 let startup = LockedExecutionStartup {
                     conn_guard,
                     conn_name,
@@ -11741,6 +11893,7 @@ impl SqlEditorWidget {
                         lazy_fetch_batch_size,
                         db_activity: &db_activity,
                         current_operation_autocommit: &current_operation_autocommit,
+                        tab_ownership: tab_ownership.clone(),
                         execution_scope: current_operation_scope(),
                         runtime_work_guard: &mut runtime_work_guard,
                     },
@@ -11817,6 +11970,11 @@ impl SqlEditorWidget {
                 if !Self::operation_snapshot_is_current(&current_operation_id, operation_id) {
                     return;
                 }
+                // The one value built above: its scope, its auto-commit pin
+                // and its transaction-mode pin are all written through it, so a
+                // batch a later execution has taken the tab from cannot move
+                // the tab it no longer speaks for.
+                let oci_tab_owner = tab_ownership;
                 // Store connection for cancel operation (separate from mutex)
                 if let Some(ref conn) = conn_opt {
                     SqlEditorWidget::set_current_query_connection(
@@ -11894,9 +12052,7 @@ impl SqlEditorWidget {
                 let mut oracle_transaction_boundary = OracleTransactionBoundaryTracker::default();
                 let transaction_mode_application = OracleTransactionModeApplication {
                     mode: transaction_mode,
-                    tab_selected: load_mutex_transaction_mode_option(
-                        &tab_transaction_mode_override,
-                    ),
+                    tab_selected: tab_transaction_mode_override.get(),
                     default_isolation: default_transaction_isolation,
                 };
                 // A batch that opens with CONNECT must not have the tab's mode
@@ -13055,15 +13211,16 @@ impl SqlEditorWidget {
                                         // Tab-scoped, like the MySQL branch: the script
                                         // changes this tab's auto-commit without touching
                                         // the shared connection default other tabs use.
-                                        store_mutex_bool_option(
+                                        // Through the tab's door, like the scope: a batch
+                                        // a later execution has taken the tab from may not
+                                        // move its pin.
+                                        SqlEditorWidget::record_batch_auto_commit_on_tab(
+                                            &oci_tab_owner,
                                             &tab_auto_commit_override,
-                                            Some(enabled),
-                                        );
-                                        auto_commit = enabled;
-                                        SqlEditorWidget::update_current_operation_autocommit(
-                                            &current_operation_autocommit,
+                                            Some(&current_operation_autocommit),
                                             enabled,
                                         );
+                                        auto_commit = enabled;
                                         SqlEditorWidget::emit_script_message(
                                             &sender,
                                             &session,
@@ -13531,9 +13688,7 @@ impl SqlEditorWidget {
                                                     Self::effective_transaction_mode(
                                                         crate::db::DatabaseType::Oracle,
                                                         next_transaction_mode,
-                                                        load_mutex_transaction_mode_option(
-                                                            &tab_transaction_mode_override,
-                                                        ),
+                                                        tab_transaction_mode_override.get(),
                                                     );
                                                 let Some(prepared_conn) =
                                                     next_conn_opt.as_ref().cloned()
@@ -13599,10 +13754,8 @@ impl SqlEditorWidget {
                                                 let post_connect_transaction_mode =
                                                     OracleTransactionModeApplication {
                                                         mode: next_active_transaction_mode,
-                                                        tab_selected:
-                                                            load_mutex_transaction_mode_option(
-                                                                &tab_transaction_mode_override,
-                                                            ),
+                                                        tab_selected: tab_transaction_mode_override
+                                                            .get(),
                                                         default_isolation:
                                                             next_default_transaction_isolation,
                                                     };
@@ -13857,14 +14010,15 @@ impl SqlEditorWidget {
                                                 // this batch.
                                                 auto_commit = Self::effective_auto_commit(
                                                     next_auto_commit,
-                                                    load_mutex_bool_option(
-                                                        &tab_auto_commit_override,
-                                                    ),
+                                                    tab_auto_commit_override.get(),
                                                 );
-                                                SqlEditorWidget::update_current_operation_autocommit(
-                                                    &current_operation_autocommit,
-                                                    auto_commit,
-                                                );
+                                                // The RUNNING operation's own
+                                                // value, through its door: it
+                                                // describes the execution the
+                                                // tab is on, so a batch the tab
+                                                // has left must not restate it.
+                                                current_operation_autocommit
+                                                    .record_for_batch(&oci_tab_owner, auto_commit);
                                                 // Update cancel connection so break_execution() uses the new connection.
                                                 // Unlike the pooled session the batch started on,
                                                 // this is the candidate CONNECTION's own session —
@@ -14282,9 +14436,7 @@ impl SqlEditorWidget {
                             {
                                 let reapplication = OracleTransactionModeApplication {
                                     mode: active_transaction_mode,
-                                    tab_selected: load_mutex_transaction_mode_option(
-                                        &tab_transaction_mode_override,
-                                    ),
+                                    tab_selected: tab_transaction_mode_override.get(),
                                     default_isolation: default_transaction_isolation,
                                 };
                                 let applied =
@@ -16484,6 +16636,7 @@ impl SqlEditorWidget {
                                         &sql_to_execute,
                                         &mut active_transaction_mode,
                                         Some(&tab_transaction_mode_override),
+                                        &oci_tab_owner,
                                         &sender,
                                     ) {
                                         cleanup
@@ -16551,16 +16704,12 @@ impl SqlEditorWidget {
                                                     SqlEditorWidget::record_batch_scope_on_tab_binding(
                                                         &connection_binding_for_worker,
                                                         binding_revision,
-                                                        // A BINDING write, not a session
-                                                        // hand-back: this owner is asked
-                                                        // only whether the tab is still on
-                                                        // this execution, and nothing is
+                                                        // A TAB write, not a session
+                                                        // hand-back: the only question is
+                                                        // whether the tab is still on this
+                                                        // execution, and nothing is
                                                         // published over a session here.
-                                                        &crate::db::SessionHandBackOwner::for_operation(
-                                                            Some(&current_operation_id),
-                                                            operation_id,
-                                                            crate::db::SessionCancelReach::none(),
-                                                        ),
+                                                        &oci_tab_owner,
                                                         scope,
                                                     );
                                                     store_batch_scope(&operation_scope, scope)
@@ -19191,7 +19340,7 @@ impl SqlEditorWidget {
         prior_retained_state: RetainedSessionState,
         selected_transaction_mode: crate::db::TransactionMode,
         db_activity: &str,
-        current_operation_autocommit: &Arc<Mutex<bool>>,
+        current_operation_autocommit: &super::TabOperationAutoCommit,
         query_timeout: Option<Duration>,
         scope_sync_context: Option<(&crate::db::SharedConnection, u64)>,
     ) -> OracleThinBatchOutcome {
@@ -19217,6 +19366,9 @@ impl SqlEditorWidget {
             current_operation_autocommit,
             None,
             None,
+            // No tab operation at all on this road, so nothing newer can own
+            // the tab.
+            crate::db::TabOperationOwnership::untracked(),
             query_timeout,
             scope_sync_context.map(|(connection, generation)| (connection.clone(), generation)),
             None,
@@ -19240,9 +19392,13 @@ impl SqlEditorWidget {
         // CONNECT replaces the connection.
         mut default_transaction_isolation: crate::db::TransactionIsolation,
         db_activity: &str,
-        current_operation_autocommit: &Arc<Mutex<bool>>,
-        tab_auto_commit_override: Option<&Arc<Mutex<Option<bool>>>>,
-        tab_transaction_mode_override: Option<&Arc<Mutex<Option<crate::db::TransactionMode>>>>,
+        current_operation_autocommit: &super::TabOperationAutoCommit,
+        tab_auto_commit_override: Option<&super::TabPin<bool>>,
+        tab_transaction_mode_override: Option<&super::TabPin<crate::db::TransactionMode>>,
+        // Which execution the two pins above belong to. Taken beside them, not
+        // derived here: they are the TAB's settings and this batch may have
+        // been abandoned, so the slots and the question travel together.
+        tab_owner: crate::db::TabOperationOwnership,
         query_timeout: Option<Duration>,
         mut scope_sync_context: Option<(crate::db::SharedConnection, u64)>,
         mut transition_context: Option<&mut OracleThinConnectionTransitionContext<'_>>,
@@ -19292,7 +19448,7 @@ impl SqlEditorWidget {
 
         let mut refreshed_pool_context_epoch: Option<u64> = None;
         let mut auto_commit = initial_auto_commit;
-        store_mutex_bool(current_operation_autocommit, auto_commit);
+        current_operation_autocommit.record_for_batch(&tab_owner, auto_commit);
         let mut continue_on_error = match session.lock() {
             Ok(guard) => guard.continue_on_error,
             Err(poisoned) => poisoned.into_inner().continue_on_error,
@@ -19618,10 +19774,31 @@ impl SqlEditorWidget {
                             );
                             match guard_result {
                                 Ok(()) => {
+                                    // Same contract as the OCI and MySQL
+                                    // branches: the batch's own value follows
+                                    // the session, and the TAB's two answers
+                                    // both go through the tab's door.
                                     auto_commit = enabled;
-                                    store_mutex_bool(current_operation_autocommit, enabled);
-                                    if let Some(override_slot) = tab_auto_commit_override {
-                                        store_mutex_bool_option(override_slot, Some(enabled));
+                                    match tab_auto_commit_override {
+                                        Some(override_slot) => {
+                                            Self::record_batch_auto_commit_on_tab(
+                                                &tab_owner,
+                                                override_slot,
+                                                Some(current_operation_autocommit),
+                                                enabled,
+                                            );
+                                        }
+                                        // The internal road, which has no tab
+                                        // pin at all (`execute_oracle_thin_batch`).
+                                        // Its ownership is untracked, so the
+                                        // door would answer yes to everything;
+                                        // saying so here keeps the running
+                                        // operation's value moving with the
+                                        // session it describes.
+                                        None => {
+                                            current_operation_autocommit
+                                                .record_for_batch(&tab_owner, enabled);
+                                        }
                                     }
                                     let _ =
                                         sender.send(QueryProgress::AutoCommitChanged { enabled });
@@ -20257,16 +20434,16 @@ impl SqlEditorWidget {
                                     // override instead of adopting it verbatim.
                                     auto_commit = Self::effective_auto_commit(
                                         candidate.auto_commit,
-                                        tab_auto_commit_override.and_then(load_mutex_bool_option),
+                                        tab_auto_commit_override.and_then(super::TabPin::get),
                                     );
-                                    store_mutex_bool(current_operation_autocommit, auto_commit);
+                                    current_operation_autocommit
+                                        .record_for_batch(&tab_owner, auto_commit);
                                     // The tab's pinned transaction mode also
                                     // survives CONNECT.
                                     active_transaction_mode = Self::effective_transaction_mode(
                                         crate::db::DatabaseType::Oracle,
                                         candidate.transaction_mode,
-                                        tab_transaction_mode_override
-                                            .and_then(load_mutex_transaction_mode_option),
+                                        tab_transaction_mode_override.and_then(super::TabPin::get),
                                     );
                                     // ... but "the connection default" that a
                                     // tab selecting `Default` isolation is put
@@ -20649,7 +20826,7 @@ impl SqlEditorWidget {
                             // asking for a session-level reset the tab no longer
                             // wants.
                             tab_selected: tab_transaction_mode_override
-                                .and_then(load_mutex_transaction_mode_option),
+                                .and_then(super::TabPin::get),
                             default_isolation: default_transaction_isolation,
                         };
                         // Both drivers state the mode through one function, so
@@ -20999,6 +21176,7 @@ impl SqlEditorWidget {
                                     &execution_sql,
                                     &mut active_transaction_mode,
                                     tab_transaction_mode_override,
+                                    &tab_owner,
                                     sender,
                                 ) {
                                     retained_state = retained_state
@@ -21065,7 +21243,7 @@ impl SqlEditorWidget {
                                                         Self::record_batch_scope_on_tab_binding(
                                                             context.connection_binding,
                                                             context.binding_revision,
-                                                            &context.session_owner(sender),
+                                                            context.tab_owner(),
                                                             scope,
                                                         );
                                                         context.scope = Some(scope.to_string());
@@ -22573,10 +22751,10 @@ impl SqlEditorWidget {
     fn record_batch_scope_on_tab_binding(
         connection_binding: &TabConnectionBinding,
         binding_revision: u64,
-        session_owner: &crate::db::SessionHandBackOwner,
+        tab_owner: &crate::db::TabOperationOwnership,
         scope: &str,
     ) -> bool {
-        if !session_owner.is_current() {
+        if !tab_owner.may_state_a_tab_fact() {
             Self::log_tab_scope_left_alone(scope, "a later execution owns the tab");
             return false;
         }
@@ -22588,6 +22766,44 @@ impl SqlEditorWidget {
             return false;
         }
         true
+    }
+
+    /// Move the TAB's auto-commit to what this batch's session was just set to.
+    ///
+    /// TWO slots, because the tab keeps two answers about auto-commit and they
+    /// are not the same answer:
+    ///
+    /// * the PIN is what the tab wants, and it outlives any one execution — so
+    ///   it goes through [`super::TabPin::record_for_batch`], which refuses
+    ///   only once a LATER execution has owned the tab. The same rule the
+    ///   tab's SCOPE follows and the same one the window applies to the
+    ///   matching notice.
+    /// * the value the tab's CANCEL SNAPSHOT reports describes the operation
+    ///   that is RUNNING, so it goes through
+    ///   [`super::TabOperationAutoCommit::record_for_batch`], which refuses as
+    ///   soon as this execution stops being the tab's. This slot is per TAB
+    ///   despite its name; it was the third slot these four call sites wrote
+    ///   and the only one that had no door at all.
+    ///
+    /// Neither asks the binding REVISION, and that is not an omission: a script
+    /// `CONNECT` rebinds the tab and the pins deliberately survive it (they are
+    /// re-resolved over the new connection's default) while the same event
+    /// resets the scope. See `docs/transaction.md`, "Tab-scoped transaction
+    /// mode".
+    ///
+    /// Answers whether the PIN moved, so a caller can keep its own report
+    /// truthful.
+    fn record_batch_auto_commit_on_tab(
+        tab_owner: &crate::db::TabOperationOwnership,
+        tab_auto_commit_override: &super::TabPin<bool>,
+        current_operation_autocommit: Option<&super::TabOperationAutoCommit>,
+        enabled: bool,
+    ) -> bool {
+        let pinned = tab_auto_commit_override.record_for_batch(tab_owner, enabled);
+        if let Some(current_operation_autocommit) = current_operation_autocommit {
+            current_operation_autocommit.record_for_batch(tab_owner, enabled);
+        }
+        pinned
     }
 
     /// Say that the tab did not follow this batch's session, and which of the
@@ -24363,6 +24579,7 @@ impl SqlEditorWidget {
             sql,
             &mut adopted_transaction_mode,
             Some(slots.tab_transaction_mode_override),
+            &slots.tab_owner,
             slots.sender,
         ) && files_with_the_batch
         {
@@ -24373,11 +24590,19 @@ impl SqlEditorWidget {
         if let Some(enabled) = Self::mysql_autocommit_change_after_successful_statement_for_db_type(
             db_type, sql, results,
         ) {
-            store_mutex_bool_option(slots.tab_auto_commit_override, Some(enabled));
+            // The TAB's two answers go through the tab's door (a batch a
+            // later execution has taken the tab from may not move them); the
+            // value BELOW is this batch's own, and it follows the session
+            // unconditionally — the session really was set to it, so every
+            // later statement of this batch runs that way whatever the tab
+            // does with the pin.
+            Self::record_batch_auto_commit_on_tab(
+                &slots.tab_owner,
+                slots.tab_auto_commit_override,
+                slots.current_operation_autocommit,
+                enabled,
+            );
             *auto_commit = enabled;
-            if let Some(operation_autocommit) = slots.current_operation_autocommit {
-                Self::update_current_operation_autocommit(operation_autocommit, enabled);
-            }
             let _ = slots
                 .sender
                 .send(QueryProgress::AutoCommitChanged { enabled });
@@ -24417,7 +24642,8 @@ impl SqlEditorWidget {
         db_type: crate::db::DatabaseType,
         sql: &str,
         active_transaction_mode: &mut crate::db::TransactionMode,
-        tab_transaction_mode_override: Option<&Arc<Mutex<Option<crate::db::TransactionMode>>>>,
+        tab_transaction_mode_override: Option<&super::TabPin<crate::db::TransactionMode>>,
+        tab_owner: &crate::db::TabOperationOwnership,
         sender: &QueryProgressSender,
     ) -> bool {
         let Some(change) = crate::db::session_transaction_mode_change_for_statement(db_type, sql)
@@ -24435,9 +24661,16 @@ impl SqlEditorWidget {
         {
             return false;
         }
+        // The SESSION really moved, so the rest of THIS batch runs under the
+        // new mode whatever the tab does with it.
         *active_transaction_mode = mode;
+        // The TAB's pin is a different question, and it goes through the pin's
+        // own door: a batch a LATER execution has taken the tab from may not
+        // repin it. The adoption still ANSWERS true either way — the
+        // session-scope override residue it clears is a fact about this batch's
+        // session, not about the tab.
         if let Some(slot) = tab_transaction_mode_override {
-            store_mutex_transaction_mode_option(slot, Some(mode));
+            slot.record_for_batch(tab_owner, mode);
         }
         let _ = sender.send(QueryProgress::TransactionModeChanged { mode });
         app::awake();
@@ -24656,26 +24889,21 @@ impl SqlEditorWidget {
             );
             return;
         }
-        if batch_effects.releases_physical_session() {
-            Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
-                shared_connection,
-                pooled_db_session,
-                connection_generation,
-                pool_context_epoch,
-                conn,
-                crate::db::RetainedSessionOutcome::DiscardPhysical,
+        // A batch whose own statement released the session is not probed: the
+        // probe is a round trip on a session that is about to be closed, and
+        // the release already ended the transaction. It is the same RULE
+        // either way — `outcome_after_successful_batch` decides retain vs close
+        // AND names what a close destroys — so the release only chooses the
+        // probe's answer, not a second dispatch beside it. It used to be one,
+        // and that is where a close with nothing to say about what it took came
+        // from.
+        let server_reports_uncommitted_work = !batch_effects.releases_physical_session()
+            && Self::mysql_session_may_have_uncommitted_work(
+                db_type,
+                &mut conn,
                 db_activity,
-                session_scope,
-                hand_back,
+                batch_effects.may_have_uncommitted_work() || prior_may_have_uncommitted_work,
             );
-            return;
-        }
-        let server_reports_uncommitted_work = Self::mysql_session_may_have_uncommitted_work(
-            db_type,
-            &mut conn,
-            db_activity,
-            batch_effects.may_have_uncommitted_work() || prior_may_have_uncommitted_work,
-        );
         let outcome = batch_effects
             .outcome_after_successful_batch(prior_retained_state, server_reports_uncommitted_work);
         Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
@@ -25336,6 +25564,70 @@ impl SqlEditorWidget {
         outcome
     }
 
+    /// What CLOSING this session now destroys: what it is CARRYING, as the
+    /// statement that just ran left it.
+    ///
+    /// The prior state alone is not that answer on a road that runs AFTER a
+    /// statement, and it is wrong in BOTH directions. A successful
+    /// `COMMIT`/`ROLLBACK` resolved the work, so reporting the prior claim
+    /// would tell the user their work was lost on exactly the button that saved
+    /// it — and an `INSERT` under `autocommit=0` from a clean session OPENED
+    /// work the prior claim knows nothing about, so a close after it reported
+    /// "nothing was lost" on the one road whose whole purpose is that it never
+    /// says that untruthfully. Only the first half used to be answered.
+    ///
+    /// Oracle has never had the second hole: both drivers name the state their
+    /// own batch delta recorded, which is the post-statement state
+    /// (`OracleCleanupSessionDecisionApplier::retained_state_a_discard_destroys`,
+    /// `oracle_thin_disposition_for_session_decision`). This is the MySQL
+    /// family's same answer, folded by the same shared rule.
+    ///
+    /// No probe is asked: this runs on a session that is about to be closed —
+    /// a failed session-info sync, a failed health check, a connection
+    /// incarnation that has ended — so the session may not be able to answer at
+    /// all. What the app believes is the honest input, and it is the same
+    /// fallback its sibling road already builds for the same reason.
+    ///
+    /// Before a statement runs the prior state IS this answer, which is why the
+    /// acquisition roads pass it directly.
+    fn mysql_state_a_close_would_destroy(
+        db_type: crate::db::DatabaseType,
+        prior_retained_state: RetainedSessionState,
+        statement_sql: &str,
+        statement_effects: crate::db::StatementSessionEffects,
+        auto_commit: bool,
+        statement_failed: bool,
+        interruption_requires_transaction_decision: bool,
+    ) -> RetainedSessionState {
+        // The PRIOR work is folded in by the shared rule below (it keeps a
+        // dirty prior state unless the statement cleared it), so naming it here
+        // would double-count it and make a successful COMMIT report a loss.
+        // The one case the shared rule cannot resolve without a live probe is
+        // its own documented contract: a FAILED statement whose kind implies an
+        // implicit commit commits nothing when it was rejected at parse time,
+        // and there is no probe here to settle it — so the prior work is
+        // carried explicitly rather than assumed gone.
+        let unresolved_prior_work = statement_failed
+            && statement_effects.has_implicit_commit()
+            && prior_retained_state.may_have_uncommitted_work();
+        let fallback_may_have_uncommitted_work = unresolved_prior_work
+            || statement_effects.starts_transaction_state()
+            || (!auto_commit && statement_effects.may_leave_uncommitted_work());
+        Self::mysql_retained_session_state_after_statement_from_probe(
+            db_type,
+            prior_retained_state,
+            statement_sql,
+            statement_effects,
+            auto_commit,
+            statement_failed,
+            crate::db::TransactionProbeResult {
+                may_have_uncommitted_work: fallback_may_have_uncommitted_work,
+                used_fallback: fallback_may_have_uncommitted_work,
+            },
+            interruption_requires_transaction_decision,
+        )
+    }
+
     fn report_retained_session_lost_with_work(
         sender: Option<&QueryProgressSender>,
         prior_retained_state: RetainedSessionState,
@@ -25349,8 +25641,12 @@ impl SqlEditorWidget {
             result_messages::RETAINED_SESSION_LOST_WITH_WORK,
         );
         if let Some(sender) = sender {
-            let _ = sender.send(QueryProgress::Message {
-                kind: ResultMessageKind::Error,
+            // NOT a `Message`: the window drops every message of an ABANDONED
+            // operation, and an abandoned operation is exactly the state in
+            // which a worker's session is closed rather than filed — so the
+            // one channel this report had was the one the window had stopped
+            // listening to. See `QueryProgress::RetainedSessionLostWithWork`.
+            let _ = sender.send(QueryProgress::RetainedSessionLostWithWork {
                 lines: vec![result_messages::RETAINED_SESSION_LOST_WITH_WORK.to_string()],
             });
             app::awake();
@@ -25492,20 +25788,15 @@ impl SqlEditorWidget {
                         Ok(false) => {
                             // Closed, not filed: no hand-back door runs here, so
                             // this is where what this execution published over
-                            // the session ends.
-                            hand_back.end_reach_before_release();
+                            // the session ends AND where the loss it takes with
+                            // it is answered. Both happen BEFORE either road
+                            // returns: the road that REQUIRES the tab's own
+                            // session — the toolbar Commit/Rollback — used to
+                            // return first, so the loss was never said on
+                            // exactly the button the user pressed to keep that
+                            // work.
+                            hand_back.release_without_door(prior_retained_state, db_activity);
                             Self::discard_mysql_pooled_connection(conn);
-                            // Reported BEFORE either road answers: what this
-                            // session was carrying died with it, and the road
-                            // that REQUIRES the tab's own session — the toolbar
-                            // Commit/Rollback — used to return first, so the
-                            // loss was never said on exactly the button the
-                            // user pressed to keep that work.
-                            Self::report_retained_session_lost_with_work(
-                                session_pool_sender,
-                                prior_retained_state,
-                                db_activity,
-                            );
                             if require_existing_session {
                                 // The loss, not the slot state — the same
                                 // answer the stale-take road has always given
@@ -25536,19 +25827,14 @@ impl SqlEditorWidget {
                                 "Discarding stale reusable {db_display_name} pooled session and retrying with a fresh session: {message}"
                             ),
                         );
-                            hand_back.end_reach_before_release();
-                            Self::discard_mysql_pooled_connection(conn);
                             // Unreachable with work today (the readiness check
                             // runs its settings only on a session that carries
-                            // none), but stated anyway so the rule is this
-                            // arm's own rather than a fact about its caller:
-                            // a work-carrying session never leaves this
-                            // function unreported.
-                            Self::report_retained_session_lost_with_work(
-                                session_pool_sender,
-                                prior_retained_state,
-                                db_activity,
-                            );
+                            // none), but the release states it anyway so the
+                            // rule is this arm's own rather than a fact about
+                            // its caller: a work-carrying session never leaves
+                            // this function unreported.
+                            hand_back.release_without_door(prior_retained_state, db_activity);
+                            Self::discard_mysql_pooled_connection(conn);
                             if require_existing_session {
                                 return Err(message);
                             }
@@ -25648,7 +25934,7 @@ impl SqlEditorWidget {
                             "{db_display_name} pooled session database setup failed with a stale-session error; retrying once: {message}"
                         ),
                     );
-                        hand_back.end_reach_before_release();
+                        hand_back.release_without_door(prior_retained_state, db_activity);
                         Self::discard_mysql_pooled_connection(conn);
                         let (fresh_held, fresh_scope) =
                             Self::acquire_prepared_fresh_mysql_pool_session(
@@ -25708,17 +25994,12 @@ impl SqlEditorWidget {
         ) {
             if Self::mysql_pool_acquire_error_should_retry_fresh(&message) {
                 if require_existing_session {
-                    hand_back.end_reach_before_release();
-                    Self::discard_mysql_pooled_connection(conn);
                     // Unreachable with work today (the setup runs no statement
                     // over a session that carries any), stated for the same
                     // reason as the readiness-check twin above: a work-carrying
                     // session never leaves this function unreported.
-                    Self::report_retained_session_lost_with_work(
-                        session_pool_sender,
-                        prior_retained_state,
-                        db_activity,
-                    );
+                    hand_back.release_without_door(prior_retained_state, db_activity);
+                    Self::discard_mysql_pooled_connection(conn);
                     return Err(message);
                 }
                 crate::utils::logging::log_warning(
@@ -25727,7 +26008,7 @@ impl SqlEditorWidget {
                         "{db_display_name} pooled session setup failed with a stale-session error; retrying once: {message}"
                     ),
                 );
-                hand_back.end_reach_before_release();
+                hand_back.release_without_door(prior_retained_state, db_activity);
                 Self::discard_mysql_pooled_connection(conn);
                 let (fresh_held, fresh_scope) = Self::acquire_prepared_fresh_mysql_pool_session(
                     &context,
@@ -26043,11 +26324,16 @@ impl SqlEditorWidget {
                     hand_back,
                 );
             }
-            crate::db::RetainedSessionOutcome::DiscardPhysical => {
+            crate::db::RetainedSessionOutcome::DiscardPhysical(carried) => {
                 // The retain arm above goes through the hand-back door, which
-                // withdraws for itself. This arm reaches no door at all, so it
-                // states the same order here.
-                hand_back.end_reach_before_release();
+                // withdraws the reach and answers the loss for itself. This arm
+                // reaches no door at all, so it states both here — and it can,
+                // because the outcome now carries what the close destroys.
+                // While it did not, every road through here (a session-info
+                // sync that failed, a statement error the session cannot be
+                // reused after, an interrupted batch whose statement requires a
+                // physical discard) took the user's transaction in silence.
+                hand_back.release_without_door(carried, log_context);
                 Self::discard_mysql_pooled_connection(conn);
             }
         }
@@ -26099,14 +26385,18 @@ impl SqlEditorWidget {
             // the same case for all four backends and reports it from there;
             // this branch never reaches the door because it cannot name the
             // family a disconnected connection no longer remembers.)
-            if let crate::db::RetainedSessionOutcome::Retain(retained_state) = disposition {
-                Self::report_retained_session_lost_with_work(
-                    hand_back.sender(),
-                    retained_state,
-                    db_activity,
-                );
-            }
-            hand_back.end_reach_before_release();
+            //
+            // BOTH arms of the outcome name what the close destroys, so the
+            // answer no longer depends on which one the caller arrived with —
+            // it used to be asked of the retain arm only, which is the arm this
+            // branch is least likely to be given.
+            let carried = match disposition {
+                crate::db::RetainedSessionOutcome::Retain(retained_state)
+                | crate::db::RetainedSessionOutcome::DiscardPhysical(retained_state) => {
+                    retained_state
+                }
+            };
+            hand_back.release_without_door(carried, db_activity);
             Self::discard_mysql_pooled_connection(conn);
         }
     }
@@ -26700,20 +26990,15 @@ impl SqlEditorWidget {
             Ok(Err(message)) => Self::mysql_interrupt_kind_for_message(message),
             _ => InterruptKind::None,
         };
-        if matches!(
-            interrupt_kind,
-            InterruptKind::ConnectionError | InterruptKind::NonRecoverableTimeout
-        ) {
-            return crate::db::RetainedSessionOutcome::DiscardPhysical;
-        }
         let lock_wait_timeout = match result {
             Ok(Err(message)) => Self::mysql_message_is_lock_wait_timeout(message),
             _ => false,
         };
         let recoverable_timeout = matches!(interrupt_kind, InterruptKind::RecoverableTimeout);
         let statement_failed = matches!(result, Ok(Err(_)));
-        let action_released_physical_session =
-            matches!(result, Ok(Ok(_))) && statement_effects.releases_physical_session();
+        // Resolved ABOVE the connection-error return below, not after it: what
+        // a close destroys is the same question on both roads, and it is folded
+        // from these two.
         let interruption_requires_transaction_decision =
             crate::db::statement_interruption_requires_transaction_decision(
                 crate::db::StatementInterruption {
@@ -26728,6 +27013,30 @@ impl SqlEditorWidget {
                 prior_retained_state.transaction_state(),
                 statement_effects.state_hint,
             );
+        let state_a_close_would_destroy = || {
+            Self::mysql_state_a_close_would_destroy(
+                db_type,
+                prior_retained_state,
+                statement_sql,
+                statement_effects,
+                auto_commit,
+                statement_failed,
+                interruption_requires_transaction_decision,
+            )
+        };
+        if matches!(
+            interrupt_kind,
+            InterruptKind::ConnectionError | InterruptKind::NonRecoverableTimeout
+        ) {
+            // What the session is carrying as this statement left it: the app
+            // can only answer for the work it believes is there, and a
+            // successful commit/rollback already resolved it.
+            return crate::db::RetainedSessionOutcome::DiscardPhysical(
+                state_a_close_would_destroy(),
+            );
+        }
+        let action_released_physical_session =
+            matches!(result, Ok(Ok(_))) && statement_effects.releases_physical_session();
         let requires_transaction_decision =
             crate::db::statement_session_post_processor_for(db_type)
                 .requires_transaction_decision_after_statement(
@@ -26754,7 +27063,9 @@ impl SqlEditorWidget {
             reuse_decision,
             crate::db::MySqlPooledSessionReuseDecision::RetainIfSessionInfoSynced
         ) {
-            return crate::db::RetainedSessionOutcome::DiscardPhysical;
+            return crate::db::RetainedSessionOutcome::DiscardPhysical(
+                state_a_close_would_destroy(),
+            );
         }
 
         let fallback_may_have_uncommitted_work = prior_retained_state.may_have_uncommitted_work()
@@ -26784,7 +27095,9 @@ impl SqlEditorWidget {
                     .with_untracked_session_state(),
             )
         } else {
-            crate::db::RetainedSessionOutcome::DiscardPhysical
+            // The state was computed just above; a close that cannot be
+            // resolved by commit/rollback still has to say what it takes.
+            crate::db::RetainedSessionOutcome::DiscardPhysical(retained_state)
         }
     }
 
@@ -26799,7 +27112,7 @@ impl SqlEditorWidget {
         matches!(result, Ok(Ok(_)))
             && matches!(
                 disposition,
-                crate::db::RetainedSessionOutcome::DiscardPhysical
+                crate::db::RetainedSessionOutcome::DiscardPhysical(_)
             )
             && Self::mysql_success_requires_retained_session_after_action(
                 db_type,
@@ -27934,7 +28247,7 @@ impl SqlEditorWidget {
                         // Timeout apply failure followed by restore failure
                         // leaves session variables in an unknown partial state,
                         // so fail closed and drop this physical session.
-                        hand_back.end_reach_before_release();
+                        hand_back.release_without_door(prior_retained_state, log_context);
                         Self::discard_mysql_pooled_connection(conn);
                     }
                     return Err(message);
@@ -27990,7 +28303,7 @@ impl SqlEditorWidget {
                     hand_back,
                 );
             } else {
-                hand_back.end_reach_before_release();
+                hand_back.release_without_door(prior_retained_state, log_context);
                 Self::discard_mysql_pooled_connection(conn);
             }
             return Err(cancelled);
@@ -28054,7 +28367,7 @@ impl SqlEditorWidget {
                         ),
                     );
                     }
-                    hand_back.end_reach_before_release();
+                    hand_back.release_without_door(prior_retained_state, log_context);
                     Self::discard_mysql_pooled_connection(conn);
                     return Err(message);
                 }
@@ -28319,7 +28632,21 @@ impl SqlEditorWidget {
             }
             crate::db::RetainedSessionOutcome::Retain(final_retained_state)
         } else {
-            crate::db::RetainedSessionOutcome::DiscardPhysical
+            // Closing it: what it was carrying, as this statement left it. A
+            // successful commit/rollback resolved the work, so the close takes
+            // nothing — claiming otherwise would report a loss on the very
+            // action that saved it.
+            crate::db::RetainedSessionOutcome::DiscardPhysical(
+                Self::mysql_state_a_close_would_destroy(
+                    db_type,
+                    prior_retained_state,
+                    statement_sql,
+                    statement_effects,
+                    auto_commit,
+                    statement_failed,
+                    interruption_requires_transaction_decision,
+                ),
+            )
         };
         let retain_pool_context_epoch =
             if should_retain_session && session_database_update.reads_session_database() {
@@ -28469,8 +28796,28 @@ fn test_query_progress_channel() -> (QueryProgressSender, mpsc::Receiver<QueryPr
 #[cfg(test)]
 mod session_transaction_mode_adoption_tests {
     use super::SqlEditorWidget;
-    use crate::db::{DatabaseType, TransactionAccessMode, TransactionIsolation, TransactionMode};
-    use std::sync::{Arc, Mutex};
+    use crate::db::{
+        DatabaseType, TabOperationOwnership, TransactionAccessMode, TransactionIsolation,
+        TransactionMode,
+    };
+    use crate::ui::sql_editor::{TabOperationAutoCommit, TabPin};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    /// The tab's three counters as a running execution sees them.
+    ///
+    /// `current` is the operation the tab is on (0 once it has ended),
+    /// `completed` is the last one that finished, and `speaks_for` is the
+    /// execution the worker under test belongs to.
+    fn ownership(current: u64, completed: u64, speaks_for: u64) -> TabOperationOwnership {
+        let current_operation_id = Arc::new(AtomicU64::new(current));
+        let last_completed_operation_id = Arc::new(AtomicU64::new(completed));
+        TabOperationOwnership::for_operation(
+            Some(&current_operation_id),
+            Some(&last_completed_operation_id),
+            speaks_for,
+        )
+    }
 
     #[test]
     fn adoption_refuses_a_merge_the_database_cannot_express() {
@@ -28480,12 +28827,15 @@ mod session_transaction_mode_adoption_tests {
             TransactionAccessMode::ReadOnly,
         );
         let mut active = read_only_pin;
-        let pin = Arc::new(Mutex::new(Some(read_only_pin)));
+        let pin = TabPin::with_value("transaction mode", Some(read_only_pin));
         let adopted = SqlEditorWidget::adopt_session_transaction_mode_change_after_statement(
             DatabaseType::Oracle,
             "ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED",
             &mut active,
             Some(&pin),
+            // This test is about the MERGE, not about ownership: no operation
+            // means nothing newer can own the tab.
+            &TabOperationOwnership::untracked(),
             &sender,
         );
         assert!(
@@ -28495,7 +28845,7 @@ mod session_transaction_mode_adoption_tests {
         );
         assert_eq!(active, read_only_pin, "the active mode must stay untouched");
         assert_eq!(
-            *pin.lock().expect("pin lock"),
+            pin.get(),
             Some(read_only_pin),
             "the tab override must stay untouched"
         );
@@ -28507,12 +28857,13 @@ mod session_transaction_mode_adoption_tests {
         // Serializable over a READ ONLY pin IS expressible (a read-only
         // Oracle transaction reads a serializable snapshot), so it adopts.
         let mut active = read_only_pin;
-        let pin = Arc::new(Mutex::new(Some(read_only_pin)));
+        let pin = TabPin::with_value("transaction mode", Some(read_only_pin));
         let adopted = SqlEditorWidget::adopt_session_transaction_mode_change_after_statement(
             DatabaseType::Oracle,
             "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE",
             &mut active,
             Some(&pin),
+            &TabOperationOwnership::untracked(),
             &sender,
         );
         assert!(adopted, "an expressible merge must still be adopted");
@@ -28523,7 +28874,198 @@ mod session_transaction_mode_adoption_tests {
                 TransactionAccessMode::ReadOnly,
             )
         );
-        assert_eq!(*pin.lock().expect("pin lock"), Some(active));
+        assert_eq!(pin.get(), Some(active));
+    }
+
+    /// A batch a LATER execution has taken the tab from may move its own
+    /// session, but not the TAB's pins.
+    ///
+    /// A force-cancelled batch is ABANDONED rather than joined — and
+    /// abandoning it clears the cancel flag, so it can go on running its
+    /// script — while the tab is published idle and the user's next execution
+    /// can already own it. That execution resolved its own auto-commit and
+    /// transaction mode at startup, and the screen/session checkpoint only runs
+    /// there, so repinning the tab from the dead batch is a change nothing
+    /// downstream would catch.
+    ///
+    /// RENAMED from `an_abandoned_batch_...`, with its reason: its fixture
+    /// always described a SUPERSEDED batch (the tab is on a newer operation),
+    /// which is the case that must be refused. Merely being abandoned is not —
+    /// see the companion test below, which is the half that was answered
+    /// wrongly.
+    #[test]
+    fn a_superseded_batch_moves_its_own_session_but_not_the_tabs_pins() {
+        let (sender, _receiver) = super::test_query_progress_channel();
+        // The tab is on operation 9; this worker speaks for 7.
+        let superseded = ownership(9, 6, 7);
+        assert!(
+            !superseded.is_current(),
+            "the fixture must really describe a batch the tab has moved on from"
+        );
+        assert!(
+            !superseded.may_state_a_tab_fact(),
+            "and one a LATER execution owns, which is what the pins refuse"
+        );
+
+        let mut active = TransactionMode::default();
+        let pin = TabPin::with_value("transaction mode", None);
+        let adopted = SqlEditorWidget::adopt_session_transaction_mode_change_after_statement(
+            DatabaseType::MySQL,
+            "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            &mut active,
+            Some(&pin),
+            &superseded,
+            &sender,
+        );
+        assert!(
+            adopted,
+            "the SESSION really moved, and the batch's own mode has to follow it"
+        );
+        assert_eq!(
+            active,
+            TransactionMode::new(
+                TransactionIsolation::Serializable,
+                TransactionAccessMode::ReadWrite,
+            ),
+            "the rest of THIS batch runs under what its session was set to"
+        );
+        assert_eq!(
+            pin.get(),
+            None,
+            "but the TAB's pin belongs to the execution the tab is on now"
+        );
+
+        let auto_commit_pin = TabPin::with_value("auto-commit", None);
+        let running_operation_auto_commit = TabOperationAutoCommit::new(false);
+        assert!(
+            !SqlEditorWidget::record_batch_auto_commit_on_tab(
+                &superseded,
+                &auto_commit_pin,
+                Some(&running_operation_auto_commit),
+                true
+            ),
+            "the auto-commit pin answers that it was left alone"
+        );
+        assert_eq!(auto_commit_pin.get(), None);
+        assert!(
+            !running_operation_auto_commit.get(),
+            "and the value the tab's cancel snapshot reports describes the \
+             RUNNING operation, which is not this one"
+        );
+
+        // And the same worker on the tab's CURRENT execution still pins it:
+        // the door refuses staleness, not the write.
+        let current = ownership(9, 6, 9);
+        assert!(SqlEditorWidget::record_batch_auto_commit_on_tab(
+            &current,
+            &auto_commit_pin,
+            Some(&running_operation_auto_commit),
+            true
+        ));
+        assert_eq!(auto_commit_pin.get(), Some(true));
+        assert!(running_operation_auto_commit.get());
+        let mode_pin = TabPin::with_value("transaction mode", None);
+        assert!(mode_pin.record_for_batch(&current, active));
+        assert_eq!(mode_pin.get(), Some(active));
+    }
+
+    /// A batch whose tab is merely IDLE still speaks for that tab's settings.
+    ///
+    /// This is the half the pins used to answer wrongly, and it is the half
+    /// that made the app's three per-tab settings disagree with each other. A
+    /// force-cancelled batch is published idle (`current_operation_id` back to
+    /// 0) while it goes on unwinding, and the user's own `USE` from such a
+    /// batch DID reach the tab — the window delivers `ScopeChangedNotice`
+    /// unless a later execution owns the tab, and writes the binding itself —
+    /// while the same batch's `SET AUTOCOMMIT` did not, because the pins asked
+    /// the stricter question. The tab then held one setting the batch had moved
+    /// and two it had not.
+    ///
+    /// The completed counter is what makes this answerable at all: it is 0 or
+    /// older here, and would be NEWER than this operation if a later execution
+    /// had come and gone while this worker unwound.
+    #[test]
+    fn an_idle_tab_still_follows_the_batch_that_was_its_own_execution() {
+        let (sender, _receiver) = super::test_query_progress_channel();
+        // Operation 7 was force-cancelled: the tab is idle and nothing newer
+        // has run.
+        let abandoned = ownership(0, 0, 7);
+        assert!(
+            !abandoned.is_current(),
+            "the tab is not ON this execution any more, so its SESSION is not this batch's"
+        );
+        assert!(
+            abandoned.may_state_a_tab_fact(),
+            "but no later execution has answered for the tab, so what this batch \
+             did to it still stands"
+        );
+
+        let auto_commit_pin = TabPin::with_value("auto-commit", None);
+        let running_operation_auto_commit = TabOperationAutoCommit::new(false);
+        assert!(
+            SqlEditorWidget::record_batch_auto_commit_on_tab(
+                &abandoned,
+                &auto_commit_pin,
+                Some(&running_operation_auto_commit),
+                true
+            ),
+            "the user's own SET AUTOCOMMIT succeeded on this tab's session"
+        );
+        assert_eq!(auto_commit_pin.get(), Some(true));
+        assert!(
+            !running_operation_auto_commit.get(),
+            "the RUNNING operation's value is a different question: there is no \
+             running operation to describe, and the abandon already reset it"
+        );
+
+        let mut active = TransactionMode::default();
+        let mode_pin = TabPin::with_value("transaction mode", None);
+        assert!(
+            SqlEditorWidget::adopt_session_transaction_mode_change_after_statement(
+                DatabaseType::MySQL,
+                "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                &mut active,
+                Some(&mode_pin),
+                &abandoned,
+                &sender,
+            )
+        );
+        assert_eq!(mode_pin.get(), Some(active));
+
+        // A later execution that has already come and gone makes it stale,
+        // even though the tab is idle again and `current_operation_id` is 0.
+        let overtaken = ownership(0, 8, 7);
+        assert!(
+            !overtaken.may_state_a_tab_fact(),
+            "the completed counter is what sees a later execution the live counter \
+             no longer shows"
+        );
+        let later_pin = TabPin::with_value("auto-commit", Some(false));
+        assert!(!SqlEditorWidget::record_batch_auto_commit_on_tab(
+            &overtaken, &later_pin, None, true
+        ));
+        assert_eq!(later_pin.get(), Some(false));
+    }
+
+    /// A value with no completed counter answers the STRICT question.
+    ///
+    /// The session hand-backs are built without one because they only ever ask
+    /// `is_current`. If such a value were handed to a tab-fact door it must not
+    /// silently answer the loose question with half its inputs.
+    #[test]
+    fn ownership_without_the_completed_counter_never_over_permits() {
+        let current_operation_id = Arc::new(AtomicU64::new(0));
+        let half = TabOperationOwnership::for_operation(Some(&current_operation_id), None, 7);
+        assert!(!half.is_current());
+        assert!(
+            !half.may_state_a_tab_fact(),
+            "it cannot tell an idle tab from one a later execution has come and gone on, \
+             so it gives the answer that cannot be wrong"
+        );
+        assert!(
+            TabOperationOwnership::untracked().may_state_a_tab_fact(),
+            "a path outside any tab operation has nothing newer to lose to"
+        );
     }
 }
 
@@ -28910,7 +29452,7 @@ mod query_execution_cleanup_tests {
             current_operation_id,
             Arc::new(AtomicU64::new(0)),
             Arc::new(Mutex::new(crate::db::session_policy::SqlKind::Unknown)),
-            Arc::new(Mutex::new(true)),
+            super::TabOperationAutoCommit::new(true),
             Arc::new(Mutex::new(None)),
         )
     }
@@ -31716,7 +32258,7 @@ mod query_execution_cleanup_tests {
                 current_operation_id.clone(),
                 last_completed_operation_id.clone(),
                 Arc::new(Mutex::new(crate::db::session_policy::SqlKind::SelectLike)),
-                Arc::new(Mutex::new(true)),
+                super::TabOperationAutoCommit::new(true),
                 Arc::new(Mutex::new(None)),
             );
             guard.track_execution_metadata(
@@ -31766,7 +32308,7 @@ mod query_execution_cleanup_tests {
                 current_operation_id,
                 last_completed_operation_id.clone(),
                 Arc::new(Mutex::new(crate::db::session_policy::SqlKind::SelectLike)),
-                Arc::new(Mutex::new(true)),
+                super::TabOperationAutoCommit::new(true),
                 Arc::new(Mutex::new(None)),
             );
             guard.track_execution_metadata(
@@ -31813,7 +32355,7 @@ mod query_execution_cleanup_tests {
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(Mutex::new(crate::db::session_policy::SqlKind::Unknown)),
-                Arc::new(Mutex::new(true)),
+                super::TabOperationAutoCommit::new(true),
                 Arc::new(Mutex::new(None)),
             );
             guard.track_execution_metadata(
@@ -32653,14 +33195,18 @@ mod query_execution_cleanup_tests {
                 RetainedSessionState::default(),
                 "ERROR 1049 (42000): Unknown database 'missing_db'",
             ),
-            RetainedSessionOutcome::DiscardPhysical
+            RetainedSessionOutcome::DiscardPhysical(RetainedSessionState::default())
         );
         assert_eq!(
             SqlEditorWidget::mysql_retained_session_scope_recheck_error_outcome(
                 dirty,
                 "ERROR 2013 (HY000): Lost connection to MySQL server during query",
             ),
-            RetainedSessionOutcome::DiscardPhysical
+            // The second case is the one that matters for the user: a session
+            // holding their transaction is closed because it cannot be reused,
+            // and the discard has to NAME that transaction or the close cannot
+            // be reported. It used to carry nothing, so it was silent.
+            RetainedSessionOutcome::DiscardPhysical(dirty)
         );
     }
 
@@ -36213,7 +36759,9 @@ mod query_execution_cleanup_tests {
             );
             assert_eq!(
                 clean_decision.outcome,
-                crate::db::RetainedSessionOutcome::DiscardPhysical,
+                crate::db::RetainedSessionOutcome::DiscardPhysical(
+                    RetainedSessionState::default()
+                ),
                 "{db_type:?} read-only autocommit-off script cancel must not request commit/rollback"
             );
             assert!(!clean_decision.requires_session_info_sync);
@@ -36875,6 +37423,112 @@ mod query_execution_cleanup_tests {
         }
     }
 
+    /// Closing a MySQL-family session must say what it TAKES, and the work the
+    /// closed statement itself opened is part of that.
+    ///
+    /// The answer used to be the state from BEFORE the statement, lowered when
+    /// a commit/rollback had resolved it and never raised. So an `INSERT` under
+    /// `autocommit=0` from a clean session — the commonest way a tab acquires
+    /// uncommitted work at all — left the close reporting "nothing was lost" on
+    /// the one road whose whole purpose is that it never says that untruthfully
+    /// (`report_retained_session_lost_with_work` asks
+    /// `may_have_uncommitted_work()` and returns silently when it is false).
+    /// Oracle has always named its post-statement state; this is the same
+    /// answer for the other two backends.
+    #[test]
+    fn a_mysql_close_names_the_work_the_closed_statement_itself_opened() {
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            let post_processor = crate::db::statement_session_post_processor_for(db_type);
+
+            // The defect: clean session, autocommit OFF, a successful INSERT.
+            let insert = post_processor.effects_for_sql("INSERT INTO t VALUES (1)");
+            let carried = SqlEditorWidget::mysql_state_a_close_would_destroy(
+                db_type,
+                RetainedSessionState::default(),
+                "INSERT INTO t VALUES (1)",
+                insert,
+                false,
+                false,
+                false,
+            );
+            assert!(
+                carried.may_have_uncommitted_work(),
+                "{db_type:?}: the statement opened a transaction, so closing the session \
+                 destroys it"
+            );
+
+            // Under autocommit ON the same statement leaves nothing behind, so
+            // the close must not invent a loss.
+            let carried = SqlEditorWidget::mysql_state_a_close_would_destroy(
+                db_type,
+                RetainedSessionState::default(),
+                "INSERT INTO t VALUES (1)",
+                insert,
+                true,
+                false,
+                false,
+            );
+            assert!(
+                !carried.may_have_uncommitted_work(),
+                "{db_type:?}: an auto-committed statement leaves nothing for the close to take"
+            );
+
+            // The half that was already right, and must stay right: reporting a
+            // loss on the very action that saved the work is the other way to
+            // be wrong.
+            let dirty = RetainedSessionState::from_transaction_state(
+                TransactionSessionState::DecisionRequired,
+            );
+            let commit = post_processor.effects_for_sql("COMMIT");
+            let carried = SqlEditorWidget::mysql_state_a_close_would_destroy(
+                db_type, dirty, "COMMIT", commit, false, false, false,
+            );
+            assert!(
+                !carried.may_have_uncommitted_work(),
+                "{db_type:?}: a successful COMMIT resolved the work, so the close takes none"
+            );
+
+            // A FAILED statement whose kind implies an implicit commit commits
+            // nothing when it was rejected at parse time, and there is no live
+            // probe on a session that is being closed — so the prior work is
+            // carried rather than assumed gone.
+            let ddl = post_processor.effects_for_sql("CREATE TABLE t (id INT)");
+            let carried = SqlEditorWidget::mysql_state_a_close_would_destroy(
+                db_type,
+                dirty,
+                "CREATE TABLE t (id INT)",
+                ddl,
+                false,
+                true,
+                false,
+            );
+            assert!(
+                carried.may_have_uncommitted_work(),
+                "{db_type:?}: a failed implicit-commit statement cannot be assumed to have \
+                 committed the prior transaction"
+            );
+
+            // And a plain SELECT over a clean session takes nothing with it.
+            let select = post_processor.effects_for_sql("SELECT 1");
+            let carried = SqlEditorWidget::mysql_state_a_close_would_destroy(
+                db_type,
+                RetainedSessionState::default(),
+                "SELECT 1",
+                select,
+                false,
+                false,
+                false,
+            );
+            assert!(
+                !carried.may_have_uncommitted_work(),
+                "{db_type:?}: a read leaves no work for the close to report"
+            );
+        }
+    }
+
     #[test]
     fn mysql_pooled_action_result_after_cancel_preserves_success_and_normalizes_errors() {
         let success: std::thread::Result<Result<(), String>> = Ok(Ok(()));
@@ -37195,7 +37849,7 @@ mod query_execution_cleanup_tests {
                 false,
                 &success,
             ),
-            crate::db::RetainedSessionOutcome::DiscardPhysical,
+            crate::db::RetainedSessionOutcome::DiscardPhysical(RetainedSessionState::default()),
         );
     }
 
@@ -37247,7 +37901,13 @@ mod query_execution_cleanup_tests {
             &result,
         );
 
-        assert_eq!(outcome, crate::db::RetainedSessionOutcome::DiscardPhysical);
+        // The connection died with the tab's transaction on the session, so the
+        // discard has to name it: that is what the release road reports as
+        // lost work.
+        assert_eq!(
+            outcome,
+            crate::db::RetainedSessionOutcome::DiscardPhysical(prior)
+        );
     }
 
     #[test]
@@ -37299,10 +37959,13 @@ mod query_execution_cleanup_tests {
                 &success,
             );
 
-            assert_eq!(
-                outcome,
-                crate::db::RetainedSessionOutcome::DiscardPhysical,
-                "{sql} has no unresolved transaction to commit or roll back"
+            let crate::db::RetainedSessionOutcome::DiscardPhysical(carried) = outcome else {
+                panic!("{sql} must close the physical session");
+            };
+            assert!(
+                !carried.may_have_uncommitted_work(),
+                "{sql} has no unresolved transaction to commit or roll back, so the close \
+                 must not claim it took work"
             );
         }
     }
@@ -37310,7 +37973,8 @@ mod query_execution_cleanup_tests {
     #[test]
     fn mysql_timeout_reset_failure_reports_lost_required_session_state() {
         let success: std::thread::Result<Result<(), String>> = Ok(Ok(()));
-        let discarded = crate::db::RetainedSessionOutcome::DiscardPhysical;
+        let discarded =
+            crate::db::RetainedSessionOutcome::DiscardPhysical(RetainedSessionState::default());
         let retained = crate::db::RetainedSessionOutcome::Retain(
             RetainedSessionState::from_transaction_state(TransactionSessionState::DecisionRequired),
         );
@@ -38329,8 +38993,8 @@ mod mysql_batch_execution_regression_tests {
         current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>>,
         pooled_db_session: crate::db::SharedDbSessionLease,
-        tab_auto_commit_override: Arc<Mutex<Option<bool>>>,
-        tab_transaction_mode_override: Arc<Mutex<Option<TransactionMode>>>,
+        tab_auto_commit_override: super::TabPin<bool>,
+        tab_transaction_mode_override: super::TabPin<TransactionMode>,
         active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
         next_lazy_fetch_session_id: Arc<AtomicU64>,
         cancel_flag: Arc<Mutex<bool>>,
@@ -38388,8 +39052,8 @@ mod mysql_batch_execution_regression_tests {
                 current_mysql_cancel_context: Arc::new(Mutex::new(None)),
                 current_query_cancel_handle: Arc::new(Mutex::new(OperationCancelTarget::default())),
                 pooled_db_session: crate::db::SharedDbSessionLease::new(),
-                tab_auto_commit_override: Arc::new(Mutex::new(None)),
-                tab_transaction_mode_override: Arc::new(Mutex::new(None)),
+                tab_auto_commit_override: super::TabPin::new("auto-commit"),
+                tab_transaction_mode_override: super::TabPin::new("transaction mode"),
                 active_lazy_fetch: Arc::new(Mutex::new(None)),
                 next_lazy_fetch_session_id: Arc::new(AtomicU64::new(1)),
                 cancel_flag: Arc::new(Mutex::new(false)),
@@ -38473,6 +39137,7 @@ mod mysql_batch_execution_regression_tests {
                 None,
                 None,
                 0,
+                crate::db::TabOperationOwnership::untracked(),
                 None,
             );
             drop(sender);
@@ -38532,7 +39197,7 @@ mod mysql_batch_execution_regression_tests {
         shared_connection: &Arc<Mutex<DatabaseConnection>>,
         session: &Arc<Mutex<SessionState>>,
         pooled_db_session: &crate::db::SharedDbSessionLease,
-        tab_auto_commit_override: &Arc<Mutex<Option<bool>>>,
+        tab_auto_commit_override: &super::TabPin<bool>,
         db_type: DatabaseType,
         script: &str,
         initial_auto_commit: bool,
@@ -38545,8 +39210,8 @@ mod mysql_batch_execution_regression_tests {
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
-        let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
-            Arc::new(Mutex::new(None));
+        let tab_transaction_mode_override: super::TabPin<crate::db::TransactionMode> =
+            super::TabPin::new("transaction mode");
         let initial_transaction_mode = {
             let guard = shared_connection
                 .lock()
@@ -38583,6 +39248,7 @@ mod mysql_batch_execution_regression_tests {
             None,
             None,
             0,
+            crate::db::TabOperationOwnership::untracked(),
             None,
         );
         drop(sender);
@@ -38677,6 +39343,9 @@ mod mysql_batch_execution_regression_tests {
                 }
                 QueryProgress::Message { kind, lines } => {
                     format!("Message({kind:?}, {})", lines.join(" | "))
+                }
+                QueryProgress::RetainedSessionLostWithWork { lines } => {
+                    format!("RetainedSessionLostWithWork({})", lines.join(" | "))
                 }
                 QueryProgress::ExplainPlanOutput { result } => {
                     format!(
@@ -38925,6 +39594,14 @@ mod mysql_batch_execution_regression_tests {
                     };
                     assert_eq!(routes, &[expected], "{label}\n{progress_summary}");
                 }
+                // The lost-session notice is an error for the user, so it goes
+                // where an error message goes; what makes it its own variant is
+                // the abandoned-operation filter, not the pane.
+                QueryProgress::RetainedSessionLostWithWork { .. } => assert_eq!(
+                    routes,
+                    &[ResultPaneRoute::MessagesErrors],
+                    "{label}\n{progress_summary}"
+                ),
                 QueryProgress::ExplainPlanOutput { .. } => assert_eq!(
                     routes,
                     &[ResultPaneRoute::DataGrid],
@@ -39075,9 +39752,9 @@ mod mysql_batch_execution_regression_tests {
         let current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>> =
             Arc::new(Mutex::new(OperationCancelTarget::default()));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
-        let tab_auto_commit_override = Arc::new(Mutex::new(None));
-        let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
-            Arc::new(Mutex::new(None));
+        let tab_auto_commit_override: super::TabPin<bool> = super::TabPin::new("auto-commit");
+        let tab_transaction_mode_override: super::TabPin<crate::db::TransactionMode> =
+            super::TabPin::new("transaction mode");
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -39111,6 +39788,7 @@ mod mysql_batch_execution_regression_tests {
             None,
             None,
             0,
+            crate::db::TabOperationOwnership::untracked(),
             None,
         );
         drop(sender);
@@ -39203,9 +39881,9 @@ mod mysql_batch_execution_regression_tests {
         let current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>> =
             Arc::new(Mutex::new(OperationCancelTarget::default()));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
-        let tab_auto_commit_override = Arc::new(Mutex::new(None));
-        let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
-            Arc::new(Mutex::new(None));
+        let tab_auto_commit_override: super::TabPin<bool> = super::TabPin::new("auto-commit");
+        let tab_transaction_mode_override: super::TabPin<crate::db::TransactionMode> =
+            super::TabPin::new("transaction mode");
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -39239,6 +39917,7 @@ mod mysql_batch_execution_regression_tests {
             None,
             None,
             0,
+            crate::db::TabOperationOwnership::untracked(),
             None,
         );
         drop(sender);
@@ -39498,9 +40177,9 @@ mod mysql_batch_execution_regression_tests {
         let current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>> =
             Arc::new(Mutex::new(OperationCancelTarget::default()));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
-        let tab_auto_commit_override = Arc::new(Mutex::new(None));
-        let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
-            Arc::new(Mutex::new(None));
+        let tab_auto_commit_override: super::TabPin<bool> = super::TabPin::new("auto-commit");
+        let tab_transaction_mode_override: super::TabPin<crate::db::TransactionMode> =
+            super::TabPin::new("transaction mode");
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -39535,6 +40214,7 @@ mod mysql_batch_execution_regression_tests {
                 None,
                 None,
                 0,
+                crate::db::TabOperationOwnership::untracked(),
                 None,
             );
             drop(sender);
@@ -39626,6 +40306,7 @@ mod mysql_batch_execution_regression_tests {
                 None,
                 None,
                 0,
+                crate::db::TabOperationOwnership::untracked(),
                 None,
             );
             drop(sender);
@@ -40130,9 +40811,9 @@ SELECT 'FINAL_STATUS' AS section_name,
         let current_query_cancel_handle: Arc<Mutex<OperationCancelTarget>> =
             Arc::new(Mutex::new(OperationCancelTarget::default()));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
-        let tab_auto_commit_override = Arc::new(Mutex::new(None));
-        let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
-            Arc::new(Mutex::new(None));
+        let tab_auto_commit_override: super::TabPin<bool> = super::TabPin::new("auto-commit");
+        let tab_transaction_mode_override: super::TabPin<crate::db::TransactionMode> =
+            super::TabPin::new("transaction mode");
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -40185,6 +40866,7 @@ SELECT 'FINAL_STATUS' AS section_name,
             None,
             None,
             0,
+            crate::db::TabOperationOwnership::untracked(),
             None,
         );
         drop(sender);
@@ -40566,11 +41248,11 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
             crate::db::SharedDbSessionLease::new(),
             crate::db::SharedDbSessionLease::new(),
         ];
-        let auto_commit_overrides = [
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
+        let auto_commit_overrides: [super::TabPin<bool>; 4] = [
+            super::TabPin::new("auto-commit"),
+            super::TabPin::new("auto-commit"),
+            super::TabPin::new("auto-commit"),
+            super::TabPin::new("auto-commit"),
         ];
         let scripts = [
             "\
@@ -42181,7 +42863,7 @@ mod mysql_transaction_feedback_tests {
         let mut conn = tns_thin::OracleThinSession::connect(config).expect("thin login");
         let session = Arc::new(Mutex::new(session_state));
         let cancel_flag = Arc::new(Mutex::new(false));
-        let current_operation_autocommit = Arc::new(Mutex::new(true));
+        let current_operation_autocommit = super::TabOperationAutoCommit::new(true);
         let (sender, receiver) = super::test_query_progress_channel();
         let trace_progress = std::env::var_os("OQT_THIN_TEST_TRACE").is_some();
         let collector = std::thread::spawn(move || {
@@ -42960,7 +43642,7 @@ mod mysql_transaction_feedback_tests {
             ..SessionState::default()
         }));
         let cancel_flag = Arc::new(Mutex::new(false));
-        let current_operation_autocommit = Arc::new(Mutex::new(true));
+        let current_operation_autocommit = super::TabOperationAutoCommit::new(true);
         let transaction_mode = TransactionMode::new(
             TransactionIsolation::Default,
             TransactionAccessMode::ReadOnly,
@@ -43042,7 +43724,7 @@ mod mysql_transaction_feedback_tests {
             ..SessionState::default()
         }));
         let cancel_flag = Arc::new(Mutex::new(false));
-        let current_operation_autocommit = Arc::new(Mutex::new(false));
+        let current_operation_autocommit = super::TabOperationAutoCommit::new(false);
         let (sender, receiver) = super::test_query_progress_channel();
         let outcome = SqlEditorWidget::execute_oracle_thin_batch(
             &mut conn,
@@ -44763,7 +45445,7 @@ mod mysql_transaction_feedback_tests {
             db_type: DatabaseType::Oracle,
             ..SessionState::default()
         }));
-        let current_operation_autocommit = Arc::new(Mutex::new(true));
+        let current_operation_autocommit = super::TabOperationAutoCommit::new(true);
         let (sender, receiver) = super::test_query_progress_channel();
         let outcome = SqlEditorWidget::execute_oracle_thin_batch(
             &mut conn,

@@ -202,9 +202,18 @@ pub(crate) struct TransactionProbeResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a caller holding a session should do with it — and, when it is to be
+/// CLOSED, what closing it destroys.
+///
+/// Both arms carry the state, and that is not symmetry for its own sake: a
+/// session that goes away with uncommitted work in it has to be reported
+/// (`RETAINED_SESSION_LOST_WITH_WORK`), and a discard arm that carries nothing
+/// cannot report what it destroyed — every road through it took the loss in
+/// silence, while the DB layer's own [`crate::db::RetainedSessionDisposition`]
+/// has carried the state through both arms since the round that found it.
 pub(crate) enum RetainedSessionOutcome {
     Retain(RetainedSessionState),
-    DiscardPhysical,
+    DiscardPhysical(RetainedSessionState),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,7 +301,9 @@ pub(crate) fn retained_session_outcome_after_transaction_resolution_success(
     retained_state_after_success: RetainedSessionState,
 ) -> RetainedSessionOutcome {
     if retained_session_transaction_resolution_should_discard_after_success(prior_state) {
-        RetainedSessionOutcome::DiscardPhysical
+        // The commit or rollback already ran, so what the discard destroys is
+        // what is left AFTER it — residue or locks, never the resolved work.
+        RetainedSessionOutcome::DiscardPhysical(retained_state_after_success)
     } else {
         RetainedSessionOutcome::Retain(retained_state_after_success)
     }
@@ -339,8 +350,15 @@ pub(crate) fn retained_session_error_outcome(
         {
             RetainedSessionOutcome::Retain(prior_state)
         }
+        // What the discard destroys is what the session was carrying when the
+        // error happened: this road is reached when the session cannot be
+        // restored (the error does not allow reuse, or the state does not
+        // require preservation), and the first of those two can be true with
+        // the user's transaction still on it.
         RetainedSessionErrorPolicy::RestoreIfReusableAndRequiresResolution
-        | RetainedSessionErrorPolicy::DiscardPhysical => RetainedSessionOutcome::DiscardPhysical,
+        | RetainedSessionErrorPolicy::DiscardPhysical => {
+            RetainedSessionOutcome::DiscardPhysical(prior_state)
+        }
     }
 }
 
@@ -351,7 +369,9 @@ pub(crate) fn retained_session_outcome_after_session_info_sync(
     if session_info_synced {
         RetainedSessionOutcome::Retain(retained_state)
     } else {
-        RetainedSessionOutcome::DiscardPhysical
+        // The state the sync failed to file is exactly what closing the session
+        // now takes with it.
+        RetainedSessionOutcome::DiscardPhysical(retained_state)
     }
 }
 
@@ -2370,7 +2390,14 @@ impl MySqlBatchSessionEffects {
         server_reports_uncommitted_work: bool,
     ) -> RetainedSessionOutcome {
         if self.releases_physical_session() {
-            RetainedSessionOutcome::DiscardPhysical
+            // A statement of the batch released the session itself, and
+            // releasing it is what ENDED its transaction
+            // (`TransactionControlOutcome::ReleasesSession` clears the
+            // transaction state), so the close destroys nothing of the user's.
+            RetainedSessionOutcome::DiscardPhysical(self.retained_state_after_successful_batch(
+                prior_state,
+                server_reports_uncommitted_work,
+            ))
         } else {
             RetainedSessionOutcome::Retain(self.retained_state_after_successful_batch(
                 prior_state,
@@ -2438,8 +2465,19 @@ impl MySqlBatchSessionEffects {
         auto_commit: bool,
     ) -> MySqlInterruptedBatchSessionDecision {
         if self.releases_physical_session() {
+            // The release statement ran and ended the transaction with the
+            // session, so this close takes nothing of the user's with it. The
+            // interrupted batch's own reading of the prior state is what says
+            // so, rather than a guess made here.
             return MySqlInterruptedBatchSessionDecision {
-                outcome: RetainedSessionOutcome::DiscardPhysical,
+                outcome: RetainedSessionOutcome::DiscardPhysical(
+                    self.retained_state_after_interrupted_batch(
+                        prior_state,
+                        script_mode,
+                        auto_commit,
+                    )
+                    .unwrap_or_default(),
+                ),
                 requires_session_info_sync: false,
             };
         }
@@ -2450,8 +2488,11 @@ impl MySqlBatchSessionEffects {
             if self.interrupted_statement_requires_physical_discard
                 && !retained_state.transaction_resolution_action_allowed()
             {
+                // This is the arm that closes a session the app itself judged
+                // needs preserving, so it must name what it is closing: the
+                // state can carry work no commit could have reached.
                 return MySqlInterruptedBatchSessionDecision {
-                    outcome: RetainedSessionOutcome::DiscardPhysical,
+                    outcome: RetainedSessionOutcome::DiscardPhysical(retained_state),
                     requires_session_info_sync: false,
                 };
             }
@@ -2466,16 +2507,21 @@ impl MySqlBatchSessionEffects {
             };
         }
 
+        // Both roads below are reached only because
+        // `retained_state_after_interrupted_batch` answered `None`, which it
+        // does exactly when the state it computed needs no preservation — so
+        // there is nothing on the session for this close to destroy, and
+        // saying so is the honest answer rather than a silence.
         if script_mode {
             return MySqlInterruptedBatchSessionDecision {
-                outcome: RetainedSessionOutcome::DiscardPhysical,
+                outcome: RetainedSessionOutcome::DiscardPhysical(RetainedSessionState::default()),
                 requires_session_info_sync: false,
             };
         }
 
         if self.interrupted_statement_requires_physical_discard {
             return MySqlInterruptedBatchSessionDecision {
-                outcome: RetainedSessionOutcome::DiscardPhysical,
+                outcome: RetainedSessionOutcome::DiscardPhysical(RetainedSessionState::default()),
                 requires_session_info_sync: false,
             };
         }
@@ -9740,10 +9786,19 @@ mod tests {
             );
 
             assert!(batch_effects.releases_physical_session(), "{sql}");
-            assert_eq!(
-                batch_effects.outcome_after_successful_batch(prior, true),
-                RetainedSessionOutcome::DiscardPhysical,
-                "{sql}"
+            // CHANGED, with its reason: the outcome now NAMES what closing the
+            // session destroys, because a discard that carries nothing cannot
+            // report the user's lost work. The discard is still the assertion;
+            // what it carries is the new half, and for a release it must be
+            // "nothing of the user's" — the same statement that released the
+            // session ended its transaction.
+            let outcome = batch_effects.outcome_after_successful_batch(prior, true);
+            let RetainedSessionOutcome::DiscardPhysical(carried) = outcome else {
+                panic!("{sql} must close the physical session");
+            };
+            assert!(
+                !carried.may_have_uncommitted_work(),
+                "{sql} ended the transaction it released, so the close takes no work with it"
             );
         }
     }
@@ -11509,10 +11564,12 @@ mod tests {
             );
             let decision = batch_effects.decision_after_interrupted_batch(prior, true, false);
 
-            assert_eq!(
-                decision.outcome,
-                RetainedSessionOutcome::DiscardPhysical,
-                "{sql}"
+            let RetainedSessionOutcome::DiscardPhysical(carried) = decision.outcome else {
+                panic!("{sql} must close the physical session");
+            };
+            assert!(
+                !carried.may_have_uncommitted_work(),
+                "{sql} released the session after ending its transaction"
             );
             assert!(!decision.requires_session_info_sync, "{sql}");
         }
@@ -11589,7 +11646,10 @@ mod tests {
             true,
         );
 
-        assert_eq!(decision.outcome, RetainedSessionOutcome::DiscardPhysical);
+        assert_eq!(
+            decision.outcome,
+            RetainedSessionOutcome::DiscardPhysical(RetainedSessionState::default())
+        );
         assert!(!decision.requires_session_info_sync);
     }
 
@@ -11626,10 +11686,13 @@ mod tests {
                 true,
             );
 
-            assert_eq!(
-                decision.outcome,
-                RetainedSessionOutcome::DiscardPhysical,
-                "{sql}"
+            let RetainedSessionOutcome::DiscardPhysical(carried) = decision.outcome else {
+                panic!("{sql} must close the physical session");
+            };
+            assert!(
+                !carried.may_have_uncommitted_work(),
+                "{sql} is discarded because nothing on the session needs resolving, \
+                 so the close must not claim it took work"
             );
             assert!(!decision.requires_session_info_sync, "{sql}");
         }
@@ -11653,10 +11716,12 @@ mod tests {
                 true,
             );
 
-            assert_eq!(
-                decision.outcome,
-                RetainedSessionOutcome::DiscardPhysical,
-                "{sql}"
+            let RetainedSessionOutcome::DiscardPhysical(carried) = decision.outcome else {
+                panic!("{sql} must close the physical session");
+            };
+            assert!(
+                !carried.may_have_uncommitted_work(),
+                "{sql} left residue, not a transaction, so the close takes no work"
             );
             assert!(!decision.requires_session_info_sync, "{sql}");
         }
@@ -11834,7 +11899,10 @@ mod tests {
                 true,
                 RetainedSessionErrorPolicy::DiscardPhysical,
             ),
-            RetainedSessionOutcome::DiscardPhysical
+            // The discard names what it closes, so the road that reports the
+            // loss has something to report: this policy closes a session that
+            // was carrying the residue above.
+            RetainedSessionOutcome::DiscardPhysical(residue_state)
         );
         assert_eq!(
             retained_session_error_outcome(
@@ -11842,7 +11910,7 @@ mod tests {
                 true,
                 RetainedSessionErrorPolicy::RestoreIfReusableAndRequiresResolution,
             ),
-            RetainedSessionOutcome::DiscardPhysical
+            RetainedSessionOutcome::DiscardPhysical(RetainedSessionState::default())
         );
     }
 
@@ -11857,7 +11925,7 @@ mod tests {
                 true,
                 RetainedSessionErrorPolicy::RestoreIfReusableAndRequiresResolution,
             ),
-            RetainedSessionOutcome::DiscardPhysical
+            RetainedSessionOutcome::DiscardPhysical(invalid_state)
         );
         assert!(!retained_session_should_restore_after_reusable_error(
             invalid_state,
@@ -11901,7 +11969,10 @@ mod tests {
         );
         assert_eq!(
             retained_session_outcome_after_session_info_sync(dirty_state, false),
-            RetainedSessionOutcome::DiscardPhysical
+            // The road this test covers is exactly one of those that used to
+            // close a work-carrying session in silence: the state it could not
+            // file is what the close destroys, so the discard carries it.
+            RetainedSessionOutcome::DiscardPhysical(dirty_state)
         );
     }
 
@@ -12140,7 +12211,11 @@ mod tests {
                 dirty_with_residue,
                 dirty_with_residue.with_transaction_state(TransactionSessionState::Clean),
             ),
-            RetainedSessionOutcome::DiscardPhysical
+            // After a successful commit/rollback: what the discard takes is
+            // what is left AFTER the resolution, never the work it resolved.
+            RetainedSessionOutcome::DiscardPhysical(
+                dirty_with_residue.with_transaction_state(TransactionSessionState::Clean)
+            )
         );
 
         let dirty_with_lock =
@@ -12150,7 +12225,9 @@ mod tests {
                 dirty_with_lock,
                 dirty_with_lock.with_transaction_state(TransactionSessionState::Clean),
             ),
-            RetainedSessionOutcome::DiscardPhysical
+            RetainedSessionOutcome::DiscardPhysical(
+                dirty_with_lock.with_transaction_state(TransactionSessionState::Clean)
+            )
         );
 
         let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
@@ -12170,7 +12247,9 @@ mod tests {
                 dirty_with_mode_override,
                 dirty_with_mode_override.with_transaction_state(TransactionSessionState::Clean),
             ),
-            RetainedSessionOutcome::DiscardPhysical
+            RetainedSessionOutcome::DiscardPhysical(
+                dirty_with_mode_override.with_transaction_state(TransactionSessionState::Clean)
+            )
         );
     }
 

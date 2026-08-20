@@ -1932,7 +1932,8 @@ fn attach_tab(shared: space_query::db::SharedConnection) -> Harness {
                 println!("    (event) {name}");
             }
             match progress_inner(&event) {
-                QueryProgress::Message { lines, .. }
+                QueryProgress::RetainedSessionLostWithWork { lines }
+                | QueryProgress::Message { lines, .. }
                 | QueryProgress::ScriptOutput { lines, .. } => {
                     capture
                         .lock()

@@ -257,6 +257,177 @@ fn store_mutex_transaction_mode_option(
     }
 }
 
+/// A per-tab SETTING a worker may move only through its own door.
+///
+/// The tab's auto-commit and transaction-mode pins used to be bare
+/// `Arc<Mutex<Option<T>>>` slots written with `store_mutex_*` from four places
+/// each, so a batch the tab had moved on from could flip a live tab's
+/// auto-commit. Putting a named door in front of them was only half the fix:
+/// the ban that made the door the ONLY writer was a source-text guard counting
+/// ONE spelling of the bare store call, and the three spellings the bare writes
+/// actually used (`&tab_...`, `slots.tab_...`, `override_slot`) went straight
+/// past it, so the regression it existed to stop would have compiled and
+/// passed.
+///
+/// The rule belongs in the TYPE. The slot is private, `store_mutex_*` cannot
+/// name it, and the only write a worker can reach is
+/// [`Self::record_for_batch`], which asks the question first. The UI thread's
+/// own writes are spelled `*_from_ui`, so a worker calling one reads wrong.
+pub(crate) struct TabPin<T> {
+    slot: Arc<Mutex<Option<T>>>,
+    /// What this pin is called in the refusal log. Carried by the pin so the
+    /// door needs no argument a caller could get wrong.
+    setting: &'static str,
+}
+
+impl<T> Clone for TabPin<T> {
+    fn clone(&self) -> Self {
+        Self {
+            slot: Arc::clone(&self.slot),
+            setting: self.setting,
+        }
+    }
+}
+
+impl<T: Copy> TabPin<T> {
+    pub(crate) fn new(setting: &'static str) -> Self {
+        Self {
+            slot: Arc::new(Mutex::new(None)),
+            setting,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_value(setting: &'static str, value: Option<T>) -> Self {
+        Self {
+            slot: Arc::new(Mutex::new(value)),
+            setting,
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<T> {
+        match self.slot.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn store(&self, value: Option<T>) {
+        match self.slot.lock() {
+            Ok(mut guard) => *guard = value,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = value;
+            }
+        }
+    }
+
+    /// The toolbar/menu write path. The UI thread IS the tab, so there is no
+    /// staler execution it could be losing to.
+    pub(crate) fn set_from_ui(&self, value: T) {
+        self.store(Some(value));
+    }
+
+    /// Drop the pin so the tab follows its connection again. UI thread only,
+    /// for the same reason as [`Self::set_from_ui`].
+    pub(crate) fn clear_from_ui(&self) {
+        self.store(None);
+    }
+
+    /// Move the pin to what this batch's session was just left with, while this
+    /// execution may still state a fact about the tab.
+    ///
+    /// [`crate::db::TabOperationOwnership::may_state_a_tab_fact`] and not
+    /// `is_current`, and the difference is the point: the pin is a fact about
+    /// the TAB — the user's own `SET AUTOCOMMIT`/`SET SESSION TRANSACTION`
+    /// really succeeded on this tab's session — so only a LATER execution's own
+    /// answer replaces it. The tab merely being idle does not, because idle is
+    /// exactly the state a force-cancelled tab is published in, and the tab's
+    /// SCOPE has followed that rule (through the window's own delivery filter)
+    /// all along. All three per-tab settings now answer it the same way.
+    ///
+    /// Answers whether the pin moved, so a caller can keep its own report
+    /// truthful.
+    pub(crate) fn record_for_batch(
+        &self,
+        tab_owner: &crate::db::TabOperationOwnership,
+        value: T,
+    ) -> bool {
+        if !tab_owner.may_state_a_tab_fact() {
+            crate::utils::logging::log_warning(
+                "sql_editor::execution",
+                &format!(
+                    "Leaving the tab's {} pin alone: a later execution owns the tab, so this batch's session change is not the tab's setting",
+                    self.setting
+                ),
+            );
+            return false;
+        }
+        self.store(Some(value));
+        true
+    }
+}
+
+/// The auto-commit the tab's CANCEL SNAPSHOT reports for the operation that is
+/// running.
+///
+/// Beside the pin and deliberately not folded into it: the pin is what the TAB
+/// wants and outlives any one execution, while this describes the execution
+/// that is live right now — which is why its door asks
+/// [`crate::db::TabOperationOwnership::is_current`] where the pin's asks the
+/// looser tab-fact question. It is a per-TAB slot despite the name, so a batch
+/// the tab had moved on from could write it; it was the third slot the four
+/// pin-writing sites touched and the only one left without a door.
+pub(crate) struct TabOperationAutoCommit {
+    slot: Arc<Mutex<bool>>,
+}
+
+impl Clone for TabOperationAutoCommit {
+    fn clone(&self) -> Self {
+        Self {
+            slot: Arc::clone(&self.slot),
+        }
+    }
+}
+
+impl TabOperationAutoCommit {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            slot: Arc::new(Mutex::new(enabled)),
+        }
+    }
+
+    pub(crate) fn get(&self) -> bool {
+        load_mutex_bool(&self.slot)
+    }
+
+    /// The tab's own write: publishing an operation, abandoning one, or the
+    /// menu pinning the tab. The caller IS the tab here.
+    pub(crate) fn publish(&self, enabled: bool) {
+        store_mutex_bool(&self.slot, enabled);
+    }
+
+    /// A worker's write. It describes the RUNNING operation, so an abandoned
+    /// batch has none to describe — `abandon_current_operation_snapshot_if_matches`
+    /// has already reset this slot, and letting the dead batch write it again
+    /// would put a stale auto-commit into the next operation's cancel snapshot.
+    pub(crate) fn record_for_batch(
+        &self,
+        tab_owner: &crate::db::TabOperationOwnership,
+        enabled: bool,
+    ) -> bool {
+        if !tab_owner.is_current() {
+            crate::utils::logging::log_warning(
+                "sql_editor::execution",
+                "Leaving the tab's running-operation auto-commit alone: this batch is no longer the tab's execution",
+            );
+            return false;
+        }
+        self.publish(enabled);
+        true
+    }
+}
+
 fn try_mark_query_running(query_running: &Arc<Mutex<bool>>) -> bool {
     match query_running.lock() {
         Ok(mut guard) => {
@@ -688,6 +859,28 @@ pub enum QueryProgress {
     },
     Message {
         kind: ResultMessageKind,
+        lines: Vec<String>,
+    },
+    /// The tab's DB session went away with uncommitted work in it.
+    ///
+    /// Its own variant rather than a `Message`, and that is what makes it
+    /// reach the user. It is not a report of this operation's PROGRESS: it is a
+    /// fact about the TAB's session, and the moment it can be learned is
+    /// usually the moment the operation that was using it has ALREADY been
+    /// abandoned — a force-cancelled batch is abandoned rather than joined, so
+    /// its worker only reaches the hand-back door (which is what discovers the
+    /// loss) after the tab has been published idle. The window drops every
+    /// `Message` of an abandoned operation, which is right for progress and
+    /// wrong for this, so the door's own answer — "a session with work never
+    /// disappears in silence" — could not be delivered by the only channel it
+    /// had. Exempt from that filter like `ScopeChangedNotice`, and for the same
+    /// reason: what already happened on the tab's session has to reach the
+    /// screen whether or not the operation was abandoned afterwards.
+    ///
+    /// The lines travel with it so the text stays owned by the one reporter
+    /// (`SqlEditorWidget::report_retained_session_lost_with_work`) instead of
+    /// being re-stated by the window.
+    RetainedSessionLostWithWork {
         lines: Vec<String>,
     },
     ExplainPlanOutput {
@@ -1973,8 +2166,8 @@ struct TransactionActionRequest<'a> {
     current_oracle_thin_cancel_context: &'a Arc<Mutex<Option<OracleThinCancelHandle>>>,
     current_query_cancel_handle: &'a Arc<Mutex<OperationCancelTarget>>,
     current_mysql_cancel_context: &'a Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-    tab_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
-    tab_transaction_mode_override: &'a Arc<Mutex<Option<TransactionMode>>>,
+    tab_auto_commit_override: &'a TabPin<bool>,
+    tab_transaction_mode_override: &'a TabPin<TransactionMode>,
     cancel_flag: &'a Arc<Mutex<bool>>,
     query_timeout: Option<Duration>,
     activity_label: &'static str,
@@ -3337,15 +3530,15 @@ pub struct SqlEditorWidget {
     current_operation_id: Arc<AtomicU64>,
     last_completed_operation_id: Arc<AtomicU64>,
     current_operation_sql_kind: Arc<Mutex<crate::db::session_policy::SqlKind>>,
-    current_operation_autocommit: Arc<Mutex<bool>>,
+    current_operation_autocommit: TabOperationAutoCommit,
     current_cancel_operation: Arc<Mutex<Option<CancelOperationMetadata>>>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-    tab_auto_commit_override: Arc<Mutex<Option<bool>>>,
+    tab_auto_commit_override: TabPin<bool>,
     /// Tab-scoped transaction mode (isolation + access mode). `None` means the
     /// tab follows the connection's configured transaction mode; the toolbar
     /// controls and successful session-scoped statements (`SET SESSION
     /// TRANSACTION ...`, `ALTER SESSION SET ISOLATION_LEVEL ...`) pin it.
-    tab_transaction_mode_override: Arc<Mutex<Option<TransactionMode>>>,
+    tab_transaction_mode_override: TabPin<TransactionMode>,
     /// The effective auto-commit value this tab's UI last displayed (status
     /// bar), or `None` while nothing has been shown. Execution startup
     /// cross-checks its own resolution against this and refuses to run on a
@@ -3613,10 +3806,7 @@ impl SqlEditorWidget {
             .current_operation_sql_kind
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = sql_kind;
-        *self
-            .current_operation_autocommit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = autocommit;
+        self.current_operation_autocommit.publish(autocommit);
         self.current_operation_id
             .store(operation_id, Ordering::Release);
     }
@@ -3772,7 +3962,7 @@ impl SqlEditorWidget {
         operation_id: &Arc<AtomicU64>,
         last_completed_operation_id: &Arc<AtomicU64>,
         sql_kind: &Arc<Mutex<crate::db::session_policy::SqlKind>>,
-        autocommit: &Arc<Mutex<bool>>,
+        autocommit: &TabOperationAutoCommit,
         cancel_operation: &Arc<Mutex<Option<CancelOperationMetadata>>>,
         expected_operation_id: u64,
     ) -> bool {
@@ -3802,16 +3992,14 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             crate::db::session_policy::SqlKind::Unknown;
-        *autocommit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        autocommit.publish(true);
         true
     }
 
     fn abandon_current_operation_snapshot_if_matches(
         operation_id: &Arc<AtomicU64>,
         sql_kind: &Arc<Mutex<crate::db::session_policy::SqlKind>>,
-        autocommit: &Arc<Mutex<bool>>,
+        autocommit: &TabOperationAutoCommit,
         cancel_operation: &Arc<Mutex<Option<CancelOperationMetadata>>>,
         expected_operation_id: u64,
     ) -> bool {
@@ -3839,9 +4027,7 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             crate::db::session_policy::SqlKind::Unknown;
-        *autocommit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        autocommit.publish(true);
         true
     }
 
@@ -3852,46 +4038,40 @@ impl SqlEditorWidget {
         expected_operation_id != 0 && operation_id.load(Ordering::Relaxed) == expected_operation_id
     }
 
-    fn update_current_operation_autocommit(autocommit: &Arc<Mutex<bool>>, enabled: bool) {
-        *autocommit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
-    }
-
     fn follow_global_auto_commit_setting(
-        tab_auto_commit_override: &Arc<Mutex<Option<bool>>>,
-        current_operation_autocommit: &Arc<Mutex<bool>>,
+        tab_auto_commit_override: &TabPin<bool>,
+        current_operation_autocommit: &TabOperationAutoCommit,
         enabled: bool,
     ) {
-        store_mutex_bool_option(tab_auto_commit_override, None);
-        Self::update_current_operation_autocommit(current_operation_autocommit, enabled);
+        tab_auto_commit_override.clear_from_ui();
+        current_operation_autocommit.publish(enabled);
     }
 
     /// Public (with `set_tab_auto_commit`) so the live verification harness
     /// can drive the menu write path and assert the pinned value, the same
     /// way it drives the transaction-mode controls.
     pub fn tab_auto_commit_override_value(&self) -> Option<bool> {
-        load_mutex_bool_option(&self.tab_auto_commit_override)
+        self.tab_auto_commit_override.get()
     }
 
     /// The menu-toggle write path: pins this tab's auto-commit, exactly like a
     /// script `SET AUTOCOMMIT` does.
     pub fn set_tab_auto_commit(&self, enabled: bool) {
-        store_mutex_bool_option(&self.tab_auto_commit_override, Some(enabled));
-        Self::update_current_operation_autocommit(&self.current_operation_autocommit, enabled);
+        self.tab_auto_commit_override.set_from_ui(enabled);
+        self.current_operation_autocommit.publish(enabled);
     }
 
     /// Public (with `set_tab_transaction_mode`) so the live verification
     /// harness can drive the toolbar write path and assert the pinned value.
     pub fn tab_transaction_mode_override_value(&self) -> Option<TransactionMode> {
-        load_mutex_transaction_mode_option(&self.tab_transaction_mode_override)
+        self.tab_transaction_mode_override.get()
     }
 
     /// The toolbar write path: pins this tab's transaction mode, exactly like
     /// a successful session-scoped `SET SESSION TRANSACTION ...` /
     /// `ALTER SESSION SET ISOLATION_LEVEL ...` statement does.
     pub fn set_tab_transaction_mode(&self, mode: TransactionMode) {
-        store_mutex_transaction_mode_option(&self.tab_transaction_mode_override, Some(mode));
+        self.tab_transaction_mode_override.set_from_ui(mode);
     }
 
     /// Clears the tab's pinned transaction mode so it falls back to the
@@ -3899,7 +4079,7 @@ impl SqlEditorWidget {
     /// Public so the live verification harness can reset a tab between
     /// scenarios.
     pub fn clear_tab_transaction_mode_override(&self) {
-        store_mutex_transaction_mode_option(&self.tab_transaction_mode_override, None);
+        self.tab_transaction_mode_override.clear_from_ui();
     }
 
     /// The tab's scope (the object browser's selected database or schema),
@@ -3953,12 +4133,12 @@ impl SqlEditorWidget {
     pub(super) fn transaction_mode_for_execution(
         db_type: DatabaseType,
         connection_mode: TransactionMode,
-        tab_transaction_mode_override: &Arc<Mutex<Option<TransactionMode>>>,
+        tab_transaction_mode_override: &TabPin<TransactionMode>,
     ) -> TransactionMode {
         Self::effective_transaction_mode(
             db_type,
             connection_mode,
-            load_mutex_transaction_mode_option(tab_transaction_mode_override),
+            tab_transaction_mode_override.get(),
         )
     }
 
@@ -4534,11 +4714,11 @@ impl SqlEditorWidget {
         let last_completed_operation_id = Arc::new(AtomicU64::new(0));
         let current_operation_sql_kind =
             Arc::new(Mutex::new(crate::db::session_policy::SqlKind::Unknown));
-        let current_operation_autocommit = Arc::new(Mutex::new(true));
+        let current_operation_autocommit = TabOperationAutoCommit::new(true);
         let current_cancel_operation = Arc::new(Mutex::new(None));
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
-        let tab_auto_commit_override = Arc::new(Mutex::new(None));
-        let tab_transaction_mode_override = Arc::new(Mutex::new(None));
+        let tab_auto_commit_override = TabPin::new("auto-commit");
+        let tab_transaction_mode_override = TabPin::new("transaction mode");
         let ui_displayed_auto_commit = Arc::new(Mutex::new(None));
         let ui_displayed_transaction_mode = Arc::new(Mutex::new(None));
         let pending_result_edit_request = Arc::new(Mutex::new(None));
@@ -6895,10 +7075,7 @@ impl SqlEditorWidget {
             None => (LazyFetchState::None, 0),
         };
 
-        let current_autocommit = *self
-            .current_operation_autocommit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current_autocommit = self.current_operation_autocommit.get();
         let query_snapshot = self.running_operation_cancel_target_snapshot();
         let lazy_is_target = Self::lazy_fetch_is_latest_cancel_target(
             lazy_operation_id,
@@ -6976,10 +7153,7 @@ impl SqlEditorWidget {
             .current_operation_sql_kind
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let current_autocommit = *self
-            .current_operation_autocommit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current_autocommit = self.current_operation_autocommit.get();
         let (operation_id, connection_generation, db_type, execution_state, activity_label) =
             current_cancel_operation.as_ref().map_or_else(
                 || {
@@ -7675,7 +7849,7 @@ impl SqlEditorWidget {
         current_operation_id: &Arc<AtomicU64>,
         current_cancel_operation: &Arc<Mutex<Option<CancelOperationMetadata>>>,
         current_operation_sql_kind: &Arc<Mutex<crate::db::session_policy::SqlKind>>,
-        current_operation_autocommit: &Arc<Mutex<bool>>,
+        current_operation_autocommit: &TabOperationAutoCommit,
         progress_sender: &QueryProgressSender,
         cancel_flag: &Arc<Mutex<bool>>,
         query_running: &Arc<Mutex<bool>>,
@@ -7732,7 +7906,7 @@ impl SqlEditorWidget {
         current_operation_id: Arc<AtomicU64>,
         current_cancel_operation: Arc<Mutex<Option<CancelOperationMetadata>>>,
         current_operation_sql_kind: Arc<Mutex<crate::db::session_policy::SqlKind>>,
-        current_operation_autocommit: Arc<Mutex<bool>>,
+        current_operation_autocommit: TabOperationAutoCommit,
         progress_sender: QueryProgressSender,
         cancel_flag: Arc<Mutex<bool>>,
         query_running: Arc<Mutex<bool>>,
@@ -8958,12 +9132,11 @@ mod transaction_action_tests {
 #[cfg(test)]
 mod execution_state_tests {
     use super::{
-        classify_edit_group, inserted_text, load_mutex_bool, load_mutex_bool_option,
-        try_mark_query_running, BufferEdit, CancelOperationMetadata, ChunkedText,
-        CompositeBufferEdit, EditGranularity, EditOperation, HighlightShadowState,
-        IntellisenseRuntimeState, QueryOperationToken, QueryProgress, QueryProgressSender,
-        QueryResult, SqlEditorWidget, TabConnectionBinding, UndoDelta, UndoSnapshot,
-        WordUndoRedoState, MAX_WORD_UNDO_HISTORY,
+        classify_edit_group, inserted_text, load_mutex_bool, try_mark_query_running, BufferEdit,
+        CancelOperationMetadata, ChunkedText, CompositeBufferEdit, EditGranularity, EditOperation,
+        HighlightShadowState, IntellisenseRuntimeState, QueryOperationToken, QueryProgress,
+        QueryProgressSender, QueryResult, SqlEditorWidget, TabConnectionBinding, UndoDelta,
+        UndoSnapshot, WordUndoRedoState, MAX_WORD_UNDO_HISTORY,
     };
     use fltk::enums::Event;
     use fltk::text::TextBuffer;
@@ -9035,8 +9208,8 @@ mod execution_state_tests {
 
     #[test]
     fn global_auto_commit_sync_clears_tab_override() {
-        let tab_auto_commit_override = Arc::new(Mutex::new(Some(false)));
-        let current_operation_autocommit = Arc::new(Mutex::new(false));
+        let tab_auto_commit_override = super::TabPin::with_value("auto-commit", Some(false));
+        let current_operation_autocommit = super::TabOperationAutoCommit::new(false);
 
         SqlEditorWidget::follow_global_auto_commit_setting(
             &tab_auto_commit_override,
@@ -9044,8 +9217,8 @@ mod execution_state_tests {
             true,
         );
 
-        assert_eq!(load_mutex_bool_option(&tab_auto_commit_override), None);
-        assert!(load_mutex_bool(&current_operation_autocommit));
+        assert_eq!(tab_auto_commit_override.get(), None);
+        assert!(current_operation_autocommit.get());
         assert!(SqlEditorWidget::auto_commit_for_execution(
             true,
             &tab_auto_commit_override
@@ -10927,7 +11100,7 @@ mod cancel_watchdog_tests {
             current_operation_id.clone(),
             cancel_operation_metadata(42, 0),
             Arc::new(Mutex::new(crate::db::session_policy::SqlKind::SelectLike)),
-            Arc::new(Mutex::new(false)),
+            super::TabOperationAutoCommit::new(false),
             progress_sender,
             cancel_flag.clone(),
             query_running.clone(),
@@ -11025,7 +11198,7 @@ mod cancel_watchdog_tests {
             current_operation_id.clone(),
             cancel_operation_metadata(42, 0),
             Arc::new(Mutex::new(crate::db::session_policy::SqlKind::SelectLike)),
-            Arc::new(Mutex::new(false)),
+            super::TabOperationAutoCommit::new(false),
             progress_sender,
             cancel_flag.clone(),
             query_running.clone(),
@@ -11170,7 +11343,7 @@ mod cancel_watchdog_tests {
         let current_cancel_operation = cancel_operation_metadata(42, 0);
         let current_operation_sql_kind =
             Arc::new(Mutex::new(crate::db::session_policy::SqlKind::SelectLike));
-        let current_operation_autocommit = Arc::new(Mutex::new(false));
+        let current_operation_autocommit = super::TabOperationAutoCommit::new(false);
         let shared_connection = create_shared_connection();
         let _held_connection_lock = shared_connection.lock().unwrap();
         let (progress_sender, progress_receiver) = mpsc::channel();
@@ -11254,7 +11427,7 @@ mod cancel_watchdog_tests {
             *current_operation_sql_kind.lock().unwrap(),
             crate::db::session_policy::SqlKind::Unknown
         );
-        assert!(load_mutex_bool(&current_operation_autocommit));
+        assert!(current_operation_autocommit.get());
     }
 
     #[test]
@@ -11300,7 +11473,7 @@ mod cancel_watchdog_tests {
         let current_cancel_operation = cancel_operation_metadata(42, 0);
         let current_operation_sql_kind =
             Arc::new(Mutex::new(crate::db::session_policy::SqlKind::SelectLike));
-        let current_operation_autocommit = Arc::new(Mutex::new(false));
+        let current_operation_autocommit = super::TabOperationAutoCommit::new(false);
         let (progress_sender, progress_receiver) = mpsc::channel();
         let progress_sender = QueryProgressSender::new(progress_sender);
         let cancel_flag = Arc::new(Mutex::new(true));
@@ -11631,7 +11804,7 @@ mod cancel_watchdog_tests {
         let current_cancel_operation = cancel_operation_metadata(43, 0);
         let current_operation_sql_kind =
             Arc::new(Mutex::new(crate::db::session_policy::SqlKind::Dml));
-        let current_operation_autocommit = Arc::new(Mutex::new(false));
+        let current_operation_autocommit = super::TabOperationAutoCommit::new(false);
 
         assert!(
             !SqlEditorWidget::abandon_current_operation_snapshot_if_matches(
@@ -11647,7 +11820,7 @@ mod cancel_watchdog_tests {
             *current_operation_sql_kind.lock().unwrap(),
             crate::db::session_policy::SqlKind::Dml
         );
-        assert!(!load_mutex_bool(&current_operation_autocommit));
+        assert!(!current_operation_autocommit.get());
     }
 
     /// A target the work has WITHDRAWN is not a target that has yet to arrive.
@@ -11670,7 +11843,7 @@ mod cancel_watchdog_tests {
         let current_cancel_operation = cancel_operation_metadata(42, 0);
         let current_operation_sql_kind =
             Arc::new(Mutex::new(crate::db::session_policy::SqlKind::SelectLike));
-        let current_operation_autocommit = Arc::new(Mutex::new(false));
+        let current_operation_autocommit = super::TabOperationAutoCommit::new(false);
         let (progress_sender, progress_receiver) = mpsc::channel();
         let progress_sender = QueryProgressSender::new(progress_sender);
         // Everything else still says the operation is running, exactly as it
@@ -11840,7 +12013,7 @@ mod cancel_watchdog_tests {
         let current_cancel_operation = cancel_operation_metadata(42, 0);
         let current_operation_sql_kind =
             Arc::new(Mutex::new(crate::db::session_policy::SqlKind::SelectLike));
-        let current_operation_autocommit = Arc::new(Mutex::new(false));
+        let current_operation_autocommit = super::TabOperationAutoCommit::new(false);
         let (progress_sender, progress_receiver) = mpsc::channel();
         let progress_sender = QueryProgressSender::new(progress_sender);
         let cancel_flag = Arc::new(Mutex::new(true));
@@ -11904,7 +12077,7 @@ mod cancel_watchdog_tests {
             *current_operation_sql_kind.lock().unwrap(),
             crate::db::session_policy::SqlKind::SelectLike
         );
-        assert!(!load_mutex_bool(&current_operation_autocommit));
+        assert!(!current_operation_autocommit.get());
     }
 
     #[test]

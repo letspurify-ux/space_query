@@ -302,7 +302,12 @@ fn verify(target: Target) -> Result<bool, String> {
                 };
                 println!("    (event) {name}");
             }
-            if let QueryProgress::Message { lines, .. } = progress_inner(&event) {
+            // Both, because the lost-session notice travels as its own variant
+            // now: the window drops an abandoned operation's messages, and an
+            // abandoned operation is exactly when a worker closes its session.
+            if let QueryProgress::Message { lines, .. }
+            | QueryProgress::RetainedSessionLostWithWork { lines } = progress_inner(&event)
+            {
                 println!("    (message) {}", lines.join(" / "));
                 messages
                     .lock()
@@ -603,7 +608,9 @@ fn make_harness(info: ConnectionInfo) -> Result<Harness, String> {
     {
         let done = Arc::clone(&done);
         editor.set_progress_callback(move |event| {
-            if let QueryProgress::Message { lines, .. } = progress_inner(&event) {
+            if let QueryProgress::Message { lines, .. }
+            | QueryProgress::RetainedSessionLostWithWork { lines } = progress_inner(&event)
+            {
                 println!("    (message) {}", lines.join(" / "));
             }
             if let QueryProgress::StatementFinished { result, .. } = progress_inner(&event) {

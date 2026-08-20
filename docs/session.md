@@ -517,6 +517,58 @@ reconnect, disconnect, pool resize):
   reaching it after the tab reconnected would take the tab off the connection
   the user is working on now. Undoing a bind holds the revision that BIND
   produced, not the one the worker started with.
+- A session CLOSED outside those doors owes the same two answers they give, and
+  they are one step: `BatchSessionHandBack::release_without_door(carried,
+  log_context)` ends what this execution published over the session AND says
+  what closing it destroys, and `discard_lazy_fetch_session` is its twin for the
+  road whose currency is `lazy_fetch_can_keep_session` rather than the tab's
+  operation id. They replaced a reach-only release, and the half that was
+  missing is the half that mattered: reporting the loss was left to each call
+  site, three of them did it and the rest did not, so the SAME event — the tab's
+  work-carrying session being closed — was announced or swallowed depending on
+  which step of the acquisition happened to notice. A caller that can release
+  without stating what it releases is the shape a transaction disappears
+  through. The lazy fetch is the sharpest case: it takes the TAB's session over,
+  so the transaction the tab opened before it is on that session, and only the
+  SUCCESS road said anything when the fetch was closed — the cancelled and
+  failed ones, the ones a user actually reaches, took it in silence.
+- What a close destroys has to be READABLE at the close, which is why
+  `RetainedSessionOutcome::DiscardPhysical` carries the state (its DB-layer
+  sibling `RetainedSessionDisposition::DiscardPhysical` already did). While it
+  carried nothing, every road through the MySQL family's disposition — a
+  session-info sync that failed, a statement error the session cannot be reused
+  after, an interrupted batch whose statement requires a physical discard — had
+  nothing to report even if it had remembered to. The Oracle twin is the
+  post-interrupt REPLACE (`OracleCleanupSessionDecisionApplier::
+  discard_physical_session`), which `decide_session_after_interrupt` answers
+  before it looks at the retained state at all — for an unfinished fetch worker
+  and for a connection error — so a tab holding an INSERT whose SELECT was
+  cancelled had its session closed and was told nothing.
+- And the report has to REACH the user. It travels as
+  `QueryProgress::RetainedSessionLostWithWork`, not as an error `Message`,
+  because the window drops every message of an ABANDONED operation — which is
+  right for progress and is exactly the state a worker is in when it reaches a
+  hand-back door, since a force-cancelled batch is abandoned rather than joined.
+  Sent as a message, the door's own promise reached nothing but the log. The
+  filter now asks `tab_fact_delivery`, which separates the OPERATION's progress
+  from a fact about the TAB that outlives it: a scope notice and the two per-tab
+  pin notices are delivered unless a later execution SUPERSEDED them, and a lost
+  work-carrying session is delivered always — no later execution can answer what
+  the older one's session took with it. The worker half of the same rule is
+  `TabOperationOwnership::may_state_a_tab_fact`, which reads the same two
+  counters `query_operation_was_superseded` does, so the writer and the
+  deliverer of a tab fact cannot disagree about whether it is stale.
+- What a close destroys is what the session is CARRYING, folded from the
+  statement that just ran — never the state from before it. All three drivers
+  answer it the same way now: Oracle OCI from its batch delta
+  (`retained_state_a_discard_destroys`), Oracle thin from its post-statement
+  `retained_state`, and the MySQL family from
+  `mysql_state_a_close_would_destroy`, which folds the statement's effects with
+  the app's own belief instead of a probe (there is none to ask on a session
+  being closed). The MySQL answer used to be the PRIOR state, lowered when a
+  commit had resolved it and never raised, so an `INSERT` under `autocommit=0`
+  from a clean session — the commonest way a tab acquires uncommitted work —
+  left the close reporting nothing at all.
 
 `assert_connection_lifecycle_closes_every_server_session` proves this against a
 live database by counting the server's own sessions (`information_schema.processlist`

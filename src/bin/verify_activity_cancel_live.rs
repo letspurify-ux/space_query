@@ -77,6 +77,7 @@ use space_query::ui::main_window::MainWindow;
 use space_query::ui::sql_editor::{
     HandBackForceProbe, MainSessionTargetAtLockRelease, QueryProgress, SqlEditorWidget,
 };
+use std::collections::HashSet;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -185,6 +186,33 @@ impl Target {
                 "DROP TABLE IF EXISTS SQ_TIMEOUT_T",
                 "CREATE TABLE SQ_TIMEOUT_T (V INT)",
             ]
+        }
+    }
+
+    /// A17's own probe table.
+    ///
+    /// Its own, and not A14's, for a reason the harness cannot avoid: a
+    /// scenario that ends with the tab still holding an open transaction keeps
+    /// holding it (a harness cannot destroy the FLTK widget that owns the
+    /// lease), and on the MySQL family that transaction holds a METADATA lock
+    /// the next scenario's `DROP TABLE` waits behind — long enough to
+    /// desynchronise everything after it.
+    fn kill_setup_sql(self) -> Vec<&'static str> {
+        if self.is_oracle() {
+            vec!["DROP TABLE SQ_KILL_T", "CREATE TABLE SQ_KILL_T (V NUMBER)"]
+        } else {
+            vec![
+                "DROP TABLE IF EXISTS SQ_KILL_T",
+                "CREATE TABLE SQ_KILL_T (V INT)",
+            ]
+        }
+    }
+
+    fn kill_retain_sql(self) -> &'static str {
+        if self.is_oracle() {
+            "INSERT INTO SQ_KILL_T VALUES (1)"
+        } else {
+            "START TRANSACTION; INSERT INTO SQ_KILL_T VALUES (1)"
         }
     }
 
@@ -414,6 +442,189 @@ fn run_slow_statement(session: &mut DbPoolSession, sql: &str) -> Result<(), Stri
         DbPoolSession::MySQL { conn, .. } => {
             use mysql::prelude::Queryable;
             conn.as_mut().query_drop(sql).map_err(|err| err.to_string())
+        }
+    }
+}
+
+/// Every server session holding an open transaction EXCEPT this one, as
+/// `sid,serial#`.
+///
+/// Its own exclusion is not tidiness. The killer takes its session from the
+/// same pool the tabs use, and a pooled Oracle session is recycled WITHOUT a
+/// rollback — so a session an earlier scenario left holding a transaction can
+/// be handed straight back to the killer, which then disconnects itself
+/// half-way through the loop and reports `DPI-1010: not connected` for whatever
+/// it tried to kill next. "From a session of its own" has to be true of the
+/// query as well as of the connection.
+const ORACLE_OPEN_TRANSACTION_SESSIONS: &str = "SELECT s.sid || ',' || s.serial# FROM v$transaction t JOIN v$session s ON s.saddr = t.ses_addr WHERE s.sid <> SYS_CONTEXT('USERENV', 'SID')";
+
+/// DISCONNECT rather than KILL, because the session is IN a call: `KILL
+/// SESSION` answers ORA-00031 ("marked for kill") and leaves the call running,
+/// which is the opposite of what this scenario needs — the connection has to go
+/// while the statement is on it. `IMMEDIATE` rolls the transaction back and
+/// ends the session without waiting for the call to finish.
+fn oracle_disconnect_session_sql(session: &str) -> String {
+    format!("ALTER SYSTEM DISCONNECT SESSION '{session}' IMMEDIATE")
+}
+
+/// Oracle answers ORA-00031 when it could only MARK the session; the session
+/// still dies, so the scenario's kill has been delivered.
+fn oracle_kill_was_delivered(error: &str) -> bool {
+    error.contains("ORA-00031")
+}
+
+/// How many rounds the kill loop below may take before it gives up. One
+/// session dies per round, and the scenarios that lead here leave at most a
+/// handful behind.
+const KILL_ROUNDS: usize = 16;
+
+/// Kill EVERY server session that is holding an open transaction, one per
+/// round, each round from a killer session of its own.
+///
+/// With one scenario running that is exactly the query tab's retained session,
+/// and the user's uncommitted work is on it — which is what makes the kill a
+/// deterministic stand-in for the connection dying under a running statement.
+/// Answers what it killed, so a scenario can print it.
+///
+/// A fresh killer per round, and the list re-read every round, because on
+/// Oracle the killer cannot be sure of surviving its own kill: it takes its
+/// session from the same pool the tabs use, and disconnecting a sibling of that
+/// pool takes the killer's own checked-out session down with it (`DPI-1010: not
+/// connected`). Killing the whole list from one session therefore lost the tool
+/// half-way through and left the rest of the list alive — intermittently, since
+/// which session is a sibling depends on what the earlier scenarios left
+/// behind. Losing the killer is harmless when it is rebuilt anyway, and the
+/// re-read is what makes a round that died before the server acted simply
+/// happen again.
+fn kill_the_session_holding_the_open_transaction(target: Target) -> Result<String, String> {
+    let mut killed: Vec<String> = Vec::new();
+    // Asked ONCE each. Oracle can answer ORA-00031 — "marked for kill" — for a
+    // session that is still in `v$transaction` on the next read, and without
+    // this the loop asked the same session every round until it ran out.
+    let mut already_asked: HashSet<String> = HashSet::new();
+    let mut last_error: Option<String> = None;
+    for _ in 0..KILL_ROUNDS {
+        match kill_one_session_holding_an_open_transaction(target, &mut already_asked) {
+            Ok(None) => {
+                last_error = None;
+                break;
+            }
+            Ok(Some(session)) => {
+                killed.push(session);
+                last_error = None;
+            }
+            // The killer died with its own kill, or could not be built this
+            // round. The list is re-read next round, so a session the server
+            // never got to is simply seen again.
+            Err(message) => last_error = Some(message),
+        }
+    }
+    if let Some(message) = last_error {
+        return Err(format!(
+            "gave up after {KILL_ROUNDS} rounds (killed {}): {message}",
+            if killed.is_empty() {
+                "nothing".to_string()
+            } else {
+                killed.join(",")
+            }
+        ));
+    }
+    if killed.is_empty() {
+        return Err("no open transaction to kill".to_string());
+    }
+    Ok(killed.join(","))
+}
+
+/// One round: read the list, kill the first entry, answer which one — or
+/// `None` when nothing is left holding a transaction.
+fn kill_one_session_holding_an_open_transaction(
+    target: Target,
+    already_asked: &mut HashSet<String>,
+) -> Result<Option<String>, String> {
+    let killer = Harness::connect(target)?;
+    let context = killer.pool_context()?;
+    let activity = track_pool_db_activity("A17 kill", target.connection_info().db_type);
+    let mut acquired = context.acquire_session_for_current_scope(&activity)?;
+    let Some(session) = acquired.session_mut() else {
+        return Err("the killer session was already given up".to_string());
+    };
+    match session {
+        DbPoolSession::Oracle(conn) => {
+            let rows = conn
+                .query_as::<String>(ORACLE_OPEN_TRANSACTION_SESSIONS, &[])
+                .map_err(|err| format!("v$transaction: {err}"))?;
+            let mut open = Vec::new();
+            for row in rows {
+                open.push(row.map_err(|err| format!("v$transaction row: {err}"))?);
+            }
+            let Some(target_session) = open
+                .iter()
+                .find(|session| !already_asked.contains(*session))
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            already_asked.insert(target_session.clone());
+            if let Err(err) = conn.execute(&oracle_disconnect_session_sql(&target_session), &[]) {
+                let message = err.to_string();
+                if !oracle_kill_was_delivered(&message) {
+                    return Err(format!("kill {target_session}: {message}"));
+                }
+            }
+            Ok(Some(target_session))
+        }
+        DbPoolSession::OracleThin(conn) => {
+            let described = conn
+                .query_described_fetch_all(ORACLE_OPEN_TRANSACTION_SESSIONS.to_string(), 64)
+                .map_err(|err| format!("v$transaction: {err}"))?;
+            let mut open = Vec::new();
+            for row in &described.result.rows {
+                match row.first() {
+                    Some(tns_thin::exec::OracleValue::Text(text)) => open.push(text.clone()),
+                    Some(tns_thin::exec::OracleValue::Number(text)) => open.push(text.clone()),
+                    other => return Err(format!("unexpected session identity: {other:?}")),
+                }
+            }
+            let Some(target_session) = open
+                .iter()
+                .find(|session| !already_asked.contains(*session))
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            already_asked.insert(target_session.clone());
+            if let Err(err) = conn.query_drop(&oracle_disconnect_session_sql(&target_session)) {
+                let message = err.to_string();
+                if !oracle_kill_was_delivered(&message) {
+                    return Err(format!("kill {target_session}: {message}"));
+                }
+            }
+            Ok(Some(target_session))
+        }
+        DbPoolSession::MySQL { conn, .. } => {
+            use mysql::prelude::Queryable;
+            // Its own thread excluded for the reason the Oracle query gives:
+            // the killer's session comes from the same pool the tabs use, and
+            // killing it mid-loop leaves the rest unkilled.
+            let ids: Vec<u64> = conn
+                .as_mut()
+                .query(
+                    "SELECT trx_mysql_thread_id FROM information_schema.innodb_trx \
+                     WHERE trx_mysql_thread_id <> CONNECTION_ID()",
+                )
+                .map_err(|err| format!("innodb_trx: {err}"))?;
+            let Some(id) = ids
+                .iter()
+                .find(|id| !already_asked.contains(&id.to_string()))
+                .copied()
+            else {
+                return Ok(None);
+            };
+            already_asked.insert(id.to_string());
+            conn.as_mut()
+                .query_drop(format!("KILL {id}"))
+                .map_err(|err| format!("kill {id}: {err}"))?;
+            Ok(Some(id.to_string()))
         }
     }
 }
@@ -703,7 +914,20 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                 // as "Error: Query cancelled"). What must NOT appear is a raw
                 // driver failure: before this was wired up the query surfaced
                 // "Error: ORA-01013 ..." as an ordinary error.
-                let reported = editor.last_message();
+                //
+                // The loss notice is NOT the statement's answer and must not be
+                // read as one: when the cancel's force tier closes a session
+                // carrying the user's work, "that work is gone" is a SECOND
+                // fact the app owes — asserted for A8 below — and it arrives on
+                // the same transcript.
+                let transcript = editor.transcript();
+                let loss = space_query::db::result_messages::RETAINED_SESSION_LOST_WITH_WORK;
+                let reported = transcript
+                    .iter()
+                    .rev()
+                    .find(|line| !line.contains(loss))
+                    .cloned()
+                    .unwrap_or_else(|| NO_STATEMENT_RESULT.to_string());
                 let looks_like_a_cancel = reported == NO_STATEMENT_RESULT
                     || reported.contains(space_query::db::result_messages::QUERY_CANCELLED);
                 if !looks_like_a_cancel {
@@ -712,6 +936,33 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                     ));
                 } else {
                     println!("   A9 ({label}) reported to the user as a cancel, not a failure");
+                }
+                // A8 only: the tab went into this holding an open transaction,
+                // so the cancel leaves it in one of exactly two stated
+                // conditions — the session and the work still there (tier 1
+                // ended only the statement), or the session gone AND the loss
+                // reported. Silence is what this refuses, and silence is what
+                // it used to get: the close is decided by the interrupt policy,
+                // which closed the session without reading what it was
+                // carrying.
+                if retained {
+                    let still_holds = editor.retained_session_state().is_some_and(|snapshot| {
+                        snapshot.retained_state.may_have_uncommitted_work()
+                    });
+                    if still_holds {
+                        println!("   A9 ({label}) the cancel cost the statement and left the work");
+                    } else if transcript.iter().any(|line| line.contains(loss)) {
+                        println!(
+                            "   A9 ({label}) the session went with the cancel, and the user was \
+                             told the work went with it"
+                        );
+                    } else {
+                        failures.push(format!(
+                            "A9 ({label}): the cancel closed a work-carrying session and nothing \
+                             said so (transcript: {})",
+                            transcript.join(" | ")
+                        ));
+                    }
                 }
             }
         }
@@ -1392,6 +1643,139 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
         let _ = editor.wait_done(Duration::from_secs(10));
     }
 
+    // A17: a work-carrying session that DIES while its statement is running
+    // must tell the user the work went with it.
+    //
+    // This is the CLEANUP's road, not the acquisition's, and that is the whole
+    // point of the scenario. When the session is found dead at the NEXT
+    // acquisition the app has always reported the loss; when it dies mid-
+    // statement the close is decided by the interrupt policy instead —
+    // `ReplacePhysicalSessionKeepUiConnected` on Oracle (answered for a
+    // connection error before the retained state is even looked at) and the
+    // MySQL family's own disposition — and BOTH closed the session in silence.
+    // The Oracle arm had the state in hand and never read it; the MySQL arm
+    // could not read it at all, because the outcome value it was given carried
+    // no state to read.
+    //
+    // The kill is the deterministic way to reach it on all four backends: the
+    // statement fails as a connection error, which is exactly what a real
+    // force-cancel, a server restart or a network drop produce.
+    {
+        reset_tracked_db_activities_for_probe();
+        let label = target.label();
+        println!("   A17 ({label}): a session that dies mid-statement says what it took with it");
+        let harness = Harness::connect(target)?;
+        let mut editor = EditorHarness::new(&harness);
+        // Settle on the tab being IDLE between steps, not on the done flag: a
+        // terminal event queued by the previous statement is drained by the
+        // same poll, so `run` can return while the batch is still going — and
+        // the next `execute_sql_text` is then refused outright, silently
+        // skipping the step. (A14 lives with it because only its final wait
+        // matters; this scenario has to get its transaction open first.)
+        fn settle(editor: &EditorHarness) {
+            editor.pump_until(Duration::from_secs(30), || {
+                (!editor.editor.is_query_running()).then_some(())
+            });
+        }
+        for sql in target.kill_setup_sql() {
+            settle(&editor);
+            let _ = editor.run(sql, Duration::from_secs(30));
+        }
+        settle(&editor);
+        let _ = editor.run(target.kill_retain_sql(), Duration::from_secs(30));
+        // Waited for as a FACT, not from the done flag: a terminal event queued
+        // by the previous statement is drained by the same poll, so the flag
+        // can already be set when this batch starts (A14 says the same).
+        let carried_work_before = editor
+            .pump_until(Duration::from_secs(30), || {
+                editor
+                    .retained_session_state()
+                    .is_some_and(|snapshot| snapshot.retained_state.may_have_uncommitted_work())
+                    .then_some(())
+            })
+            .is_some();
+        if !carried_work_before {
+            failures.push(format!(
+                "A17 ({label}): the tab did not retain a session carrying work, so there is \
+                 nothing for the kill to take"
+            ));
+        }
+        // As a SCRIPT, for the reason A13 and A14 give: a single-statement
+        // SELECT is handed to a lazy fetch, and this is about the statement
+        // road the tab's own session runs on.
+        settle(&editor);
+        editor.start(&format!("{};\n{}", target.slow_sql(), target.trivial_sql()));
+        // The kill has to land on a session that is really executing, or it
+        // becomes the acquisition's road again.
+        thread::sleep(Duration::from_millis(800));
+        match kill_the_session_holding_the_open_transaction(target) {
+            Ok(killed) => println!("   A17 ({label}) killed the tab's session ({killed})"),
+            Err(message) => failures.push(format!("A17 ({label}): {message}")),
+        }
+        let reported = editor.pump_until(Duration::from_secs(60), || {
+            let transcript = editor.transcript();
+            (!transcript.is_empty()).then(|| transcript.join(" | "))
+        });
+        let _ = editor.wait_done(Duration::from_secs(30));
+        let transcript = reported.unwrap_or_default();
+        let lowered = transcript.to_ascii_lowercase();
+        // The same two stated conditions A14 asserts, and for the same reason:
+        // either the tab still holds a session it can use, or the session is
+        // gone AND the loss was reported. SILENCE is what this scenario refuses.
+        if editor
+            .retained_session_state()
+            .is_some_and(|snapshot| snapshot.retained_state.may_have_uncommitted_work())
+        {
+            // The tab still CLAIMS the work — which is what both Oracle drivers
+            // answer here, because an interrupted statement with work on the
+            // session takes the resolution road rather than the replace one.
+            // The claim is only honest if something still settles it: the next
+            // statement finds the session dead, and THAT is where the loss has
+            // to be said. A claim that simply disappears is the same silence by
+            // a longer road.
+            println!(
+                "   A17 ({label}) the tab still holds the claim; the next statement settles it"
+            );
+            settle(&editor);
+            editor.start(target.trivial_sql());
+            let after = editor
+                .pump_until(Duration::from_secs(60), || {
+                    let transcript = editor.transcript();
+                    (!transcript.is_empty()).then(|| transcript.join(" | "))
+                })
+                .unwrap_or_default();
+            let _ = editor.wait_done(Duration::from_secs(30));
+            let still_claims = editor
+                .retained_session_state()
+                .is_some_and(|snapshot| snapshot.retained_state.may_have_uncommitted_work());
+            if after.to_ascii_lowercase().contains(
+                &space_query::db::result_messages::RETAINED_SESSION_LOST_WITH_WORK
+                    .to_ascii_lowercase(),
+            ) {
+                println!("   A17 ({label}) and the next statement answered the loss");
+            } else if still_claims {
+                println!(
+                    "   A17 ({label}) and the tab still holds the work for the user to resolve"
+                );
+            } else {
+                failures.push(format!(
+                    "A17 ({label}): the tab's claim on the work disappeared without a word \
+                     (transcript: {after})"
+                ));
+            }
+        } else if lowered.contains(
+            &space_query::db::result_messages::RETAINED_SESSION_LOST_WITH_WORK.to_ascii_lowercase(),
+        ) {
+            println!("   A17 ({label}) the user was told the work went with the session");
+        } else {
+            failures.push(format!(
+                "A17 ({label}): the tab's work-carrying session was closed and nothing said so \
+                 (transcript: {transcript})"
+            ));
+        }
+        let _ = editor.run("COMMIT", Duration::from_secs(30));
+    }
+
     // A16: a script CONNECT moves the operation's REGISTRY ROW with it.
     //
     // The registry keeps three facts about which connection a row belongs to:
@@ -1541,7 +1925,13 @@ impl EditorHarness {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .push(result.message.clone());
                 }
+                // The lost-session notice has a variant of its own (the
+                // window drops an abandoned operation's messages, and an
+                // abandoned operation is exactly when a worker's session is
+                // closed), and a scenario asking what the user was told has to
+                // read it where it now travels.
                 QueryProgress::Message { lines, .. }
+                | QueryProgress::RetainedSessionLostWithWork { lines }
                 | QueryProgress::ScriptOutput { lines, .. } => {
                     messages
                         .lock()

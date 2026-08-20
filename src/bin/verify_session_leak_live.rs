@@ -400,7 +400,8 @@ impl Tab {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(result.message.clone()),
-                QueryProgress::Message { lines, .. }
+                QueryProgress::RetainedSessionLostWithWork { lines }
+                | QueryProgress::Message { lines, .. }
                 | QueryProgress::ScriptOutput { lines, .. } => {
                     messages
                         .lock()

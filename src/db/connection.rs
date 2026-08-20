@@ -4283,6 +4283,128 @@ impl Drop for DbSessionLeaseEntry {
     }
 }
 
+/// Which execution a worker's write onto the TAB speaks for.
+///
+/// A tab runs one execution at a time, but a force-cancelled one is ABANDONED
+/// rather than joined: the tab is published idle while its worker is still
+/// unwinding — and abandoning it CLEARS the cancel flag, so that worker can go
+/// on running the rest of its script — while the user's next execution may
+/// already be the tab's. Everything a worker writes ONTO THE TAB asks this
+/// value first, and asking it is what stops a dead batch from moving a live
+/// tab.
+///
+/// It answers TWO questions, and conflating them is what the round that added
+/// this type had to come back and fix:
+///
+/// * [`Self::is_current`] — "is the tab on this execution *right now*?" — for
+///   anything that TAKES OVER the tab's live state: its session slot, its
+///   cancel reach, the auto-commit its cancel snapshot reports for the running
+///   operation. An abandoned batch's session is closed rather than filed
+///   because the tab is not on that execution any more, whether or not a newer
+///   one has started.
+/// * [`Self::may_state_a_tab_fact`] — "has a LATER execution owned this tab?" —
+///   for a fact the worker REPORTS about the tab that has already happened: the
+///   schema its session was moved to, the auto-commit or transaction mode the
+///   user's own statement set on it. Nothing but a later execution's own answer
+///   can replace such a fact; the tab merely being idle cannot, because idle is
+///   exactly the state a force-cancelled tab is left in. This is the same rule
+///   the window applies when it decides whether to DELIVER the report
+///   (`TabFactDelivery::UnlessSuperseded`), and the two used to disagree — the
+///   worker refused the scope write for an abandoned batch while the window
+///   delivered its notice and wrote the very same binding itself, so which
+///   answer the tab ended up with depended on which of the two writers ran.
+///
+/// It is one value rather than the counters and the id beside each other
+/// because those are one fact, and a door given them separately can be given
+/// two that disagree.
+#[derive(Clone, Debug, Default)]
+pub struct TabOperationOwnership {
+    current_operation_id: Option<Arc<AtomicU64>>,
+    /// The tab's last COMPLETED operation, which only
+    /// [`Self::may_state_a_tab_fact`] reads.
+    ///
+    /// It is what tells "the tab is idle after MY operation" from "a later one
+    /// has come and gone": `current_operation_id` is 0 in both. A value built
+    /// without it therefore gives the STRICT answer to the loose question
+    /// rather than guessing — which is what the session hand-backs, who ask
+    /// only [`Self::is_current`], are built with.
+    last_completed_operation_id: Option<Arc<AtomicU64>>,
+    operation_id: u64,
+}
+
+impl TabOperationOwnership {
+    pub fn for_operation(
+        current_operation_id: Option<&Arc<AtomicU64>>,
+        last_completed_operation_id: Option<&Arc<AtomicU64>>,
+        operation_id: u64,
+    ) -> Self {
+        Self {
+            current_operation_id: current_operation_id.cloned(),
+            last_completed_operation_id: last_completed_operation_id.cloned(),
+            operation_id,
+        }
+    }
+
+    /// A write from a path that runs outside any tab operation — a UI-thread
+    /// action, an internal execution, a harness. There is no newer execution
+    /// that could own the tab, so every write is current.
+    pub fn untracked() -> Self {
+        Self {
+            current_operation_id: None,
+            last_completed_operation_id: None,
+            operation_id: 0,
+        }
+    }
+
+    /// The tab's live operation counter, for a caller that has to pass the
+    /// identity on to a helper which builds its own owner.
+    pub fn current_operation_id(&self) -> Option<&Arc<AtomicU64>> {
+        self.current_operation_id.as_ref()
+    }
+
+    /// The operation this ownership speaks for. `0` means "no operation was
+    /// recorded", which is what [`Self::untracked`] answers.
+    pub fn operation_id(&self) -> u64 {
+        self.operation_id
+    }
+
+    pub fn is_current(&self) -> bool {
+        match self.current_operation_id.as_ref() {
+            None => true,
+            // An operation id of 0 means the caller never recorded one, so
+            // there is nothing to compare and nothing newer to lose to.
+            Some(_) if self.operation_id == 0 => true,
+            Some(current) => current.load(Ordering::Relaxed) == self.operation_id,
+        }
+    }
+
+    /// Whether this execution may still state a FACT about the tab — one that
+    /// already happened on the tab's own session and that no later execution
+    /// has answered.
+    ///
+    /// The mirror of `query_operation_was_superseded` in the window, and
+    /// deliberately so: the worker that records the fact and the window that
+    /// delivers it must not answer differently, or the tab keeps a value one of
+    /// them refused and the other wrote.
+    pub fn may_state_a_tab_fact(&self) -> bool {
+        let Some(current_operation_id) = self.current_operation_id.as_ref() else {
+            return true;
+        };
+        if self.operation_id == 0 {
+            return true;
+        }
+        let Some(last_completed_operation_id) = self.last_completed_operation_id.as_ref() else {
+            // This value cannot see the completed counter, so it cannot tell
+            // the tab being IDLE after this execution from a later one having
+            // come and gone. It answers the strict question instead of guessing
+            // the loose one.
+            return self.is_current();
+        };
+        current_operation_id.load(Ordering::Relaxed) <= self.operation_id
+            && last_completed_operation_id.load(Ordering::Relaxed) <= self.operation_id
+    }
+}
+
 /// Names the execution a worker's session hand-back belongs to.
 ///
 /// A tab runs one execution at a time, but a force-cancelled one is abandoned
@@ -4291,8 +4413,9 @@ impl Drop for DbSessionLeaseEntry {
 /// [`SharedDbSessionLease::hand_back_worker_session`].
 #[derive(Clone, Debug, Default)]
 pub struct SessionHandBackOwner {
-    current_operation_id: Option<Arc<AtomicU64>>,
-    operation_id: u64,
+    /// Which execution this hand-back speaks for — the same value the per-tab
+    /// setting writers ask, so "the tab has moved on" is ONE answer.
+    ownership: TabOperationOwnership,
     /// What this execution published over the session, so the hand-back door
     /// can end the reach before the session stops being the work's. See
     /// [`SessionCancelReach`].
@@ -4306,8 +4429,16 @@ impl SessionHandBackOwner {
         cancel_reach: SessionCancelReach,
     ) -> Self {
         Self {
-            current_operation_id: current_operation_id.cloned(),
-            operation_id,
+            // No completed counter, and that is the whole of what a hand-back
+            // needs: it asks [`TabOperationOwnership::is_current`], which reads
+            // the live counter alone. The looser tab-FACT question is the one
+            // that needs both, and a hand-back never asks it — a session is not
+            // a fact about the tab that outlives the execution holding it.
+            ownership: TabOperationOwnership::for_operation(
+                current_operation_id,
+                None,
+                operation_id,
+            ),
             cancel_reach,
         }
     }
@@ -4321,8 +4452,7 @@ impl SessionHandBackOwner {
     /// user of this constructor — is reachable for its whole life.
     pub fn untracked(cancel_reach: SessionCancelReach) -> Self {
         Self {
-            current_operation_id: None,
-            operation_id: 0,
+            ownership: TabOperationOwnership::untracked(),
             cancel_reach,
         }
     }
@@ -4347,23 +4477,17 @@ impl SessionHandBackOwner {
     /// The tab's live operation counter, for a caller that has to pass the
     /// identity on to a helper which builds its own owner.
     pub fn current_operation_id(&self) -> Option<&Arc<AtomicU64>> {
-        self.current_operation_id.as_ref()
+        self.ownership.current_operation_id()
     }
 
     /// The operation this hand-back speaks for. `0` means "no operation was
     /// recorded", which is what [`Self::untracked`] answers.
     pub fn operation_id(&self) -> u64 {
-        self.operation_id
+        self.ownership.operation_id()
     }
 
     pub fn is_current(&self) -> bool {
-        match self.current_operation_id.as_ref() {
-            None => true,
-            // An operation id of 0 means the caller never recorded one, so
-            // there is nothing to compare and nothing newer to lose to.
-            Some(_) if self.operation_id == 0 => true,
-            Some(current) => current.load(Ordering::Relaxed) == self.operation_id,
-        }
+        self.ownership.is_current()
     }
 }
 
