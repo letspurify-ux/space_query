@@ -349,7 +349,14 @@ struct OracleThinConnectedCandidate {
     /// against the connection the statements now run on, never the one that
     /// was replaced.
     default_transaction_isolation: crate::db::TransactionIsolation,
-    connection_id: crate::db::ConnectionId,
+    /// The runtime the app registered for this candidate.
+    ///
+    /// ONE value rather than an id beside a connection: giving it up asks the
+    /// registry door whether anything can still reach it and, failing that,
+    /// ends the connection, and a door handed those two separately can be
+    /// handed two that disagree. See
+    /// `TabConnectionBinding::give_up_transient_connection`.
+    runtime: Arc<crate::db::ConnectionRuntime>,
     /// When work on THIS connection is over, for the operation's registry row.
     ///
     /// Read here, where the candidate's lock is already held, because the row
@@ -1582,12 +1589,12 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             // hook together, or the row goes on describing the connection this
             // batch has just left.
             sender.move_status_activity_to_connection(
-                candidate.connection_id,
+                candidate.runtime.id(),
                 candidate.activity_lifetime.clone(),
                 candidate.connection_generation,
             );
             sender.set_execution_origin(Some(ExecutionOrigin {
-                connection_id: candidate.connection_id,
+                connection_id: candidate.runtime.id(),
                 connection_generation: candidate.connection_generation,
                 pool_context_epoch: candidate.pool_context_epoch,
                 binding_revision: candidate.binding_revision,
@@ -13717,13 +13724,17 @@ impl SqlEditorWidget {
                                                         None,
                                                     )
                                                 else {
-                                                    crate::db::end_connection_leaving_the_app(
-                                                        candidate_connection.clone(),
-                                                    );
-                                                    drop(candidate_work_guard);
-                                                    let _ = connection_binding_for_worker
-                                                        .remove_transient_if_idle(
-                                                            candidate_runtime_id,
+                                                    // Registered, so it leaves
+                                                    // through the door that asks
+                                                    // whether anything can still
+                                                    // reach it -- and the claim
+                                                    // goes with the call rather
+                                                    // than in a statement of its
+                                                    // own.
+                                                    connection_binding_for_worker
+                                                        .give_up_transient_connection(
+                                                            &candidate_runtime,
+                                                            candidate_work_guard,
                                                         );
                                                     SqlEditorWidget::emit_script_message(
                                                         &sender,
@@ -19123,18 +19134,18 @@ impl SqlEditorWidget {
         // `remove_idle_transient_runtimes`, which ENDS the connection.
         let (candidate_runtime, candidate_work_guard) =
             connection_binding.register_transient_connection(candidate_connection.clone());
-        let candidate_runtime_id = candidate_runtime.id();
         let binding_revision = match connection_binding.bind_if_revision(
             expected_binding_revision,
-            candidate_runtime,
+            candidate_runtime.clone(),
             None,
         ) {
             Ok(revision) => revision,
             Err(_) => {
                 session.release();
-                crate::db::end_connection_leaving_the_app(candidate_connection.clone());
-                drop(candidate_work_guard);
-                let _ = connection_binding.remove_transient_if_idle(candidate_runtime_id);
+                // Registered, so the registry door ends it: only that door can
+                // say whether anything still reaches this connection.
+                connection_binding
+                    .give_up_transient_connection(&candidate_runtime, candidate_work_guard);
                 return Err(
                     "The query tab connection changed while CONNECT was authenticating".to_string(),
                 );
@@ -19160,7 +19171,7 @@ impl SqlEditorWidget {
             auto_commit,
             transaction_mode,
             default_transaction_isolation,
-            connection_id: candidate_runtime_id,
+            runtime: candidate_runtime,
             activity_lifetime: candidate_activity_lifetime,
             work_guard: candidate_work_guard,
         })
@@ -20154,28 +20165,37 @@ impl SqlEditorWidget {
                                         // The revision to hold is the CANDIDATE's
                                         // -- the context still carries the one
                                         // from before the bind.
+                                        //
+                                        // GIVEN UP, not detached: a detach keeps
+                                        // the tab naming the runtime, which is
+                                        // right for a script DISCONNECT (the
+                                        // connection stays live and metadata is
+                                        // still read through it) and wrong here
+                                        // twice over -- the tab would name a
+                                        // connection that is being ended, and
+                                        // the detached count would make
+                                        // `is_idle` say "something still names
+                                        // this" for good, so the door below
+                                        // could never end it.
                                         let _ = context
                                             .connection_binding
-                                            .detach_if_revision(candidate.binding_revision);
-                                        crate::db::end_connection_leaving_the_app(
-                                            candidate.connection.clone(),
+                                            .give_up_if_revision(candidate.binding_revision);
+                                        context.connection_binding.give_up_transient_connection(
+                                            &candidate.runtime,
+                                            candidate.work_guard,
                                         );
-                                        drop(candidate.work_guard);
-                                        let _ = context
-                                            .connection_binding
-                                            .remove_transient_if_idle(candidate.connection_id);
                                         command_error = Some(message);
                                         break 'connect_command;
                                     }
                                     // Same as every other road the work moves
                                     // by: the row goes with it, whole.
                                     sender.move_status_activity_to_connection(
-                                        candidate.connection_id,
+                                        candidate.runtime.id(),
                                         candidate.activity_lifetime.clone(),
                                         candidate.connection_generation,
                                     );
                                     sender.set_execution_origin(Some(ExecutionOrigin {
-                                        connection_id: candidate.connection_id,
+                                        connection_id: candidate.runtime.id(),
                                         connection_generation: candidate.connection_generation,
                                         pool_context_epoch: candidate.pool_context_epoch,
                                         binding_revision: candidate.binding_revision,

@@ -200,25 +200,49 @@ impl Drop for OutstandingConnectionCleanup {
 /// disconnect loop has released each guard. (The tasks themselves must never
 /// run on a caller's thread: see [`start_pending_connection_cleanups`].)
 pub fn wait_for_connection_cleanups(deadline: Instant) -> usize {
-    // Nothing merely PARKED: a task no worker has been started for would
-    // otherwise be waited out in full and still not have run.
-    start_pending_connection_cleanups();
     let (mutex, finished) = outstanding_connection_cleanups();
-    let mut outstanding = mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    while *outstanding > 0 {
+    loop {
+        // Nothing merely PARKED: a task no worker has been started for would
+        // otherwise be waited out in full and still not have run.
+        //
+        // Asked on EVERY pass, not once on the way in, and for the same reason
+        // [`wait_for_graceful_cancel`] asks its own question first every time:
+        // a spawn can fail while this wait is already running, and the count
+        // rises with the task (it is part of what a task IS), so the waiter
+        // would then be waiting for something nothing is running. Every other
+        // caller is rescued by the status tick's
+        // [`retry_pending_connection_cleanups`]; at application exit there is
+        // no next tick, which is the one place this wait is used.
+        //
+        // OUTSIDE the count mutex, deliberately: this spawns threads, and a
+        // worker's very first act is to take that mutex to release its own
+        // count. Starting one from under it would put a lock the detector
+        // cannot see (it is handed to a `Condvar`) above a thread spawn.
+        start_pending_connection_cleanups();
+        let outstanding = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *outstanding == 0 {
+            return 0;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            break;
+            return *outstanding;
         }
-        let (next, _timeout) = finished
-            .wait_timeout(outstanding, remaining)
+        // Capped so a task parked DURING the wait is picked up by the next
+        // pass. The `Condvar` still ends the wait the instant the count
+        // reaches zero, so a quiet teardown costs nothing.
+        let (outstanding, _timeout) = finished
+            .wait_timeout(outstanding, remaining.min(CONNECTION_CLEANUP_WAIT_POLL))
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        outstanding = next;
+        // Released before the next pass starts a worker.
+        drop(outstanding);
     }
-    *outstanding
 }
+
+/// How often [`wait_for_connection_cleanups`] looks again for cleanup a failed
+/// thread spawn parked while it was already waiting.
+const CONNECTION_CLEANUP_WAIT_POLL: Duration = Duration::from_millis(50);
 
 /// Connection incarnations are numbered process-wide, so a generation names
 /// one incarnation of one connection. Zero is reserved for "never connected".
@@ -10288,6 +10312,12 @@ pub(crate) fn db_activity_names_connection(connection_id: ConnectionId) -> bool 
     // cancelled read is still unwinding on it -- and the one caller of this
     // does not merely forget a connection, it disconnects it. See
     // [`CANCELLED_WORK_STILL_HOLDING_A_SESSION`].
+    //
+    // Two reads rather than one decision, and that is sound because the WRITE
+    // is one step: the row leaves the registry and enters the ledger in a
+    // single acquisition of the registry lock, so a reader that misses it in
+    // the first place finds it in the second. There is no order of these two
+    // reads in which work that never stopped goes unnamed.
     a_row_names_it || cancelled_work_still_holds_a_session_on(connection_id)
 }
 
@@ -10578,7 +10608,25 @@ fn lock_cancelled_work_still_holding_a_session(
 }
 
 /// Remember what a cancel ended, until it has actually stopped.
+///
+/// **Takes the registry guard**, so it cannot be written anywhere but in the
+/// same acquisition that removes the rows — the compiler is what enforces
+/// that, not the order of two statements. The ledger stands in for the row
+/// exactly while the row is gone, and a cancel that removed a row without
+/// filling the ledger yet leaves an instant in which the work is named by
+/// NEITHER: `db_activity_names_connection` then answers "nothing can reach
+/// this connection" about a read that is still unwinding on it, which is the
+/// one answer whose consequence — `remove_transient_if_idle` DISCONNECTS —
+/// cannot be taken back. The two facts are one fact seen from two sides, so
+/// they are stated together.
+///
+/// Taking a leaf ledger under the registry is what round 10 did for the filing
+/// decision (`SESSION_LEASE -> RETIRED_GENERATIONS`) and for the same reason.
+/// It does not weaken the rule the registry lock is held under — *nothing that
+/// can block or re-enter runs while it is held* — because this runs no
+/// caller-supplied code at all: a `Vec` push and `Weak::strong_count`.
 fn remember_cancelled_work_still_holding_a_session(
+    _registry: &TrackedGuard<'_, Vec<TrackedDbActivity>>,
     work: Vec<(Option<ConnectionId>, Weak<DbActivityGuardInner>)>,
 ) {
     if work.is_empty() {
@@ -10634,6 +10682,12 @@ fn cancel_db_activities_where(
     // `interrupt` makes a network call (MySQL cancels over a second
     // connection), and a cancel hook calls back into the owner, which may touch
     // the registry itself. Both happen after the lock is released.
+    //
+    // The one thing that does happen under it is the LEDGER, and it has to:
+    // the ledger names this work exactly while the registry no longer does, so
+    // filing it in a second acquisition leaves an instant in which nothing
+    // names it. See `remember_cancelled_work_still_holding_a_session`, which
+    // takes the guard so it cannot be written anywhere else.
     let mut selected = Vec::new();
     let mut still_holding = Vec::new();
     let mut retired = 0usize;
@@ -10668,6 +10722,9 @@ fn cancel_db_activities_where(
             }
             false
         });
+        // In the SAME acquisition that removed them: the app never stops
+        // naming work it has ended until that work has stopped.
+        remember_cancelled_work_still_holding_a_session(&activities, still_holding);
     }
 
     let mut dispatched = Vec::new();
@@ -10696,10 +10753,6 @@ fn cancel_db_activities_where(
         }
     }
     spawn_force_cancel_watchdog(dispatched, force_timeout);
-    // Outside the registry lock, like everything else this function does with
-    // what it took out of it: the registry is a leaf and nothing may be taken
-    // under it.
-    remember_cancelled_work_still_holding_a_session(still_holding);
     retired
 }
 
@@ -12724,6 +12777,48 @@ mod tests {
             ran.load(Ordering::Acquire),
             "a parked cleanup must be started by the wait, or exit waits out its whole \
              deadline for work nothing is running"
+        );
+    }
+
+    /// ...and a task parked WHILE the wait is already running is started too.
+    ///
+    /// The count rises with the task, because the count is part of what a task
+    /// IS. So a spawn that fails after the wait has begun makes the waiter wait
+    /// for something nothing is running — asking only on the way in is asking
+    /// once for a question whose answer changes. Every other caller is rescued
+    /// by the status tick's `retry_pending_connection_cleanups`; application
+    /// exit, the one caller of this wait, has no next tick.
+    #[test]
+    fn a_cleanup_parked_while_the_wait_is_running_is_started_too() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_task = Arc::clone(&ran);
+        // Something is ALREADY outstanding, so the wait below really waits --
+        // that is what makes this able to tell the two shapes apart. Asked only
+        // on the way in, the wait sits on the `Condvar`, which is notified when
+        // the count reaches ZERO and never does: the parked task's own place in
+        // the count keeps it above it.
+        spawn_connection_cleanup(|| std::thread::sleep(Duration::from_millis(150)));
+        let parker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            lock_pending_connection_cleanups().push(ConnectionCleanupTask::new(move || {
+                ran_in_task.store(true, Ordering::Release);
+            }));
+        });
+
+        let deadline = Duration::from_secs(3);
+        let started = Instant::now();
+        wait_for_connection_cleanups(Instant::now() + deadline);
+        let waited = started.elapsed();
+        parker.join().expect("the parking thread should finish");
+
+        assert!(
+            ran.load(Ordering::Acquire),
+            "a cleanup parked during the wait must still be started, or its sessions go with \
+             the process"
+        );
+        assert!(
+            waited < deadline,
+            "and the wait ends because the work ran, not because the deadline passed"
         );
     }
 
@@ -14829,6 +14924,43 @@ mod tests {
             !db_activity_names_connection(connection_id),
             "and once it has let go, nothing names the connection any more"
         );
+    }
+
+    /// ...and it is named at EVERY instant, because the row leaves the registry
+    /// and enters the ledger in ONE acquisition of the registry lock.
+    ///
+    /// The test above cannot see the difference: it looks after the cancel has
+    /// returned, and both orderings answer the same thing by then. What is
+    /// asserted here is the ordering itself, through the app-wide lock-order
+    /// tracker — the pair only exists if the ledger really was written while
+    /// the registry lock was held, and the shape this replaced (fill the ledger
+    /// after the hooks and a thread spawn) could never produce it.
+    ///
+    /// The gap it closes: `db_activity_names_connection` answers "nothing can
+    /// reach this connection" in that window, and its one caller does not
+    /// forget a connection, it DISCONNECTS it.
+    #[test]
+    fn work_the_app_ends_is_named_without_a_gap_between_the_registry_and_the_ledger() {
+        let _test_guard = db_activity_test_lock();
+        let connection_id = ConnectionId::for_test(4245);
+        let activity = track_db_activity_for_connection("a metadata read", None, connection_id);
+        let _registration = activity
+            .attach_canceler(Arc::new(TestCanceler::default()))
+            .attached()
+            .expect("the canceler should attach");
+
+        assert_eq!(cancel_db_activity_for_test(activity.id()), 1);
+
+        if cfg!(debug_assertions) {
+            assert!(
+                crate::db::lock_order::observed_lock_order().contains(&(
+                    crate::db::lock_order::names::ACTIVITY_REGISTRY,
+                    crate::db::lock_order::names::CANCELLED_WORK,
+                )),
+                "the ledger must be filled UNDER the registry lock, or there is an instant in \
+                 which work that never stopped is named by neither"
+            );
+        }
     }
 
     /// A cancelled row that was holding NO session does not keep its connection

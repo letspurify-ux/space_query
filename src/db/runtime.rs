@@ -1241,6 +1241,59 @@ impl TabConnectionBinding {
             .is_some_and(|registry| registry.remove_transient_if_idle(id))
     }
 
+    /// Give up a transient connection this binding REGISTERED, through the one
+    /// door that asks whether anything can still reach it.
+    ///
+    /// The twin of [`Self::register_transient_connection`], and it takes the
+    /// claim BY VALUE for the same reason that one hands it back with the
+    /// runtime: the claim is what makes the connection un-endable, so giving up
+    /// while still holding it is a state a caller must not be able to write.
+    /// A caller that dropped it in a separate statement could also forget to,
+    /// and then nothing would ever end the connection.
+    ///
+    /// [`crate::db::end_connection_leaving_the_app`] is deliberately NOT what a
+    /// registered candidate takes: it disconnects unconditionally, and its own
+    /// premise is that nothing runs on the connection. Only the registry door
+    /// can answer that -- [`ConnectionRuntime::is_idle`] asks the activity
+    /// registry and the ledger of work the app has ended but which has not
+    /// stopped, which is where a metadata read holding a pooled session shows
+    /// up. So the direct call is left to the one road that has no runtime at
+    /// all: a candidate rejected before it was ever registered.
+    ///
+    /// Answers whether the connection was ended. `false` means something still
+    /// names it, and then it STAYS in the list every session-ending action
+    /// walks -- which is what makes it endable by the next
+    /// `remove_idle_transient_runtimes`, a tab close, or application exit.
+    ///
+    /// TOTAL on the registry-less binding too, and that is not a corner: a tab
+    /// created while nothing is selected and no tab can be forked from holds a
+    /// binding with no registry (`TabConnectionBinding::unbound`), and its
+    /// transient runtime is scoped to the binding itself. There is no registry
+    /// to ask and none that can name it, which is exactly
+    /// [`crate::db::end_connection_leaving_the_app`]'s own premise, so the
+    /// direct end is the right answer THERE -- and only there.
+    ///
+    /// Takes the RUNTIME, not an id and a connection, because those are one
+    /// fact: a door given the two separately can be given two that disagree.
+    ///
+    /// Nothing of this binding's own state is held while it runs: the door
+    /// takes the connection registry and then the connection mutex, and this
+    /// binding's state lock must never be underneath either.
+    pub fn give_up_transient_connection(
+        &self,
+        runtime: &Arc<ConnectionRuntime>,
+        claim: ConnectionWorkGuard,
+    ) -> bool {
+        // FIRST: the claim is what makes the connection un-endable, so the
+        // door below cannot answer while this frame still holds it.
+        drop(claim);
+        if self.inner.registry.is_some() {
+            return self.remove_transient_if_idle(runtime.id());
+        }
+        crate::db::connection::end_connection_leaving_the_app(runtime.connection());
+        true
+    }
+
     pub fn metadata_connection(&self) -> Option<SharedConnection> {
         let snapshot = self.snapshot();
         snapshot
@@ -1326,6 +1379,46 @@ impl TabConnectionBinding {
             return Err(state.revision);
         }
         Ok(Self::detach_locked(&mut session, &mut state))
+    }
+
+    /// Stop naming this binding's runtime ALTOGETHER -- the twin of
+    /// [`Self::detach_if_revision`] for a runtime that is being GIVEN UP rather
+    /// than kept.
+    ///
+    /// A detach keeps the runtime named (`detached_runtime`), and that is what
+    /// a script `DISCONNECT` needs: the connection stays live and the tab goes
+    /// on reading metadata through it. A candidate whose adoption FAILED is the
+    /// opposite case, and detaching it there is wrong twice over -- the tab
+    /// would hand IntelliSense, the bind probes and the column loads a
+    /// connection the app is about to end, and the detached count would make
+    /// [`ConnectionRuntime::is_idle`] answer "something still names this"
+    /// forever, so the registry door could never end it and the road had to
+    /// spell the disconnect by hand.
+    ///
+    /// Revision-held like every other write of the binding, for the reason
+    /// [`Self::detach_if_revision`] states: an abandoned batch reaching here
+    /// after the tab moved on may not unbind the connection the user is
+    /// working on now.
+    pub fn give_up_if_revision(&self, expected_revision: u64) -> Result<u64, u64> {
+        let mut session = self
+            .inner
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.revision != expected_revision {
+            return Err(state.revision);
+        }
+        let revision = Self::detach_locked(&mut session, &mut state);
+        // The detach above named it; a runtime being given up is named by
+        // nothing. Dropping the reference is what lets the registry door end
+        // the connection.
+        state.detached_runtime = None;
+        Ok(revision)
     }
 
     fn detach_locked(session: &mut SessionState, state: &mut TabConnectionBindingState) -> u64 {
@@ -2456,6 +2549,100 @@ mod tests {
         assert!(runtime.is_idle());
         assert!(registry.remove_transient_if_idle(id));
         assert!(registry.get(id).is_none());
+    }
+
+    /// A candidate the tab could not adopt is GIVEN UP, and giving up is not
+    /// detaching.
+    ///
+    /// A detach leaves the tab naming the runtime, which is exactly what a
+    /// script `DISCONNECT` needs -- the connection stays live and metadata is
+    /// still read through it. The thin script `CONNECT` whose `replace_pooled`
+    /// failed is the opposite case, and detaching there was wrong twice over:
+    /// the tab handed IntelliSense, the bind probes and the column loads a
+    /// connection that was being ENDED, and the detached count made `is_idle`
+    /// answer "something still names this" for good -- so the registry door
+    /// could never end it and the road had to spell the disconnect by hand,
+    /// against the very premise that door states.
+    #[test]
+    fn a_candidate_that_could_not_be_adopted_is_named_by_nothing() {
+        let registry = ConnectionRegistry::new();
+        let (runtime, claim) = registry.register_transient(connection());
+        let id = runtime.id();
+        let binding =
+            TabConnectionBinding::bound_in_registry(registry.clone(), runtime.clone(), None);
+
+        let revision = binding.snapshot().revision;
+        assert!(binding.give_up_if_revision(revision).is_ok());
+        assert_eq!(runtime.bound_tab_count(), 0);
+        assert_eq!(
+            runtime.detached_tab_count(),
+            0,
+            "a runtime being given up is named by nothing -- a DETACH would name it"
+        );
+        assert!(
+            binding.snapshot().detached_runtime.is_none(),
+            "and the tab must not read its metadata through a connection that is being ended"
+        );
+
+        // The claim still stands, so the door refuses -- and the connection
+        // stays in the list every session-ending action walks.
+        assert!(!runtime.is_idle());
+        assert!(registry.get(id).is_some());
+
+        assert!(
+            binding.give_up_transient_connection(&runtime, claim),
+            "handed the claim, the door can answer, and it ENDS the connection"
+        );
+        assert!(registry.get(id).is_none());
+    }
+
+    /// The give-up is revision-held like every other write of the binding: an
+    /// abandoned batch reaching it after the tab moved on may not unbind the
+    /// connection the user is working on now.
+    #[test]
+    fn giving_up_a_runtime_a_newer_bind_replaced_is_refused() {
+        let registry = ConnectionRegistry::new();
+        let (candidate, _candidate_claim) = registry.register_transient(connection());
+        let (newer, _newer_claim) = registry.register_transient(connection());
+        let binding =
+            TabConnectionBinding::bound_in_registry(registry.clone(), candidate.clone(), None);
+
+        let stale_revision = binding.snapshot().revision;
+        binding.bind(newer.clone(), None);
+
+        assert!(binding.give_up_if_revision(stale_revision).is_err());
+        assert_eq!(
+            binding.snapshot().connection_id(),
+            Some(newer.id()),
+            "the tab the user is working on now keeps its connection"
+        );
+    }
+
+    /// ...and the door is TOTAL: a binding with no registry has nothing to ask,
+    /// so it ends the connection itself.
+    ///
+    /// Not a corner case. A tab created while nothing is selected and no tab
+    /// can be forked from holds `TabConnectionBinding::unbound`, whose
+    /// transient runtime is scoped to the binding itself. A door that only
+    /// asked a registry would simply leak that tab's rejected candidate.
+    #[test]
+    fn giving_up_a_candidate_with_no_registry_ends_it_anyway() {
+        let binding = TabConnectionBinding::unbound();
+        let shared = connection();
+        {
+            let mut guard = crate::db::lock_connection(&shared);
+            guard.set_connection_pool_size(1);
+        }
+        let (runtime, claim) = binding.register_transient_connection(Arc::clone(&shared));
+
+        assert!(
+            binding.give_up_transient_connection(&runtime, claim),
+            "with no registry to ask, the connection is ended directly"
+        );
+        assert!(
+            !crate::db::lock_connection(&shared).is_connected(),
+            "and it really is ended, rather than left for a registry that does not exist"
+        );
     }
 
     /// A tab forked from a detached one names the runtime as well: it reads

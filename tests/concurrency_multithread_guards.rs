@@ -2998,7 +2998,31 @@ fn script_connect_transfers_runtime_work_tracking_before_old_guard_is_dropped() 
     );
     assert!(execution.contains("runtime_work_guard = Some(candidate_work_guard);"));
     assert!(execution.contains("*context.runtime_work_guard = Some(candidate.work_guard);"));
-    assert!(execution.contains("drop(candidate_work_guard);"));
+    // The rejection roads dispose of the claim too — a claim left standing is a
+    // connection `is_idle` can never answer for, so nothing would ever end it.
+    // HANDED to the door that gives the candidate up, by value, rather than
+    // dropped in a statement of its own: a statement can be forgotten, an
+    // argument cannot.
+    assert!(
+        !execution.contains("drop(candidate_work_guard);")
+            && !execution.contains("drop(candidate.work_guard);"),
+        "the claim must not be released by hand beside the give-up"
+    );
+    // Needles stop at the last ARGUMENT, not at the closing paren: whether
+    // `cargo fmt` wraps a call and leaves a trailing comma is a fact about the
+    // formatter, and binding a rule to it is how these guards have gone red
+    // for saying nothing true.
+    let compact_execution = compact_for_pattern(&execution);
+    assert_eq!(
+        compact_execution
+            .matches("give_up_transient_connection(&candidate_runtime,candidate_work_guard")
+            .count()
+            + compact_execution
+                .matches("give_up_transient_connection(&candidate.runtime,candidate.work_guard")
+                .count(),
+        3,
+        "every road that rejects a registered candidate hands the door its claim"
+    );
 
     // The registration is the only way to get one, so it cannot be forgotten.
     let runtime = read_source("src/db/runtime.rs");
@@ -6850,6 +6874,13 @@ fn every_backend_hands_a_batch_session_back_through_the_door_that_names_its_oper
         "and it must be the ONLY one: an unconditional unbind is a discard road \
          with no door on it"
     );
+    // Its sibling — used where the runtime is GIVEN UP rather than kept — obeys
+    // the same rule, and for the same reason.
+    assert!(
+        runtime.contains("pub fn give_up_if_revision(&self, expected_revision: u64)")
+            && !runtime.contains("pub fn give_up(&self)"),
+        "the guarded give-up must exist and must be the only one"
+    );
     for source in ["src/ui/sql_editor/execution.rs", "src/ui/main_window.rs"] {
         assert_eq!(
             read_source(source).matches("_binding.detach()").count(),
@@ -6861,13 +6892,29 @@ fn every_backend_hands_a_batch_session_back_through_the_door_that_names_its_oper
     // also the one place the guarded unbind has to be reached with the
     // CANDIDATE's revision: the context still carries the one from before the
     // bind, and holding that would refuse every undo.
+    //
+    // Bounded by the road's own end (`break 'connect_command;`) rather than by
+    // a byte count: a comment added inside it used to push the very line being
+    // asserted out of the window, which is how a documentation change turns
+    // into a red test that says nothing true.
     let thin_connect = execution
         .find("if let Err(message) = conn.replace_pooled(candidate.session)")
         .expect("the thin script CONNECT should swap the session");
+    let undo_road = &execution[thin_connect..];
+    let undo_road = undo_road
+        .find("break 'connect_command;")
+        .map(|end| &undo_road[..end])
+        .expect("the failed-adoption road should leave the CONNECT command");
     assert!(
-        slice_from(&execution, thin_connect, 1600)
-            .contains("detach_if_revision(candidate.binding_revision)"),
-        "undoing the candidate bind must hold the revision that bind produced"
+        undo_road.contains("give_up_if_revision(candidate.binding_revision)"),
+        "undoing the candidate bind must hold the revision that bind produced: {undo_road}"
+    );
+    // GIVEN UP, not detached: a detach keeps the tab naming the runtime, which
+    // is right for a script DISCONNECT (the connection stays live and metadata
+    // is still read through it) and wrong for a candidate the app is ending.
+    assert!(
+        !undo_road.contains("detach_if_revision("),
+        "and a candidate that could not be adopted is given up, never detached: {undo_road}"
     );
 }
 
@@ -10974,10 +11021,37 @@ fn a_connection_leaves_the_registry_only_when_it_has_been_ended() {
         .map(|offset| slice_to_end_of_fn(&connection_source, offset))
         .expect("the cancel dispatch should exist");
     assert!(
-        compact_for_pattern(dispatch)
-            .contains("remember_cancelled_work_still_holding_a_session(still_holding);"),
+        compact_for_pattern(dispatch).contains(
+            "remember_cancelled_work_still_holding_a_session(&activities,still_holding);"
+        ),
         "and the cancel must be what fills it, so no road can end work without the connection \
          going on being named until it has let go: {dispatch}"
+    );
+    // In the SAME acquisition that removed the rows. Filed a step later — after
+    // the hooks and a thread spawn — there is an instant in which the work is
+    // named by NEITHER store, and `db_activity_names_connection` then answers
+    // "nothing can reach this connection" about a read that is still unwinding
+    // on it. That answer disconnects it, and cannot be taken back.
+    let fill = compact_for_pattern(dispatch)
+        .find("remember_cancelled_work_still_holding_a_session(")
+        .expect("the fill is asserted above");
+    let dispatch_leaves_the_lock = compact_for_pattern(dispatch)
+        .find("letmutdispatched=Vec::new();")
+        .expect("the cancel dispatch leaves the registry lock before it touches the cancelers");
+    assert!(
+        fill < dispatch_leaves_the_lock,
+        "the ledger must be filled while the registry lock is still held: {dispatch}"
+    );
+    let remember = connection_source
+        .find("fn remember_cancelled_work_still_holding_a_session(")
+        .map(|offset| slice_to_end_of_fn(&connection_source, offset))
+        .expect("the ledger's writer should exist");
+    assert!(
+        compact_for_pattern(remember)
+            .contains("_registry:&TrackedGuard<'_,Vec<TrackedDbActivity>>,"),
+        "and the lock is its ARGUMENT, so the fill cannot be written anywhere else — the \
+         compiler enforces the one acquisition rather than the order of two statements: \
+         {remember}"
     );
     assert!(
         compact_for_pattern(dispatch).contains("if!tracked.cancelers.is_empty(){"),
@@ -11044,8 +11118,76 @@ fn a_connection_leaves_the_registry_only_when_it_has_been_ended() {
         execution
             .matches("crate::db::end_connection_leaving_the_app(")
             .count(),
-        8,
-        "every script-CONNECT road that rejects a candidate connection uses the door"
+        5,
+        "every script-CONNECT road that rejects a candidate connection BEFORE registering it \
+         uses the door"
+    );
+
+    // ...and once the candidate HAS been registered, the door is the wrong
+    // one: it disconnects unconditionally, while its own premise is that
+    // nothing runs on the connection. Only the registry door can answer that
+    // (`is_idle` asks the activity registry and the ended-but-not-stopped
+    // ledger), so a registered candidate leaves through it — and through the
+    // one call that also takes its CLAIM, because a road that drops the claim
+    // in a statement of its own can forget to, and then nothing ever ends the
+    // connection.
+    assert!(
+        !execution.contains("remove_transient_if_idle("),
+        "a worker may not ask the registry to remove a candidate without handing over the \
+         claim that makes it un-endable; `give_up_transient_connection` is the one door"
+    );
+    assert_eq!(
+        execution.matches("give_up_transient_connection(").count(),
+        3,
+        "the three roads that reject a REGISTERED candidate (OCI bind, thin bind, thin \
+         replace_pooled) all take it"
+    );
+    let give_up = runtime
+        .find("pub fn give_up_transient_connection(")
+        .map(|offset| slice_to_end_of_fn(&runtime, offset))
+        .expect("the door a registered candidate leaves through should exist");
+    let give_up_compact = compact_for_pattern(give_up);
+    assert!(
+        give_up_compact.contains("claim:ConnectionWorkGuard,"),
+        "it takes the claim BY VALUE, so giving a candidate up while still claiming it is a \
+         state no caller can write: {give_up}"
+    );
+    let claim_released = give_up_compact
+        .find("drop(claim);")
+        .expect("the claim must be released");
+    let asks = give_up_compact
+        .find("remove_transient_if_idle(runtime.id())")
+        .expect("the door must ask the registry");
+    assert!(
+        claim_released < asks,
+        "and it releases the claim BEFORE it asks, or the answer is always \
+         'something still names this': {give_up}"
+    );
+    assert!(
+        give_up_compact.contains("end_connection_leaving_the_app(runtime.connection())"),
+        "and it is TOTAL: a binding with no registry has nothing to ask and nothing that can \
+         name the runtime, so the connection is ended directly there — without it, that tab's \
+         candidate would simply be leaked: {give_up}"
+    );
+
+    // A candidate that is being GIVEN UP is not DETACHED. A detach keeps the
+    // tab naming the runtime, which is what a script DISCONNECT needs and the
+    // opposite of what this road needs: the tab would name a connection the
+    // app is ending, and the detached count would make `is_idle` say
+    // "something still names this" for good.
+    let give_up_binding = runtime
+        .find("pub fn give_up_if_revision(&self, expected_revision: u64) -> Result<u64, u64> {")
+        .map(|offset| slice_to_end_of_fn(&runtime, offset))
+        .expect("the binding's give-up should exist");
+    assert!(
+        compact_for_pattern(give_up_binding).contains("state.detached_runtime=None;"),
+        "giving up a runtime must stop naming it, or the registry door can never end it: \
+         {give_up_binding}"
+    );
+    assert!(
+        !compact_for_pattern(&execution).contains("detach_if_revision(candidate.binding_revision)"),
+        "and the road whose candidate could not be adopted must not detach it, which is what \
+         left the tab reading metadata through a connection that had just been ended"
     );
     // The needle is compacted TOO. It used to be spelled with spaces and
     // compared against a whitespace-stripped haystack, so it could never match

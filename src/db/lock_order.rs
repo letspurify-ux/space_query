@@ -295,9 +295,10 @@ pub mod names {
     pub const PENDING_CLEANUPS: &str = "PENDING_CLEANUPS";
 
     /// Work the app has ENDED but which has not STOPPED, listed by connection.
-    /// A leaf, taken from the cancel dispatch (holding nothing) and from under
-    /// the connection registry when a transient connection is asked whether
-    /// anything can still reach it.
+    /// A leaf, taken from under the ACTIVITY registry (the cancel dispatch
+    /// fills it in the same acquisition that removes the rows, so nothing
+    /// names the work in between) and from under the CONNECTION registry when
+    /// a transient connection is asked whether anything can still reach it.
     pub const CANCELLED_WORK: &str = "CANCELLED_WORK";
 
     pub const ALL: [&str; 12] = [
