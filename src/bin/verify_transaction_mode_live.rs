@@ -81,6 +81,15 @@
 //       skipped its per-statement scope assertion for any session it had to
 //       preserve, and a lazily streamed thin SELECT never asserted the scope
 //       at all.
+//   S65 (MySQL family) a `USE` inside a MULTI-STATEMENT unit whose database
+//       name is touched by a comment (`USE db#c`, `USE db-- c` — statements
+//       the server runs, in the shape a custom `DELIMITER` produces) records
+//       the database the SERVER is in. The app parsed the unit text for it and
+//       the unquoted token ended only at whitespace or `;`, so it recorded
+//       `db#c` onto the batch's scope cell and onto the tab, and the next
+//       statement of the same run asserted that name and failed with ER 1049.
+//       A `USE` typed on its own is a ScriptItem::ToolCommand and never takes
+//       this road, which is why the shape below is the reachable one.
 //   S46 a tab whose scope was DROPPED keeps working: the current
 //       schema/database is only a name-resolution namespace, so the fallback
 //       has to keep the tab usable — including for the statement that fixes
@@ -3189,12 +3198,30 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
             format!("scope events: {:?}", notice.scope_changes),
         );
         // What the window does with that report: the tab moves there.
-        h.editor.set_tab_scope(reported_scope);
+        h.editor.set_tab_scope(reported_scope.clone());
         let after_use = h.select_scalar(current_scope_sql)?;
         h.check(
             "S42 the session really moved",
             after_use.trim().eq_ignore_ascii_case(scratch_scope),
             format!("{current_scope_sql} = {after_use:?}"),
+        );
+        // ...and the report names it CHARACTER FOR CHARACTER, because the
+        // report is the session's own answer now and not a parse of the
+        // command. This arm used to compose its own answer out of the name it
+        // had parsed, which is wrong whenever the server does not store the
+        // name the way it was typed (`lower_case_table_names=1` folds it) --
+        // and the recorded scope then disagreed with the session for the rest
+        // of the run, re-issuing the database switch on every statement and
+        // clearing the diagnostics `ROW_COUNT()`/`FOUND_ROWS()` read from.
+        // The DISAGREEING server is driven by the unit
+        // `a_mysql_scope_change_records_where_the_session_landed`; what this
+        // proves live is that the road really goes through the shared step.
+        h.check(
+            "S42 the reported scope is the session's own answer, character for character",
+            reported_scope
+                .as_deref()
+                .is_some_and(|scope| scope.trim() == after_use.trim()),
+            format!("reported {reported_scope:?} vs session {after_use:?}"),
         );
         let still_there = h.select_scalar(current_scope_sql)?;
         h.check(
@@ -3202,6 +3229,91 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
             still_there.trim().eq_ignore_ascii_case(scratch_scope),
             format!("{current_scope_sql} = {still_there:?}"),
         );
+        h.editor.set_tab_scope(Some(base_scope.clone()));
+        let _ = h.editor.discard_pooled_session_for_close();
+        let _ = h.run(&format!("DROP DATABASE IF EXISTS {scratch_scope}"));
+        h.run("ROLLBACK")?;
+    }
+
+    // ---- S65: a commented USE inside a multi-statement unit -----------------
+    // `USE db#c` and `USE db-- c` are statements the server runs, and inside a
+    // custom-`DELIMITER` unit the whole unit goes to the server as one string —
+    // so the app never sees the `USE` as a tool command and reads the UNIT TEXT
+    // to learn where the session went. That read ended an unquoted name only at
+    // whitespace or `;`, so it recorded `db#c`: onto the batch's own scope cell,
+    // which every later statement of the run is asserted against, and onto the
+    // tab through `ScopeChangedNotice`. The next statement then asked for a
+    // database that does not exist (ER 1049) and the tab was left pointing at
+    // it.
+    //
+    // Both halves are driven: the statement AFTER the unit is the one the batch
+    // cell breaks, and the reported scope is what the tab would be moved to.
+    // (A block comment cannot reach here — the splitter strips it — so the two
+    // shapes below are the whole of what is reachable.)
+    if !target.is_oracle() {
+        println!("  --- S65 a commented USE inside a multi-statement unit ---");
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        let scratch_scope = "SQ_TM_SCOPE8";
+        let _ = h.run(&format!("DROP DATABASE IF EXISTS {scratch_scope}"));
+        let capture = h.run(&format!("CREATE DATABASE {scratch_scope}"))?;
+        if !capture.results.first().is_some_and(|result| result.success) {
+            return Err(format!(
+                "S65 could not create the scratch database: {:?}",
+                capture.results.first().map(|r| r.message.clone())
+            ));
+        }
+        for comment in ["#c", "-- c"] {
+            h.editor.set_tab_scope(None);
+            let _ = h.editor.discard_pooled_session_for_close();
+            let script = format!(
+                "DELIMITER $$\nSELECT 1; USE {scratch_scope}{comment}\n$$\nDELIMITER ;\n{current_scope_sql};"
+            );
+            let capture = h.run(&script)?;
+            h.check(
+                &format!("S65 every statement after `USE db{comment}` still runs"),
+                capture.results.iter().all(|result| result.success),
+                format!(
+                    "results: {:?}",
+                    capture
+                        .results
+                        .iter()
+                        .map(|r| (r.success, r.message.clone()))
+                        .collect::<Vec<_>>()
+                ),
+            );
+            let landed = capture
+                .rows
+                .last()
+                .and_then(|row| row.last())
+                .cloned()
+                .or_else(|| {
+                    capture
+                        .results
+                        .iter()
+                        .rfind(|r| r.is_select)
+                        .and_then(|r| r.rows.first())
+                        .and_then(|row| row.last())
+                        .cloned()
+                });
+            h.check(
+                &format!("S65 the statement after `USE db{comment}` runs in the new database"),
+                landed
+                    .as_deref()
+                    .is_some_and(|scope| scope.trim().eq_ignore_ascii_case(scratch_scope)),
+                format!("{current_scope_sql} = {landed:?}"),
+            );
+            // The scope the UI is handed — the value that would become the
+            // tab's binding, its browser card and its metadata scope.
+            let reported_scope = capture.scope_changes.last().cloned().flatten();
+            h.check(
+                &format!("S65 the reported scope for `USE db{comment}` is the database itself"),
+                reported_scope
+                    .as_deref()
+                    .is_some_and(|scope| scope.trim().eq_ignore_ascii_case(scratch_scope)),
+                format!("scope events: {:?}", capture.scope_changes),
+            );
+        }
         h.editor.set_tab_scope(Some(base_scope.clone()));
         let _ = h.editor.discard_pooled_session_for_close();
         let _ = h.run(&format!("DROP DATABASE IF EXISTS {scratch_scope}"));
@@ -3393,10 +3505,11 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
 
     // ---- S45: a scope change the push never reached still governs ----------
     // The eager push onto the tab's retained session is a convenience, not the
-    // guarantee: `retained_scope_update_for_tab` needs the connection lock and
-    // returns `None` when another tab's work holds it, and it also gives up on
-    // an empty scope. The guarantee is the per-statement assertion each batch
-    // makes. So drive ONLY the binding half — exactly what the GUI is left
+    // guarantee: `retained_scope_update_for_tab` gives up on an empty scope and
+    // on a connection that is not up, and the push can fail on the wire. (It no
+    // longer gives up because a NEIGHBOUR tab holds the connection mutex — that
+    // was a defect, and it is why this scenario existed before the guarantee
+    // did.) The guarantee is the per-statement assertion each batch makes. So drive ONLY the binding half — exactly what the GUI is left
     // with when the push cannot run — over a session that carries work, and
     // the next statement must still run in the tab's scope.
     //
@@ -4976,7 +5089,10 @@ fn check_recycled_session_isolation(
             Some(DatabaseType::Oracle),
         );
         let mut acquired = context
-            .acquire_session_for_current_scope(&activity)
+            .acquire_session_for_current_scope(
+                space_query::db::PooledSessionPurpose::AppRead,
+                &activity,
+            )
             .map_err(|e| format!("{scenario} acquire: {e}"))?;
         let Some(session) = acquired.session_mut() else {
             return Err(format!(

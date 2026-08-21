@@ -55,6 +55,14 @@
 //       from the pool). Driven directly for the same reason A10 is, and the
 //       assertion is asked of the SERVER: the tab's transaction must still be
 //       there afterwards.
+//   A18 cancelling a PAUSED lazy fetch asks the server nothing, so the
+//       watchdog's force pass is the only thing that can ever ask it — the
+//       premise the lazy force tier used to escalate on, checked per backend.
+//   A19 the SAME publication, forced with the purpose that ENDS THE
+//       CONNECTION, must reach the tier that destroys — never the re-break
+//       A10 asserts for a cancel. Without it the app could not end a call on
+//       the connection's own session at all, so `File > Disconnect` refused on
+//       a statement the app had already told the user it could not stop.
 //   A16 (Oracle only — the MySQL family refuses `CONNECT`) a script `CONNECT`
 //       moves the operation's REGISTRY ROW to the connection the batch moved
 //       to. Only the row's connection ID used to move; its lifetime kept
@@ -280,6 +288,17 @@ impl Target {
         }
     }
 
+    /// A SELECT whose result is far larger than one lazy-fetch batch, so the
+    /// fetch stops after its first chunk and WAITS for the user -- the state
+    /// A18 is about, and the one every result grid sits in after a big query.
+    fn paused_lazy_select_sql(self) -> &'static str {
+        if self.is_oracle() {
+            "SELECT a.OBJECT_NAME, b.OBJECT_NAME AS B_NAME FROM all_objects a, all_objects b              WHERE a.object_id > 0"
+        } else {
+            "SELECT a.COLUMN_NAME, b.COLUMN_NAME AS B_NAME FROM information_schema.COLUMNS a,              information_schema.COLUMNS b"
+        }
+    }
+
     fn slow_sql(self) -> &'static str {
         if self.is_oracle() {
             // NOT a DBMS_SESSION.SLEEP: that is uninterruptible server-side, so
@@ -367,7 +386,10 @@ impl SlowStatement {
             let outcome = (|| -> Result<(), String> {
                 // Session and cancel reach as ONE value: the reach lasts
                 // exactly as long as the statement runs on the session.
-                let mut acquired = context.acquire_session_for_current_scope(&activity)?;
+                let mut acquired = context.acquire_session_for_current_scope(
+                    space_query::db::PooledSessionPurpose::AppRead,
+                    &activity,
+                )?;
                 acquired_in_worker.store(true, Ordering::Release);
                 let Some(session) = acquired.session_mut() else {
                     return Err("the acquired session was already given up".to_string());
@@ -544,7 +566,10 @@ fn kill_one_session_holding_an_open_transaction(
     let killer = Harness::connect(target)?;
     let context = killer.pool_context()?;
     let activity = track_pool_db_activity("A17 kill", target.connection_info().db_type);
-    let mut acquired = context.acquire_session_for_current_scope(&activity)?;
+    let mut acquired = context.acquire_session_for_current_scope(
+        space_query::db::PooledSessionPurpose::AppRead,
+        &activity,
+    )?;
     let Some(session) = acquired.session_mut() else {
         return Err("the killer session was already given up".to_string());
     };
@@ -801,7 +826,10 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
         let context = harness.pool_context()?;
         let first = track_pool_db_activity("Live detach probe", target.connection_info().db_type);
         {
-            let _acquired = context.acquire_session_for_current_scope(&first)?;
+            let _acquired = context.acquire_session_for_current_scope(
+                space_query::db::PooledSessionPurpose::AppRead,
+                &first,
+            )?;
         }
         // The session went back to the pool; the activity must no longer claim
         // it can cancel anything.
@@ -1026,7 +1054,9 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
             for _ in 0..40 {
                 editor.editor.explain_current();
                 let caught = editor.pump_until(Duration::from_secs(3), || {
-                    editor.editor.force_cancel_published_session_for_probe()
+                    editor.editor.force_cancel_published_session_for_probe(
+                        space_query::db::SessionCancelPurpose::StopOneCall,
+                    )
                 });
                 if let Some(outcome) = caught {
                     forced = Some(outcome);
@@ -1038,9 +1068,32 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                 None => failures.push(format!(
                     "A10 ({label}): the explain plan never published a session for the force tier"
                 )),
-                Some(outcome) => {
-                    println!("   A10 ({label}) force tier answered {outcome:?}");
+                // The tier must NAME what it did, and against the connection's
+                // own session the only honest name is "I broke it again".
+                // While both tiers answered `Delivered`, the cancel watchdog
+                // read this as the tear-down: it reported `ForceCompleted`,
+                // retired the operation's activity row and abandoned the
+                // operation -- publishing the tab idle and clearing the cancel
+                // flag that stops a batch at its next safe point -- for a
+                // statement the server was still running. On all four backends.
+                Some(Ok(space_query::db::ForceTierOutcome::AskedAgain)) => {
+                    println!(
+                        "   A10 ({label}) the force tier broke the connection's own session \
+                         again and said so, rather than claiming a tear-down"
+                    );
                 }
+                Some(Ok(space_query::db::ForceTierOutcome::Destroyed)) => failures.push(format!(
+                    "A10 ({label}): the force tier reported DESTROYING the connection's own \
+                     session -- the one every other tab is working on"
+                )),
+                Some(Ok(space_query::db::ForceTierOutcome::Withdrawn)) => failures.push(format!(
+                    "A10 ({label}): the explain plan's session was withdrawn before the tier \
+                     could reach it, so this scenario proved nothing"
+                )),
+                Some(Err(message)) => failures.push(format!(
+                    "A10 ({label}): the force tier failed against the connection's own session: \
+                     {message}"
+                )),
             }
             editor.pump_until(cancel_deadline(), || {
                 (!editor.editor.is_query_running()).then_some(())
@@ -1269,8 +1322,11 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                 let probe = context.track_activity("Live acquire yardstick");
                 let started = Instant::now();
                 {
-                    let _session =
-                        context.acquire_session_for_scope(target.metadata_probe_scope(), &probe)?;
+                    let _session = context.acquire_session_for_scope(
+                        target.metadata_probe_scope(),
+                        space_query::db::PooledSessionPurpose::AppRead,
+                        &probe,
+                    )?;
                 }
                 longest = longest.max(started.elapsed());
             }
@@ -1868,6 +1924,196 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                 ));
             }
         }
+    }
+
+    // A18: cancelling a PAUSED lazy fetch asks the server nothing, so the
+    // watchdog's force pass is the only thing that can ever ask it.
+    //
+    // This is the PREMISE the lazy road's force tier used to act on, checked
+    // per backend because it is a per-backend fact.
+    // `cancel_lazy_fetch_handle_for_session` sends a DB break only for a fetch
+    // that is MID-FILL; a fetch that is waiting between chunks -- which is
+    // where every result grid sits after a big query, and what every
+    // result-tab close and every paused cancel button reaches -- is sent a
+    // `GracefulClose` and nothing else. Its publication therefore stays at
+    // `GracefulBreakProgress::NotAsked` for the whole close, and the watchdog
+    // used to read that exactly as it read `Answered`: escalate. A close that
+    // wedged (a cursor close behind a lock, a stalled socket) met KILL
+    // CONNECTION / a drop-close as the first thing that ever reached the
+    // session -- destroying the tab's own retained transaction that `Cancel`
+    // had just promised to keep.
+    //
+    // What the watchdog now DOES with `NotAsked` is proven by the unit
+    // `a_paused_lazy_fetchs_session_is_asked_to_stop_before_it_is_torn_down`
+    // (fail-before): the wedge itself cannot be arranged against a healthy
+    // server, which is the same split rounds 8, 20 and 21 used.
+    {
+        use space_query::db::session_policy::LazyFetchState;
+        use space_query::ui::sql_editor::{GracefulBreakProgress, LazyFetchRequest};
+
+        let label = target.label();
+        println!(
+            "   A18 ({label}): cancelling a paused lazy fetch reaches the server only through \
+             the watchdog"
+        );
+        let harness = Harness::connect(target)?;
+        let mut editor = EditorHarness::new(&harness);
+        editor.editor.set_text(target.paused_lazy_select_sql());
+        editor.editor.execute_current();
+
+        let paused = editor.pump_until(Duration::from_secs(60), || {
+            let snapshot = editor.editor.cancel_target_snapshot();
+            (snapshot.lazy_state == LazyFetchState::Waiting
+                && editor.editor.active_lazy_fetch_session().is_some())
+            .then(|| editor.editor.active_lazy_fetch_session())
+            .flatten()
+        });
+        match paused {
+            None => failures.push(format!(
+                "A18 ({label}): the query never left a lazy fetch waiting between chunks, so \
+                 the premise could not be checked (transcript: {:?})",
+                editor.transcript()
+            )),
+            Some(session_id) => {
+                // `Cancel`, not `CancelAndDiscard`: the road that promises to
+                // KEEP the tab's session.
+                let requested = editor
+                    .editor
+                    .request_lazy_fetch(session_id, LazyFetchRequest::Cancel);
+                if !requested {
+                    failures.push(format!(
+                        "A18 ({label}): the paused lazy fetch refused the cancel"
+                    ));
+                }
+                let mut asked_the_server = None;
+                let closed = editor.pump_until(Duration::from_secs(60), || {
+                    match editor.editor.lazy_fetch_graceful_break_progress_for_probe() {
+                        Some(GracefulBreakProgress::NotAsked) | None => {}
+                        Some(progress) => asked_the_server = Some(progress),
+                    }
+                    editor
+                        .editor
+                        .active_lazy_fetch_session()
+                        .is_none()
+                        .then_some(())
+                });
+                if closed.is_none() {
+                    failures.push(format!("A18 ({label}): the lazy fetch never closed"));
+                }
+                match asked_the_server {
+                    None => println!(
+                        "   A18 ({label}) nothing asked the server to stop, so the force tier \
+                         would have been the first thing to reach this session"
+                    ),
+                    Some(progress) => println!(
+                        "   A18 ({label}) the cancel road did break the session ({progress:?}); \
+                         the premise no longer holds on this backend, and the watchdog's own \
+                         break is then simply redundant"
+                    ),
+                }
+                // And the promise the `Cancel` made: the tab's session is still
+                // usable afterwards.
+                if !editor.run(target.trivial_sql(), Duration::from_secs(30))
+                    || editor.last_message().to_ascii_lowercase().contains("error")
+                {
+                    failures.push(format!(
+                        "A18 ({label}): the tab could not use its session after a retaining \
+                         cancel of a paused lazy fetch (transcript: {:?})",
+                        editor.transcript()
+                    ));
+                }
+            }
+        }
+        let _ = editor.wait_done(Duration::from_secs(10));
+    }
+
+    // A19: the OTHER half of the rule A10 asserts. The same publication -- the
+    // explain plan's, which runs on the connection's OWN session on all four
+    // backends -- forced with the purpose that ENDS THE CONNECTION must reach
+    // the tier that destroys, never the re-break.
+    //
+    // Why it matters, and why it is live rather than only a unit: the rule used
+    // to be a fact about the SESSION alone, which read as "a main session is
+    // never destroyed" and left the deliberate action the rule's own header
+    // names -- File > Disconnect -- unable to destroy one either. A statement
+    // wedged there (Oracle thin's in-band break does not reach a call that is
+    // already blocked) could then be neither cancelled nor disconnected around:
+    // the force tier told the user to disconnect, and the disconnect answered
+    // "Stop it before continuing".
+    //
+    // The assertion is "NOT AskedAgain", which is exactly the branch this
+    // change opens. What the destroy itself answers is a per-driver fact and is
+    // printed rather than asserted: OCI cannot drop-close a connection with a
+    // call in flight (DPI-1011), and there the graceful tier -- which does land
+    // on OCI -- is what ends the work; the app's own wait
+    // (`wait_until_ended_db_work_let_go`) is what decides either way.
+    //
+    // Destructive by design: it opens a connection of its own and does not use
+    // it afterwards.
+    {
+        reset_tracked_db_activities_for_probe();
+        let label = target.label();
+        println!("   A19 ({label}): the tier that ENDS the connection may destroy its own session");
+        let harness = Harness::connect(target)?;
+        let mut editor = EditorHarness::new(&harness);
+        editor.editor.set_text(target.explain_probe_sql());
+        editor.pump_until(Duration::from_secs(20), || {
+            space_query::db::try_lock_connection(&harness.connection).map(|_| ())
+        });
+        let blocker = if target.is_oracle() {
+            None
+        } else {
+            match block_mysql_table(target) {
+                Ok(blocker) => Some(blocker),
+                Err(err) => {
+                    failures.push(format!(
+                        "A19 ({label}): could not take the blocking lock: {err}"
+                    ));
+                    None
+                }
+            }
+        };
+        if target.is_oracle() || blocker.is_some() {
+            let mut forced = None;
+            for _ in 0..40 {
+                editor.editor.explain_current();
+                let caught = editor.pump_until(Duration::from_secs(3), || {
+                    editor.editor.force_cancel_published_session_for_probe(
+                        space_query::db::SessionCancelPurpose::EndTheConnection,
+                    )
+                });
+                if let Some(outcome) = caught {
+                    forced = Some(outcome);
+                    break;
+                }
+                editor.pump_until(Duration::from_millis(200), || None::<()>);
+            }
+            match forced {
+                None => failures.push(format!(
+                    "A19 ({label}): the explain plan never published a session for the force tier"
+                )),
+                Some(Ok(space_query::db::ForceTierOutcome::AskedAgain)) => failures.push(format!(
+                    "A19 ({label}): the action that ENDS the connection was still refused the                      tier that destroys, so a statement wedged on the connection's own session                      can be neither cancelled nor disconnected around"
+                )),
+                Some(Ok(space_query::db::ForceTierOutcome::Destroyed)) => println!(
+                    "   A19 ({label}) the connection-ending tier tore its own session down"
+                ),
+                Some(Ok(space_query::db::ForceTierOutcome::Withdrawn)) => failures.push(format!(
+                    "A19 ({label}): the explain plan's session was withdrawn before the tier                      could reach it, so this scenario proved nothing"
+                )),
+                Some(Err(message)) => println!(
+                    "   A19 ({label}) the tier that destroys was REACHED and this driver                      refused it ({message}); the graceful tier is what ends the work here, and                      the app's own wait decides"
+                ),
+            }
+            editor.pump_until(cancel_deadline(), || {
+                (!editor.editor.is_query_running()).then_some(())
+            });
+        }
+        if let Some(mut blocker) = blocker {
+            use mysql::prelude::Queryable;
+            let _ = blocker.query_drop("UNLOCK TABLES");
+        }
+        let _ = editor.wait_done(Duration::from_secs(10));
     }
 
     reset_tracked_db_activities_for_probe();

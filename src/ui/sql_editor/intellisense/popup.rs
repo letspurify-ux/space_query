@@ -937,7 +937,11 @@ impl SqlEditorWidget {
                 // Session and cancel reach as one value -- see
                 // `AcquiredPoolSession`.
                 let mut acquired =
-                    context.acquire_session_for_scope(tab_scope.as_deref(), &activity_guard)?;
+                    context.acquire_session_for_scope(
+                    tab_scope.as_deref(),
+                    crate::db::PooledSessionPurpose::AppRead,
+                    &activity_guard,
+                )?;
                 if !crate::db::cached_pool_session_context_matches_shared_connection(
                     &connection,
                     &context,

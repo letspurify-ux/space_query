@@ -1055,8 +1055,9 @@ fn object_metadata_refresh_aborts_when_scope_apply_fails() {
     let compact_pooled_helper = pooled_helper.split_whitespace().collect::<String>();
     assert!(
         compact_pooled_helper.contains("letcontext=base_context.for_scope(selected_scope);")
-            && compact_pooled_helper
-                .contains("base_context.acquire_session_for_scope(selected_scope,&activity_guard)?"),
+            && compact_pooled_helper.contains(
+                "base_context.acquire_session_for_scope(selected_scope,crate::db::PooledSessionPurpose::AppRead,&activity_guard,)?"
+            ),
         "Object actions should acquire sessions for the selected connection root's explicit scope before querying metadata"
     );
 
@@ -1071,7 +1072,9 @@ fn object_metadata_refresh_aborts_when_scope_apply_fails() {
     // rustfmt wraps the call across lines here, so compare without whitespace.
     let compact_metadata_loader = metadata_loader.split_whitespace().collect::<String>();
     assert!(
-        compact_metadata_loader.contains("context.acquire_session_for_current_scope(activity)")
+        compact_metadata_loader.contains(
+            "context.acquire_session_for_current_scope(crate::db::PooledSessionPurpose::AppRead,activity)"
+        )
             && metadata_loader.contains("return None;"),
         "Object metadata refresh should stop when current-scope session acquire/apply fails"
     );
@@ -1088,8 +1091,9 @@ fn object_metadata_refresh_aborts_when_scope_apply_fails() {
         .unwrap_or(main_content.len());
     let schema_loader = &main_content[schema_start..schema_end];
     assert!(
-        schema_loader.contains("acquire_session_for_current_scope(activity)")
-            && schema_loader.contains("return None;"),
+        schema_loader.contains(
+            "acquire_session_for_current_scope(crate::db::PooledSessionPurpose::AppRead, activity)"
+        ) && schema_loader.contains("return None;"),
         "Schema metadata refresh should stop when current-scope session acquire/apply fails"
     );
 }
@@ -1178,7 +1182,9 @@ fn column_loader_applies_the_requesting_tabs_scope_before_unqualified_metadata_q
     // activity guard, and rustfmt wraps it over several lines.
     let compact = content.split_whitespace().collect::<String>();
     assert!(
-        compact.contains("context.acquire_session_for_scope(scope.as_deref(),&activity_guard)")
+        compact.contains(
+            "context.acquire_session_for_scope(scope.as_deref(),crate::db::PooledSessionPurpose::AppRead,&activity_guard,)"
+        )
             && compact
                 .contains("Self::send_empty_column_load_update(&sender,&table_key,foreign_keys);"),
         "Column loading should acquire for the requesting tab's scope and abort \
@@ -1638,12 +1644,20 @@ fn pooled_metadata_sessions_apply_current_scope_on_acquire() {
 fn regression_01_mysql_pool_sessions_apply_global_autocommit_from_context() {
     let content = read_source("src/db/connection.rs");
 
+    // CHANGED, with its reason: the context's field is now
+    // `connection_auto_commit` and it is PRIVATE. It always described the
+    // connection's own default; naming it so is what stops a caller from
+    // reaching in and replacing it with a tab's value (the MySQL execution
+    // acquire used to do exactly that to the transaction-mode field beside it).
+    // What this clause protects — the value a pooled session is prepared with
+    // comes from the context, not from something a call site invents — is
+    // unchanged and asserted below through the resolver.
     assert!(
-        content.contains("pub auto_commit: bool"),
-        "DbPoolSessionContext must carry the global auto-commit value"
+        content.contains("connection_auto_commit: bool"),
+        "DbPoolSessionContext must carry the connection's auto-commit default"
     );
     assert!(
-        content.contains("auto_commit: self.auto_commit"),
+        content.contains("connection_auto_commit: self.auto_commit"),
         "DatabaseConnection::pool_session_context must snapshot the current auto-commit value"
     );
 
@@ -1668,8 +1682,10 @@ fn regression_01_mysql_pool_sessions_apply_global_autocommit_from_context() {
         "MySQL/MariaDB pool current-scope apply must set transaction options for both empty and selected database scopes"
     );
     assert!(
-        scope_helper.contains("context.auto_commit"),
-        "MySQL/MariaDB pool current-scope apply must use the context auto-commit value"
+        scope_helper.contains("context.session_auto_commit_for(purpose)"),
+        "MySQL/MariaDB pool current-scope apply must take the auto-commit from the context's one \
+         resolver, which is also where an app read's \"never leave a transaction open\" rule is \
+         applied"
     );
 }
 
@@ -1697,7 +1713,7 @@ fn regression_02_auto_commit_changes_invalidate_pool_context_cache() {
         "set_auto_commit should bump the pool context epoch after storing the new value"
     );
     assert!(
-        content.contains("&& left.auto_commit == right.auto_commit"),
+        content.contains("&& left.connection_auto_commit == right.connection_auto_commit"),
         "cached pool context identity must include auto-commit"
     );
     assert!(
@@ -1734,10 +1750,18 @@ fn regression_03_mysql_pool_sessions_apply_transaction_mode_centrally() {
         helper.contains("default_transaction_isolation"),
         "MySQL/MariaDB pool setup must resolve default isolation through the tracked context"
     );
+    // CHANGED, with its reason: `context.transaction_mode` was a public field
+    // the MySQL execution acquire OVERWROTE with the tab's mode, while the
+    // auto-commit field beside it kept the connection's — one struct, two
+    // fields of the same kind, two owners. The mode now reaches the apply
+    // through the context's own resolver, which takes the purpose and therefore
+    // states WHOSE mode it is. Centrality, which is what this clause protects,
+    // is unchanged.
     assert!(
-        content.contains("context.transaction_mode")
+        content.contains("context.session_transaction_mode_for(purpose)")
             && content.contains("context.default_transaction_isolation"),
-        "MySQL/MariaDB current-scope apply must use transaction mode from DbPoolSessionContext"
+        "MySQL/MariaDB current-scope apply must take the transaction mode from the context's one \
+         resolver"
     );
 }
 
@@ -2002,6 +2026,162 @@ fn regression_retained_lease_reuse_checks_pool_context_epoch() {
     );
 }
 
+/// The app's own bookkeeping on a tab's session must not open a transaction.
+///
+/// Under `autocommit = 0` — the GUI's connection default for the whole life of
+/// the process — a TABLE read opens an InnoDB transaction on MySQL. The app
+/// runs bookkeeping of its own on the TAB's session (it cannot be pinned to
+/// `autocommit=1` the way the connection's live session is, because it must
+/// keep the tab's own setting), and the collation read it does after every
+/// scope application used to read `INFORMATION_SCHEMA.SCHEMATA`. Nothing ended
+/// that transaction, the dirty probe reported it truthfully, and the user's
+/// next `SET SESSION autocommit = ...` was refused with a remedy — commit or
+/// roll back — for work that was entirely the app's own.
+///
+/// The rule: an app read with a transaction-free spelling must use it, and the
+/// table read may only be the fallback.
+#[test]
+fn app_bookkeeping_reads_on_a_tab_session_have_a_transaction_free_spelling() {
+    let connection = read_source("src/db/connection.rs");
+
+    let probe_start = connection
+        .find("pub const fn mysql_database_collation_probe_sql()")
+        .expect("the transaction-free collation read should be named");
+    let probe_body = slice_to_end_of_fn(&connection, probe_start);
+    assert!(
+        !compact_for_pattern(probe_body)
+            .to_uppercase()
+            .contains("FROM"),
+        "the collation probe must read no table — that is the whole point of it"
+    );
+
+    let reader_start = connection
+        .find("fn mysql_current_database_collation_for_db_type<C: Queryable>(")
+        .expect("the collation reader should exist");
+    let reader_body = slice_to_end_of_fn(&connection, reader_start);
+    let transaction_free = reader_body
+        .find("Self::mysql_database_collation_probe_sql()")
+        .expect("the reader must use the transaction-free spelling");
+    let information_schema = reader_body.find("INFORMATION_SCHEMA.SCHEMATA").expect(
+        "the table read stays as the fallback for a server that cannot answer the variable",
+    );
+    assert!(
+        transaction_free < information_schema,
+        "the transaction-free read must come FIRST; the table read may only be the fallback, \
+         because it can still open a transaction on the tab's session"
+    );
+}
+
+/// Every pooled session states WHOSE settings it is prepared with, at the door.
+///
+/// Two kinds of work borrow a pooled session and want opposite things: a tab's
+/// statements need the TAB's auto-commit and transaction mode, while the app's
+/// own reads (object-browser metadata, IntelliSense, bind probes) need only not
+/// to leave a transaction open on a session they hand back. The door could not
+/// tell them apart, so every read was prepared with the connection's logical
+/// auto-commit — `false` for the life of the GUI — and left an InnoDB
+/// transaction, and its metadata locks, open until that session was handed out
+/// again. The same hazard was already recognised and fixed for the connection's
+/// LIVE session.
+///
+/// The purpose is an ARGUMENT, so a new acquire site cannot be written without
+/// answering it, and the two settings live in one value so neither can be
+/// stated without the other.
+#[test]
+fn a_pooled_session_is_prepared_for_a_named_purpose() {
+    let connection = read_source("src/db/connection.rs");
+
+    assert!(
+        connection.contains("pub enum PooledSessionPurpose {")
+            && connection.contains("    AppRead,")
+            && connection.contains("    TabStatements {"),
+        "the app's own reads and a tab's statements must be tellable apart at the acquire door"
+    );
+    for door in [
+        "pub fn acquire_session_for_current_scope(",
+        "pub fn acquire_session_for_scope(",
+    ] {
+        let start = connection
+            .find(door)
+            .unwrap_or_else(|| panic!("{door} should exist"));
+        assert!(
+            slice_to_end_of_fn(&connection, start).contains("purpose: PooledSessionPurpose"),
+            "{door} must require its caller to state the session's purpose"
+        );
+    }
+    let app_read_start = connection
+        .find("fn auto_commit(self, _connection_default: bool) -> bool {")
+        .expect("the purpose must decide the prepared auto-commit");
+    let app_read_body = slice_to_end_of_fn(&connection, app_read_start);
+    assert!(
+        app_read_body.contains("Self::AppRead => true"),
+        "an app read is prepared auto-commit ON whatever the connection default is — that is the \
+         whole rule, and it is stated once"
+    );
+
+    // The other half: the context states the CONNECTION's defaults and nothing
+    // reaches in to replace one of them. The MySQL execution acquire used to
+    // overwrite `context.transaction_mode` with the tab's value while leaving
+    // `context.auto_commit` holding the connection's — one struct, two fields
+    // of the same kind, two owners.
+    let context_start = connection
+        .find("pub struct DbPoolSessionContext {")
+        .expect("the pool session context should exist");
+    let context_fields = slice_to_end_of_item(&connection, context_start);
+    assert!(
+        context_fields.contains("connection_auto_commit: bool")
+            && context_fields.contains("connection_transaction_mode: TransactionMode"),
+        "the context's two session options must be named for their owner"
+    );
+    assert!(
+        !context_fields.contains("pub auto_commit:")
+            && !context_fields.contains("pub transaction_mode:"),
+        "and they must be private, so no caller can replace one of them"
+    );
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    assert!(
+        !execution.contains("context.transaction_mode =")
+            && !execution.contains("context.auto_commit ="),
+        "the execution layer must state the tab's settings at the door, not by writing into the \
+         connection's context"
+    );
+}
+
+/// A retained session's state is ONE value; the transaction-only fold of it is
+/// a function, never a second field.
+///
+/// `PooledSessionLeaseSnapshot` used to store both `retained_state` and
+/// `transaction_state` (= `retained_state.summary_transaction_state()`, which
+/// collapses session residue and held locks into `MaybeDirty`). Two fields for
+/// one fact, told apart only by which one a call site happened to type — and
+/// the fold is the answer that names commit/rollback as the remedy, which
+/// cannot clear a `SET NAMES`. The test constructions had already drifted out
+/// of step with what production can produce, and nothing could notice.
+#[test]
+fn a_retained_session_snapshot_states_its_transaction_state_once() {
+    let connection = read_source("src/db/connection.rs");
+    let snapshot_start = connection
+        .find("pub struct PooledSessionLeaseSnapshot {")
+        .expect("the retained-session lease snapshot should exist");
+    let snapshot_fields = slice_to_end_of_item(&connection, snapshot_start);
+    assert!(
+        snapshot_fields.contains("pub retained_state: RetainedSessionState"),
+        "the snapshot must carry the precise retained state"
+    );
+    assert!(
+        !snapshot_fields.contains("transaction_state:"),
+        "the transaction-only fold must be DERIVED from the retained state, not stored beside it"
+    );
+    let accessor_start = connection
+        .find("pub fn transaction_state(&self) -> TransactionSessionState {")
+        .expect("the derived transaction-state accessor should exist");
+    assert!(
+        slice_to_end_of_fn(&connection, accessor_start)
+            .contains("self.retained_state.summary_transaction_state()"),
+        "and the accessor must compute it, so no construction can put the two out of step"
+    );
+}
+
 #[test]
 fn regression_scope_change_uses_retained_preflight_and_structured_outcomes() {
     let main_window = read_source("src/ui/main_window.rs");
@@ -2024,6 +2204,60 @@ fn regression_scope_change_uses_retained_preflight_and_structured_outcomes() {
         object_browser.contains("set_scope_switch_preflight_callback")
             && object_browser.contains("scope_switch_preflight_callback"),
         "object-browser scope switches must preflight retained sessions before switching the live scope"
+    );
+}
+
+/// All THREE per-tab settings build their retained-session plan from the
+/// runtime's lock-free identity, never from the connection mutex.
+///
+/// Auto-commit and transaction mode were moved off the mutex deliberately
+/// (`RetainedSessionOptionChangePlan::from_runtime`): a neighbour tab's query
+/// holds that mutex, and waiting on it would freeze the UI thread. The SCOPE
+/// pick still opened with `try_lock_connection`, which does not wait — it
+/// answers `None` — and the caller then applied NOTHING and said NOTHING. The
+/// tab's binding, its browser card and its metadata moved to the new scope
+/// while the retained session holding the user's open transaction stayed in the
+/// old one, because a neighbour was busy. Its own preflight cannot cover that:
+/// `retained_scope_change_blocker_for_connection` only refuses on THIS tab's
+/// work.
+#[test]
+fn every_per_tab_setting_builds_its_retained_plan_without_the_connection_mutex() {
+    let main_window = read_source("src/ui/main_window.rs");
+
+    let scope_plan_start = main_window
+        .find("    fn retained_scope_update_for_tab(")
+        .expect("the scope pick must have a plan builder");
+    let scope_plan = slice_to_end_of_fn(&main_window, scope_plan_start);
+    assert!(
+        !scope_plan.contains("try_lock_connection") && !scope_plan.contains("lock_connection"),
+        "the scope plan must not be built behind the connection mutex: a connection that is \
+         merely BUSY would answer None and the pick would silently move the tab without moving \
+         its session"
+    );
+    assert!(
+        scope_plan.contains("connection_binding.snapshot().runtime?")
+            && scope_plan.contains("runtime.connection_generation()")
+            && scope_plan.contains("runtime.pool_context_epoch()")
+            && scope_plan.contains("runtime.sanitized_info()"),
+        "...it is built from the runtime's lock-free identity, exactly as the two sibling \
+         settings are"
+    );
+    assert!(
+        scope_plan.contains("ConnectionRuntimeState::Connected"),
+        "and the refusals it keeps — not connected, connecting, failed, transitioning — are \
+         asked of the published state rather than of whoever holds the mutex"
+    );
+
+    let sibling_plan_start = main_window
+        .find("    fn from_runtime(")
+        .expect("the auto-commit/transaction-mode plan builder must exist");
+    let sibling_plan = slice_to_end_of_fn(&main_window, sibling_plan_start);
+    assert!(
+        !sibling_plan.contains("lock_connection")
+            && sibling_plan.contains("runtime.connection_generation()")
+            && sibling_plan.contains("runtime.sanitized_info()"),
+        "the sibling settings stay off the mutex too — this is the shape the scope pick was \
+         brought in line with"
     );
 }
 
@@ -2190,18 +2424,48 @@ fn mysql_use_refreshes_metadata_without_connection_transition() {
     // the database the statement itself selected. A second event built
     // from the connection's stored name would arrive right behind it and
     // overwrite that with another tab's database.
+    // CHANGED, with its reason: the report goes through the ONE step every
+    // successful statement of this family takes, which reaches
+    // `note_batch_scope_change` inside `MySqlBatchScopeChange::report`. This
+    // arm used to hand-roll it, and that is how the family ended up with two
+    // answers to "where did the session land" -- the other roads ask the
+    // SESSION, and this one read the name it had parsed out of the command.
     assert!(
-        use_branch.contains("note_batch_scope_change")
+        use_branch.contains("record_successful_mysql_batch_statement(")
+            && use_branch.contains("scope_change.report(")
             && !use_branch.contains("QueryProgress::DatabaseChanged"),
-        "USE should report its scope once, from the statement's own target"
+        "USE should report its scope once, through the step that also records it"
     );
     assert!(
         !use_branch.contains("sync_mysql_current_database_name"),
         "a pooled tab's USE moves only that tab, not the connection's stored database"
     );
+    // CHANGED, with its reason: the database carried into the scope change is
+    // the SESSION's answer now, taken from `MySqlSessionLandedScope` inside the
+    // shared step, with the statement's own target only as the fallback for a
+    // session that could not be asked. Composing it here from the parsed name
+    // was the defect: the server does not always store the name the way it was
+    // typed (`lower_case_table_names=1` folds it), and the recorded scope then
+    // disagreed with the session for the rest of the run.
     assert!(
-        use_branch.contains("Some(current_database.to_string())"),
-        "USE should carry the database it selected into the scope change"
+        !use_branch.contains("current_database_changed_message("),
+        "USE must not compose a scope of its own out of the name it parsed: {use_branch}"
+    );
+    // The SAME rule where the executor writes the statement's own result
+    // message. It named the parsed text too, which is a second answer to the
+    // one question -- the grid could say "changed to MyDb" for a session the
+    // server had put in `mydb`.
+    let executor = read_source("src/db/query/mysql_executor.rs");
+    let executor_use = executor
+        .find("MysqlStatementKind::Use => {")
+        .map(|at| slice_from(&executor, at, 1400))
+        .expect("the executor must run a USE");
+    assert!(
+        executor_use.contains("Self::session_current_database(conn)")
+            && executor_use
+                .contains(".unwrap_or_else(|| Self::extract_use_database_name(trimmed))"),
+        "the executor's USE message must be the SESSION's answer, with the parse only as the \
+         fallback for a session that could not be asked: {executor_use}"
     );
     assert!(
         !use_branch.contains("QueryProgress::ConnectionChanged"),
@@ -2271,10 +2535,17 @@ fn mysql_plain_use_statement_updates_scope_and_refreshes_metadata() {
     // Recording it where the batch reads its scope and reporting it to the
     // window stay ONE step, and the value that carries it cannot be dropped in
     // silence.
-    let carrier = content
+    // Bounded by the end of the impl block, never by a byte count: a guard
+    // must fail when the SHAPE changes, not when a method or a doc comment is
+    // added to the code it guards. (Ninth time; see the byte-window lesson.)
+    let carrier_start = content
         .find("struct MySqlBatchScopeChange(")
-        .map(|offset| slice_from(&content, offset, 700))
         .expect("the scope change must travel as a value");
+    let carrier_end = content[carrier_start..]
+        .match_indices("\n}\n")
+        .nth(1)
+        .map_or(content.len(), |(offset, _)| carrier_start + offset);
+    let carrier = &content[carrier_start..carrier_end];
     assert!(
         carrier.contains("note_batch_scope_change("),
         "reporting a scope change must go through the step that also records it: {carrier}"
@@ -2285,22 +2556,56 @@ fn mysql_plain_use_statement_updates_scope_and_refreshes_metadata() {
         ),
         "and a branch that drops it must not compile clean"
     );
-    // Every branch that runs a statement takes that step: the plain executor,
-    // the streaming SELECT and the lazy fetch. One definition plus three calls.
-    assert_eq!(
-        content
-            .matches("record_successful_mysql_batch_statement(")
-            .count(),
-        4,
-        "every MySQL statement branch must record what its statement changed"
-    );
-    // And no MySQL branch may keep a copy of the two adoptions: one branch
-    // having them is what left the other two without them. Production code
-    // only — the test modules below call them too.
+    // Production code only — the test modules below call these too, and a test
+    // that drives one of them must not read as a fourth branch.
     let production = content
         .split_once("\nmod session_transaction_mode_adoption_tests {")
         .map(|(before, _)| before.to_string())
         .unwrap_or_else(|| content.clone());
+    // Every branch that runs a statement takes that step: the plain executor,
+    // the streaming SELECT, the lazy fetch and the `USE` tool command. One
+    // definition plus four calls.
+    //
+    // CHANGED, with its reason: this said three calls, and the `USE` TOOL
+    // COMMAND — the road a `USE` typed on its own actually takes — was the one
+    // it did not count. That arm hand-rolled the step: it applied the effects
+    // itself and built its own scope answer out of the name it had parsed out
+    // of the command, so the family had two answers to "where did the session
+    // land" (the other roads ask the session through
+    // `MySqlSessionLandedScope`). The text answer is wrong whenever the server
+    // stores the name differently from the way it was typed — `USE MyDb` under
+    // `lower_case_table_names=1` lands in `mydb` — and the recorded scope then
+    // disagreed with the session for the rest of the run.
+    assert_eq!(
+        production
+            .matches("record_successful_mysql_batch_statement(")
+            .count(),
+        5,
+        "every MySQL statement branch must record what its statement changed"
+    );
+    // ...and the `USE` tool command may not compose a scope of its own again.
+    let use_command_start = production
+        .find("ToolCommand::Use { database } => {")
+        .expect("the MySQL batch must handle the `USE` tool command");
+    let use_command = &production[use_command_start
+        ..use_command_start
+            + production[use_command_start..]
+                .find("ToolCommand::Connect")
+                .unwrap_or_else(|| production[use_command_start..].len().min(6000))];
+    assert!(
+        use_command.contains("record_successful_mysql_batch_statement("),
+        "the `USE` tool command must take the one step every other statement takes: {use_command}"
+    );
+    assert!(
+        !use_command.contains("current_database_changed_message("),
+        "and it must not build a notice — and therefore a scope — out of the name it parsed:          {use_command}"
+    );
+    assert!(
+        use_command.contains("scope_change.notice()"),
+        "the notice it echoes into the script log is the one the step produced: {use_command}"
+    );
+    // And no MySQL branch may keep a copy of the two adoptions: one branch
+    // having them is what left the other two without them.
     assert_eq!(
         production
             .matches("adopt_session_transaction_mode_change_after_statement(")
@@ -2315,6 +2620,236 @@ fn mysql_plain_use_statement_updates_scope_and_refreshes_metadata() {
             .count(),
         3,
         "the rule itself, its test-only single-db wrapper, and the MySQL family's one step"
+    );
+}
+
+/// WHERE a MySQL-family statement left the session is the SESSION's answer, and
+/// every statement branch asks for it.
+///
+/// Both Oracle drivers read the schema back off the session; this family read
+/// the statement TEXT, and the text is not always the name the server used —
+/// `USE mydb/*c*/`, `USE mydb#c` and `USE mydb-- c` all run, and so does
+/// `USE MyDb` under `lower_case_table_names`. The parsed value went onto the
+/// tab's binding, its browser card and the batch's own scope cell, so every
+/// statement after it asserted a database the session was not in.
+///
+/// The second half is the readback itself: the family dispatches a unit by its
+/// LEADING keyword, and the streaming branch passed a hardcoded `false` for
+/// "does this unit move the session's database?", so a `USE` inside a
+/// SELECT-leading unit was never read back at all.
+#[test]
+fn a_mysql_statement_records_the_scope_the_session_reports() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    let record_start = execution
+        .find("    fn record_successful_mysql_batch_statement(")
+        .expect("the one step that records what a statement changed should exist");
+    let record = slice_to_end_of_fn(&execution, record_start);
+    assert!(
+        record.contains("match session_landed_scope.take() {"),
+        "the recorded scope must be the session's answer, taken once: {record}"
+    );
+    assert!(
+        record.contains("None => parsed_database.or_else(connection_database),"),
+        "...with the statement's own target only as the fallback for a session that could \
+         not be asked"
+    );
+
+    // ONE derivation of "this unit moves the session's database", asked by
+    // every branch that runs a statement.
+    let derivation_start = execution
+        .find("    fn mysql_unit_requires_session_database_readback(")
+        .expect("the one readback derivation should exist");
+    let derivation = slice_to_end_of_fn(&execution, derivation_start);
+    assert!(
+        derivation.contains("Self::mysql_unit_moves_session_database(db_type, sql).is_some()"),
+        "the derivation asks the unit reader: {derivation}"
+    );
+    assert_eq!(
+        execution
+            .matches("mysql_unit_requires_session_database_readback(db_type, sql)")
+            .count(),
+        2,
+        "both statement branches — the plain executor and the streaming SELECT — must ask it, \
+         and neither may hardcode an answer"
+    );
+
+    // The channel is per statement, cleared where the statement starts and
+    // filled only where the session was read back.
+    let action_start = execution
+        .find("    pub(super) fn run_mysql_pooled_action_with_timeout<T, F>(")
+        .expect("the pooled action should exist");
+    // Bounded by the next item, never by a byte count: a guard must fail when
+    // the SHAPE changes, not when a comment is added to the code it guards.
+    let action = slice_to_end_of_fn(&execution, action_start);
+    assert!(
+        action.contains("session_landed_scope.clear();"),
+        "a statement that never asks the session must leave no answer behind for the next one"
+    );
+    assert!(
+        action.contains("session_landed_scope.record(landed.clone());"),
+        "and the only thing that fills it is the sync that read the session back"
+    );
+}
+
+/// A per-tab setting is never refused because ANOTHER tab's work holds the
+/// connection, and a pick the app does not apply never stays on the screen.
+///
+/// Two halves of one defect. `transaction_control_state` goes to
+/// `try_lock_connection`, which answers `None` for a connection that is merely
+/// BUSY -- a neighbour tab's statement, an Oracle explain plan, an OCI script
+/// after `CONNECT`, a metadata load. That is right for the DISPLAY, which
+/// re-arms; it was also the WRITE's gate, which made the transaction mode the
+/// one per-tab setting another tab's work could refuse. Auto-commit reads the
+/// connection's default from the cached view and proceeds, and the scope pick
+/// was moved off the mutex in its own round.
+///
+/// The second half is what the refusal left behind: the combos are an INPUT, so
+/// after a refused pick they hold the refused value, and
+/// `sync_transaction_mode_controls` deliberately leaves them untouched while
+/// the connection cannot be read -- exactly when a busy refusal happens. The
+/// toolbar then showed a mode the tab was not pinned to, and the
+/// screen/behaviour checkpoint could not catch it because
+/// `ui_displayed_transaction_mode`, the value it compares against, had not
+/// moved either.
+#[test]
+fn a_transaction_mode_pick_neither_waits_for_the_connection_mutex_nor_sticks_when_refused() {
+    let main_window = read_source("src/ui/main_window.rs");
+
+    let pick_start = main_window
+        .find("fn update_transaction_mode_from_controls(")
+        .expect("the toolbar pick callback should exist");
+    let pick = slice_to_end_of_fn(&main_window, pick_start);
+    assert!(
+        pick.contains("s.transaction_mode_pick_context()"),
+        "the WRITE must build its answer without the connection mutex: {pick}"
+    );
+    assert!(
+        !pick.contains("transaction_control_state()"),
+        "...and must not go back to the display's reader, which gives up on a BUSY connection"
+    );
+    // Every road that does NOT apply the pick puts the combos back; the two
+    // that leave them where they are (the no-op and the applied pick) are the
+    // only ones that may call the plain sync.
+    assert_eq!(
+        pick.matches("revert_transaction_mode_controls_to_displayed()").count(),
+        5,
+        "blocked by tab work, not connected, defaults not learned, an impossible pair, and a          retained session that refuses -- all five must put the combos back: {pick}"
+    );
+    assert_eq!(
+        pick.matches("sync_transaction_mode_controls()").count(),
+        2,
+        "only the no-op road and the applied pick leave the combos alone"
+    );
+
+    let context_start = main_window
+        .find("    fn transaction_mode_pick_context(")
+        .expect("the lock-free pick context should exist");
+    let context = slice_to_end_of_fn(&main_window, context_start);
+    assert!(
+        !context.contains("try_lock_connection") && !context.contains("lock_connection"),
+        "the pick context must never reach for the connection mutex: {context}"
+    );
+    assert!(
+        context.contains("self.cached_connection_defaults.transaction_mode"),
+        "it reads the connection default from the cached view, exactly as auto-commit does"
+    );
+
+    let revert_start = main_window
+        .find("    fn revert_transaction_mode_controls_to_displayed(")
+        .expect("the revert door should exist");
+    let revert = slice_to_end_of_fn(&main_window, revert_start);
+    assert!(
+        revert.contains("self.sql_editor.displayed_transaction_mode()"),
+        "the combos go back to what the app RECORDED the screen as saying, never to a value          re-derived from a connection that may not be readable: {revert}"
+    );
+
+    // The two connection defaults are ONE value with ONE writer, which is what
+    // keeps a second option from growing a cache the other does not have.
+    let refresh_start = main_window
+        .find("    fn refresh_active_connection_view(")
+        .expect("the one writer of the active-connection view should exist");
+    let refresh = slice_to_end_of_fn(&main_window, refresh_start);
+    assert_eq!(
+        main_window
+            .matches("self.cached_connection_defaults = ")
+            .count(),
+        refresh
+            .matches("self.cached_connection_defaults = ")
+            .count(),
+        "only `refresh_active_connection_view` may write the cached connection defaults"
+    );
+    assert!(
+        refresh.contains("auto_commit: Some(guard.auto_commit()),")
+            && refresh.contains("transaction_mode: Some(guard.transaction_mode()),"),
+        "and both defaults come out of the SAME read of the connection: {refresh}"
+    );
+}
+
+/// A retry loop must be able to GIVE UP on work the app cannot end.
+///
+/// Closing a tab with running work cancels it and re-asks every 0.2s until the
+/// tab goes idle. Each pass dispatches a fresh cancel — normally a no-op,
+/// because `cancel_target_is_pending` refuses a second Cancel while one is in
+/// flight. But a statement on the connection's OWN session answers
+/// `ForceAskedAgain`, which deliberately CLEARS the pending entry so the user
+/// can ask again, and the tab never goes idle: every 0.2s, for the life of the
+/// process, this started a whole new cancel cycle — a graceful break, a
+/// watchdog thread and a force tier — against a server that had already
+/// refused two of them.
+///
+/// So the entry refuses BEFORE it prompts (the prompt offers to cancel and
+/// close, and neither half can be kept), and the loop itself ends rather than
+/// re-cancelling for ever.
+#[test]
+fn closing_a_tab_gives_up_on_work_the_app_cannot_end() {
+    let window = read_source("src/ui/main_window.rs");
+
+    let loop_body = slice_to_end_of_fn(
+        &window,
+        window
+            .find("    fn defer_close_query_editor_tab_until_idle(")
+            .expect("the close-until-idle loop should exist"),
+    );
+    let gave_up = loop_body
+        .find("if gave_up {")
+        .expect("the loop must be able to give up");
+    let retried = loop_body
+        .find("MainWindow::defer_close_query_editor_tab_until_idle(&state_for_retry, tab_id);")
+        .expect("...and it must still retry for work that CAN stop");
+    assert!(
+        gave_up < retried,
+        "the give-up arm has to come first, or the loop re-cancels before it stops: {loop_body}"
+    );
+    assert!(
+        loop_body.contains("TabDbWork::UnstoppableStatement"),
+        "and the one state it gives up on is the app's own answer for it: {loop_body}"
+    );
+    let should_wait_at = loop_body[gave_up..]
+        .find("if should_wait {")
+        .map(|at| gave_up + at)
+        .expect("the retry arm follows the give-up arm");
+    let give_up_arm = &loop_body[gave_up..should_wait_at];
+    assert!(
+        !give_up_arm.contains("cancel_query_editor_tab"),
+        "giving up must not dispatch one more cancel: {give_up_arm}"
+    );
+
+    let entry = slice_to_end_of_fn(
+        &window,
+        window
+            .find("    fn close_query_editor_tab_with_dirty_check(")
+            .expect("the close entry should exist"),
+    );
+    let refused = entry
+        .find("if has_running_work && gave_up {")
+        .expect("the entry must refuse work it cannot end");
+    let prompted = entry
+        .find("Self::confirm_cancel_running_query_for_close(state, tab_id)")
+        .expect("...before the prompt that offers to cancel and close");
+    assert!(
+        refused < prompted,
+        "an offer the app cannot keep must not be made: {entry}"
     );
 }
 
@@ -3946,13 +4481,20 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     let blocked_start = editor_mod
         .find("pub fn transaction_mode_change_blocked_now(")
         .expect("the tab must own the mode-change gate");
-    let blocked_body = &editor_mod[blocked_start..blocked_start + 900];
+    // Bounded by the function rather than by a byte count, and CHANGED with its
+    // reason: the two kinds of WORK are asked through the app's one per-tab
+    // derivation now (`TabDbWork`). Listing them here was a third listing of
+    // the same question, and it counted two of the three kinds — so during the
+    // window a DEFERRED execution waits, the combos stayed live while the
+    // callback beside them refused. The retained-state half is unchanged and is
+    // what the rest of this guard is about.
+    let blocked_body = slice_to_end_of_fn(&editor_mod, blocked_start);
     assert!(
-        blocked_body.contains("is_query_running()")
-            && blocked_body.contains("has_open_lazy_fetch()")
+        blocked_body.contains("TabDbWork::for_editor(self).blocks()")
             && blocked_body
                 .contains("retained_session_state_transaction_mode_change_preflight_decision("),
-        "the gate must cover a running query, an open lazy fetch, and a session that needs resolution"
+        "the gate must cover every kind of the tab's work and a session that needs resolution: \
+         {blocked_body}"
     );
     let blocked_delegate_start = main_window
         .find("fn transaction_mode_change_blocked_for_active_tab(")
@@ -4098,6 +4640,31 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         "the non-lazy BatchFinished handler must re-sync the transaction-mode controls so a query-driven change is reflected after completion"
     );
 
+    // (6b) ...and the status tick syncs them too, so no single call site is
+    // load-bearing.
+    //
+    // Clause (6) above, and the Commit/Rollback re-sync beside it, were each
+    // added because ONE call site had been forgotten — the same defect twice,
+    // in a chain of twenty-odd sites that all had to remember. The tab's
+    // auto-commit indicator never had that problem, because
+    // `render_status_bar` heals it on every tick whatever happened. The
+    // transaction-mode controls now heal on the same tick, from the same
+    // frame, for the same reason: what the screen shows is checked against
+    // what the next statement will do, and a promise kept by callers
+    // remembering is not kept. The per-event call sites stay (they make the
+    // toolbar right in the same UI frame as the event rather than up to one
+    // tick later) but none of them is the guarantee.
+    let render_at = main_window
+        .find("fn render_status_bar(&mut self) -> bool {")
+        .expect("the status renderer should exist");
+    let render_body = slice_to_end_of_fn(&main_window, render_at);
+    assert!(
+        render_body.contains("self.sync_auto_commit_indicators();")
+            && render_body.contains("self.sync_transaction_mode_controls();"),
+        "the status tick must settle BOTH per-tab settings' controls, so neither depends on a \
+         caller having remembered"
+    );
+
     // (7) The toolbar choices show the tab's transaction-mode SETTING and
     // cannot represent what the session is actually carrying — an open
     // transaction, or a one-shot SET TRANSACTION that the next transaction
@@ -4175,13 +4742,43 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         connection.contains("fn oracle_session_isolation_reset_statement("),
         "Oracle must be able to express \"put this session back to the connection default\""
     );
+    // CHANGED, with its reason: this used to require the execution layer's
+    // `OracleTransactionModeApplication::statements()` to call the reset helper
+    // ITSELF. That made the execution layer a second composer of the same list
+    // — the DB layer's `oracle_transaction_mode_statements_for_tab` composes it
+    // too, its doc says both drivers go through it, and its unit test pinned a
+    // function production never called. Two copies of one rule, with the test
+    // on the dead one. The clause now requires the single composition to live
+    // in the DB layer and the execution layer to DELEGATE to it, which is the
+    // same protection (no site builds its own list, so none can omit the reset)
+    // asserted where it cannot rot.
+    assert!(
+        connection.contains("fn oracle_transaction_mode_statements_for_tab("),
+        "the DB layer must own the composition of Oracle's transaction-mode statements"
+    );
+    let composer_start = connection
+        .find("pub fn oracle_transaction_mode_statements_for_tab(")
+        .expect("the Oracle transaction-mode composer should exist");
+    let composer_body = slice_to_end_of_fn(&connection, composer_start);
+    assert!(
+        composer_body.contains("oracle_session_isolation_reset_statement(")
+            && composer_body.contains("transaction_mode_statements_for("),
+        "the composer must be the place the session-default reset is put in front of the tab's \
+         own mode statements"
+    );
     let application_start = execution
         .find("impl OracleTransactionModeApplication {")
         .expect("the Oracle transaction-mode application helper should exist");
     let application_body = &execution[application_start..application_start + 1400];
     assert!(
-        application_body.contains("oracle_session_isolation_reset_statement("),
-        "the shared Oracle transaction-mode application must include the session-default reset"
+        application_body.contains("oracle_transaction_mode_statements_for_tab("),
+        "the execution layer must delegate to the DB layer's composer instead of rebuilding the \
+         statement list"
+    );
+    assert!(
+        !application_body.contains("oracle_session_isolation_reset_statement("),
+        "and it must not compose the reset itself — that is exactly the second copy this clause \
+         exists to prevent"
     );
     // CHANGED, with its reason: this used to count `.statements()` calls and
     // require at least three, one per site. All three sites now reach that list
@@ -5542,8 +6139,10 @@ fn tab_metadata_lookups_acquire_their_session_for_the_requesting_tabs_scope() {
             body.contains("self.connection_binding.snapshot().scope"),
             "{function} must take the requesting tab's scope"
         );
+        // Whitespace-insensitive: rustfmt now wraps the call, which also names
+        // the session's purpose.
         assert!(
-            body.contains("acquire_session_for_scope(tab_scope.as_deref()"),
+            compact_for_pattern(body).contains("acquire_session_for_scope(tab_scope.as_deref(),"),
             "{function} must acquire its session for that scope"
         );
         assert!(
@@ -6221,12 +6820,137 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
     let answer = content
         .find("fn db_work_blocking_session_teardown(")
         .expect("the shared session-teardown gate should exist");
-    let answer_body = compact_for_pattern(slice_from(&content, answer, 500));
+    let answer_body = compact_for_pattern(slice_to_end_of_fn(&content, answer));
+    // CHANGED, with its reason: the tab half is asked as the OBSTACLE now, and
+    // this gate owns the whole sentence rather than a noun phrase the caller
+    // wraps in "Finish or cancel … first". One of the three answers cannot be
+    // finished or cancelled — the app has already spent its strongest cancel
+    // tier on it and failed — so a caller with only a slot to fill told the
+    // user to do the impossible, which is the trap the force tier's own
+    // message fell into. Both halves are still asked, which is what this guard
+    // is about.
     assert!(
-        answer_body.contains("self.tab_work_blocking_session_teardown(scope)")
+        answer_body.contains("self.tab_work_obstacle_for_session_teardown(scope)")
             && answer_body.contains("self.background_work_blocking_session_teardown(scope)"),
         "the pool-resize gate must ask BOTH halves — a preference change may destroy \
          neither the query tabs' work nor the background work holding sessions: {answer_body}"
+    );
+    assert!(
+        answer_body.contains("returnTabDbWork::UnstoppableStatement.block_message(action);"),
+        "and work the app could not stop must be refused with the app's ONE sentence for it -- \
+         which names a remedy that exists, instead of \"finish or cancel it\": {answer_body}"
+    );
+    // Both kinds still refuse a preference change: it destroys nothing, so it
+    // can end neither.
+    assert!(
+        answer_body.contains("TabWorkObstacle::None=>{}"),
+        "only NOTHING lets a pool rebuild through: {answer_body}"
+    );
+    // ...and the sentence itself is the app's one, so a second gate cannot word
+    // it differently. The two result-view refusals used to carry their own
+    // literal "A query is running. Stop it before closing tabs." -- an
+    // instruction the user cannot follow for a statement the app has already
+    // failed to stop, which then left the result views uncloseable for the
+    // life of that connection.
+    let editor_source = read_source("src/ui/sql_editor/mod.rs");
+    let messages = slice_to_end_of_fn(
+        &editor_source,
+        editor_source
+            .find("    pub(crate) fn block_message(")
+            .expect("the one per-tab refusal wording should exist"),
+    );
+    assert!(
+        messages.contains("TabDbWork::UnstoppableStatement")
+            || messages.contains("Self::UnstoppableStatement"),
+        "the one wording must have an arm for work that cannot be stopped: {messages}"
+    );
+    assert!(
+        messages.contains("File > Disconnect"),
+        "...and it must name the action that CAN end it: {messages}"
+    );
+    for literal in [
+        "\"A query is running. Stop it before closing tabs.\"",
+        "\"A query is running. Stop it before clearing results.\"",
+    ] {
+        assert!(
+            !content.contains(literal),
+            "no gate may carry its own copy of the wording again: {literal}"
+        );
+    }
+    assert_eq!(
+        content.matches(".running_query_block_message(").count(),
+        2,
+        "the two result-view refusals ask the one answer for their words"
+    );
+    // The transaction-control gate asks it too, for the half its own
+    // running-flag reservation cannot see: a statement the tab has ACCEPTED and
+    // not started. A COMMIT accepted inside that window took the flag, and the
+    // statement the user had already launched was then refused when it started.
+    let action_gate = slice_to_end_of_fn(
+        &editor_source,
+        editor_source
+            .find("    fn spawn_tracked_transaction_action(")
+            .expect("the transaction-control gate should exist"),
+    );
+    assert!(
+        action_gate.contains("block_message_beside_a_running_statement("),
+        "transaction control must refuse on every kind of the tab's work its own reservation \
+         cannot see: {action_gate}"
+    );
+    let beside = compact_for_pattern(slice_to_end_of_fn(
+        &editor_source,
+        editor_source
+            .find("    pub(crate) fn block_message_beside_a_running_statement(")
+            .expect("the split should exist"),
+    ));
+    assert!(
+        beside.contains("Self::RunningQuery|Self::UnstoppableStatement=>None,"),
+        "and it must leave the running statement to the reservation, or one COMMIT is refused \
+         twice with two different answers: {beside}"
+    );
+    // ...and a THIRD half neither of the other two can see: work the app has
+    // already ENDED but which has not STOPPED. A cancel removes its registry
+    // row at DISPATCH, and the query tab's own force tier publishes the tab
+    // IDLE the moment it has torn a session down, so both of the halves above
+    // go quiet while the worker is still holding a session checked out of the
+    // pool this rebuild is about to retire. `ConnectionRuntime::is_idle` and
+    // application exit have asked the ledger since the rounds that added it;
+    // the rebuild is the action with the strictest contract of the three — it
+    // is a preference change, so it must destroy nothing — and it was the one
+    // that did not ask.
+    assert!(
+        answer_body.contains("self.ended_work_that_has_not_stopped(scope)"),
+        "the pool-resize gate must also refuse on work it already ended that has not let go \
+         of its session: {answer_body}"
+    );
+    let ended = compact_for_pattern(
+        content
+            .find("fn ended_db_work_has_not_stopped(")
+            .map(|at| slice_to_end_of_fn(&content, at))
+            .expect("the scoped form of the standing answer should exist"),
+    );
+    assert!(
+        ended.contains("crate::db::cancelled_db_work_still_holding_a_session()>0")
+            && ended.contains("crate::db::cancelled_db_work_still_holds_a_session_on(id)"),
+        "and it must ask the app's ONE standing answer, scoped the way every other half is: \
+         {ended}"
+    );
+    // Both of the roads that retire a row for work that has not stopped fill
+    // that ledger. `finish()` says the work is OVER, which a force tier cannot
+    // say: it destroys the SESSION while the worker goes on holding its pool
+    // slot for as long as its unwind takes.
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let production = editor
+        .find("\n#[cfg(test)]\n")
+        .map(|end| &editor[..end])
+        .unwrap_or(editor.as_str());
+    assert_eq!(
+        production
+            .matches("status_activity.finish_for_work_that_has_not_stopped()")
+            .count(),
+        2,
+        "both force watchdogs -- the tab operation's and the lazy fetch's -- must retire their \
+         row through the door that keeps the app able to say the work has not let go"
     );
 
     // The background half is the one that knows about DB work with no query
@@ -6246,34 +6970,143 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
     );
 
     // The tab half must still cover the query tabs' own work, for both scopes.
-    let tab_half = content
-        .find("fn tab_work_blocking_session_teardown(")
-        .expect("the tab half of the session-teardown gate should exist");
-    let tab_half_body = compact_for_pattern(slice_from(&content, tab_half, 900));
+    // CHANGED, with its reason: the tab half is the OBSTACLE itself now. The
+    // `bool` form and the `blocks_an_action_that_may_destroy_nothing()` helper
+    // beside it were an indirection with one caller, and that caller now needs
+    // the KIND anyway -- a preference change refuses on both, but only one of
+    // them can be finished or cancelled, and the sentence has to say so.
+    let obstacle = content
+        .find("fn tab_work_obstacle_for_session_teardown(")
+        .expect("the one tab-work obstacle derivation should exist");
+    let obstacle_body = compact_for_pattern(slice_to_end_of_fn(&content, obstacle));
     assert!(
-        tab_half_body.contains("self.has_running_query_or_lazy_fetch()")
-            && tab_half_body.contains("self.has_running_query_or_lazy_fetch_for_tab(tab.tab_id)")
-            && tab_half_body.contains("self.lazy_fetch_sessions_for_connection(connection_id)"),
+        obstacle_body.contains("Self::tab_has_unfinished_db_work(&tab.sql_editor)")
+            && obstacle_body.contains("self.has_running_query_or_lazy_fetch_for_tab(tab.tab_id)")
+            && obstacle_body.contains("self.lazy_fetch_sessions_for_connection(connection_id)"),
         "the tab half must cover a tab's running work, its deferred execution and its \
          result-grid lazy fetches, for one connection as well as for all of them: \
-         {tab_half_body}"
+         {obstacle_body}"
+    );
+    // The per-tab classification and the fold are ONE rule each, apart from the
+    // widgets that answer the flags, so a unit can pin the precedence
+    // (`a_teardown_refuses_work_the_user_can_stop_and_ends_work_the_app_could_not`)
+    // rather than an FLTK widget nothing can build in a test.
+    assert!(
+        obstacle_body.contains("obstacle.or(TabWorkObstacle::for_one_tab(TabDbWork::for_editor(&tab.sql_editor),self.tab_progress_holds_a_lazy_fetch(tab.tab_id),))"),
+        "the scope's answer must be the app's ONE per-tab answer folded, never a second \
+         classification written inline -- and the progress context is the one thing that \
+         answer cannot see: {obstacle_body}"
+    );
+    let one_tab = compact_for_pattern(
+        content
+            .find("    fn for_one_tab(")
+            .map(|at| slice_to_end_of_fn(&content, at))
+            .expect("the per-tab obstacle rule should exist"),
+    );
+    assert!(
+        one_tab.contains("TabDbWork::UnstoppableStatementif!progress_context_holds_a_lazy_fetch"),
+        "a wedged statement counts only when it is the tab's WHOLE work, and the answer it \
+         reads already requires that of the editor's own flags: {one_tab}"
+    );
+    // ...which is where the two the editor CAN see are listed, once.
+    let editor_derivation = compact_for_pattern(slice_to_end_of_fn(
+        &editor_source,
+        editor_source
+            .find("    pub(crate) fn from_flags(")
+            .expect("the one per-tab work derivation should exist"),
+    ));
+    assert!(
+        editor_derivation.contains(
+            "the_app_could_not_stop_the_statement&&!open_lazy_fetch&&!accepted_execution"
+        ),
+        "a lazy fetch or an accepted execution beside the statement makes the tab stoppable \
+         again: {editor_derivation}"
+    );
+    let fold = compact_for_pattern(
+        content
+            .find("    fn or(self, other: Self) -> Self {")
+            .map(|at| slice_to_end_of_fn(&content, at))
+            .expect("the fold should exist"),
+    );
+    assert!(
+        fold.contains("(Self::Stoppable,_)|(_,Self::Stoppable)=>Self::Stoppable,"),
+        "STOPPABLE DOMINATES: one tab's ordinary running work refuses the whole action, \
+         because ending a connection over work that could still have been stopped is what \
+         this gate exists to prevent: {fold}"
     );
 
     // A tab with a DEFERRED execution reads perfectly idle — no query running,
-    // no batch begun — but a statement is still coming. Every session-ending
-    // gate has to see it, not only the result-grid reservation logic.
+    // no batch begun — but a statement is still coming. Every gate that must
+    // not walk past it asks ONE derivation, and that derivation is the only
+    // place the three kinds are listed.
     let tab_work = content
         .find("fn tab_has_unfinished_db_work(")
         .expect("the shared per-tab work predicate should exist");
-    let tab_work_body = slice_from(&content, tab_work, 400);
+    let tab_work_body = slice_to_end_of_fn(&content, tab_work);
+    assert!(
+        tab_work_body.contains("TabDbWork::for_editor(editor).blocks()"),
+        "the session-ending gate must be the ONE derivation as a bool, not a second listing \
+         of the kinds of work it happens to remember: {tab_work_body}"
+    );
+    // CHANGED, with its reason: the derivation lives with the TAB whose work it
+    // describes now, because there is a FOURTH asker that could not reach it in
+    // `main_window` — the toolbar's own ENABLEMENT,
+    // `SqlEditorWidget::transaction_mode_change_blocked_now`, which listed the
+    // same two of three and so left the combos offering a change the callback
+    // beside them would refuse.
+    let editor_source = read_source("src/ui/sql_editor/mod.rs");
+    let derivation = editor_source
+        .find("    pub(crate) fn for_editor(editor: &SqlEditorWidget) -> Self {")
+        .expect("the one per-tab work derivation should exist");
+    let derivation_body = slice_to_end_of_fn(&editor_source, derivation);
     for expected in [
         "editor.is_query_running()",
-        "editor.active_lazy_fetch_session().is_some()",
+        "editor.has_open_lazy_fetch()",
         "editor.has_deferred_execution()",
     ] {
         assert!(
-            tab_work_body.contains(expected),
-            "a session-ending gate must count {expected} as unfinished work: {tab_work_body}"
+            derivation_body.contains(expected),
+            "a gate must count {expected} as unfinished work: {derivation_body}"
+        );
+    }
+    let enablement = slice_to_end_of_fn(
+        &editor_source,
+        editor_source
+            .find("    pub fn transaction_mode_change_blocked_now(")
+            .expect("the toolbar's enablement gate should exist"),
+    );
+    assert!(
+        enablement.contains("TabDbWork::for_editor(self).blocks()"),
+        "the control that says a change is allowed and the callback that refuses it must ask \
+         ONE question: {enablement}"
+    );
+    assert!(
+        !enablement.contains("self.is_query_running() || self.has_open_lazy_fetch()"),
+        "and it may not go back to listing the kinds it happens to remember"
+    );
+    // ...and the three PER-TAB SETTINGS ask that same value. They used to
+    // assemble their own answer from two of the three ingredients, so an
+    // auto-commit toggle or a transaction-mode pick during the 0.2s a deferred
+    // execution waits was accepted — and the statement the user had already
+    // launched then started on the other side of it, because both deferred
+    // roads re-read the tab's pins at startup. The display checkpoints cannot
+    // catch that: the displayed value moves with the pin.
+    assert_eq!(
+        content
+            .matches("TabDbWork::for_editor(&s.sql_editor).block_message(")
+            .count(),
+        2,
+        "the auto-commit menu and the transaction-mode toolbar must both refuse on the one \
+         answer every session-ending gate uses"
+    );
+    for assembled in [
+        "s.sql_editor.is_query_running(),\n            s.sql_editor.has_open_lazy_fetch(),",
+        "transaction_option_block_message(",
+        "connection_transition_block_message(",
+    ] {
+        assert!(
+            !content.contains(assembled),
+            "no gate may assemble its own answer out of the ingredients again: {assembled}"
         );
     }
     for gate_fn in [
@@ -6554,18 +7387,22 @@ fn both_oracle_drivers_record_transaction_mode_effects_before_the_round_trip() {
         .find("fn apply_oracle_transaction_mode_statements_with(")
         .expect("both Oracle drivers should state the mode through one function");
     let shared_body = slice_from(&content, shared, 1200);
+    // The statement and its kind travel as one value now
+    // (`crate::db::OracleTransactionModeStatement`), so these read `.sql()`
+    // where they used to read a bare `&statement`. The ORDER they pin is
+    // unchanged and is the whole point of the clause.
     let record = shared_body
-        .find("record_stated_statement(&statement);")
+        .find("record_stated_statement(statement.sql());")
         .expect("the shared application should record each statement's effects");
     let execute = shared_body
-        .find("execute(&statement)")
+        .find("execute(statement.sql())")
         .expect("the shared application should execute each statement");
     assert!(
         record < execute,
         "the shared application must record the effects BEFORE the statement is issued"
     );
     assert!(
-        shared_body.contains("if !restores_session_default {"),
+        shared_body.contains("if !statement.restores_session_default() {"),
         "and the session-default RESET is the one statement it must NOT record: it restores a \
          state the tab already represents, so recording it would stop the next execution for a \
          resolution decision the user does not owe"
@@ -7239,7 +8076,11 @@ fn every_backend_can_cancel_work_on_its_own_main_connection() {
     // And the rule itself is stated ONCE, ahead of the per-driver tear-down.
     let force_start = content
         .find(
-            "    fn force(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
+            "    fn force(
+        &self,
+        claim: &SessionCancelClaim,
+        purpose: SessionCancelPurpose,
+    ) -> Result<SessionCancelDelivery, String> {
         // How far the force tier may go",
         )
         .expect("the shared force tier should exist");
@@ -7252,7 +8093,7 @@ fn every_backend_can_cancel_work_on_its_own_main_connection() {
     let force = &content[force_start..force_end];
     let rule = force
         .find(
-            "if !self.session().force_tier_may_destroy_it() {
+            "if !self.session().force_tier_may_destroy_it(purpose) {
             return self.interrupt(claim);",
         )
         .expect("a cancel must never destroy the connection's own session");
@@ -7575,16 +8416,21 @@ fn a_force_tier_asks_its_rule_about_the_session_it_will_tear_down() {
          back: {resolved_body}"
     );
 
+    // The whole function, not a byte window: a comment added to it must not be
+    // able to push the assertion's own subject out of range (round 9's lesson,
+    // and round 20 hit it again).
     let force = editor
         .find("pub(crate) fn force_cancel_blocking(")
         .expect("the force tier should exist");
-    let force_body = slice_from(&editor, force, 900);
+    // Whitespace-compacted, so a rustfmt re-wrap of a call chain cannot break
+    // the pin -- the recurring hazard this file records.
+    let force_body = compact_for_pattern(slice_to_end_of_fn(&editor, force));
     let resolve_at = force_body
         .find("self.resolve_for_action(claim)")
         .expect("the force tier must resolve the indirection once");
     let rule_at = force_body
-        .find("kind.force_tier_may_destroy_it()")
-        .expect("the force tier must ask the app's one rule");
+        .find("kind.force_tier_may_destroy_it(purpose)")
+        .expect("the force tier must ask the app's one rule, with the caller's purpose");
     let destroy_at = force_body
         .find("session.destroy(&claim)")
         .expect("the force tier must tear the resolved session down");
@@ -8230,9 +9076,36 @@ fn the_transaction_option_indicators_settle_themselves() {
         indicators_body.contains("if app::grab().is_some() {"),
         "the tick must not restate a menu item while a pulldown owns it"
     );
+    // CHANGED, with its reason: the filter and the resolution are ONE reader
+    // now (`displayable_auto_commit_for_active_tab`). They were two
+    // computations with two different filters — the status bar asked
+    // `conn_info.is_some() && has_live_connection`, this asked
+    // `has_live_connection` alone — and the status bar's is also what
+    // `record_displayed_auto_commit` hands to the execution checkpoint, so a
+    // drift would have put the menu and the value a statement is verified
+    // against on different answers.
     assert!(
-        indicators_body.contains(".filter(|_| self.has_live_connection)"),
+        indicators_body.contains("self.displayable_auto_commit_for_active_tab()"),
         "a value may only be shown for a connection that is really there"
+    );
+    let reader = slice_to_end_of_fn(
+        &main_window,
+        main_window
+            .find("    fn displayable_auto_commit_for_active_tab(")
+            .expect("the one reader should exist"),
+    );
+    assert!(
+        reader.contains("if !self.has_live_connection {")
+            && reader.contains(".is_none()")
+            && reader.contains("effective_auto_commit("),
+        "and that reader is the one place the filter and the resolution live: {reader}"
+    );
+    assert_eq!(
+        main_window
+            .matches("self.displayable_auto_commit_for_active_tab()")
+            .count(),
+        2,
+        "the status bar and the Tools menu both ask it, and nothing else computes it"
     );
     assert!(
         indicators_body.contains("if !self.has_live_connection {")
@@ -8754,21 +9627,39 @@ fn every_force_tier_asks_one_rule_before_it_destroys_a_session() {
     let rule = connection
         .find("pub fn force_tier_may_destroy_it(")
         .expect("the one force-tier rule should exist");
-    let rule_body = slice_from(&connection, rule, 220);
+    // Bounded by the function, not by a byte count.
+    let rule_body = compact_for_pattern(slice_to_end_of_fn(&connection, rule));
+    // CHANGED, with its reason: the rule used to be a fact about the SESSION
+    // alone, and the two clauses below were `Self::Pooled => true` and
+    // `Self::Main => false`. Read as a whole that said "a main session is never
+    // destroyed", which left the deliberate action the rule's own header points
+    // at -- File > Disconnect -- unable to destroy one either. So every
+    // session-ending action refused on a statement wedged on the connection's
+    // own session with "Stop it before continuing", including the very remedy
+    // the force tier's message names. The PURPOSE is the other half of the
+    // question; both clauses are still here, and the third is the action the
+    // header always named.
     assert!(
-        rule_body.contains("Self::Pooled => true") && rule_body.contains("Self::Main => false"),
+        rule_body.contains("(Self::Pooled,_)=>true")
+            && rule_body.contains("(Self::Main,SessionCancelPurpose::StopOneCall)=>false"),
         "a cancel may destroy a pooled session and may never destroy the connection's own: \
          {rule_body}"
+    );
+    assert!(
+        rule_body.contains("(Self::Main,SessionCancelPurpose::EndTheConnection)=>true"),
+        "...and the action that ENDS the connection may, which is the deliberate action with \
+         its own bookkeeping the rule has always named: {rule_body}"
     );
 
     let pool_force = connection
         .find("impl DbActivityCanceler for PoolSessionCanceler")
         .and_then(|start| connection[start..].find("fn force(").map(|at| start + at))
         .expect("the DB layer's force tier should exist");
-    let pool_force_body = slice_from(&connection, pool_force, 700);
+    let pool_force_body = compact_for_pattern(slice_to_end_of_fn(&connection, pool_force));
     assert!(
-        pool_force_body.contains("self.session().force_tier_may_destroy_it()"),
-        "the DB layer's force tier must ask the shared rule: {pool_force_body}"
+        pool_force_body.contains("self.session().force_tier_may_destroy_it(purpose)"),
+        "the DB layer's force tier must ask the shared rule, and pass the caller's purpose to \
+         it rather than deciding for itself: {pool_force_body}"
     );
 
     // The query tab's own force tier asks the SAME rule, once, before the
@@ -8778,19 +9669,105 @@ fn every_force_tier_asks_one_rule_before_it_destroys_a_session() {
     let editor_force = editor
         .find("pub(crate) fn force_cancel_blocking(")
         .expect("the query tab's force tier should exist");
-    let editor_force_body = slice_from(&editor, editor_force, 700);
+    let editor_force_body = compact_for_pattern(slice_to_end_of_fn(&editor, editor_force));
     assert!(
-        editor_force_body.contains("kind.force_tier_may_destroy_it()")
-            && editor_force_body.contains("return session.interrupt(&claim);")
-            && editor_force_body.contains("session.destroy(&claim)"),
+        editor_force_body.contains("kind.force_tier_may_destroy_it(purpose)")
+            && editor_force_body.contains("session.interrupt(&claim)")
+            && editor_force_body.contains("session.destroy(&claim)")
+            && editor_force_body.contains("self.resolve_for_action(claim)"),
         "the query tab's force tier must ask the shared rule before tearing anything down, \
          and re-break instead when it may not: {editor_force_body}"
     );
+    // And the two must not answer the same thing. `Ok(Delivered)` came back
+    // from both, and the tab's watchdog read it as the tear-down: it reported
+    // `ForceCompleted`, retired the operation's registry row and abandoned the
+    // operation — publishing the tab idle and clearing its cancel flag — for a
+    // statement that had merely been broken again on the connection's OWN
+    // session. So the tier NAMES what it did.
     assert!(
-        editor_force_body.contains("self.resolve_for_action(claim)"),
-        "and it must ask about the session it RESOLVED, not about a second reading of a slot \
-         that can change under it: {editor_force_body}"
+        editor_force_body.contains("ForceTierOutcome::after_re_break")
+            && editor_force_body.contains("ForceTierOutcome::after_tear_down"),
+        "a re-break and a tear-down must not be the same answer: {editor_force_body}"
     );
+    let watchdog = editor
+        .find("fn start_query_cancel_watchdog(")
+        .expect("the tab's force tier should exist");
+    let watchdog_body = slice_to_end_of_fn(&editor, watchdog);
+    let watchdog_body = compact_for_pattern(watchdog_body);
+    let asked_again = watchdog_body
+        .find("ifletOk(ForceTierOutcome::AskedAgain)=force_result{")
+        .expect("the watchdog must recognise a session it was not allowed to destroy");
+    let completed = watchdog_body
+        .find("outcome:QueryCancelOutcome::ForceCompleted,")
+        .expect("the watchdog must still report a real tear-down");
+    assert!(
+        asked_again < completed,
+        "and it must answer that BEFORE it says the work is over: {watchdog_body}"
+    );
+    let asked_again_arm = &watchdog_body[asked_again..completed];
+    assert!(
+        !asked_again_arm.contains("abandon_query_cancel_operation_if_matches")
+            && !asked_again_arm.contains("status_activity"),
+        "a session that was only broken again may not end the operation or retire its row -- \
+         the statement may still be running and every session-ending gate asks that row: \
+         {asked_again_arm}"
+    );
+    // ...and the user must be able to ask AGAIN: the watchdog's own claim goes
+    // before the answer is published, so a fresh watchdog can start, and the
+    // window drops the pending-cancel entry for this outcome
+    // (`query_cancel_phase_after_outcome`), because `cancel_target_is_pending`
+    // refuses a second Cancel while one is there.
+    assert!(
+        asked_again_arm.contains("drop(watchdog_claim);"),
+        "a re-break must leave a new watchdog able to start: {asked_again_arm}"
+    );
+    // ...and it must RECORD what happened on the publication. Until it did,
+    // nothing in the app could tell a statement that will not stop from one
+    // that is merely slow, so every session-ending action refused on it with
+    // "Stop it before continuing" -- including the `File > Disconnect` the
+    // outcome's own message names, which left the user in a loop with no exit.
+    assert!(
+        asked_again_arm.contains(".note_the_app_could_not_stop_it();"),
+        "a session the app could not stop must be recorded as one, or the action that CAN end \
+         it goes on refusing: {asked_again_arm}"
+    );
+    let publication = compact_for_pattern(
+        editor
+            .find("    fn the_app_could_not_stop_it(&self) -> bool {")
+            .map(|at| slice_to_end_of_fn(&editor, at))
+            .expect("the publication must be able to answer it"),
+    );
+    assert!(
+        publication.contains("Self::Published{the_app_could_not_stop_it:true,..}"),
+        "and only a live publication answers yes -- a withdrawn or unpublished one has no \
+         session a tier could have failed on: {publication}"
+    );
+    let window = read_source("src/ui/main_window.rs");
+    let phase = compact_for_pattern(
+        window
+            .find("fn query_cancel_phase_after_outcome(")
+            .map(|at| slice_to_end_of_fn(&window, at))
+            .expect("the cancel-phase mapping should exist"),
+    );
+    let clears = phase
+        .find("QueryCancelOutcome::ForceAskedAgain=>None,")
+        .expect("a re-break must stop being a PENDING cancel, or it cannot be retried");
+    let dispatched = phase
+        .find("=>Some(QueryCancelPhase::Dispatched),")
+        .expect("a landed cancel is still dispatched");
+    assert!(
+        dispatched < clears,
+        "and it must not be folded in with the outcomes that stay dispatched: {phase}"
+    );
+    // The tear-down road retires its row through the door that REMEMBERS work
+    // the app has ended but which has not stopped: the session is destroyed,
+    // the worker is not, and it goes on holding its pool slot for as long as
+    // its unwind takes.
+    assert!(
+        watchdog_body.contains("status_activity.finish_for_work_that_has_not_stopped()"),
+        "the force tier's own row must not leave the work named by nothing: {watchdog_body}"
+    );
+
     assert_eq!(
         editor
             .matches("fn destroy(self, claim: &SessionCancelClaim)")
@@ -9233,8 +10210,15 @@ fn every_session_ending_action_asks_the_one_preflight() {
             .find("fn ask(")
             .expect("the disconnect family's shared preflight should exist"),
     );
+    // CHANGED, with its reason: the preflight asks the OBSTACLE now, not the
+    // bool. The bool could only say "there is work", so the preflight refused
+    // on all of it with "Stop it before continuing" -- unsatisfiable for a
+    // statement wedged on the connection's OWN session, which the app has
+    // already failed to stop and the user has nothing stronger for. It is
+    // still asked FIRST and it still refuses on a tab's own stoppable work,
+    // which is what this guard is about.
     let refuse = ask
-        .find("s.tab_work_blocking_session_teardown(")
+        .find("s.tab_work_obstacle_for_session_teardown(")
         .expect("the preflight must refuse a query tab's own work");
     let probe = ask
         .find("try_lock_connection_with_activity(connection")
@@ -9285,7 +10269,12 @@ fn every_session_ending_action_asks_the_one_preflight() {
             // Disconnect All uses the two halves separately, because it has to
             // ask about EVERY connection before it commits any of them.
             "\"File/Disconnect All\" => {",
-            "DecidedSessionTeardown::ask(",
+            // CHANGED, with its reason: the entry point is `decide`, which is
+            // `ask` plus the ONE obstacle a refusal cannot remove -- a
+            // statement the app has already failed to stop, which the user
+            // cannot stop either. `ask` itself is unchanged and still ends
+            // nothing.
+            "DecidedSessionTeardown::decide(",
             "let plan = Self::resolve_pooled_sessions_for_tabs(",
         ),
         (
@@ -9437,20 +10426,24 @@ fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
     // ONE place -- which is also what stops the force tier reading it twice and
     // asking its rule about the first read. See
     // `a_force_tier_asks_its_rule_about_the_session_it_will_tear_down`.
-    for tier in [
-        "pub(crate) fn cancel_interrupt(",
-        "pub(crate) fn force_cancel_blocking(",
+    for (tier, withdraw_answer) in [
+        // The graceful tier answers the delivery itself; the force tier answers
+        // what it DID (`ForceTierOutcome`), whose withdraw arm is the same
+        // fact under the name the caller acts on. Both must have an answer for
+        // "the session stopped being this work's" that is not an action.
+        ("pub(crate) fn cancel_interrupt(", "SessionCancelDelivery"),
+        ("pub(crate) fn force_cancel_blocking(", "ForceTierOutcome"),
     ] {
         let start = editor
             .find(tier)
             .unwrap_or_else(|| panic!("{tier} should exist"));
-        let body = slice_from(&editor, start, 900);
+        let body = slice_to_end_of_fn(&editor, start);
         assert!(
             body.contains("resolve_for_action(claim)"),
             "{tier} must re-read the slot through the one resolution: {body}"
         );
         assert!(
-            body.contains("SessionCancelDelivery"),
+            body.contains(withdraw_answer),
             "{tier} must answer a withdraw rather than acting: {body}"
         );
     }
@@ -9490,7 +10483,7 @@ fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
          see a withdraw: {watchdog_body}"
     );
     assert!(
-        watchdog_body.contains("if let Ok(SessionCancelDelivery::Withdrawn) = force_result {"),
+        watchdog_body.contains("if let Ok(ForceTierOutcome::Withdrawn) = force_result {"),
         "a withdraw that lands mid-tear-down is not a force that FAILED, and must not invite \
          the user to retry one: {watchdog_body}"
     );
@@ -9540,7 +10533,15 @@ fn every_cancel_asks_again_at_the_moment_it_reaches_the_server() {
     // The contract: both tiers take the claim and answer what they DID.
     for tier in [
         "fn interrupt(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String>;",
-        "fn force(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String>;",
+        // CHANGED, with its reason: the force tier now also carries WHY it is
+        // reaching the session, because how far it may go is a question about
+        // the session AND the action. The claim and the delivery -- what this
+        // guard is about -- are unchanged.
+        "    fn force(
+        &self,
+        claim: &SessionCancelClaim,
+        purpose: SessionCancelPurpose,
+    ) -> Result<SessionCancelDelivery, String>;",
     ] {
         assert!(
             connection.contains(tier),
@@ -11155,16 +12156,53 @@ fn the_force_tier_is_never_the_first_thing_a_session_sees() {
         "a published session must record how far the break that was asked for has got"
     );
     // The claim on a publication is taken under the slot lock, so exactly one
-    // tier sends the break. It is written in two places on purpose: the cancel
-    // thread's claim (`claim_graceful_break`) and the watchdog's one locked
-    // force-pass decision, whose `SendGracefulBreak` answer IS a claim.
+    // tier sends the break. Two claimers: the cancel thread's
+    // `claim_graceful_break`, and the force-pass decision, whose
+    // `SendGracefulBreak` answer IS a claim.
     assert!(
-        editor
-            .matches("*graceful_break = GracefulBreakProgress::Sending {")
-            .count()
-            >= 2,
-        "both the claim and the force-pass decision must take the break under the slot lock"
+        editor.contains("state.graceful_break = GracefulBreakProgress::Sending {"),
+        "the cancel thread's claim must be taken under the slot lock"
     );
+    // The decision is ONE implementation, on the state it spends, and BOTH
+    // roads reach it. It used to exist only on the operation slot: the lazy
+    // road asked a narrower question of its own ("is a break in flight?") that
+    // folded `NotAsked` into `Answered`, so a lazy fetch's session could meet
+    // the tear-down having never been asked to stop at all.
+    let rule = editor
+        .find("impl GracefulBreakProgress {")
+        .map(|at| slice_to_end_of_item(&editor, at))
+        .expect("the force-pass rule must live on the state it spends");
+    assert!(
+        rule.contains("Self::NotAsked => {")
+            && rule.contains("*self = Self::Sending {")
+            && rule.contains("ForcePassDecision::SendGracefulBreak"),
+        "a publication nothing has asked to stop must be ASKED, not torn down: {rule}"
+    );
+    assert_eq!(
+        editor.matches("*self = Self::Sending {").count(),
+        1,
+        "and the rule must have one home -- exactly one place turns a publication nothing has \
+         asked to stop into one that has been asked -- or the two roads drift again"
+    );
+    for (road, delegation) in [
+        (
+            "impl OperationCancelTarget {",
+            "graceful_break.force_pass_decision()",
+        ),
+        (
+            "impl QueryCancelTarget {",
+            "state.graceful_break.force_pass_decision()",
+        ),
+    ] {
+        let body = editor
+            .find(road)
+            .map(|at| slice_to_end_of_item(&editor, at))
+            .unwrap_or_else(|| panic!("{road} should exist"));
+        assert!(
+            body.contains(delegation),
+            "{road} must answer its force pass with the shared rule: {body}"
+        );
+    }
 
     // Both senders claim BEFORE they act. A claim taken afterwards would let
     // the other thread send a second break while the first is still opening a
@@ -11198,6 +12236,45 @@ fn the_force_tier_is_never_the_first_thing_a_session_sees() {
         watchdog_body.contains("force_deadline = Instant::now() + timeout;"),
         "a session asked to stop late gets the same grace every other session gets: \
          {watchdog_body}"
+    );
+
+    // The LAZY road's watchdog takes the same pass, in the same order. It is
+    // the road the rule was missing from, and the one a user reaches most: a
+    // lazy fetch cancelled while it is WAITING between chunks -- every
+    // result-tab close, and the cancel button whenever the fetch is paused --
+    // is sent a `GracefulClose` and NO DB break at all, because
+    // `cancel_lazy_fetch_handle_for_session` breaks only a fetch that is
+    // mid-fill.
+    let lazy = editor
+        .find("fn start_lazy_fetch_cancel_watchdog_with(")
+        .expect("the lazy fetch's force tier should exist");
+    let lazy_body = slice_to_end_of_fn(&editor, lazy);
+    let lazy_decision = lazy_body
+        .find("target.force_pass_decision()")
+        .expect("the lazy watchdog must decide its pass with the shared rule");
+    let lazy_send = lazy_body
+        .find("ForcePassDecision::SendGracefulBreak => {")
+        .expect("the lazy watchdog must be able to send the break the cancel road did not");
+    let lazy_force = lazy_body
+        .find("LazyFetchCommand::ForceCancel")
+        .expect("the lazy watchdog must still force");
+    assert!(
+        lazy_decision < lazy_send && lazy_send < lazy_force,
+        "decide, then ask, then tear down -- never the other way round: {lazy_body}"
+    );
+    assert!(
+        lazy_body.contains("send_graceful_break_already_claimed"),
+        "and it must send through the door that answers the claim its decision took: {lazy_body}"
+    );
+    let breaks_only_a_running_fetch = read_source("src/ui/sql_editor/mod.rs")
+        .find("fn cancel_lazy_fetch_handle_for_session(")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the lazy cancel road should exist");
+    assert!(
+        breaks_only_a_running_fetch.contains("if fetch_in_progress && first_cancel_request {"),
+        "the premise of the branch above: the cancel road itself breaks only a fetch that is \
+         mid-fill, so the watchdog is the only thing that can ask a paused one: \
+         {breaks_only_a_running_fetch}"
     );
 }
 
@@ -11315,9 +12392,11 @@ fn the_force_tier_waits_for_a_break_it_has_not_seen_answered() {
         production
             .matches("force_deadline_held: held @ false")
             .count(),
-        2,
-        "both roads — the operation slot's decision and the lazy target's hold — spend the \
-         bound under the lock that read it"
+        1,
+        "the bound is spent in ONE place — `GracefulBreakProgress::force_pass_decision`, which \
+         both roads reach — so the operation slot and the lazy target cannot drift into \
+         answering the same question differently, which is exactly how the lazy road came to \
+         fold `NotAsked` in with `Answered`"
     );
 
     // The lazy road's watchdog asks the same question at its deadline: a
@@ -11328,7 +12407,7 @@ fn the_force_tier_waits_for_a_break_it_has_not_seen_answered() {
         .expect("the lazy fetch's force tier should exist");
     let lazy_watchdog_body = slice_to_end_of_fn(&editor, lazy_watchdog);
     assert!(
-        lazy_watchdog_body.contains("hold_force_deadline_for_break_in_flight"),
+        lazy_watchdog_body.contains("ForcePassDecision::HoldForBreakInFlight => continue"),
         "the lazy watchdog must hold its deadline for a break in flight: {lazy_watchdog_body}"
     );
 
@@ -11340,8 +12419,28 @@ fn the_force_tier_waits_for_a_break_it_has_not_seen_answered() {
         .expect("the lazy force-grace derivation should exist");
     let lazy_grace_body = slice_to_end_of_fn(&editor, lazy_grace);
     assert!(
-        lazy_grace_body.contains("graceful_break_may_not_interrupt_a_blocked_call"),
-        "the thin cap must be gated on the per-backend break fact: {lazy_grace_body}"
+        lazy_grace_body.contains("lazy_fetch_force_grace_after_a_db_break"),
+        "the grace after a DB break must be derived the one way: {lazy_grace_body}"
+    );
+    let shared_grace = editor
+        .find("fn lazy_fetch_force_grace_after_a_db_break(")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the one derivation should exist");
+    assert!(
+        shared_grace.contains("graceful_break_may_not_interrupt_a_blocked_call"),
+        "the thin cap must be gated on the per-backend break fact: {shared_grace}"
+    );
+    // Both breaks reach it: the one the CANCEL ROAD sent before the watchdog
+    // started, and the one the watchdog sends itself when the road sent none.
+    // A second derivation is how the shortening would apply to one and not the
+    // other.
+    assert_eq!(
+        production
+            .matches("lazy_fetch_force_grace_after_a_db_break(")
+            .count(),
+        3,
+        "one definition and both callers -- the cancel road's derivation and the watchdog's \
+         own, after it has sent the break the road did not"
     );
     let break_fact = editor
         .find("fn graceful_break_may_not_interrupt_a_blocked_call(&self) -> bool")
@@ -11481,10 +12580,65 @@ fn a_session_ending_action_ends_nothing_until_every_refusal_is_spent() {
         );
     }
     assert!(
-        ask.contains("tab_work_blocking_session_teardown")
+        ask.contains("tab_work_obstacle_for_session_teardown")
             && ask.contains("try_lock_connection_with_activity"),
         "and it must put BOTH refusable questions -- the tab's work and the connection \
          itself: {ask}"
+    );
+
+    // The ONE obstacle a refusal cannot remove is ended OUTSIDE `ask`, by the
+    // step that has already decided to end this connection -- and `ask` is put
+    // AGAIN afterwards, so the premise everything below rests on (nothing holds
+    // this connection's mutex for long) is re-established by a real refusal
+    // rather than assumed.
+    //
+    // Why the exception exists at all: a statement wedged on the connection's
+    // OWN session cannot be stopped by asking, so "Stop it before continuing"
+    // is unsatisfiable -- and it was the answer `File > Disconnect` gave, which
+    // is the remedy the force tier's own message names. Ending the connection
+    // is the only thing left that ends it.
+    let decide = slice_to_end_of_fn(
+        &window,
+        window
+            .find("fn decide(")
+            .expect("the step that may end what a refusal cannot should exist"),
+    );
+    assert_eq!(
+        window
+            .matches("Self::end_work_the_app_could_not_stop(connection_id)")
+            .count(),
+        1,
+        "exactly one caller, and it is `decide`"
+    );
+    assert!(
+        decide.contains("Self::end_work_the_app_could_not_stop(connection_id)"),
+        "...which is this one: {decide}"
+    );
+    let ended_at = decide
+        .find("Self::end_work_the_app_could_not_stop(connection_id)")
+        .expect("decide ends it");
+    assert!(
+        decide[ended_at..].contains("Self::ask(state, connection, connection_id, probe_activity)"),
+        "and it asks AGAIN afterwards, so the connection probe is still the last word: {decide}"
+    );
+    assert_eq!(
+        decide
+            .matches("Self::end_work_the_app_could_not_stop(")
+            .count(),
+        1,
+        "ONCE, never in a loop: the tier that ends a session has already been spent"
+    );
+    let ender = slice_to_end_of_fn(
+        &window,
+        window
+            .find("fn end_work_the_app_could_not_stop(")
+            .expect("the ender should exist"),
+    );
+    assert!(
+        ender.contains("SESSION_TEARDOWN_UNSTOPPABLE_WORK_BREAK_GRACE")
+            && ender.contains("wait_until_ended_db_work_let_go("),
+        "it ends the work and WAITS for it to let go -- a cancel on its own is asynchronous \
+         and would buy the second ask nothing: {ender}"
     );
 
     let commit = slice_to_end_of_fn(
@@ -11510,7 +12664,7 @@ fn a_session_ending_action_ends_nothing_until_every_refusal_is_spent() {
             &window[disconnect_all..disconnect_all + end]
         });
     let asked = disconnect_all_body
-        .find("DecidedSessionTeardown::ask(")
+        .find("DecidedSessionTeardown::decide(")
         .expect("Disconnect All must ask through the two-phase preflight");
     let collected = disconnect_all_body[asked..]
         .find("push(decision)")
@@ -11631,7 +12785,7 @@ fn a_connection_leaves_the_registry_only_when_it_has_been_ended() {
     // object-browser card and asks this question in the same UI-thread frame.
     assert!(
         compact_for_pattern(names)
-            .contains("cancelled_work_still_holds_a_session_on(connection_id)"),
+            .contains("cancelled_db_work_still_holds_a_session_on(connection_id)"),
         "and from work that was cancelled and has not let go, or a cancel makes this answer \
          stale in the one place where it disconnects a live session: {names}"
     );

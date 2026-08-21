@@ -687,16 +687,79 @@ enum MySqlSessionLedgerOwner {
     LazyFetchThatTookTheSession,
 }
 
+/// Where the session a MySQL-family statement ran on says it is NOW.
+///
+/// Filled by the one place that can know — the post-statement sync inside
+/// [`SqlEditorWidget::run_mysql_pooled_action_with_timeout`], which reads the
+/// database back off the session — and TAKEN by the statement loop immediately
+/// afterwards, which is the only thing that may record a scope for the batch or
+/// for the tab.
+///
+/// It exists because "where did the session land?" had TWO answers on this
+/// family and the wrong one won. Both Oracle drivers ask the SESSION
+/// (`sync_oracle_pooled_session_current_schema`); the MySQL family asked the
+/// statement TEXT. `USE mydb/*c*/`, `USE mydb#c` and `USE mydb-- c` are all
+/// statements the server runs and the app executes verbatim, so the text answer
+/// could name a database that does not exist — and that value went into the
+/// tab's binding, its browser card and the batch's own scope cell, after which
+/// every statement of the run failed with "Unknown database". The parse now
+/// only answers WHETHER a unit moved the session.
+///
+/// [`Self::take`] rather than a getter: one statement, one answer, and a
+/// statement that never asked the session must leave the loop with no answer
+/// rather than the previous statement's.
+#[derive(Default)]
+pub(crate) struct MySqlSessionLandedScope {
+    landed: std::cell::Cell<Option<Option<String>>>,
+}
+
+impl MySqlSessionLandedScope {
+    /// Said by the sync that read the session back. The outer `Option` is "the
+    /// session was asked", the inner one is the answer — `None` meaning the
+    /// server has detached this session from every database.
+    fn record(&self, landed: Option<String>) {
+        self.landed.set(Some(landed));
+    }
+
+    /// Forget whatever the previous statement left here.
+    fn clear(&self) {
+        self.landed.set(None);
+    }
+
+    fn take(&self) -> Option<Option<String>> {
+        self.landed.take()
+    }
+}
+
 /// A scope change a successful statement made, on its way to the one step that
 /// records it where the batch reads its scope AND reports it to the window.
 ///
 /// `#[must_use]`, and that is the point: the branch that runs a statement is the
 /// branch that has to report the move, and the two branches that never did are
 /// the reason this is a value instead of a side effect.
+///
+/// It records the BATCH's cell only, never the tab's binding, and that is this
+/// family's answer rather than a gap: the MySQL family re-acquires its session
+/// per statement and asserts the BATCH's scope on it, the retained lease
+/// records where the session really is, and `ScopeChangedNotice` moves the tab
+/// under the same "has a later execution owned this tab?" rule the worker door
+/// would apply (`TabFactDelivery::UnlessSuperseded`). See
+/// `a_worker_moves_its_tabs_scope_only_while_it_still_owns_the_tab`.
 #[must_use = "a scope change that is not reported leaves the rest of the script asserting the scope the session has left"]
 struct MySqlBatchScopeChange(Option<(String, Option<String>)>);
 
 impl MySqlBatchScopeChange {
+    /// The notice this change owes the user, for a branch whose own output
+    /// order ALSO echoes it into the script log before reporting it.
+    ///
+    /// Read rather than rebuilt: the `USE` tool command used to compose its own
+    /// notice from the name it parsed out of the command, which is how this
+    /// family ended up with two answers to "where did the session land" again
+    /// after the one-answer channel was built for the other roads.
+    fn notice(&self) -> Option<&str> {
+        self.0.as_ref().map(|(message, _)| message.as_str())
+    }
+
     fn report(self, record_scope: impl FnOnce(&str), sender: &QueryProgressSender) {
         if let Some((message, selected_scope)) = self.0 {
             SqlEditorWidget::note_batch_scope_change(record_scope, sender, message, selected_scope);
@@ -1185,27 +1248,19 @@ impl OracleTransactionModeApplication {
         }
     }
 
-    /// Each statement to issue, paired with whether it is the session-default
-    /// reset. The reset restores the connection default, so it leaves the
-    /// session in a state the tab already represents: its effects must NOT be
-    /// recorded as session residue, or the tab's next execution would stop to
-    /// ask the user to resolve a session the app itself just made clean.
-    fn statements(self) -> Result<Vec<(String, bool)>, String> {
-        let reset = crate::db::DatabaseConnection::oracle_session_isolation_reset_statement(
+    /// Each statement to issue, and which kind each one is.
+    ///
+    /// Composed by the DB layer
+    /// ([`crate::db::DatabaseConnection::oracle_transaction_mode_statements_for_tab`]),
+    /// not here. This used to rebuild the same list — the session-default reset
+    /// followed by the mode statements — so the rule existed twice, and the
+    /// copy the unit test pinned was the one production did not run.
+    fn statements(self) -> Result<Vec<crate::db::OracleTransactionModeStatement>, String> {
+        crate::db::DatabaseConnection::oracle_transaction_mode_statements_for_tab(
             self.tab_selected,
+            self.mode,
             self.default_isolation,
-        );
-        let mut statements: Vec<(String, bool)> =
-            reset.into_iter().map(|sql| (sql, true)).collect();
-        statements.extend(
-            crate::db::DatabaseConnection::transaction_mode_statements_for(
-                crate::db::DatabaseType::Oracle,
-                self.mode,
-            )?
-            .into_iter()
-            .map(|sql| (sql, false)),
-        );
-        Ok(statements)
+        )
     }
 }
 
@@ -1510,7 +1565,18 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                     // operation's sender, and every road that does not take it
                     // -- including the wrong-family answer below -- ends the
                     // reach before the session goes.
-                    match pool_context.acquire_session_for_current_scope(&execution_activity) {
+                    match pool_context.acquire_session_for_current_scope(
+                        // The tab's own two settings, resolved before dispatch.
+                        // Oracle expresses neither as a session setting the
+                        // scope apply carries, but the session IS this tab's,
+                        // and saying so at the door is what keeps a future
+                        // session setting from being prepared for nobody.
+                        crate::db::PooledSessionPurpose::tab_statements(
+                            initial_auto_commit,
+                            initial_transaction_mode,
+                        ),
+                        &execution_activity,
+                    ) {
                         Ok(acquired) => match acquired.into_oracle_thin() {
                             Ok(conn) => (conn.take_for(sender), RetainedSessionState::default()),
                             Err(other) => {
@@ -8753,6 +8819,11 @@ impl SqlEditorWidget {
         let statement_effects =
             Self::mysql_statement_session_effects_for_sql_for_db_type(db_type, marker_sql);
         let scope_report = SessionScopeReport::default();
+        // A grid save runs one marker statement that never moves the session's
+        // database, so nothing is asked and nothing is recorded. The channel is
+        // still passed rather than made optional: an action that CAN move the
+        // session must not be able to reach this door without one.
+        let session_landed_scope = MySqlSessionLandedScope::default();
         // How the save bracketed itself, which is also what its message may
         // claim: a save nested in the user's own transaction is saved and NOT
         // committed, whatever the tab's auto-commit says.
@@ -8773,6 +8844,7 @@ impl SqlEditorWidget {
             auto_commit,
             transaction_mode,
             false,
+            &session_landed_scope,
             false,
             None,
             marker_sql,
@@ -8956,6 +9028,11 @@ impl SqlEditorWidget {
         // re-acquired per statement too), so this latch is what keeps one
         // missing database from being reported once per statement of a script.
         let scope_report = &SessionScopeReport::default();
+        // Where each statement left the session. Filled by the action that read
+        // the session back and taken by the statement that records the move, so
+        // the scope the batch and the tab keep is the session's own answer and
+        // never a parse of the statement text.
+        let session_landed_scope = &MySqlSessionLandedScope::default();
         let mysql_batch_interrupted = std::cell::Cell::new(false);
         let mysql_batch_executed_sql_statement = std::cell::Cell::new(false);
 
@@ -9017,9 +9094,10 @@ impl SqlEditorWidget {
             MySqlBatchStatementError,
         > {
             // A `USE` anywhere in the unit moved the session, so the encoding
-            // has to be read again — not only a unit that STARTS with one.
-            let refresh_encoding_after =
-                SqlEditorWidget::mysql_unit_moves_session_database(db_type, sql).is_some();
+            // has to be read again — and the session has to be asked where it
+            // landed — not only for a unit that STARTS with one.
+            let unit_moves_session_database =
+                SqlEditorWidget::mysql_unit_requires_session_database_readback(db_type, sql);
             let statement_effects = begin_mysql_batch_statement(sql, batch_effects)?;
             // The tab-mode gate is NOT here. It lives where the session is
             // handed to a statement (`acquire_mysql_pooled_session`), because
@@ -9052,7 +9130,8 @@ impl SqlEditorWidget {
                 db_activity,
                 auto_commit,
                 active_transaction_mode.get(),
-                refresh_encoding_after,
+                unit_moves_session_database,
+                session_landed_scope,
                 false,
                 None,
                 sql,
@@ -9100,6 +9179,11 @@ impl SqlEditorWidget {
                 );
                 let statement_reached_server = std::cell::Cell::new(false);
                 let statement_scope = current_execution_scope();
+                // The same question the plain branch asks: a unit that starts
+                // with a SELECT can still carry a `USE`, and the session has to
+                // be asked where it landed either way.
+                let unit_moves_session_database =
+                    SqlEditorWidget::mysql_unit_requires_session_database_readback(db_type, sql);
                 match SqlEditorWidget::run_mysql_pooled_action_with_timeout(
                     shared_connection,
                     pooled_db_session,
@@ -9115,7 +9199,8 @@ impl SqlEditorWidget {
                     db_activity,
                     auto_commit,
                     active_transaction_mode.get(),
-                    false,
+                    unit_moves_session_database,
+                    session_landed_scope,
                     false,
                     None,
                     sql,
@@ -9832,42 +9917,62 @@ impl SqlEditorWidget {
                                 &mysql_batch_effects,
                             ) {
                                 Ok(success) => {
-                                    SqlEditorWidget::apply_successful_mysql_batch_statement_effects(
-                                        use_sql.as_str(),
-                                        auto_commit,
-                                        success.effects,
-                                        &mut mysql_batch_effects,
-                                    );
-                                    let info = Self::connection_info_snapshot_for_ui(
-                                        shared_connection,
-                                        db_activity,
-                                    );
-                                    // The database this `USE` moved THIS
-                                    // tab's session to. The connection's
-                                    // stored name is another tab's business
-                                    // and is deliberately left alone, so it
-                                    // is only a last resort here.
-                                    let current_database = Some(database.trim())
-                                        .filter(|database| !database.is_empty())
-                                        .or_else(|| {
-                                            info.as_ref()
-                                                .map(|info| info.service_name.trim())
+                                    // THE SAME ONE STEP every other successful
+                                    // statement of this family goes through.
+                                    //
+                                    // This arm used to hand-roll it: it applied
+                                    // the effects itself and then built its own
+                                    // scope answer out of the name it had
+                                    // parsed out of the command. That left the
+                                    // family with TWO answers to "where did the
+                                    // session land" — the multi-statement road
+                                    // asks the session
+                                    // (`MySqlSessionLandedScope`, filled by the
+                                    // very `execute_mysql_sql` call above) and
+                                    // this one read the text — and the text is
+                                    // wrong whenever the server stores the name
+                                    // differently from the way it was typed
+                                    // (`lower_case_table_names=1` folds it). The
+                                    // recorded scope then disagreed with the
+                                    // session for the rest of the run, so every
+                                    // later statement re-issued the database
+                                    // switch and cleared the statement
+                                    // diagnostics `ROW_COUNT()`/`FOUND_ROWS()`
+                                    // read from.
+                                    let scope_change =
+                                        SqlEditorWidget::record_successful_mysql_batch_statement(
+                                            db_type,
+                                            use_sql.as_str(),
+                                            &[],
+                                            success.effects,
+                                            MySqlSessionLedgerOwner::Batch,
+                                            &mut auto_commit,
+                                            &tab_session_slots,
+                                            &mut mysql_batch_effects,
+                                            session_landed_scope,
+                                            || {
+                                                // The connection's stored name
+                                                // is another tab's business and
+                                                // is deliberately left alone, so
+                                                // it is only a last resort here.
+                                                Self::connection_info_snapshot_for_ui(
+                                                    shared_connection,
+                                                    db_activity,
+                                                )
+                                                .map(|info| info.service_name.trim().to_string())
                                                 .filter(|database| !database.is_empty())
-                                        })
-                                        .unwrap_or_default();
-                                    let notice = SqlEditorWidget::current_database_changed_message(
-                                        current_database,
-                                    );
-                                    SqlEditorWidget::emit_script_output(
-                                        sender,
-                                        session,
-                                        SqlEditorWidget::message_lines(&notice),
-                                    );
-                                    SqlEditorWidget::note_batch_scope_change(
+                                            },
+                                        );
+                                    if let Some(notice) = scope_change.notice() {
+                                        SqlEditorWidget::emit_script_output(
+                                            sender,
+                                            session,
+                                            SqlEditorWidget::message_lines(notice),
+                                        );
+                                    }
+                                    scope_change.report(
                                         |scope| store_batch_scope(&execution_scope, scope),
                                         sender,
-                                        notice,
-                                        Some(current_database.to_string()),
                                     );
                                 }
                                 Err(error) => {
@@ -10258,6 +10363,7 @@ impl SqlEditorWidget {
                                     &mut auto_commit,
                                     &tab_session_slots,
                                     &mut mysql_batch_effects,
+                                    session_landed_scope,
                                     || {
                                         Self::connection_info_snapshot_for_ui(
                                             shared_connection,
@@ -10407,6 +10513,7 @@ impl SqlEditorWidget {
                                         &mut auto_commit,
                                         &tab_session_slots,
                                         &mut mysql_batch_effects,
+                                        session_landed_scope,
                                         || {
                                             Self::connection_info_snapshot_for_ui(
                                                 shared_connection,
@@ -10556,6 +10663,7 @@ impl SqlEditorWidget {
                                     &mut auto_commit,
                                     &tab_session_slots,
                                     &mut mysql_batch_effects,
+                                    session_landed_scope,
                                     || {
                                         Self::connection_info_snapshot_for_ui(
                                             shared_connection,
@@ -11076,8 +11184,11 @@ impl SqlEditorWidget {
                     let activity_guard = context.track_activity(activity.clone());
                     // Session and cancel reach as one value -- see
                     // `AcquiredPoolSession`.
-                    let mut acquired =
-                        context.acquire_session_for_scope(tab_scope.as_deref(), &activity_guard)?;
+                    let mut acquired = context.acquire_session_for_scope(
+                        tab_scope.as_deref(),
+                        crate::db::PooledSessionPurpose::AppRead,
+                        &activity_guard,
+                    )?;
                     if !crate::db::cached_pool_session_context_matches_shared_connection(
                         &connection,
                         &context,
@@ -19231,7 +19342,15 @@ impl SqlEditorWidget {
         // two used to be separate locals, and the compiler dropped the session
         // first.
         let mut session = match pool_context
-            .acquire_session_for_current_scope(&activity_guard)?
+            .acquire_session_for_current_scope(
+                // The candidate becomes the tab's connection, so this session
+                // is the tab's from the moment it is acquired. Auto-commit is
+                // the candidate's birth value here on purpose (see above): the
+                // tab's own `SET AUTOCOMMIT` survives CONNECT and resolves on
+                // top of it in `begin_execution`.
+                crate::db::PooledSessionPurpose::tab_statements(auto_commit, transaction_mode),
+                &activity_guard,
+            )?
             .into_oracle_thin()
         {
             Ok(session) => session,
@@ -24456,11 +24575,11 @@ impl SqlEditorWidget {
         mut record_stated_statement: impl FnMut(&str),
         mut execute: impl FnMut(&str) -> Result<(), String>,
     ) -> Result<OracleTransactionModeApplied, String> {
-        for (statement, restores_session_default) in application.statements()? {
-            if !restores_session_default {
-                record_stated_statement(&statement);
+        for statement in application.statements()? {
+            if !statement.restores_session_default() {
+                record_stated_statement(statement.sql());
             }
-            if let Err(message) = execute(&statement) {
+            if let Err(message) = execute(statement.sql()) {
                 if crate::db::oracle_error_says_transaction_still_open(&message) {
                     return Ok(OracleTransactionModeApplied::TransactionStillOpen);
                 }
@@ -24509,13 +24628,13 @@ impl SqlEditorWidget {
         if let Ok(statements) = transaction_mode.statements() {
             let post_processor =
                 crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
-            for (statement, restores_session_default) in statements {
-                if restores_session_default {
+            for statement in statements {
+                if statement.restores_session_default() {
                     continue;
                 }
                 Self::apply_oracle_db_statement_effects(
                     cleanup,
-                    post_processor.effects_for_sql(&statement),
+                    post_processor.effects_for_sql(statement.sql()),
                 );
             }
         }
@@ -24561,6 +24680,9 @@ impl SqlEditorWidget {
         auto_commit: &mut bool,
         slots: &MySqlTabSessionSlots<'_>,
         batch_effects: &mut crate::db::MySqlBatchSessionEffects,
+        // Where the SESSION says it is now, when it was asked. The only value
+        // this may record as a scope; see [`MySqlSessionLandedScope`].
+        session_landed_scope: &MySqlSessionLandedScope,
         connection_database: impl FnOnce() -> Option<String>,
     ) -> MySqlBatchScopeChange {
         let files_with_the_batch = ledger_owner == MySqlSessionLedgerOwner::Batch;
@@ -24611,10 +24733,23 @@ impl SqlEditorWidget {
 
         MySqlBatchScopeChange(
             Self::mysql_unit_moves_session_database(db_type, sql).and_then(|parsed_database| {
-                // The statement's own target, not the connection's database: a
-                // successful `USE` moved THIS tab's session there, and the
-                // connection's stored name is deliberately left alone.
-                let selected_scope = parsed_database.or_else(connection_database);
+                // WHETHER the session moved is the statement's answer; WHERE it
+                // landed is the SESSION's, exactly as it is on both Oracle
+                // drivers. Reading the text for the destination was the defect:
+                // `USE mydb/*c*/`, `USE mydb#c` and `USE mydb-- c` all run, and
+                // the name the app derived from them was a database the server
+                // does not have — which then went onto the tab, its browser
+                // card and the batch's own cell, so every statement after it
+                // failed with "Unknown database".
+                let selected_scope = match session_landed_scope.take() {
+                    Some(landed) => landed,
+                    // The session could not be asked: this statement closed it,
+                    // or a lazy fetch took it over with the statement's effects
+                    // in hand. The statement's own target is then the best
+                    // answer there is — and it is what the user asked for, so
+                    // the tab keeps following it onto its next session.
+                    None => parsed_database.or_else(connection_database),
+                };
                 let message = selected_scope
                     .as_deref()
                     .map(Self::current_database_changed_message)
@@ -24625,8 +24760,8 @@ impl SqlEditorWidget {
                             .map(|result| result.message.clone())
                             .unwrap_or_default()
                     });
-                // The move is still recorded by the session sync; an empty
-                // notice is not a notice.
+                // The move is still recorded on the lease by the same sync
+                // that answered above; an empty notice is not a notice.
                 (!message.trim().is_empty()).then_some((message, selected_scope))
             }),
         )
@@ -25697,7 +25832,7 @@ impl SqlEditorWidget {
             let activity = session_pool_sender
                 .and_then(QueryProgressSender::operation_activity)
                 .unwrap_or_else(|| conn_guard.activity());
-            let mut context = conn_guard
+            let context = conn_guard
                 .pool_session_context()?
                 .for_scope(execution_scope);
             // Tab-scoped transaction mode: the session is prepared with the
@@ -25705,7 +25840,12 @@ impl SqlEditorWidget {
             // what keeps the connection default out of reach here — the
             // fallback this used to have is the door the "tab pin overwritten
             // by the connection default" bug came through.
-            context.transaction_mode = transaction_mode;
+            //
+            // It used to be stated by OVERWRITING `context.transaction_mode`,
+            // which put the tab's mode and the connection's auto-commit in two
+            // fields of one struct with no way to tell whose each was. The two
+            // plain values below are the tab's; the context now only ever
+            // states the connection's.
             (context, activity)
         };
         let db_display_name = context.connection_info.db_type.display_name();
@@ -25949,7 +26089,7 @@ impl SqlEditorWidget {
                             fresh_held,
                             context.connection_info.db_type,
                             auto_commit,
-                            context.transaction_mode,
+                            transaction_mode,
                             context.default_transaction_isolation,
                             statement_requires_transaction_boundary,
                         )?;
@@ -25987,7 +26127,7 @@ impl SqlEditorWidget {
             &mut conn,
             context.connection_info.db_type,
             auto_commit,
-            context.transaction_mode,
+            transaction_mode,
             context.default_transaction_isolation,
             preserve_existing_session_state,
             statement_requires_transaction_boundary,
@@ -26022,7 +26162,7 @@ impl SqlEditorWidget {
                     fresh_held,
                     context.connection_info.db_type,
                     auto_commit,
-                    context.transaction_mode,
+                    transaction_mode,
                     context.default_transaction_isolation,
                     statement_requires_transaction_boundary,
                 )?;
@@ -27124,10 +27264,10 @@ impl SqlEditorWidget {
     }
 
     fn mysql_timeout_reset_failure_loses_successful_scope_sync<T>(
-        refresh_encoding_after: bool,
+        unit_moves_session_database: bool,
         result: &thread::Result<Result<T, String>>,
     ) -> bool {
-        refresh_encoding_after && matches!(result, Ok(Ok(_)))
+        unit_moves_session_database && matches!(result, Ok(Ok(_)))
     }
 
     fn oracle_pooled_session_health_check(conn: &Connection, log_context: &str) -> bool {
@@ -27199,6 +27339,25 @@ impl SqlEditorWidget {
             |earlier, later| earlier || later,
         )
         .answer
+    }
+
+    /// Whether a unit moves the session's database, asked the SAME way by every
+    /// MySQL-family statement path.
+    ///
+    /// The family runs a unit down one of three branches and the dispatch reads
+    /// the LEADING keyword, so `SELECT 1; USE other` (one unit under a custom
+    /// `DELIMITER`, both statements run by the server) goes to the streaming
+    /// branch. That branch answered `false` here, so the `USE` inside it
+    /// neither refreshed the session encoding nor had the session's database
+    /// read back — while the very same unit still reported a scope change from
+    /// its text. One derivation, so a branch cannot answer this differently
+    /// from its siblings; it is the same trap that once put the read-only gate
+    /// on one path of three.
+    fn mysql_unit_requires_session_database_readback(
+        db_type: crate::db::DatabaseType,
+        sql: &str,
+    ) -> bool {
+        Self::mysql_unit_moves_session_database(db_type, sql).is_some()
     }
 
     /// Where a UNIT left this session's database, when it moved it at all.
@@ -28004,7 +28163,16 @@ impl SqlEditorWidget {
         log_context: &str,
         auto_commit: bool,
         transaction_mode: crate::db::TransactionMode,
-        refresh_encoding_after: bool,
+        // Whether this unit moves the session's database, which is one
+        // question with two consequences: the session's encoding has to be
+        // read again, and the session has to be ASKED where it landed. Derived
+        // once for every statement path by
+        // `mysql_unit_requires_session_database_readback`.
+        unit_moves_session_database: bool,
+        // Where this statement left the session, for the loop that records the
+        // move. Written here because this is the only frame that reads the
+        // session back.
+        session_landed_scope: &MySqlSessionLandedScope,
         require_existing_session: bool,
         required_resolution_action: Option<RetainedSessionResolutionAction>,
         statement_sql: &str,
@@ -28019,6 +28187,10 @@ impl SqlEditorWidget {
         // `crate::db::app_operation_transaction_scope`).
         F: FnOnce(&mut mysql::PooledConn, RetainedSessionState) -> Result<T, MysqlError>,
     {
+        // One statement, one answer: whatever a previous statement left in the
+        // channel is not this statement's, and a statement that never asks the
+        // session must leave the loop with NO answer rather than a stale one.
+        session_landed_scope.clear();
         // A one-shot `SET TRANSACTION ...` has to be the first statement of its
         // transaction, so the session has to be prepared back to a boundary for
         // it even when it already carries the wanted settings. `XA START` has
@@ -28421,7 +28593,7 @@ impl SqlEditorWidget {
                     return Err(Self::mysql_retained_session_lost_after_success_message());
                 }
                 if Self::mysql_timeout_reset_failure_loses_successful_scope_sync(
-                    refresh_encoding_after,
+                    unit_moves_session_database,
                     &result,
                 ) {
                     return Err(Self::mysql_scope_sync_lost_after_success_message());
@@ -28459,7 +28631,7 @@ impl SqlEditorWidget {
         // DROP DATABASE of the current database also needs the stored name
         // cleared, but losing that sync is recoverable (the missing-database
         // fallback handles it), so it must not fail the statement.
-        let use_statement_scope_sync_required = refresh_encoding_after && statement_succeeded;
+        let use_statement_scope_sync_required = unit_moves_session_database && statement_succeeded;
         let session_database_update = if statement_succeeded {
             Self::mysql_session_database_update_after_statement(
                 db_type,
@@ -28518,7 +28690,7 @@ impl SqlEditorWidget {
                     &mut conn,
                     log_context,
                     connection_generation,
-                    refresh_encoding_after,
+                    unit_moves_session_database,
                     session_database_update,
                     preserve_session_state_after_action,
                     matches!(&result, Ok(Ok(_)))
@@ -28661,8 +28833,12 @@ impl SqlEditorWidget {
             };
         // A `USE` moves the tab's session out from under the scope this action
         // was prepared in, and the sync above is the only thing that saw where
-        // it landed. Record that, not the database the statement started in.
+        // it landed. Record that, not the database the statement started in —
+        // on the LEASE here, and in the channel the statement loop records the
+        // batch's and the TAB's scope from. One answer, so the session, the
+        // batch and the tab cannot end up naming three different databases.
         if let Some(landed) = session_current_database {
+            session_landed_scope.record(landed.clone());
             session_scope = landed;
         }
         Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
@@ -29066,6 +29242,126 @@ mod session_transaction_mode_adoption_tests {
             TabOperationOwnership::untracked().may_state_a_tab_fact(),
             "a path outside any tab operation has nothing newer to lose to"
         );
+    }
+}
+
+#[cfg(test)]
+mod mysql_batch_scope_tests {
+    use super::{
+        MySqlSessionLandedScope, MySqlSessionLedgerOwner, MySqlTabSessionSlots, SqlEditorWidget,
+    };
+    use crate::db::{DatabaseType, TabOperationOwnership, TransactionMode};
+    use crate::ui::sql_editor::TabPin;
+    use std::cell::Cell;
+
+    /// Run one successful MySQL-family statement through the step that records
+    /// what it changed, and answer the scope change it produced.
+    fn recorded_scope_for(
+        sql: &str,
+        landed: Option<Option<String>>,
+    ) -> (Option<String>, MySqlSessionLandedScope) {
+        let (sender, _receiver) = super::test_query_progress_channel();
+        let db_type = DatabaseType::MySQL;
+        let active_transaction_mode = Cell::new(TransactionMode::default());
+        let tab_transaction_mode_override = TabPin::with_value("transaction mode", None);
+        let tab_auto_commit_override = TabPin::with_value("auto-commit", None);
+        let slots = MySqlTabSessionSlots {
+            sender: &sender,
+            active_transaction_mode: &active_transaction_mode,
+            tab_transaction_mode_override: &tab_transaction_mode_override,
+            tab_auto_commit_override: &tab_auto_commit_override,
+            current_operation_autocommit: None,
+            tab_owner: TabOperationOwnership::untracked(),
+        };
+        let mut auto_commit = false;
+        let mut batch_effects = crate::db::MySqlBatchSessionEffects::for_db_type(db_type);
+        let effects =
+            SqlEditorWidget::mysql_statement_session_effects_for_sql_for_db_type(db_type, sql);
+        let session_landed_scope = MySqlSessionLandedScope::default();
+        if let Some(landed) = landed {
+            session_landed_scope.record(landed);
+        }
+        let change = SqlEditorWidget::record_successful_mysql_batch_statement(
+            db_type,
+            sql,
+            &[],
+            effects,
+            MySqlSessionLedgerOwner::Batch,
+            &mut auto_commit,
+            &slots,
+            &mut batch_effects,
+            &session_landed_scope,
+            || None,
+        );
+        let selected = change.0.and_then(|(_, selected_scope)| selected_scope);
+        (selected, session_landed_scope)
+    }
+
+    /// WHERE the session landed is the SESSION's answer, not a parse of the
+    /// statement that moved it.
+    ///
+    /// Both Oracle drivers already read the schema back off the session
+    /// (`sync_oracle_pooled_session_current_schema`); this family read the
+    /// statement TEXT, and that value went onto the tab's binding, its browser
+    /// card and the batch's own scope cell — the three things every later
+    /// statement of the run is asserted against.
+    ///
+    /// The discriminator is a case the text cannot answer even with a perfect
+    /// parser: under `lower_case_table_names=1` the server folds the name, so
+    /// `USE MyDb` really lands in `mydb`. Recording the text there makes the
+    /// next statement assert a database the session is not in.
+    #[test]
+    fn a_mysql_scope_change_records_where_the_session_landed() {
+        let (selected, channel) =
+            recorded_scope_for("SELECT 1; USE MyDb", Some(Some("mydb".to_string())));
+        assert_eq!(
+            selected.as_deref(),
+            Some("mydb"),
+            "the session's own answer is what the batch and the tab keep"
+        );
+        assert!(
+            channel.take().is_none(),
+            "one statement, one answer: taking it empties the channel so the next statement \
+             cannot inherit it"
+        );
+    }
+
+    /// A session that could not be asked falls back to what the user asked for.
+    ///
+    /// It is not always askable: the statement may have closed the session, or
+    /// a lazy fetch may have taken it over with the statement's effects in
+    /// hand. The tab still has to follow its own `USE` onto its next session,
+    /// so the statement's target is the answer there — and the parse has to be
+    /// exact for it, which is the other half of this fix.
+    ///
+    /// The unit shapes below are the ones this reader really meets. A `USE`
+    /// typed on its own becomes a `ScriptItem::ToolCommand`, whose name the
+    /// script parser extracts and which never reaches here; what does reach
+    /// here is a `USE` inside a MULTI-STATEMENT unit — the shape a custom
+    /// `DELIMITER` produces, where the whole unit goes to the server as one
+    /// string. `#` and `-- ` comments survive into that unit text; a block
+    /// comment is stripped by the splitter, so it cannot get this far.
+    #[test]
+    fn a_scope_change_falls_back_to_the_statements_own_target() {
+        let (selected, _) = recorded_scope_for("SELECT 1; USE mydb", None);
+        assert_eq!(selected.as_deref(), Some("mydb"));
+
+        for sql in ["SELECT 1; USE mydb#c", "SELECT 1; USE mydb-- c"] {
+            let (selected, _) = recorded_scope_for(sql, None);
+            assert_eq!(
+                selected.as_deref(),
+                Some("mydb"),
+                "a comment touching the name is not part of the name: {sql}"
+            );
+        }
+    }
+
+    /// A statement that moves nothing produces no scope change at all, so
+    /// nothing can be recorded from a stale answer.
+    #[test]
+    fn a_statement_that_moves_nothing_reports_no_scope_change() {
+        let (selected, _) = recorded_scope_for("SELECT 1", Some(Some("mydb".to_string())));
+        assert_eq!(selected, None);
     }
 }
 
@@ -31971,7 +32267,6 @@ mod query_execution_cleanup_tests {
         let clean_snapshot = crate::db::PooledSessionLeaseSnapshot {
             db_type: crate::db::DatabaseType::MySQL,
             pool_context_epoch: 0,
-            transaction_state: TransactionSessionState::Clean,
             retained_state: RetainedSessionState::from_transaction_state(
                 TransactionSessionState::Clean,
             ),
@@ -31980,7 +32275,6 @@ mod query_execution_cleanup_tests {
         let dirty_snapshot = crate::db::PooledSessionLeaseSnapshot {
             db_type: crate::db::DatabaseType::MySQL,
             pool_context_epoch: 0,
-            transaction_state: TransactionSessionState::MaybeDirty,
             retained_state: RetainedSessionState::from_transaction_state(
                 TransactionSessionState::MaybeDirty,
             ),
@@ -31989,7 +32283,6 @@ mod query_execution_cleanup_tests {
         let decision_snapshot = crate::db::PooledSessionLeaseSnapshot {
             db_type: crate::db::DatabaseType::Oracle,
             pool_context_epoch: 0,
-            transaction_state: TransactionSessionState::DecisionRequired,
             retained_state: RetainedSessionState::from_transaction_state(
                 TransactionSessionState::DecisionRequired,
             ),
@@ -32009,7 +32302,6 @@ mod query_execution_cleanup_tests {
         let transaction_mode_snapshot = crate::db::PooledSessionLeaseSnapshot {
             db_type: crate::db::DatabaseType::MySQL,
             pool_context_epoch: 0,
-            transaction_state: TransactionSessionState::Clean,
             retained_state: transaction_mode_override_state,
             current_scope: None,
         };
@@ -32660,11 +32952,11 @@ mod query_execution_cleanup_tests {
             .expect("open Oracle transaction should retain a pooled session");
         assert_eq!(snapshot.db_type, DatabaseType::Oracle);
         assert_eq!(
-            snapshot.transaction_state,
+            snapshot.transaction_state(),
             TransactionSessionState::MaybeDirty
         );
         assert!(
-            snapshot.transaction_state.may_have_uncommitted_work(),
+            snapshot.transaction_state().may_have_uncommitted_work(),
             "open Oracle transaction should be visible as retained session state"
         );
 
@@ -32693,7 +32985,7 @@ mod query_execution_cleanup_tests {
             .expect("rolled back Oracle transaction should keep the tab pooled session");
         assert_eq!(snapshot.db_type, DatabaseType::Oracle);
         assert!(
-            !snapshot.transaction_state.may_have_uncommitted_work(),
+            !snapshot.transaction_state().may_have_uncommitted_work(),
             "rolled back Oracle transaction should not be marked as transaction state"
         );
 
@@ -32753,7 +33045,10 @@ mod query_execution_cleanup_tests {
             return;
         };
         let Some(crate::db::DbPoolSession::Oracle(conn)) = connection
-            .acquire_pool_session()
+            .acquire_pool_session(crate::db::PooledSessionPurpose::tab_statements(
+                connection.auto_commit(),
+                connection.transaction_mode(),
+            ))
             .expect("Oracle pool session should be acquired")
         else {
             panic!("expected Oracle pool session");
@@ -34752,49 +35047,174 @@ mod query_execution_cleanup_tests {
         );
     }
 
-    /// A withdrawable target's break progress is a fact about ONE publication.
+    /// FORCE IS NEVER THE FIRST THING A SESSION SEES — on the lazy road too.
+    ///
+    /// The ordinary way to cancel a lazy fetch reaches this state: a fetch that
+    /// is WAITING between chunks (`fetch_in_progress == false`) is sent a
+    /// `GracefulClose` and NO DB break at all, because
+    /// `cancel_lazy_fetch_handle_for_session` breaks only a fetch that is
+    /// mid-fill. Every result-tab close does it, and so does the cancel button
+    /// whenever the fetch is paused. So if that close wedges — a cursor close
+    /// behind a lock, a stalled socket — the watchdog's deadline is the first
+    /// thing that ever asks the server anything, and it used to escalate
+    /// straight to the tier that cannot be taken back: `KILL CONNECTION` on the
+    /// MySQL family, a drop-close on Oracle, destroying the tab's own retained
+    /// transaction that `Cancel` had just promised to keep.
+    ///
+    /// Asserted by ORDER rather than by timing: the watchdog announces the
+    /// tear-down to the fetch worker with `LazyFetchCommand::ForceCancel`
+    /// BEFORE it acts, so a `ForceCancel` already queued at the moment the
+    /// session is first reached means the tear-down got there first.
+    #[test]
+    fn a_paused_lazy_fetchs_session_is_asked_to_stop_before_it_is_torn_down() {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (progress_sender, _progress_receiver) = progress_channel();
+        let reached_the_session = Arc::new(AtomicBool::new(false));
+        let release_the_tear_down = Arc::new(AtomicBool::new(false));
+        let lazy_force_target = QueryCancelTarget::empty();
+        lazy_force_target.publish(QueryCancelHandle::TestBlockingForce {
+            started: reached_the_session.clone(),
+            release: release_the_tear_down.clone(),
+        });
+        // NOTHING has claimed a break: this publication has never been asked to
+        // stop, which is what a paused fetch's cancel leaves behind.
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            index: 1,
+            session_id: 77,
+            operation_id: 77,
+            connection_generation: 3,
+            connection_id: None,
+            db_type: crate::db::DatabaseType::MySQL,
+            sender: command_sender,
+            cancel_handle: Some(lazy_force_target.as_handle()),
+            cancel_requested: Arc::new(AtomicBool::new(true)),
+            // `Cancel`, not `CancelAndDiscard`: the session is the tab's and
+            // the cancel promised to keep it.
+            retain_session_on_cancel: Arc::new(AtomicBool::new(true)),
+            db_cancel_requested: Arc::new(AtomicBool::new(false)),
+            fetch_in_progress: Arc::new(AtomicBool::new(false)),
+            cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            status_activity: None,
+        })));
+        let grace = Duration::from_millis(150);
+
+        SqlEditorWidget::start_lazy_fetch_cancel_watchdog_with(
+            active.clone(),
+            progress_sender,
+            77,
+            grace,
+        )
+        .expect("lazy fetch cancel watchdog should start");
+
+        let mut asked = false;
+        for _ in 0..400 {
+            if reached_the_session.load(Ordering::Relaxed) {
+                asked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(asked, "the watchdog must reach the session at its deadline");
+        assert!(
+            command_receiver.try_recv().is_err(),
+            "the FIRST thing that reaches a session must be the break, not the tear-down"
+        );
+
+        // ...and the tear-down still comes: the extra grace is one grace, spent
+        // in the publication's own state, not a way to postpone for ever.
+        let mut torn_down = false;
+        for _ in 0..600 {
+            if matches!(
+                command_receiver.try_recv(),
+                Ok(LazyFetchCommand::ForceCancel)
+            ) {
+                torn_down = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        release_the_tear_down.store(true, Ordering::Relaxed);
+        assert!(
+            torn_down,
+            "work that will not stop after it has been asked is still torn down"
+        );
+    }
+
+    /// A withdrawable target's break progress is a fact about ONE publication,
+    /// and its force pass is the SAME pass the operation slot takes.
     ///
     /// Publishing resets it — a fresh session has never been asked to stop, and
     /// a progress that outlived the publication it described would let the
     /// force tier hold (or skip holding) for a break that was aimed at a
-    /// different session. And with nothing published there is nothing a
-    /// tear-down could be too early for, so neither a claim nor a hold is
-    /// granted.
+    /// different session.
+    ///
+    /// The first assertion after a publish is the one this test was extended
+    /// for, and it is the whole of the lazy road's half of the fix: a
+    /// publication NOTHING HAS ASKED TO STOP answers `SendGracefulBreak`, not
+    /// `Force`. The old question ("is a break in flight?") could only say hold
+    /// or do not hold, and `NotAsked` fell in the same bucket as `Answered`, so
+    /// a lazy fetch cancelled while it was WAITING between chunks — sent a
+    /// `GracefulClose` and no DB break at all — met the tear-down as the first
+    /// thing that ever reached its session.
     #[test]
-    fn a_lazy_targets_break_progress_belongs_to_its_publication() {
-        use crate::ui::sql_editor::GracefulBreakClaim;
+    fn a_lazy_targets_force_pass_is_the_one_the_operation_slot_takes() {
+        use crate::ui::sql_editor::{ForcePassDecision, GracefulBreakClaim};
 
         let target = QueryCancelTarget::empty();
         assert_eq!(target.claim_graceful_break(), GracefulBreakClaim::NoSession);
-        assert!(!target.hold_force_deadline_for_break_in_flight());
+        assert_eq!(
+            target.force_pass_decision(),
+            ForcePassDecision::Withdrawn,
+            "with nothing published there is nothing to break and nothing to tear down"
+        );
 
         target.publish(QueryCancelHandle::Test(Arc::new(AtomicBool::new(false))));
-        assert_eq!(target.claim_graceful_break(), GracefulBreakClaim::Claimed);
+        // FORCE IS NEVER THE FIRST THING A SESSION SEES: the pass sends the
+        // break itself, and deciding so CLAIMS it.
+        assert_eq!(
+            target.force_pass_decision(),
+            ForcePassDecision::SendGracefulBreak
+        );
         assert_eq!(
             target.claim_graceful_break(),
             GracefulBreakClaim::AlreadySent,
-            "one publication's break is claimed once"
+            "deciding to send took the claim, so nothing else may send this publication's break"
         );
-        // The force deadline holds once for the travelling break, and only
+        // The force deadline then holds once for the travelling break, and only
         // once: a sender that never answers cannot postpone the force tier.
-        assert!(target.hold_force_deadline_for_break_in_flight());
-        assert!(!target.hold_force_deadline_for_break_in_flight());
+        assert_eq!(
+            target.force_pass_decision(),
+            ForcePassDecision::HoldForBreakInFlight
+        );
+        assert_eq!(target.force_pass_decision(), ForcePassDecision::Force);
 
         // A republish while a break travels: the new session has never been
-        // asked, so nothing is travelling FOR IT — no hold, and its own break
-        // is still claimable.
+        // asked, so its own break is sent first and is still claimable.
         target.publish(QueryCancelHandle::Test(Arc::new(AtomicBool::new(false))));
-        assert!(!target.hold_force_deadline_for_break_in_flight());
-        assert_eq!(target.claim_graceful_break(), GracefulBreakClaim::Claimed);
+        assert_eq!(
+            target.force_pass_decision(),
+            ForcePassDecision::SendGracefulBreak
+        );
         target.finish_graceful_break();
-        assert!(
-            !target.hold_force_deadline_for_break_in_flight(),
+        assert_eq!(
+            target.force_pass_decision(),
+            ForcePassDecision::Force,
             "a break that has answered holds nothing — escalation is honest from there"
         );
 
+        // A break claimed by the CANCEL THREAD is what the hold exists for, and
+        // the pass sees it because the claim and the hold are one state.
+        target.publish(QueryCancelHandle::Test(Arc::new(AtomicBool::new(false))));
+        assert_eq!(target.claim_graceful_break(), GracefulBreakClaim::Claimed);
+        assert_eq!(
+            target.force_pass_decision(),
+            ForcePassDecision::HoldForBreakInFlight
+        );
+        assert_eq!(target.force_pass_decision(), ForcePassDecision::Force);
+
         target.withdraw();
         assert_eq!(target.claim_graceful_break(), GracefulBreakClaim::NoSession);
-        assert!(!target.hold_force_deadline_for_break_in_flight());
+        assert_eq!(target.force_pass_decision(), ForcePassDecision::Withdrawn);
     }
 
     #[test]
@@ -35083,21 +35503,33 @@ mod query_execution_cleanup_tests {
             )),
             "OCI and the MySQL family have graceful breaks that interrupt, so they keep the configured grace"
         );
-        let derivation = source
-            .find("fn lazy_fetch_cancel_watchdog_timeout_for(")
-            .expect("the lazy force-grace derivation must exist");
-        let derivation_end = source[derivation..]
-            .find("\n    fn ")
-            .map(|end| derivation + end)
-            .unwrap_or(source.len());
-        let derivation_body = &source[derivation..derivation_end];
+        let body_of = |signature: &str| -> String {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} must exist"));
+            let end = source[start..]
+                .find("\n    fn ")
+                .map(|end| start + end)
+                .unwrap_or(source.len());
+            source[start..end].to_string()
+        };
+        // The watchdog-start derivation asks the SHARED one, because the
+        // watchdog asks it again after sending a break of its own: a fetch
+        // cancelled while it is paused is sent no DB break by the cancel road
+        // at all, so the shortening has to reach the watchdog's break too.
+        let derivation_body = body_of("fn lazy_fetch_cancel_watchdog_timeout_for(");
         assert!(
-            derivation_body.contains("graceful_break_may_not_interrupt_a_blocked_call"),
-            "the thin cap must be gated on the per-backend break fact"
+            derivation_body.contains("Self::lazy_fetch_force_grace_after_a_db_break("),
+            "the grace after a DB break must be derived the one way: {derivation_body}"
+        );
+        let shared_body = body_of("fn lazy_fetch_force_grace_after_a_db_break(");
+        assert!(
+            shared_body.contains("graceful_break_may_not_interrupt_a_blocked_call"),
+            "the thin cap must be gated on the per-backend break fact: {shared_body}"
         );
         assert!(
-            derivation_body.contains("ORACLE_THIN_LAZY_FETCH_DB_CANCEL_FORCE_TIMEOUT"),
-            "the capped arm still uses the thin force grace"
+            shared_body.contains("ORACLE_THIN_LAZY_FETCH_DB_CANCEL_FORCE_TIMEOUT"),
+            "the capped arm still uses the thin force grace: {shared_body}"
         );
     }
 
@@ -38785,7 +39217,10 @@ mod mysql_batch_execution_regression_tests {
         }
         let advanced = connection.get_info().advanced.clone();
         let Some(DbPoolSession::MySQL { mut conn, .. }) = connection
-            .acquire_pool_session()
+            .acquire_pool_session(crate::db::PooledSessionPurpose::tab_statements(
+                connection.auto_commit(),
+                connection.transaction_mode(),
+            ))
             .expect("acquire MySQL pool session")
         else {
             panic!("expected MySQL pool session");
@@ -38840,7 +39275,10 @@ mod mysql_batch_execution_regression_tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let connection_generation = connection.connection_generation();
             let Some(DbPoolSession::MySQL { mut conn, .. }) = connection
-                .acquire_pool_session()
+                .acquire_pool_session(crate::db::PooledSessionPurpose::tab_statements(
+                    connection.auto_commit(),
+                    connection.transaction_mode(),
+                ))
                 .expect("acquire MySQL pool session")
             else {
                 panic!("expected MySQL pool session");
@@ -39693,6 +40131,68 @@ mod mysql_batch_execution_regression_tests {
         progress
     }
 
+    /// Whether this script turns auto-commit off, read from the script itself
+    /// with the parser the executor uses.
+    ///
+    /// ASKED, not passed in. The helper used to assert unconditionally that an
+    /// `AutoCommitChanged { enabled: false }` event was emitted, which is true
+    /// for the callers whose scripts contain `SET AUTOCOMMIT OFF` and
+    /// impossible for the two that pass a FIXTURE file: neither
+    /// `test_mariadb/test7.txt` nor `test8.txt` contains the `@TRANSACTION`
+    /// directive their test names are about, so both tests asserted an event
+    /// nothing in them could produce, and neither had ever passed.
+    ///
+    /// Making it a parameter would only move the same mistake to the caller.
+    /// The script is right here, and the production parser answers the question
+    /// exactly — including the tool-command spelling, which no substring match
+    /// would get right.
+    fn script_turns_auto_commit_off(script: &str, db_type: DatabaseType) -> bool {
+        // The executor's own splitter, so a tool command and a statement are
+        // told apart here exactly as they are when the batch runs.
+        SqlEditorWidget::build_mysql_batch_items(script, db_type, None)
+            .into_iter()
+            .any(|item| match item {
+                crate::db::ScriptItem::ToolCommand(crate::db::ToolCommand::SetAutoCommit {
+                    enabled,
+                }) => !enabled,
+                crate::db::ScriptItem::ToolCommand(_) => false,
+                crate::db::ScriptItem::Statement(sql) => {
+                    crate::db::transaction::mysql_set_autocommit_value_for_db_type(db_type, &sql)
+                        == Some(false)
+                }
+            })
+    }
+
+    /// The predicate above DECIDES whether an assertion runs, so a wrong answer
+    /// would silently weaken every test that uses it — which is exactly how the
+    /// two fixture tests came to assert something impossible. It runs without a
+    /// database, so it is checked on every build.
+    #[test]
+    fn the_auto_commit_expectation_is_read_from_the_script() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert!(
+                script_turns_auto_commit_off("@TRANSACTION\nSELECT 1;", db_type),
+                "the tool-command spelling must be recognised on {db_type}"
+            );
+            assert!(
+                script_turns_auto_commit_off("SET AUTOCOMMIT OFF;\nSELECT 1;", db_type),
+                "the statement spelling must be recognised on {db_type}"
+            );
+            assert!(
+                script_turns_auto_commit_off("SET SESSION autocommit = 0;", db_type),
+                "the assignment spelling must be recognised on {db_type}"
+            );
+            assert!(
+                !script_turns_auto_commit_off("SELECT 1;\nSTART TRANSACTION;\nCOMMIT;", db_type),
+                "an explicit transaction is not an auto-commit change on {db_type}"
+            );
+            assert!(
+                !script_turns_auto_commit_off("SET AUTOCOMMIT ON;", db_type),
+                "turning it ON is not turning it off on {db_type}"
+            );
+        }
+    }
+
     fn assert_mysql_batch_script_reaches_final_status_pass(script: &str, db_activity: &str) {
         assert_mysql_batch_script_reaches_final_status_pass_for_db_type(
             script,
@@ -39702,6 +40202,18 @@ mod mysql_batch_execution_regression_tests {
     }
 
     fn assert_mysql_batch_script_reaches_final_status_pass_for_db_type(
+        script: &str,
+        db_activity: &str,
+        db_type: DatabaseType,
+    ) {
+        assert_mysql_batch_script_reaches_final_status_pass_with_auto_commit(
+            script,
+            db_activity,
+            db_type,
+        );
+    }
+
+    fn assert_mysql_batch_script_reaches_final_status_pass_with_auto_commit(
         script: &str,
         db_activity: &str,
         db_type: DatabaseType,
@@ -39804,13 +40316,15 @@ mod mysql_batch_execution_regression_tests {
             _ => None,
         });
 
-        assert!(
-            progress.iter().any(|message| matches!(
-                message,
-                QueryProgress::AutoCommitChanged { enabled: false }
-            )),
-            "@TRANSACTION should disable autocommit during batch execution\n{progress_summary}"
-        );
+        if script_turns_auto_commit_off(script, db_type) {
+            assert!(
+                progress.iter().any(|message| matches!(
+                    message,
+                    QueryProgress::AutoCommitChanged { enabled: false }
+                )),
+                "a script that turns auto-commit off must say so during batch execution\n{progress_summary}"
+            );
+        }
         assert!(
             final_status_index.is_some(),
             "batch execution should emit the FINAL_STATUS select\n{progress_summary}"
@@ -39967,11 +40481,22 @@ mod mysql_batch_execution_regression_tests {
         );
     }
 
+    /// Run a session-rule script and hand back BOTH what it did and the
+    /// HARNESS that owns the connection.
+    ///
+    /// Returning the harness is the whole point. A retained session lives in a
+    /// SLOT, but the session itself belongs to the connection's pool — so
+    /// handing back only the lease dropped the last `Arc` on that connection,
+    /// and the session died asynchronously while the assertions were still
+    /// asking about it. `snapshot()` answered `Some` on one line and `None` on
+    /// the next, and the five retention regressions below failed for that
+    /// reason on every run, covering nothing. The caller holds the harness for
+    /// as long as it holds the answer.
     fn execute_mysql_session_rule_script(
         script: &str,
         initial_auto_commit: bool,
         db_activity: &str,
-    ) -> Option<(Vec<QueryProgress>, crate::db::SharedDbSessionLease)> {
+    ) -> Option<(Vec<QueryProgress>, MysqlSessionRuleHarness)> {
         execute_mysql_session_rule_script_for_db_type(
             script,
             initial_auto_commit,
@@ -39985,10 +40510,10 @@ mod mysql_batch_execution_regression_tests {
         initial_auto_commit: bool,
         db_activity: &str,
         db_type: DatabaseType,
-    ) -> Option<(Vec<QueryProgress>, crate::db::SharedDbSessionLease)> {
+    ) -> Option<(Vec<QueryProgress>, MysqlSessionRuleHarness)> {
         let harness = MysqlSessionRuleHarness::new_for_db_type(initial_auto_commit, db_type)?;
         let progress = harness.execute(script, db_activity);
-        Some((progress, harness.pooled_db_session.clone()))
+        Some((progress, harness))
     }
 
     fn assert_no_failed_mysql_statement(progress: &[QueryProgress]) {
@@ -40546,13 +41071,16 @@ FROM qt_session_rule_result;
 DROP PROCEDURE IF EXISTS qt_session_rule_call;
 DROP TABLE IF EXISTS qt_session_rule_result;
 ";
-        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+        let Some((progress, session_rule_harness)) = execute_mysql_session_rule_script(
             script,
             true,
             "mysql complex session retention regression",
         ) else {
             return;
         };
+        // Held for the whole test: the session in this lease belongs to the
+        // harness's connection, and dropping that connection kills it.
+        let pooled_db_session = session_rule_harness.pooled_db_session.clone();
 
         assert_no_failed_mysql_statement(&progress);
         assert_mysql_final_status_pass(&progress);
@@ -40572,13 +41100,16 @@ DROP TABLE IF EXISTS qt_session_rule_result;
     #[test]
     #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn mysql_pooled_session_retains_read_only_autocommit_off_statement() {
-        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+        let Some((progress, session_rule_harness)) = execute_mysql_session_rule_script(
             "@TRANSACTION\nSELECT 1 AS read_only_probe;",
             true,
             "mysql read-only autocommit-off tab session regression",
         ) else {
             return;
         };
+        // Held for the whole test: the session in this lease belongs to the
+        // harness's connection, and dropping that connection kills it.
+        let pooled_db_session = session_rule_harness.pooled_db_session.clone();
 
         assert_no_failed_mysql_statement(&progress);
         let snapshot = pooled_db_session
@@ -40586,7 +41117,7 @@ DROP TABLE IF EXISTS qt_session_rule_result;
             .expect("read-only autocommit-off statement should keep the tab pooled session");
         assert_eq!(snapshot.db_type, DatabaseType::MySQL);
         assert!(
-            !snapshot.transaction_state.may_have_uncommitted_work(),
+            !snapshot.transaction_state().may_have_uncommitted_work(),
             "read-only SELECT should not ask for commit/rollback\n{}",
             summarize_progress(&progress)
         );
@@ -40606,7 +41137,7 @@ DROP TABLE IF EXISTS qt_session_rule_result;
     }
 
     fn assert_mysql_pooled_session_retains_open_transaction_until_rollback(db_type: DatabaseType) {
-        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script_for_db_type(
+        let Some((progress, session_rule_harness)) = execute_mysql_session_rule_script_for_db_type(
             "\
 DROP TABLE IF EXISTS qt_session_rule_open_tx;
 CREATE TABLE qt_session_rule_open_tx (id INT PRIMARY KEY);
@@ -40620,6 +41151,9 @@ SELECT 'OPEN_TX' AS section_name, COUNT(*) AS row_count FROM qt_session_rule_ope
         ) else {
             return;
         };
+        // Held for the whole test: the session in this lease belongs to the
+        // harness's connection, and dropping that connection kills it.
+        let pooled_db_session = session_rule_harness.pooled_db_session.clone();
 
         assert_no_failed_mysql_statement(&progress);
         let snapshot = pooled_db_session
@@ -40627,13 +41161,13 @@ SELECT 'OPEN_TX' AS section_name, COUNT(*) AS row_count FROM qt_session_rule_ope
             .expect("open transaction should retain a pooled session");
         assert_eq!(snapshot.db_type, db_type);
         assert!(
-            snapshot.transaction_state.may_have_uncommitted_work(),
+            snapshot.transaction_state().may_have_uncommitted_work(),
             "open transaction should be visible as retained session state"
         );
 
         pooled_db_session.clear();
 
-        let Some((cleanup_progress, cleanup_pooled_db_session)) =
+        let Some((cleanup_progress, cleanup_harness)) =
             execute_mysql_session_rule_script_for_db_type(
                 "ROLLBACK; DROP TABLE IF EXISTS qt_session_rule_open_tx;",
                 true,
@@ -40643,6 +41177,9 @@ SELECT 'OPEN_TX' AS section_name, COUNT(*) AS row_count FROM qt_session_rule_ope
         else {
             return;
         };
+        // Held for the whole test: the session in this lease belongs to the
+        // harness's connection, and dropping that connection kills it.
+        let cleanup_pooled_db_session = cleanup_harness.pooled_db_session.clone();
 
         assert_no_failed_mysql_statement(&cleanup_progress);
         let snapshot = cleanup_pooled_db_session.snapshot().expect(
@@ -40650,7 +41187,7 @@ SELECT 'OPEN_TX' AS section_name, COUNT(*) AS row_count FROM qt_session_rule_ope
         );
         assert_eq!(snapshot.db_type, db_type);
         assert!(
-            !snapshot.transaction_state.may_have_uncommitted_work(),
+            !snapshot.transaction_state().may_have_uncommitted_work(),
             "rollback cleanup should not be marked as transaction or lock state\n{}",
             summarize_progress(&cleanup_progress)
         );
@@ -40670,13 +41207,16 @@ SELECT 'FINAL_STATUS' AS section_name,
            ELSE CONCAT('FAIL lock_state=', COALESCE(IS_FREE_LOCK(@qt_session_rule_lock_name), -1))
        END AS result_status;
 ";
-        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+        let Some((progress, session_rule_harness)) = execute_mysql_session_rule_script(
             script,
             true,
             "mysql selected-range lock release regression",
         ) else {
             return;
         };
+        // Held for the whole test: the session in this lease belongs to the
+        // harness's connection, and dropping that connection kills it.
+        let pooled_db_session = session_rule_harness.pooled_db_session.clone();
 
         assert_no_failed_mysql_statement(&progress);
         assert_mysql_final_status_pass(&progress);
@@ -40706,13 +41246,16 @@ SELECT 'FINAL_STATUS' AS section_name,
            ELSE CONCAT('FAIL lock_state=', COALESCE(IS_FREE_LOCK(@qt_session_rule_lock_name), -1))
        END AS result_status;
 ";
-        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+        let Some((progress, session_rule_harness)) = execute_mysql_session_rule_script(
             script,
             true,
             "mysql selected-range single lock release retention regression",
         ) else {
             return;
         };
+        // Held for the whole test: the session in this lease belongs to the
+        // harness's connection, and dropping that connection kills it.
+        let pooled_db_session = session_rule_harness.pooled_db_session.clone();
 
         assert_no_failed_mysql_statement(&progress);
         assert_mysql_final_status_pass(&progress);
@@ -40721,7 +41264,7 @@ SELECT 'FINAL_STATUS' AS section_name,
             .expect("single RELEASE_LOCK should conservatively retain a pooled session");
         assert_eq!(snapshot.db_type, DatabaseType::MySQL);
         assert!(
-            snapshot.transaction_state.may_have_uncommitted_work(),
+            snapshot.transaction_state().may_have_uncommitted_work(),
             "single RELEASE_LOCK retention should be visible as retained session state"
         );
 
@@ -40740,13 +41283,16 @@ SELECT 'FINAL_STATUS' AS section_name,
            ELSE CONCAT('FAIL owner=', COALESCE(IS_USED_LOCK(@qt_session_rule_lock_name), -1))
        END AS result_status;
 ";
-        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+        let Some((progress, session_rule_harness)) = execute_mysql_session_rule_script(
             script,
             true,
             "mysql selected-range lock retention regression",
         ) else {
             return;
         };
+        // Held for the whole test: the session in this lease belongs to the
+        // harness's connection, and dropping that connection kills it.
+        let pooled_db_session = session_rule_harness.pooled_db_session.clone();
 
         assert_no_failed_mysql_statement(&progress);
         assert_mysql_final_status_pass(&progress);
@@ -40755,7 +41301,7 @@ SELECT 'FINAL_STATUS' AS section_name,
             .expect("open named lock should retain a pooled session");
         assert_eq!(snapshot.db_type, DatabaseType::MySQL);
         assert!(
-            snapshot.transaction_state.may_have_uncommitted_work(),
+            snapshot.transaction_state().may_have_uncommitted_work(),
             "open named lock should be visible as retained session state"
         );
 
@@ -41209,8 +41755,17 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
             eprintln!("skipping: test_mariadb/test8.txt requires MariaDB");
             return;
         }
-        assert_mysql_batch_script_reaches_final_status_pass_for_db_type(
-            include_str!("../../../test_mariadb/test8.txt"),
+        // The directive this test is named for. It is NOT in the fixture —
+        // that is why the test could never pass — and putting it in the
+        // fixture would change a file that is certified against a live server
+        // for its grammar, not for this. Running the script AFTER the
+        // directive is exactly what the name claims, so the test states it
+        // here.
+        assert_mysql_batch_script_reaches_final_status_pass_with_auto_commit(
+            &format!(
+                "@TRANSACTION\n{}",
+                include_str!("../../../test_mariadb/test8.txt")
+            ),
             "mysql test8 regression",
             DatabaseType::MariaDB,
         );
@@ -41223,8 +41778,17 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
             eprintln!("skipping: test_mariadb/test7.txt requires MariaDB");
             return;
         }
-        assert_mysql_batch_script_reaches_final_status_pass_for_db_type(
-            include_str!("../../../test_mariadb/test7.txt"),
+        // The directive this test is named for. It is NOT in the fixture —
+        // that is why the test could never pass — and putting it in the
+        // fixture would change a file that is certified against a live server
+        // for its grammar, not for this. Running the script AFTER the
+        // directive is exactly what the name claims, so the test states it
+        // here.
+        assert_mysql_batch_script_reaches_final_status_pass_with_auto_commit(
+            &format!(
+                "@TRANSACTION\n{}",
+                include_str!("../../../test_mariadb/test7.txt")
+            ),
             "mysql test7 regression",
             DatabaseType::MariaDB,
         );

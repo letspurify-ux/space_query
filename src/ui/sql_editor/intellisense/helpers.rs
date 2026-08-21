@@ -502,7 +502,11 @@ impl SqlEditorWidget {
         // sibling metadata lookups (signature hints, bind-prompt routine
         // arguments) already acquire this way.
         let mut pool_session = match context
-            .acquire_session_for_scope(scope.as_deref(), &activity_guard)
+            .acquire_session_for_scope(
+            scope.as_deref(),
+            crate::db::PooledSessionPurpose::AppRead,
+            &activity_guard,
+        )
         {
             Ok(session) => session,
             Err(_) => {

@@ -743,7 +743,19 @@ impl MysqlExecutor {
             MysqlStatementKind::Use => {
                 let start = Instant::now();
                 conn.query_drop(sql)?;
-                let db_name = Self::extract_use_database_name(trimmed);
+                // WHERE the session landed is the SESSION's answer, not a parse
+                // of the statement that moved it -- the same rule the app
+                // applies to the scope it RECORDS
+                // (`MySqlSessionLandedScope`). Naming the parsed text here was
+                // the second answer to that one question: the server does not
+                // always store a database name the way it was typed
+                // (`lower_case_table_names=1` folds it), so the grid could say
+                // "changed to MyDb" for a session that is in `mydb`.
+                //
+                // The parse stays as the fallback for a session that could not
+                // be asked, which is what it has always been.
+                let db_name = Self::session_current_database(conn)
+                    .unwrap_or_else(|| Self::extract_use_database_name(trimmed));
                 Ok(vec![QueryResult::new_non_select_success(
                     sql,
                     Self::current_database_changed_message(&db_name),
@@ -1217,6 +1229,22 @@ impl MysqlExecutor {
         )
     }
 
+    /// What the SESSION says its database is, or `None` when it could not be
+    /// asked.
+    ///
+    /// A `USE` is the one statement whose whole effect is invisible to the
+    /// client, so the client has to ask. An empty answer means the server has
+    /// detached this session from every database, which is not a name and must
+    /// not be reported as one.
+    fn session_current_database<C: Queryable>(conn: &mut C) -> Option<String> {
+        conn.query_first::<Option<String>, _>("SELECT DATABASE()")
+            .ok()
+            .flatten()
+            .flatten()
+            .map(|database| database.trim().to_string())
+            .filter(|database| !database.is_empty())
+    }
+
     fn current_database_changed_message(database: &str) -> String {
         result_messages::current_scope_changed("database", database)
     }
@@ -1230,6 +1258,20 @@ impl MysqlExecutor {
             }
         }
         index
+    }
+
+    /// Whether a MySQL/MariaDB comment BEGINS at `index`.
+    ///
+    /// The one definition of the family's three comment openers, so the rule
+    /// that skips trivia BEFORE an identifier and the rule that ENDS an
+    /// unquoted identifier cannot disagree about what a comment is. They did:
+    /// the leading side knew all three and the trailing side knew none, so
+    /// `USE mydb/*c*/` — a statement the server runs — yielded the name
+    /// `mydb/*c*/`.
+    fn mysql_comment_starts_at(bytes: &[u8], index: usize) -> bool {
+        (bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*'))
+            || bytes.get(index) == Some(&b'#')
+            || sql_text::is_mysql_dash_comment_start(bytes, index)
     }
 
     fn skip_use_statement_trivia(source: &str, mut index: usize) -> usize {
@@ -1295,7 +1337,12 @@ impl MysqlExecutor {
     }
 
     /// First identifier token of `after`, honoring backtick quoting with ``
-    /// escapes; unquoted names end at whitespace or `;`.
+    /// escapes; unquoted names end at whitespace, `;`, or a COMMENT.
+    ///
+    /// The comment half is not decoration. `USE mydb/*c*/`, `USE mydb#c` and
+    /// `USE mydb-- c` are all statements MySQL runs, and the app executes the
+    /// unit verbatim — so taking the comment as part of the name made every
+    /// caller name a database the server does not have.
     fn leading_identifier_token(after: &str) -> String {
         let after = after.trim_start();
         if after.starts_with('`') {
@@ -1316,12 +1363,22 @@ impl MysqlExecutor {
             }
             after.get(1..idx).unwrap_or(after).replace("``", "`")
         } else {
-            // Unquoted: take the first whitespace/semicolon-delimited token.
-            after
-                .split(|c: char| c.is_ascii_whitespace() || c == ';')
-                .next()
-                .unwrap_or("")
-                .to_string()
+            // Unquoted: the name runs until whitespace, `;`, or the start of a
+            // comment. Scanning by byte is safe for a multi-byte name — every
+            // terminator is ASCII, and a UTF-8 continuation byte can never
+            // match one, so the break index is always a char boundary.
+            let bytes = after.as_bytes();
+            let mut idx = 0usize;
+            while idx < bytes.len() {
+                if bytes[idx].is_ascii_whitespace()
+                    || bytes[idx] == b';'
+                    || Self::mysql_comment_starts_at(bytes, idx)
+                {
+                    break;
+                }
+                idx += 1;
+            }
+            after.get(..idx).unwrap_or(after).to_string()
         }
     }
 
@@ -4123,6 +4180,60 @@ mod tests {
             MysqlExecutor::extract_use_database_name("USE /* first */ /* second */ `my database`;"),
             "my database",
             "multiple block comments before a quoted db name should be ignored"
+        );
+    }
+
+    /// A comment that runs straight into the database name ends it.
+    ///
+    /// All three are statements the server accepts and the app executes
+    /// verbatim, so the name it derives has to be the name the server used.
+    /// It was not: the unquoted token ended only at whitespace or `;`, so
+    /// `USE mydb/*c*/` produced `mydb/*c*/` — and that value went into the
+    /// tab's binding, its browser card and the batch's own scope cell, after
+    /// which every statement of the run failed with "Unknown database".
+    #[test]
+    fn mysql_extract_use_database_name_ends_at_a_comment_touching_the_name() {
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE mydb/*c*/"),
+            "mydb",
+            "a block comment touching the name is not part of the name"
+        );
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE mydb/*c*/;"),
+            "mydb"
+        );
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE mydb#c"),
+            "mydb",
+            "`#` opens a comment on this family with no whitespace needed"
+        );
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE mydb-- c"),
+            "mydb",
+            "`-- ` opens a comment, and the name stops where the comment starts"
+        );
+        // The rule is only about COMMENT starts: a dash run that is not a
+        // comment opener still belongs to the token, exactly as before.
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE mydb-x"),
+            "mydb-x"
+        );
+        // ...and a quoted name is untouched by any of it.
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE `my db`/*c*/"),
+            "my db"
+        );
+    }
+
+    /// The same token rule, and therefore the same fix, for the other caller.
+    #[test]
+    fn mysql_drop_database_name_ends_at_a_comment_touching_the_name() {
+        assert_eq!(
+            MysqlExecutor::drop_database_statement_database_name_for_db_type(
+                DatabaseType::MySQL,
+                "DROP DATABASE mydb/*c*/"
+            ),
+            Some("mydb".to_string())
         );
     }
 

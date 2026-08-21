@@ -51,7 +51,7 @@ use crate::ui::{
     ObjectBrowserMetadataSnapshot, ObjectBrowserWidget, QualifiedMemberKind, QueryCancelOutcome,
     QueryHistoryDialog, QueryOperationToken, QueryProgress, QueryTabId, QueryTabsWidget,
     ResultMessageKind, ResultTabCloseTarget, ResultTabId, ResultTabRequest, ResultTabStatus,
-    ResultTabsWidget, SqlAction, SqlEditorContextAction, SqlEditorWidget,
+    ResultTabsWidget, SqlAction, SqlEditorContextAction, SqlEditorWidget, TabDbWork,
     TableBrowseExecuteCallback, TableBrowseNavigation, TableBrowsePageRequest, TableBrowseTarget,
 };
 use crate::utils::arithmetic::{safe_div, safe_div_f64_to_usize, safe_rem};
@@ -118,6 +118,24 @@ const APPLICATION_EXIT_SESSION_TEARDOWN_POLL: Duration = Duration::from_millis(2
 // unwinding, and the session went with the process. Every phase ends the
 // instant its work is done, so a quiet exit spends none of this.
 const APPLICATION_EXIT_WORK_STOP_GRACE: Duration = Duration::from_secs(3);
+
+/// The grace a connection-ending teardown gives work the app has ALREADY
+/// failed to stop, before it destroys the session.
+///
+/// Short on purpose, and that is the whole of it: the graceful tier exists so a
+/// statement can stop of its own accord, and this one has been asked twice
+/// already — the cancel's own two tiers, whose failure is what put the work in
+/// this state. Repeating the configured cancel timeout (1-120s) here would only
+/// make the user wait it out a second time for an answer that has already come.
+const SESSION_TEARDOWN_UNSTOPPABLE_WORK_BREAK_GRACE: Duration = Duration::from_millis(250);
+
+/// How long that teardown then waits for the worker to let go of the session it
+/// just destroyed, before it refuses.
+///
+/// The same budget application exit gives the same question
+/// ([`APPLICATION_EXIT_WORK_STOP_GRACE`]), because it IS the same question: the
+/// session is gone, and what is being waited for is the worker's own unwind.
+const SESSION_TEARDOWN_UNSTOPPABLE_WORK_STOP_GRACE: Duration = Duration::from_secs(3);
 // How long exit waits for the teardown it has already DECIDED to actually reach
 // the server. Every road that ends a connection hands the logoff itself to the
 // connection cleanup worker (`retire_connection_resources_in_background`), so
@@ -626,7 +644,9 @@ impl SchemaMetadataLoader for OracleSchemaMetadataLoader {
         // was used at all, so the longest-running background read in the app
         // was neither offerable by the cancel button nor breakable by a
         // disconnect. See `AcquiredPoolSession`.
-        let acquired = match context.acquire_session_for_current_scope(activity) {
+        let acquired = match context
+            .acquire_session_for_current_scope(crate::db::PooledSessionPurpose::AppRead, activity)
+        {
             Ok(acquired) => acquired,
             Err(err) => {
                 eprintln!("Warning: failed to acquire Oracle metadata session: {err}");
@@ -795,7 +815,9 @@ impl SchemaMetadataLoader for MysqlSchemaMetadataLoader {
         context.ensure_current().ok()?;
         // One value, session and cancel reach together -- see the Oracle
         // loader above and `AcquiredPoolSession`.
-        let acquired = match context.acquire_session_for_current_scope(activity) {
+        let acquired = match context
+            .acquire_session_for_current_scope(crate::db::PooledSessionPurpose::AppRead, activity)
+        {
             Ok(acquired) => acquired,
             Err(err) => {
                 eprintln!("Warning: failed to acquire {display_name} metadata session: {err}");
@@ -1428,6 +1450,144 @@ enum QueryCancelPhase {
     Dispatched,
 }
 
+/// The per-connection DEFAULTS the screen last learned from the active tab's
+/// connection.
+///
+/// ONE value rather than one field per option, because they are one fact: they
+/// are learned in the SAME read of the connection, they are valid for the same
+/// [`AppState::active_connection_view_id`], and they go stale together. They
+/// were not one, and that is what made the transaction mode the only per-tab
+/// setting a BUSY connection could refuse: auto-commit had a cache and read it,
+/// while the transaction-mode toolbar went to the connection mutex for the
+/// connection's own default and gave up when a NEIGHBOUR tab's statement, an
+/// Oracle explain plan, an OCI script after `CONNECT` or a metadata load was
+/// holding it.
+///
+/// `None` means "not learned for this connection yet", which is not the same as
+/// a default value and must never be shown as one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CachedConnectionDefaults {
+    auto_commit: Option<bool>,
+    transaction_mode: Option<TransactionMode>,
+}
+
+/// Why a session teardown was refused, in the form the CALLER has to act on.
+///
+/// Two answers, not one string, because they call for opposite things. A
+/// `Reported` refusal is the user's to satisfy — stop the query, wait for the
+/// connection. The other one is not: a statement wedged on the connection's OWN
+/// session cannot be stopped by asking, because a cancel may never destroy that
+/// session and Oracle thin's in-band break does not reach a call that is
+/// already blocked. Telling the user to "stop it before continuing" there sent
+/// them round a loop with no exit — the force tier's own message names
+/// `File > Disconnect`, and `File > Disconnect` refused for the same work.
+///
+/// So it is not a message: it is an instruction to
+/// [`DecidedSessionTeardown::decide`] to end that work and ask again.
+enum SessionTeardownRefusal {
+    /// The user can act on this. The message is theirs.
+    Reported(String),
+    /// A statement the app has already spent its strongest cancel tier on.
+    /// Only ending the connection ends it, and that is what the caller is
+    /// doing.
+    WorkTheAppCouldNotStop,
+}
+
+/// What a query tab's DB work means for an action that ends sessions.
+///
+/// THREE answers, not two. A gate that could only say "there is work" had to
+/// refuse on all of it with "Stop it before continuing", and that is
+/// unsatisfiable for work the APP has already spent its strongest cancel tier
+/// on: the session is the connection's own, a cancel may never destroy one, and
+/// on Oracle thin an in-band break does not reach a call that is already
+/// blocked. The force tier told the user to use `File > Disconnect`; the gate
+/// then refused `File > Disconnect` for the same work.
+///
+/// See [`crate::ui::sql_editor::SqlEditorWidget::db_work_the_app_could_not_stop`]
+/// for where the fact comes from, and [`crate::db::SessionCancelPurpose`] for
+/// the tier that ends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabWorkObstacle {
+    /// Nothing a session-ending action would run over.
+    None,
+    /// Work the user can still stop. Every session-ending action refuses on it.
+    Stoppable,
+    /// A statement the app has already failed to stop, and nothing else. An
+    /// action that ENDS THE CONNECTION does not refuse on it -- it ends it,
+    /// which is the only thing left that can.
+    UnstoppableByAsking,
+}
+
+impl TabWorkObstacle {
+    /// What ONE tab's work means, apart from the widgets that answer the flags
+    /// — so the PRECEDENCE is pinned by a unit rather than by an FLTK widget
+    /// nothing can build in a test.
+    ///
+    /// "Can this be stopped by asking?" is not asked again here: it is part of
+    /// the app's ONE answer about a tab's work
+    /// ([`TabDbWork::UnstoppableStatement`], which already requires the wedged
+    /// statement to be the tab's whole work), because every gate that refuses
+    /// owes the user the right instruction and each of them would otherwise
+    /// re-derive it.
+    ///
+    /// Asked ONLY of a tab the SCOPE has already said has work, and the
+    /// catch-all arm below is that premise made load-bearing rather than a
+    /// hole: for one connection the scope's question is
+    /// `has_running_query_or_lazy_fetch_for_tab`, which also counts a lazy
+    /// fetch living in the tab's PROGRESS CONTEXT — work the editor's own flags
+    /// cannot see, because a fetch stays on the connection it was opened on
+    /// while the tab's binding can move. Answering `None` for it would let a
+    /// disconnect walk past work the gate has refused on since it was written.
+    fn for_one_tab(work: TabDbWork, progress_context_holds_a_lazy_fetch: bool) -> Self {
+        match work {
+            TabDbWork::UnstoppableStatement if !progress_context_holds_a_lazy_fetch => {
+                Self::UnstoppableByAsking
+            }
+            // Including `TabDbWork::None` — see the header.
+            _ => Self::Stoppable,
+        }
+    }
+
+    /// Fold one tab's answer into the answer for the whole scope.
+    ///
+    /// STOPPABLE DOMINATES: ending a connection over work that could still have
+    /// been stopped by asking is the thing this gate exists to prevent, so one
+    /// tab holding an ordinary running statement refuses the whole action even
+    /// when another tab's work is wedged.
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Stoppable, _) | (_, Self::Stoppable) => Self::Stoppable,
+            (Self::UnstoppableByAsking, _) | (_, Self::UnstoppableByAsking) => {
+                Self::UnstoppableByAsking
+            }
+            (Self::None, Self::None) => Self::None,
+        }
+    }
+}
+
+/// What the app knows when the user picks a transaction mode.
+///
+/// THREE answers, not two, and the third is why this is a value: "the
+/// connection's own defaults have not been read yet" is not "there is no
+/// connection". The first refuses and says why, the second silently puts the
+/// combos back -- and folding them together is what made a busy connection look
+/// like a disconnected one to the road that WRITES the pin.
+enum TransactionModePickContext {
+    Ready {
+        db_type: DatabaseType,
+        /// The mode this tab is effectively on right now, which is what decides
+        /// whether the SESSION has to be told anything.
+        previous_mode: TransactionMode,
+    },
+    /// The active tab has no live connection. There is nothing to pin a mode
+    /// on and nothing to say about it.
+    NotConnected,
+    /// The connection is up, but its own defaults have never been read on this
+    /// tab -- the mutex has been busy for the whole time it has been active.
+    /// The effective mode cannot be derived, so the pick is refused.
+    DefaultsNotLearnedYet,
+}
+
 fn query_cancel_phase_after_outcome(
     current: Option<QueryCancelPhase>,
     outcome: &QueryCancelOutcome,
@@ -1442,18 +1602,75 @@ fn query_cancel_phase_after_outcome(
         QueryCancelOutcome::AlreadyFinished
         | QueryCancelOutcome::StoppedBeforeInterrupt
         | QueryCancelOutcome::Failed(_)
-        | QueryCancelOutcome::ForceFailed(_) => None,
+        | QueryCancelOutcome::ForceFailed(_)
+        // Both tiers ran and the statement may still be running: the session
+        // is the connection's OWN, and destroying it is a deliberate action
+        // with its own bookkeeping, never a side effect of cancelling one call.
+        // So the cancel stops being PENDING — `cancel_target_is_pending`
+        // refuses a second Cancel while an entry is there, and the whole
+        // answer here is "ask again, or disconnect". The result tab goes back
+        // to Running, which is what it is; the reason reaches the user through
+        // `query_cancel_user_message`. The tab's own cancel flag stays set, so
+        // a script still stops at its next safe point.
+        | QueryCancelOutcome::ForceAskedAgain => None,
     }
 }
 
-fn query_cancel_failure_message(outcome: &QueryCancelOutcome) -> Option<String> {
-    match outcome {
-        QueryCancelOutcome::InterruptFailed(message) => Some(format!(
-            "Graceful cancel failed; force cancellation pending: {message}"
-        )),
-        QueryCancelOutcome::Failed(message) | QueryCancelOutcome::ForceFailed(message) => {
-            Some(format!("Cancel failed: {message}"))
+/// What a cancel outcome owes the user in the messages pane, if anything.
+///
+/// The KIND travels with the TEXT because the caller cannot derive it: it is a
+/// fact about the outcome, and the outcome is not always a failure.
+/// `ForceAskedAgain` is the one that proves it — the tier did the strongest
+/// thing it is allowed to do, and the app deliberately does not end the
+/// operation for it — so filing it under Errors (and pulling the Errors pane
+/// to the front) said the cancel had gone wrong when nothing had. Saying
+/// nothing at all is not the answer either: it is the one outcome after which
+/// the statement may still be running, so the user would be watching a tab
+/// that stays busy after two cancels with no explanation.
+///
+/// The remedy it names is one the app PERFORMS. It was not: every
+/// session-ending action refused on this work with "Stop it before continuing"
+/// — including the `File > Disconnect` named here — so the user was sent round
+/// a loop with no exit. The gate now has a third answer for work the app has
+/// already failed to stop ([`TabWorkObstacle::UnstoppableByAsking`]) and the
+/// teardown ends it with the tier ending a connection is allowed to use
+/// ([`crate::db::SessionCancelPurpose::EndTheConnection`]). A message must
+/// never name an action the app will refuse.
+struct QueryCancelUserMessage {
+    kind: ResultMessageKind,
+    text: String,
+}
+
+impl QueryCancelUserMessage {
+    fn error(text: String) -> Self {
+        Self {
+            kind: ResultMessageKind::Error,
+            text,
         }
+    }
+
+    fn info(text: String) -> Self {
+        Self {
+            kind: ResultMessageKind::Info,
+            text,
+        }
+    }
+}
+
+fn query_cancel_user_message(outcome: &QueryCancelOutcome) -> Option<QueryCancelUserMessage> {
+    match outcome {
+        QueryCancelOutcome::InterruptFailed(message) => Some(QueryCancelUserMessage::error(
+            format!("Graceful cancel failed; force cancellation pending: {message}"),
+        )),
+        QueryCancelOutcome::Failed(message) | QueryCancelOutcome::ForceFailed(message) => Some(
+            QueryCancelUserMessage::error(format!("Cancel failed: {message}")),
+        ),
+        QueryCancelOutcome::ForceAskedAgain => Some(QueryCancelUserMessage::info(
+            "The statement is running on this connection's own session, which a cancel may not \
+             close. It was asked to stop again; if it does not, use File > Disconnect — that \
+             ends the connection, and this statement with it."
+                .to_string(),
+        )),
         _ => None,
     }
 }
@@ -1958,13 +2175,16 @@ pub struct AppState {
     /// [`AppState::refresh_active_connection_view`], which never lowers it on
     /// an answer that is not knowledge.
     has_live_connection: bool,
-    /// Last observed auto-commit default of the active tab's connection, kept
-    /// because the connection mutex is held for the whole run of a query and
-    /// the status bar must not lose the indicator meanwhile. Valid only for
-    /// [`AppState::active_connection_view_id`]: a cache that outlived its
-    /// connection showed one connection's default on another connection's tab.
-    /// Written only by [`AppState::refresh_active_connection_view`].
-    cached_connection_auto_commit: Option<bool>,
+    /// The per-connection DEFAULTS the active tab's connection last reported,
+    /// kept because the connection mutex is held for the whole run of a query
+    /// and neither the status bar nor a per-tab option change may lose its
+    /// answer meanwhile.
+    ///
+    /// Valid only for [`AppState::active_connection_view_id`]: a cache that
+    /// outlived its connection showed one connection's default on another
+    /// connection's tab. Written only by
+    /// [`AppState::refresh_active_connection_view`].
+    cached_connection_defaults: CachedConnectionDefaults,
     pending_connection_metadata_refresh: bool,
     pending_metadata_refresh_tabs: HashSet<QueryTabId>,
     latest_schema_request_id: u64,
@@ -2542,7 +2762,10 @@ impl AppState {
             // Screenshot harness: there is no server, and every road below
             // would correctly answer "not connected".
             self.has_live_connection = true;
-            self.cached_connection_auto_commit = Some(false);
+            self.cached_connection_defaults = CachedConnectionDefaults {
+                auto_commit: Some(false),
+                transaction_mode: Some(TransactionMode::default()),
+            };
             *self
                 .connection_info
                 .lock()
@@ -2560,7 +2783,7 @@ impl AppState {
             self.connection = self.unbound_connection.clone();
             self.active_connection_view_id = None;
             self.has_live_connection = false;
-            self.cached_connection_auto_commit = None;
+            self.cached_connection_defaults = CachedConnectionDefaults::default();
             *self
                 .connection_info
                 .lock()
@@ -2582,10 +2805,17 @@ impl AppState {
                     info.clear_password();
                     info
                 });
-                let auto_commit = guard.auto_commit();
+                // Both defaults come out of the SAME read, which is what
+                // makes them one value: a second reader would have its own
+                // window in which the connection is busy, and the two answers
+                // would then describe different moments.
+                let defaults = CachedConnectionDefaults {
+                    auto_commit: Some(guard.auto_commit()),
+                    transaction_mode: Some(guard.transaction_mode()),
+                };
                 drop(guard);
                 self.has_live_connection = is_live;
-                self.cached_connection_auto_commit = Some(auto_commit);
+                self.cached_connection_defaults = defaults;
                 *self
                     .connection_info
                     .lock()
@@ -2625,7 +2855,7 @@ impl AppState {
                 if !describes_same_connection {
                     // A default read from another connection is worse than no
                     // indicator at all; the next successful read fills it in.
-                    self.cached_connection_auto_commit = None;
+                    self.cached_connection_defaults = CachedConnectionDefaults::default();
                 }
             }
         }
@@ -2634,7 +2864,43 @@ impl AppState {
     /// The auto-commit default of the connection the ACTIVE TAB is on, or
     /// `None` when it has not been read yet (or there is no connection).
     fn active_connection_auto_commit(&self) -> Option<bool> {
-        self.cached_connection_auto_commit
+        self.cached_connection_defaults.auto_commit
+    }
+
+    /// The auto-commit the SCREEN may show for the active tab, or `None` when
+    /// it may show none.
+    ///
+    /// ONE reader, because the answer is one value and it was computed twice
+    /// with two different filters: the status bar asked
+    /// `conn_info.is_some() && has_live_connection` and the Tools menu asked
+    /// `has_live_connection` alone. The two move together today, so nothing
+    /// disagreed — but the status bar's computation is also what
+    /// `record_displayed_auto_commit` hands to the execution checkpoint, so a
+    /// future filter that drifted would put the menu and the value a statement
+    /// is verified against on different answers.
+    ///
+    /// The connection default comes from [`CachedConnectionDefaults`] and the
+    /// override from the tab, which is the same resolution every execution path
+    /// uses (`SqlEditorWidget::effective_auto_commit`).
+    fn displayable_auto_commit_for_active_tab(&self) -> Option<bool> {
+        if !self.has_live_connection {
+            return None;
+        }
+        if self
+            .connection_info
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+        {
+            return None;
+        }
+        self.active_connection_auto_commit()
+            .map(|connection_default| {
+                crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
+                    connection_default,
+                    self.sql_editor.tab_auto_commit_override_value(),
+                )
+            })
     }
 
     /// Screenshot harness only: present the window as if the active tab's
@@ -2758,19 +3024,13 @@ impl AppState {
     /// Whether this tab still has DB work a session-ending action must not run
     /// over.
     ///
-    /// THREE things count, not two. Besides a running query and a live lazy
-    /// fetch there is an execution the tab has already ACCEPTED but has not
-    /// started — it is waiting for a previous lazy fetch to be cancelled. In
-    /// that window the tab reads perfectly idle (no query running, no batch
-    /// begun) yet a statement is still coming, and `has_deferred_execution`
-    /// was consulted in exactly one place: result-grid reservations. So a pool
-    /// resize, a disconnect, a Disconnect All or an exit could pass the gate
-    /// there and the statement would then start against a connection whose
-    /// generation and epoch had just moved, losing its session.
+    /// [`TabDbWork`] is the answer and the reason THREE things count; this is
+    /// the same answer as a `bool`. A pool resize, a disconnect, a Disconnect
+    /// All or an exit that walked past an accepted-but-unstarted execution let
+    /// it start against a connection whose generation and epoch had just
+    /// moved, losing its session.
     fn tab_has_unfinished_db_work(editor: &SqlEditorWidget) -> bool {
-        editor.is_query_running()
-            || editor.active_lazy_fetch_session().is_some()
-            || editor.has_deferred_execution()
+        TabDbWork::for_editor(editor).blocks()
     }
 
     /// Every editor that can own DB work — the query tabs, and only them.
@@ -2799,6 +3059,34 @@ impl AppState {
     /// editor must never be able to disagree about which tabs exist.
     fn tabs_that_can_own_db_work(&self) -> impl Iterator<Item = &QueryEditorTab> {
         self.editor_tabs.iter()
+    }
+
+    /// Why a RUNNING STATEMENT refuses `action`, in the user's words, or `None`
+    /// when none is running.
+    ///
+    /// The gate is exactly [`Self::is_any_query_running`] — these callers abort
+    /// lazy fetches themselves rather than refusing on them — and only the
+    /// WORDS come from the app's one answer. They were a literal "A query is
+    /// running. Stop it before ...", which is an instruction the user cannot
+    /// follow when the statement is one the app has already spent its strongest
+    /// cancel tier on: the result views could then never be closed or cleared
+    /// again for the life of that connection.
+    ///
+    /// STOPPABLE WINS when several tabs are running, for the same reason it
+    /// does in [`TabWorkObstacle`]: the cheapest true instruction is the one to
+    /// give.
+    fn running_query_block_message(&self, action: &str) -> Option<String> {
+        let mut unstoppable = None;
+        for editor in self.editors_that_can_own_db_work() {
+            match TabDbWork::for_editor(editor) {
+                TabDbWork::RunningQuery => return TabDbWork::RunningQuery.block_message(action),
+                TabDbWork::UnstoppableStatement => {
+                    unstoppable = Some(TabDbWork::UnstoppableStatement);
+                }
+                TabDbWork::None | TabDbWork::OpenLazyFetch | TabDbWork::AcceptedExecution => {}
+            }
+        }
+        unstoppable.and_then(|work| work.block_message(action))
     }
 
     fn is_any_query_running(&self) -> bool {
@@ -3049,21 +3337,65 @@ impl AppState {
     /// Work a QUERY TAB owns on `scope`: a running statement, a live lazy
     /// fetch, or an execution the tab has accepted but not started.
     ///
-    /// The half a session-ending action always refuses on, because the user
-    /// may not know it is running and its result cannot be reproduced by
-    /// retrying.
-    fn tab_work_blocking_session_teardown(&self, scope: SessionTeardownScope) -> bool {
-        match scope {
-            SessionTeardownScope::EveryConnection => self.has_running_query_or_lazy_fetch(),
-            SessionTeardownScope::Connection(connection_id) => {
-                self.editor_tabs.iter().any(|tab| {
+    /// Whether this tab's progress context still names a lazy fetch, which is
+    /// work a session-ending action must not run over and which the editor's
+    /// own flags cannot answer for.
+    fn tab_progress_holds_a_lazy_fetch(&self, tab_id: QueryTabId) -> bool {
+        self.progress_contexts
+            .get(&tab_id)
+            .is_some_and(|context| !context.lazy_fetch_sessions.is_empty())
+    }
+
+    /// What a query tab's work MEANS for an action that ends sessions.
+    ///
+    /// THREE answers, not two, and the third is the fix: work the app has
+    /// ALREADY spent its strongest cancel tier on and failed to stop is not
+    /// work the user can stop either, so refusing with "Stop it before
+    /// continuing" asks for something the app has proven impossible. That was
+    /// the state `File > Disconnect` refused in — the very remedy the force
+    /// tier's own message names — leaving a wedged statement on the
+    /// connection's own session with no way out but quitting the application.
+    ///
+    /// STOPPABLE DOMINATES: one tab holding an ordinary running statement
+    /// refuses the whole action even when another tab's work is unstoppable,
+    /// because ending a connection over work that could still have been
+    /// stopped by asking is the thing this gate exists to prevent. And a tab is
+    /// only ever counted unstoppable when the wedged statement is its ONLY
+    /// work: a lazy fetch or an accepted execution beside it is stoppable, and
+    /// the tab is then stoppable too.
+    fn tab_work_obstacle_for_session_teardown(
+        &self,
+        scope: SessionTeardownScope,
+    ) -> TabWorkObstacle {
+        let mut obstacle = TabWorkObstacle::None;
+        for tab in self.tabs_that_can_own_db_work() {
+            let has_work = match scope {
+                SessionTeardownScope::EveryConnection => {
+                    Self::tab_has_unfinished_db_work(&tab.sql_editor)
+                }
+                SessionTeardownScope::Connection(connection_id) => {
                     tab.connection_binding.snapshot().connection_id() == Some(connection_id)
                         && self.has_running_query_or_lazy_fetch_for_tab(tab.tab_id)
-                }) || !self
-                    .lazy_fetch_sessions_for_connection(connection_id)
-                    .is_empty()
+                }
+            };
+            if !has_work {
+                continue;
             }
+            obstacle = obstacle.or(TabWorkObstacle::for_one_tab(
+                TabDbWork::for_editor(&tab.sql_editor),
+                self.tab_progress_holds_a_lazy_fetch(tab.tab_id),
+            ));
         }
+        let lazy_fetches_outside_a_tab = match scope {
+            SessionTeardownScope::EveryConnection => self.has_active_lazy_fetches(),
+            SessionTeardownScope::Connection(connection_id) => !self
+                .lazy_fetch_sessions_for_connection(connection_id)
+                .is_empty(),
+        };
+        if lazy_fetches_outside_a_tab {
+            obstacle = obstacle.or(TabWorkObstacle::Stoppable);
+        }
+        obstacle
     }
 
     /// Everything ELSE holding a session on `scope`: object-browser metadata,
@@ -3103,11 +3435,65 @@ impl AppState {
     /// user asked for there: it refuses on [`Self::tab_work_blocking_session_teardown`]
     /// and CANCELS [`Self::background_work_blocking_session_teardown`]
     /// deliberately, rather than letting the stale sweep force it afterwards.
-    fn db_work_blocking_session_teardown(&self, scope: SessionTeardownScope) -> Option<String> {
-        if self.tab_work_blocking_session_teardown(scope) {
-            return Some("running queries and lazy fetches".to_string());
+    fn db_work_blocking_session_teardown(
+        &self,
+        scope: SessionTeardownScope,
+        action: &str,
+    ) -> Option<String> {
+        // The WHOLE sentence, not a noun phrase the caller wraps in "Finish or
+        // cancel … first". One of these answers cannot be finished or
+        // cancelled -- the app has already spent its strongest cancel tier on
+        // it and failed -- so a caller with only a slot to fill told the user
+        // to do something impossible, which is exactly the trap the force
+        // tier's own message fell into.
+        match self.tab_work_obstacle_for_session_teardown(scope) {
+            TabWorkObstacle::Stoppable => {
+                return Some(format!(
+                    "Finish or cancel the running queries and lazy fetches before {action}."
+                ));
+            }
+            TabWorkObstacle::UnstoppableByAsking => {
+                // The app's ONE sentence for work it could not stop, so a
+                // second gate cannot word it differently -- or, as three of
+                // them did, tell the user to finish or cancel it.
+                return TabDbWork::UnstoppableStatement.block_message(action);
+            }
+            TabWorkObstacle::None => {}
         }
-        self.background_work_blocking_session_teardown(scope)
+        if let Some(background) = self.background_work_blocking_session_teardown(scope) {
+            return Some(format!("Finish or cancel {background} before {action}."));
+        }
+        self.ended_work_that_has_not_stopped(scope).then(|| {
+            format!(
+                "DB work that was cancelled has not released its session yet. Try {action} \
+                 again in a moment."
+            )
+        })
+    }
+
+    /// Work the app has already ENDED but which has not STOPPED, in `scope`.
+    ///
+    /// The third half, and the one neither of the other two can see. A cancel
+    /// removes its registry row at DISPATCH — rightly; the screen must not go
+    /// on showing work the user ended — and the query tab's own force tier
+    /// publishes the tab IDLE the moment it has torn a session down. So from
+    /// that instant until the worker unwinds, the job is named only by
+    /// `crate::db::CANCELLED_WORK_STILL_HOLDING_A_SESSION`, the app's one
+    /// standing answer to "what did we end that has not let go?".
+    ///
+    /// `ConnectionRuntime::is_idle` and application exit have asked it since
+    /// the rounds that added it. The POOL REBUILD did not, and it is the action
+    /// with the strictest contract of the three: it is a preference change, so
+    /// it must destroy nothing. It bumps every connection's generation and
+    /// epoch and retires the old pool, so a cancelled metadata read, schema
+    /// load or bind probe still holding a session out of that pool had the pool
+    /// closed underneath it and its hand-back refused — for a settings change
+    /// the user made while the status bar had already stopped naming the job.
+    ///
+    /// Self-clearing: the ledger prunes every entry whose activity guard is
+    /// gone, so this refuses only while a job is genuinely still holding.
+    fn ended_work_that_has_not_stopped(&self, scope: SessionTeardownScope) -> bool {
+        scope.ended_db_work_has_not_stopped()
     }
 
     fn lazy_fetch_session_is_active_in_editor(&self, session_id: u64) -> bool {
@@ -3875,10 +4261,16 @@ impl AppState {
                 self.restore_progress_context_after_cancel_failure(token, status);
             }
         }
-        if let Some(message) = query_cancel_failure_message(outcome) {
+        if let Some(message) = query_cancel_user_message(outcome) {
             if let Some(mut result_tabs) = self.result_tabs_for_tab(token.tab_id) {
-                result_tabs.append_message_lines(ResultMessageKind::Error, &[message]);
-                result_tabs.select_messages_errors();
+                result_tabs.append_message_lines(message.kind, &[message.text]);
+                // The pane the explanation went into, so the user is looking at
+                // it — and so a cancel that did NOT fail stops pulling the
+                // Errors pane forward.
+                match message.kind {
+                    ResultMessageKind::Info => result_tabs.select_messages_info(),
+                    ResultMessageKind::Error => result_tabs.select_messages_errors(),
+                }
             }
         }
         true
@@ -4212,6 +4604,32 @@ impl AppState {
         // of ONE value: healing the label alone left the menu — the control the
         // user actually acts on — contradicting it.
         self.sync_auto_commit_indicators();
+        // The tab's OTHER two per-tab settings are settled here too, for the
+        // same reason and on the same tick.
+        //
+        // These three are one family — the tab's auto-commit, its transaction
+        // mode and its scope — and the app promises the same thing about each:
+        // what the screen shows is what the next statement will do, checked at
+        // execution startup (`auto_commit_display_mismatch_error` and
+        // `transaction_mode_display_mismatch_error`). Auto-commit kept that
+        // promise with a tick that heals it whatever happened; the transaction
+        // mode kept it by TWENTY-ODD call sites each remembering to re-sync
+        // after anything that could have moved it, which is the shape this
+        // subsystem has already been bitten by twice (the non-lazy
+        // `BatchFinished` handler had no re-sync, so a query-driven `SET
+        // SESSION TRANSACTION` left the toolbar stale and greyed; and nothing
+        // re-synced after a Commit/Rollback, which left the combos
+        // permanently disabled). Both were fixed by adding one more call site.
+        //
+        // Same protection, stated once: a rule kept by callers remembering is
+        // not kept. The existing call sites stay — they make the toolbar
+        // correct in the same UI frame as the event, rather than up to one tick
+        // later — but none of them is load-bearing any more. This costs a
+        // `try_lock` and two `set_value`s on a tick that already re-reads the
+        // connection; the choice menus are only rebuilt when their LABELS
+        // change, and the sync defers itself while a pulldown holds the FLTK
+        // grab.
+        self.sync_transaction_mode_controls();
         let conn_info = self
             .connection_info
             .lock()
@@ -4240,15 +4658,7 @@ impl AppState {
         let displayed_registry_count = usize::from(selected_activity.is_some());
         let selection_summary = self.result_tabs.selection_summary_label();
         let indicator_visible = conn_info.is_some() && self.has_live_connection;
-        let displayed_auto_commit = self
-            .active_connection_auto_commit()
-            .filter(|_| indicator_visible)
-            .map(|connection_default| {
-                crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
-                    connection_default,
-                    self.sql_editor.tab_auto_commit_override_value(),
-                )
-            });
+        let displayed_auto_commit = self.displayable_auto_commit_for_active_tab();
         // Hand the value the screen is about to show to the active tab, so
         // execution startup can verify it acts on exactly this state.
         self.sql_editor
@@ -4360,6 +4770,80 @@ impl AppState {
     /// state that requires resolution first.
     fn transaction_mode_change_blocked_for_active_tab(&self, db_type: DatabaseType) -> bool {
         self.sql_editor.transaction_mode_change_blocked_now(db_type)
+    }
+
+    /// What a transaction-mode PICK needs to know, built WITHOUT the connection
+    /// mutex -- the way the two sibling per-tab settings build theirs.
+    ///
+    /// [`Self::transaction_control_state`] is the DISPLAY's reader: it goes to
+    /// `try_lock_connection`, and answering `None` for a connection that is
+    /// merely BUSY is right there, because the display re-arms and shows the
+    /// truth a moment later. It is wrong for a WRITE. Using it as the pick's
+    /// gate made the transaction mode the ONE per-tab setting another tab's
+    /// work could refuse: a neighbour tab's statement, an Oracle explain plan,
+    /// an OCI script after `CONNECT` or a metadata load holds that mutex, and
+    /// the pick was then alerted away as "connection busy" -- for a setting
+    /// that touches nothing but this tab.
+    ///
+    /// Auto-commit never had the problem (it reads the connection's default
+    /// from [`CachedConnectionDefaults`]) and the scope pick was moved off the
+    /// mutex in its own right (`retained_scope_update_for_tab`). This is the
+    /// third, and now all three build their answer the same way.
+    fn transaction_mode_pick_context(&self) -> TransactionModePickContext {
+        let Some(runtime) = self.active_connection_runtime() else {
+            return TransactionModePickContext::NotConnected;
+        };
+        if !matches!(runtime.state(), ConnectionRuntimeState::Connected)
+            || !self.has_live_connection
+        {
+            return TransactionModePickContext::NotConnected;
+        }
+        let db_type = runtime.sanitized_info().db_type;
+        let Some(connection_default) = self.cached_connection_defaults.transaction_mode else {
+            return TransactionModePickContext::DefaultsNotLearnedYet;
+        };
+        TransactionModePickContext::Ready {
+            db_type,
+            // Tab-scoped: the toolbar shows and pins the ACTIVE tab's effective
+            // transaction mode (tab override over connection default).
+            previous_mode: crate::ui::sql_editor::SqlEditorWidget::effective_transaction_mode(
+                db_type,
+                connection_default,
+                self.sql_editor.tab_transaction_mode_override_value(),
+            ),
+        }
+    }
+
+    /// Put the two transaction-mode combos back to what the app RECORDED the
+    /// screen as saying.
+    ///
+    /// Every road that does NOT apply a pick has to call this, and
+    /// [`Self::sync_transaction_mode_controls`] cannot be that door on its own:
+    /// it deliberately leaves the combos untouched while the connection cannot
+    /// be READ, which is exactly when a pick is refused for being busy. The
+    /// screen then went on showing a mode the tab was not pinned to -- and the
+    /// screen/behaviour checkpoint could not catch it either, because
+    /// `ui_displayed_transaction_mode`, the value it compares against, had not
+    /// moved. A statement launched in that window ran under the OLD mode with
+    /// the toolbar showing the NEW one.
+    ///
+    /// The recorded displayed mode is the one source of truth for "what the
+    /// screen last said", so restoring from it can never invent a value.
+    fn revert_transaction_mode_controls_to_displayed(&mut self) {
+        let displayed = self.sql_editor.displayed_transaction_mode();
+        let db_type = self
+            .active_connection_runtime()
+            .map(|runtime| runtime.sanitized_info().db_type);
+        if let (Some(mode), Some(db_type)) = (displayed, db_type) {
+            self.transaction_isolation_choice
+                .set_value(transaction_isolation_choice_index(db_type, mode.isolation));
+            self.transaction_access_choice
+                .set_value(transaction_access_choice_index(mode.access_mode));
+        }
+        // Still the ordinary sync afterwards: when the connection IS readable
+        // it re-derives, re-activates and re-records, and when it is not it
+        // arms the retry that will.
+        self.sync_transaction_mode_controls();
     }
 
     fn selected_transaction_mode_from_controls(&self, db_type: DatabaseType) -> TransactionMode {
@@ -4517,15 +5001,23 @@ impl AppState {
         &self,
         connection_id: ConnectionId,
     ) -> Option<String> {
-        if self.active_connection_id() == Some(connection_id)
-            && self.has_running_query_or_lazy_fetch_for_tab(self.active_editor_tab_id)
+        if self.active_connection_id() != Some(connection_id)
+            || !self.has_running_query_or_lazy_fetch_for_tab(self.active_editor_tab_id)
         {
-            return Some(
-                "Cannot change scope while a query or lazy fetch is active on this tab."
-                    .to_string(),
-            );
+            return None;
         }
-        None
+        // The third per-tab setting says the same thing the other two do when
+        // the work cannot be stopped: waiting will not help, and the action
+        // that CAN end it is named. Stating only the fact ("a query is active")
+        // is true here and still leaves the user waiting for something that is
+        // not coming.
+        let work = self
+            .find_tab_index(self.active_editor_tab_id)
+            .map(|index| TabDbWork::for_editor(&self.editor_tabs[index].sql_editor));
+        if work == Some(TabDbWork::UnstoppableStatement) {
+            return TabDbWork::UnstoppableStatement.block_message("changing scope");
+        }
+        Some("Cannot change scope while a query or lazy fetch is active on this tab.".to_string())
     }
 
     /// The tab whose scope a browser pick on `connection_id` governs: the
@@ -4535,6 +5027,33 @@ impl AppState {
         (self.active_connection_id() == Some(connection_id)).then_some(self.active_editor_tab_id)
     }
 
+    /// What a scope pick has to push onto the tab's retained session, built the
+    /// way the two SIBLING per-tab settings build theirs.
+    ///
+    /// From the runtime's LOCK-FREE identity, and that is the fix rather than a
+    /// detail. This used to open with `try_lock_connection`, which answers
+    /// `None` for a connection that is merely BUSY — a neighbour tab running a
+    /// statement, an Oracle explain plan, an OCI script after `CONNECT` — or
+    /// that has an announced transition. The scope preflight only refuses on
+    /// THIS tab's work (`retained_scope_change_blocker_for_connection`), so a
+    /// pick landing in that window returned `None` and the caller silently
+    /// applied NOTHING: the tab's binding, its browser card and its metadata
+    /// moved to the new scope while the retained session — holding the user's
+    /// open transaction — stayed in the old one, with no message. The same
+    /// callback's metadata refresh has a pending/retry road for exactly this;
+    /// the session apply had neither retry nor report.
+    ///
+    /// Auto-commit and transaction mode were moved off the mutex for this
+    /// reason already (`RetainedSessionOptionChangePlan::from_runtime`), so all
+    /// three per-tab settings now build their plan from one kind of answer.
+    /// Stale identity is safe here for the same reason it is there: the
+    /// retained take validates the generation against the lease, and a
+    /// generation that has moved means the session belonged to a retired
+    /// incarnation of the connection.
+    ///
+    /// `None` still means "there is nothing to push" — no runtime, a connection
+    /// that is not up, a database with no scope concept, or an empty pick — and
+    /// none of those depend on who holds the mutex.
     fn retained_scope_update_for_tab(
         &self,
         tab_id: QueryTabId,
@@ -4542,13 +5061,16 @@ impl AppState {
     ) -> Option<RetainedScopeUpdate> {
         let scope = Self::normalize_scope_name(scope)?;
         let tab = self.editor_tabs.iter().find(|tab| tab.tab_id == tab_id)?;
-        let connection = tab.connection_binding.snapshot().connection()?;
-        let conn_guard = crate::db::try_lock_connection(&connection)?;
-        if !conn_guard.is_connected() {
+        let runtime = tab.connection_binding.snapshot().runtime?;
+        // The published state, not the connection: `Connecting`, `Failed`,
+        // `Disconnected` and `Transitioning` all mean there is nothing to push
+        // onto a retained session, which is exactly what the old
+        // `is_connected()` and transition checks answered.
+        if !matches!(runtime.state(), ConnectionRuntimeState::Connected) {
             return None;
         }
-        let db_type = conn_guard.db_type();
-        if !db_type.has_connection_scope() {
+        let info = runtime.sanitized_info();
+        if !info.db_type.has_connection_scope() {
             return None;
         }
         let editors = if tab.sql_editor.pooled_session_activity_snapshot().is_some() {
@@ -4557,10 +5079,10 @@ impl AppState {
             Vec::new()
         };
         Some((
-            db_type,
-            conn_guard.connection_generation(),
-            conn_guard.pool_context_epoch(),
-            conn_guard.get_info().advanced.clone(),
+            info.db_type,
+            runtime.connection_generation(),
+            runtime.pool_context_epoch(),
+            info.advanced,
             scope,
             editors,
         ))
@@ -5025,17 +5547,9 @@ impl AppState {
             return;
         };
         // Shown only for a connection this tab is really on and that was really
-        // read — the same filter the status-bar indicator applies, because the
-        // two are one value.
-        let effective = self
-            .active_connection_auto_commit()
-            .filter(|_| self.has_live_connection)
-            .map(|connection_default| {
-                crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
-                    connection_default,
-                    self.sql_editor.tab_auto_commit_override_value(),
-                )
-            });
+        // read — THE SAME reader the status-bar indicator uses, because the two
+        // are one value. They used to be two computations with two filters.
+        let effective = self.displayable_auto_commit_for_active_tab();
         match effective {
             Some(true) => {
                 item.set();
@@ -5531,6 +6045,44 @@ impl SessionTeardownScope {
         crate::db::PoolSessionHandoutHold::take(connection_ids)
     }
 
+    /// Whether work the app ENDED in this scope is still holding a session.
+    ///
+    /// The scoped form of the app's one standing answer. `EveryConnection`
+    /// counts a job that cannot name its connection too, exactly as
+    /// application exit does: a rebuild walks every connection, so work that
+    /// cannot be attributed must still refuse it. `Connection(id)` counts only
+    /// what names that connection, for the same reason
+    /// `background_work_blocking_session_teardown` does — guessing would refuse
+    /// one connection's teardown for another's work.
+    fn ended_db_work_has_not_stopped(self) -> bool {
+        match self {
+            Self::EveryConnection => crate::db::cancelled_db_work_still_holding_a_session() > 0,
+            Self::Connection(id) => crate::db::cancelled_db_work_still_holds_a_session_on(id),
+        }
+    }
+
+    /// Wait, up to `timeout`, for work this scope ENDED to let go of its
+    /// session. Answers whether it has.
+    ///
+    /// The same shape every other wait in the app uses
+    /// (`crate::db::wait_for_graceful_cancel`): the question is asked FIRST on
+    /// every pass, so an already elapsed deadline is never an answer on its
+    /// own. Scoped rather than app-wide because the caller is refusing ONE
+    /// connection's teardown, and another connection's unfinished job is not a
+    /// reason to.
+    fn wait_until_ended_db_work_let_go(self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.ended_db_work_has_not_stopped() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(APPLICATION_EXIT_SESSION_TEARDOWN_POLL);
+        }
+    }
+
     fn cancel_background_db_work(self, force_timeout: Duration) -> usize {
         match self {
             Self::EveryConnection => crate::db::cancel_all_db_activities(force_timeout),
@@ -5571,6 +6123,14 @@ impl SessionTeardownScope {
 /// connections' background work cancelled for a disconnect that was then
 /// abandoned — the same rule its prompts already obey, applied to the half
 /// that ends work instead of the half that commits transactions.
+///
+/// [`Self::decide`] looks like the removed shape and is not, in the two ways
+/// that made the old one worthless. It runs ONLY for the one obstacle a
+/// refusal cannot remove — a statement wedged on the connection's own session,
+/// which the app has already told the user it could not stop — instead of for
+/// every disconnect; and it WAITS for the work to let go before it asks again,
+/// which is what the old shape had no answer for. A dispatched cancel bought
+/// the probe nothing precisely because nothing waited on it.
 #[must_use = "a decided session teardown that is never committed ends nothing and holds nothing"]
 struct DecidedSessionTeardown {
     connection_id: ConnectionId,
@@ -5585,34 +6145,131 @@ impl DecidedSessionTeardown {
         connection: &crate::db::SharedConnection,
         connection_id: ConnectionId,
         probe_activity: &str,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, SessionTeardownRefusal> {
         let (tab_work, force_timeout) = {
             let s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             (
-                s.tab_work_blocking_session_teardown(SessionTeardownScope::Connection(
+                s.tab_work_obstacle_for_session_teardown(SessionTeardownScope::Connection(
                     connection_id,
                 )),
                 s.configured_cancel_timeout(),
             )
         };
-        if tab_work {
-            return Err(
-                "A query or lazy fetch is active on this connection. Stop it before continuing."
-                    .to_string(),
-            );
+        match tab_work {
+            TabWorkObstacle::Stoppable => {
+                return Err(SessionTeardownRefusal::Reported(
+                    "A query or lazy fetch is active on this connection. Stop it before continuing."
+                        .to_string(),
+                ));
+            }
+            // NOT reported to the user: asking them to stop it is asking for
+            // what the app has already proven impossible. The caller ends it
+            // and asks again. See [`SessionTeardownRefusal`].
+            TabWorkObstacle::UnstoppableByAsking => {
+                return Err(SessionTeardownRefusal::WorkTheAppCouldNotStop);
+            }
+            TabWorkObstacle::None => {}
         }
         // The connection itself, asked on the state as it IS. Only
         // File > Disconnect used to ask at all; Disconnect All and Reconnect
         // went straight to a waiting lock on the UI thread.
         if try_lock_connection_with_activity(connection, probe_activity.to_string()).is_none() {
-            return Err(format_connection_busy_message());
+            return Err(SessionTeardownRefusal::Reported(
+                format_connection_busy_message(),
+            ));
         }
         Ok(Self {
             connection_id,
             force_timeout,
         })
+    }
+
+    /// [`Self::ask`], plus the ONE obstacle a refusal cannot remove.
+    ///
+    /// `ask` stays a pure question -- an `Err` from it leaves the app exactly
+    /// as it was, which is what lets the prompts and the waiting lock below it
+    /// assume every refusal has been spent. This is where the one irreversible
+    /// step lives, named and visible, and it runs ONCE: a statement wedged on
+    /// the connection's OWN session cannot be stopped by asking (a cancel may
+    /// never destroy that session, and on Oracle thin an in-band break does not
+    /// reach a call that is already blocked), so the user cannot satisfy "Stop
+    /// it before continuing" no matter how long they try. Ending the connection
+    /// is the only thing left that ends it -- and that is what this action is.
+    ///
+    /// The second `ask` is not a formality: it puts the connection probe again,
+    /// so the premise the rest of the disconnect rests on -- nothing holds this
+    /// connection's mutex for long -- is re-established by a real refusal
+    /// rather than assumed. If the tear-down did not land, that ask refuses and
+    /// nothing irreversible follows.
+    ///
+    /// KNOWN and bounded: `Disconnect All` asks about every connection before
+    /// it commits any, so a LATER connection's refusal abandons the action
+    /// after this step has already run on an earlier one. It cannot be removed
+    /// -- the step is irreversible and the ask after it must still be able to
+    /// refuse -- and what it costs is a session the app has already reported as
+    /// unstoppable, on a connection the user has just asked to end. No
+    /// connection is COMMITTED in that window, so nothing else is touched.
+    fn decide(
+        state: &Arc<Mutex<AppState>>,
+        connection: &crate::db::SharedConnection,
+        connection_id: ConnectionId,
+        probe_activity: &str,
+    ) -> Result<Self, String> {
+        match Self::ask(state, connection, connection_id, probe_activity) {
+            Ok(decided) => Ok(decided),
+            Err(SessionTeardownRefusal::Reported(message)) => Err(message),
+            Err(SessionTeardownRefusal::WorkTheAppCouldNotStop) => {
+                Self::end_work_the_app_could_not_stop(connection_id);
+                Self::ask(state, connection, connection_id, probe_activity).map_err(|refusal| {
+                    match refusal {
+                        SessionTeardownRefusal::Reported(message) => message,
+                        // Asked, ended, and it is still there. Once, not in a
+                        // loop: the tier that ends a session has already been
+                        // spent, and repeating it would only spend it again.
+                        SessionTeardownRefusal::WorkTheAppCouldNotStop => {
+                            "A statement on this connection's own session was asked to end and \
+                             has not let go of it yet. Try again in a moment."
+                                .to_string()
+                        }
+                    }
+                })
+            }
+        }
+    }
+
+    /// End the work on this connection that the app has ALREADY FAILED to
+    /// stop, and wait for it to let go.
+    ///
+    /// The one irreversible step of a teardown that has not been decided yet,
+    /// and it is reached only from [`Self::decide`], only for a connection the
+    /// user has just asked to END, and only over work the app has already told
+    /// them it could not stop.
+    ///
+    /// NOT the shape an earlier round removed ("cancel first, then probe"): a
+    /// cancel is asynchronous and bought the probe nothing. This dispatches the
+    /// tier that ENDS the session -- available here and nowhere else, because
+    /// ending the connection is what this action does
+    /// ([`crate::db::SessionCancelPurpose::EndTheConnection`]) -- and then asks
+    /// the app's own standing answer to "what did we end that has not let go?"
+    /// before anything else is allowed to depend on it.
+    ///
+    /// It ends the connection's BACKGROUND work alongside, because the one road
+    /// that reaches a row's cancelers is scoped to a connection -- and
+    /// `commit` ends exactly the same work a moment later. What that costs on
+    /// the refusal path is a metadata load, a schema load or a bind probe, all
+    /// of which the app re-arms; what it buys is the only way to make the
+    /// connection's own session let go. Losing an object-browser read to a
+    /// disconnect that is then refused is a trade this path may make and the
+    /// ORDINARY path may not, which is why `ask` still does none of it.
+    fn end_work_the_app_could_not_stop(connection_id: ConnectionId) {
+        crate::db::cancel_db_activities_for_connection(
+            connection_id,
+            SESSION_TEARDOWN_UNSTOPPABLE_WORK_BREAK_GRACE,
+        );
+        SessionTeardownScope::Connection(connection_id)
+            .wait_until_ended_db_work_let_go(SESSION_TEARDOWN_UNSTOPPABLE_WORK_STOP_GRACE);
     }
 
     /// The action is decided: end the background work it covers and hold this
@@ -5823,36 +6480,24 @@ fn should_accept_lazy_fetch_session_event(
     })
 }
 
-fn validate_result_edit_action_allowed(has_running_queries: bool) -> Result<(), String> {
-    if has_running_queries {
-        Err("A query is running. Wait for completion before editing result rows.".to_string())
-    } else {
-        Ok(())
+/// Whether a result-grid edit may go ahead, and what to say if it may not.
+///
+/// The WORDS come from the app's one answer about the tab's work, because
+/// "wait for completion" is not something the user can do for a statement that
+/// will not complete: the session is the connection's own, the app has already
+/// spent its strongest cancel tier on it, and the grid could then never be
+/// edited again for the life of that connection. The GATE is unchanged — a
+/// running statement of any kind, and nothing else.
+fn validate_result_edit_action_allowed(work: TabDbWork) -> Result<(), String> {
+    match work {
+        TabDbWork::RunningQuery => {
+            Err("A query is running. Wait for completion before editing result rows.".to_string())
+        }
+        TabDbWork::UnstoppableStatement => Err(TabDbWork::UnstoppableStatement
+            .block_message("editing result rows")
+            .unwrap_or_default()),
+        TabDbWork::None | TabDbWork::OpenLazyFetch | TabDbWork::AcceptedExecution => Ok(()),
     }
-}
-
-fn connection_transition_block_message(
-    has_running_query: bool,
-    has_active_lazy_fetches: bool,
-    action: &str,
-) -> Option<String> {
-    if has_running_query {
-        Some(format!("A query is running. Stop it before {action}."))
-    } else if has_active_lazy_fetches {
-        Some(format!(
-            "A lazy fetch is still open. Fetch all rows or cancel it before {action}."
-        ))
-    } else {
-        None
-    }
-}
-
-fn transaction_option_block_message(
-    has_running_query: bool,
-    has_active_lazy_fetches: bool,
-    action: &str,
-) -> Option<String> {
-    connection_transition_block_message(has_running_query, has_active_lazy_fetches, action)
 }
 
 fn should_finish_progress_after_lazy_fetch_close(
@@ -6178,27 +6823,34 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
         let mut s = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(message) = transaction_option_block_message(
-            s.sql_editor.is_query_running(),
-            s.sql_editor.has_open_lazy_fetch(),
-            "changing transaction mode",
-        ) {
-            s.sync_transaction_mode_controls();
+        if let Some(message) =
+            TabDbWork::for_editor(&s.sql_editor).block_message("changing transaction mode")
+        {
+            s.revert_transaction_mode_controls_to_displayed();
             s.set_status_message(&message);
             drop(s);
             crate::ui::alert_on_main(&message);
             return;
         }
-        let Some((db_type, is_connected, current_mode, _)) = s.transaction_control_state() else {
-            s.sync_transaction_mode_controls();
-            drop(s);
-            crate::ui::alert_on_main(&format_connection_busy_message());
-            return;
+        // Built WITHOUT the connection mutex, like the auto-commit toggle and
+        // the scope pick: a pick that touches nothing but this tab must not be
+        // refused because a NEIGHBOUR tab's work is holding the connection.
+        let (db_type, current_mode) = match s.transaction_mode_pick_context() {
+            TransactionModePickContext::Ready {
+                db_type,
+                previous_mode,
+            } => (db_type, previous_mode),
+            TransactionModePickContext::NotConnected => {
+                s.revert_transaction_mode_controls_to_displayed();
+                return;
+            }
+            TransactionModePickContext::DefaultsNotLearnedYet => {
+                s.revert_transaction_mode_controls_to_displayed();
+                drop(s);
+                crate::ui::alert_on_main(&format_connection_busy_message());
+                return;
+            }
         };
-        if !is_connected {
-            s.sync_transaction_mode_controls();
-            return;
-        }
         (
             s.sql_editor.clone(),
             s.active_connection_runtime(),
@@ -6239,7 +6891,7 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
         let mut s = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        s.sync_transaction_mode_controls();
+        s.revert_transaction_mode_controls_to_displayed();
         s.set_status_message(&format!("Transaction mode unchanged: {reason}"));
         return;
     }
@@ -6265,7 +6917,7 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
             let mut s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            s.sync_transaction_mode_controls();
+            s.revert_transaction_mode_controls_to_displayed();
             s.set_status_message(&format!("Transaction mode unchanged: {}", err));
             return;
         }
@@ -6512,7 +7164,9 @@ impl MainWindow {
             guard.refresh_result_edit_controls();
             return Err(err);
         }
-        if let Err(err) = validate_result_edit_action_allowed(guard.sql_editor.is_query_running()) {
+        if let Err(err) =
+            validate_result_edit_action_allowed(TabDbWork::for_editor(&guard.sql_editor))
+        {
             guard.set_status_message(&err);
             guard.refresh_result_edit_controls();
             return Err(err);
@@ -7078,12 +7732,12 @@ impl MainWindow {
     }
 
     fn close_result_tab_by_target(state: &Arc<Mutex<AppState>>, target: ResultTabCloseTarget) {
-        let query_running = state
+        let blocked = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_any_query_running();
-        if query_running {
-            crate::ui::alert_on_main("A query is running. Stop it before closing tabs.");
+            .running_query_block_message("closing tabs");
+        if let Some(message) = blocked {
+            crate::ui::alert_on_main(&message);
             return;
         }
         let lazy_fetch_sessions = {
@@ -7131,12 +7785,12 @@ impl MainWindow {
     }
 
     fn clear_all_result_views(state: &Arc<Mutex<AppState>>) {
-        let query_running = state
+        let blocked = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_any_query_running();
-        if query_running {
-            crate::ui::alert_on_main("A query is running. Stop it before clearing results.");
+            .running_query_block_message("clearing results");
+        if let Some(message) = blocked {
+            crate::ui::alert_on_main(&message);
             return;
         }
         let lazy_fetch_sessions = {
@@ -8014,7 +8668,7 @@ impl MainWindow {
         probe_activity: &str,
     ) -> Result<crate::db::PoolSessionHandoutHold, String> {
         Ok(
-            DecidedSessionTeardown::ask(state, connection, connection_id, probe_activity)?
+            DecidedSessionTeardown::decide(state, connection, connection_id, probe_activity)?
                 .commit(state),
         )
     }
@@ -8889,7 +9543,7 @@ impl MainWindow {
             query_split_ratio,
             connection_info: Arc::new(Mutex::new(None)),
             has_live_connection: false,
-            cached_connection_auto_commit: None,
+            cached_connection_defaults: CachedConnectionDefaults::default(),
             pending_connection_metadata_refresh: false,
             pending_metadata_refresh_tabs: HashSet::new(),
             latest_schema_request_id: 0,
@@ -10072,14 +10726,51 @@ impl MainWindow {
         });
     }
 
+    /// Close this tab once its work has stopped, cancelling it until it does.
+    ///
+    /// The loop has to be able to GIVE UP, and it could not. It re-asked every
+    /// 0.2s for as long as the tab had work, and each pass dispatched a fresh
+    /// cancel -- normally a no-op, because `cancel_target_is_pending` refuses a
+    /// second Cancel while one is in flight. But a statement on the
+    /// connection's OWN session answers `ForceAskedAgain`, which deliberately
+    /// CLEARS the pending entry so the user can ask again, and it never stops:
+    /// every 0.2s, for the life of the process, this started a whole new cancel
+    /// cycle -- a graceful break, a watchdog thread and a force tier -- against
+    /// a server that had already refused two of them, and the tab still never
+    /// closed.
+    ///
+    /// So the one state the app cannot cancel its way out of ends the loop
+    /// instead, with the sentence that names the action that CAN end it.
     fn defer_close_query_editor_tab_until_idle(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) {
         let state_for_retry = Arc::clone(state);
         Self::schedule_with_app_state(state, 0.2, move |s| {
-            let should_wait = s.find_tab_index(tab_id).is_some()
-                && s.has_running_query_or_lazy_fetch_for_tab(tab_id);
+            let present = s.find_tab_index(tab_id).is_some();
+            let should_wait = present && s.has_running_query_or_lazy_fetch_for_tab(tab_id);
+            // Asked of the same value every gate asks: work the app has already
+            // spent its strongest cancel tier on is not work another cancel can
+            // end.
+            let gave_up = should_wait
+                && s.find_tab_index(tab_id).is_some_and(|index| {
+                    TabDbWork::for_editor(&s.editor_tabs[index].sql_editor)
+                        == TabDbWork::UnstoppableStatement
+                });
             // The rest re-enters the app state, so it must run after the
             // guard this closure was handed is released.
             crate::ui::ui_timeout::schedule(0.0, move || {
+                if gave_up {
+                    let message = TabDbWork::UnstoppableStatement
+                        .block_message("closing this tab")
+                        .unwrap_or_default();
+                    // Through the one door, never a blocking lock: this runs
+                    // inside a UI timer, and the alert below pumps these timers
+                    // itself.
+                    let status = message.clone();
+                    MainWindow::schedule_with_app_state(&state_for_retry, 0.0, move |s| {
+                        s.set_status_message(&status);
+                    });
+                    crate::ui::alert_on_main(&message);
+                    return;
+                }
                 if should_wait {
                     MainWindow::cancel_query_editor_tab(&state_for_retry, tab_id);
                     MainWindow::defer_close_query_editor_tab_until_idle(&state_for_retry, tab_id);
@@ -10103,15 +10794,35 @@ impl MainWindow {
             return QueryEditorCloseOutcome::Cancelled;
         }
 
-        let has_running_work = {
+        let (has_running_work, gave_up) = {
             let s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if s.find_tab_index(tab_id).is_none() {
+            let Some(index) = s.find_tab_index(tab_id) else {
                 return QueryEditorCloseOutcome::Cancelled;
-            }
-            s.has_running_query_or_lazy_fetch_for_tab(tab_id)
+            };
+            (
+                s.has_running_query_or_lazy_fetch_for_tab(tab_id),
+                TabDbWork::for_editor(&s.editor_tabs[index].sql_editor)
+                    == TabDbWork::UnstoppableStatement,
+            )
         };
+        // Asked BEFORE the prompt, because the prompt offers to cancel the
+        // query and close -- and for a statement the app has already spent its
+        // strongest cancel tier on, neither half of that offer can be kept. It
+        // used to prompt, dispatch a cancel that could not land, and hand the
+        // tab to a retry loop that never ended.
+        if has_running_work && gave_up {
+            let message = TabDbWork::UnstoppableStatement
+                .block_message("closing this tab")
+                .unwrap_or_default();
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .set_status_message(&message);
+            crate::ui::alert_on_main(&message);
+            return QueryEditorCloseOutcome::Cancelled;
+        }
         if has_running_work && !Self::confirm_cancel_running_query_for_close(state, tab_id) {
             return QueryEditorCloseOutcome::Cancelled;
         }
@@ -13755,7 +14466,7 @@ impl MainWindow {
                 // transactions.
                 let mut decided = Vec::with_capacity(runtimes.len());
                 for runtime in &runtimes {
-                    match DecidedSessionTeardown::ask(
+                    match DecidedSessionTeardown::decide(
                         state,
                         &runtime.connection(),
                         runtime.id(),
@@ -14395,11 +15106,9 @@ impl MainWindow {
                     let mut s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Some(message) = transaction_option_block_message(
-                        s.sql_editor.is_query_running(),
-                        s.sql_editor.has_open_lazy_fetch(),
-                        "changing auto-commit",
-                    ) {
+                    if let Some(message) =
+                        TabDbWork::for_editor(&s.sql_editor).block_message("changing auto-commit")
+                    {
                         crate::ui::alert_on_main(&message);
                         s.set_status_message(&message);
                         revert_item(&mut item);
@@ -14562,12 +15271,13 @@ impl MainWindow {
                         let s = state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        s.db_work_blocking_session_teardown(SessionTeardownScope::EveryConnection)
+                        s.db_work_blocking_session_teardown(
+                            SessionTeardownScope::EveryConnection,
+                            "changing connection pool size",
+                        )
                     };
                     if let Some(blocked) = blocked {
-                        crate::ui::alert_on_main(&format!(
-                            "Finish or cancel {blocked} before changing connection pool size."
-                        ));
+                        crate::ui::alert_on_main(&blocked);
                         return true;
                     }
                     // Announced BEFORE the prompts, not after them.
@@ -18283,6 +18993,37 @@ mod tests {
             ),
             None
         );
+        // Both tiers ran and the statement may still be running: the cancel
+        // stops being pending so the user can ask AGAIN, because a second
+        // Cancel is refused while an entry is there
+        // (`cancel_target_is_pending`). Reporting it as still DISPATCHED —
+        // which is what `ForceCompleted` does — would leave the only remaining
+        // way out of a statement on the connection's own session being File >
+        // Disconnect, with no way to try the cheap thing once more.
+        assert_eq!(
+            query_cancel_phase_after_outcome(
+                Some(QueryCancelPhase::Dispatched),
+                &QueryCancelOutcome::ForceAskedAgain,
+            ),
+            None
+        );
+        let asked_again = query_cancel_user_message(&QueryCancelOutcome::ForceAskedAgain)
+            .expect("and the user is told why the tab is still busy after two cancels");
+        assert!(asked_again.text.contains("File > Disconnect"));
+        assert_eq!(
+            asked_again.kind,
+            ResultMessageKind::Info,
+            "the tier did the strongest thing it is allowed to do, so the explanation is not a \
+             cancel FAILURE and must not file itself under Errors"
+        );
+        // The outcomes that really are failures still are, which is what stops
+        // the kind from becoming decoration.
+        assert_eq!(
+            query_cancel_user_message(&QueryCancelOutcome::ForceFailed("boom".to_string()))
+                .expect("a failed force still owes the user a message")
+                .kind,
+            ResultMessageKind::Error
+        );
     }
 
     #[test]
@@ -19685,57 +20426,214 @@ mod tests {
 
     #[test]
     fn validate_result_edit_action_allows_when_no_query_is_running() {
-        assert!(validate_result_edit_action_allowed(false).is_ok());
+        assert!(validate_result_edit_action_allowed(TabDbWork::None).is_ok());
+        // The gate is unchanged: only a running statement refuses.
+        for allowed in [TabDbWork::OpenLazyFetch, TabDbWork::AcceptedExecution] {
+            assert!(validate_result_edit_action_allowed(allowed).is_ok());
+        }
+        // ...and a statement that will not complete is not told to complete.
+        let unstoppable = validate_result_edit_action_allowed(TabDbWork::UnstoppableStatement)
+            .expect_err("a wedged statement still refuses the edit");
+        assert!(
+            !unstoppable.contains("Wait for completion")
+                && unstoppable.contains("File > Disconnect"),
+            "the grid must not be told to wait for a statement that will not complete: \
+             {unstoppable}"
+        );
     }
 
     #[test]
     fn validate_result_edit_action_blocks_when_query_is_running() {
         assert_eq!(
-            validate_result_edit_action_allowed(true),
+            validate_result_edit_action_allowed(TabDbWork::RunningQuery),
             Err("A query is running. Wait for completion before editing result rows.".to_string())
         );
     }
 
+    /// A session-ending action refuses on work the user can stop, and ENDS the
+    /// work the app could not.
+    ///
+    /// The third answer is the fix. A gate that could only say "there is work"
+    /// refused on all of it with "Stop it before continuing", and that is
+    /// unsatisfiable for a statement wedged on the connection's OWN session: a
+    /// cancel may never destroy that session, and on Oracle thin an in-band
+    /// break does not reach a call that is already blocked, so the app has
+    /// already tried everything it is allowed to and the user has nothing
+    /// stronger. The force tier's own message tells them to use
+    /// `File > Disconnect` — and `File > Disconnect` gave them that refusal for
+    /// the same work, so the loop had no exit.
     #[test]
-    fn connection_transition_blocks_running_query_before_lazy_fetch() {
+    fn a_teardown_refuses_work_the_user_can_stop_and_ends_work_the_app_could_not() {
+        // The one answer already knows whether the statement can be stopped,
+        // so the gate does not ask a second question about it.
         assert_eq!(
-            connection_transition_block_message(true, true, "connecting"),
+            TabDbWork::from_flags(true, false, false, false),
+            TabDbWork::RunningQuery
+        );
+        assert_eq!(
+            TabDbWork::from_flags(true, false, false, true),
+            TabDbWork::UnstoppableStatement
+        );
+        // ...but only when it is the tab's WHOLE work. A lazy fetch or an
+        // accepted execution beside it can still be stopped by asking, so the
+        // tab can be, and the action must go on refusing until it has been.
+        assert_eq!(
+            TabDbWork::from_flags(true, true, false, true),
+            TabDbWork::RunningQuery
+        );
+        assert_eq!(
+            TabDbWork::from_flags(true, false, true, true),
+            TabDbWork::RunningQuery
+        );
+        // And the instruction each one gives is the one the user can follow.
+        assert_eq!(
+            TabDbWork::RunningQuery.block_message("disconnecting"),
+            Some("A query is running. Stop it before disconnecting.".to_string())
+        );
+        let unstoppable = TabDbWork::UnstoppableStatement
+            .block_message("disconnecting")
+            .expect("work the app could not stop still owes the user a message");
+        assert!(
+            !unstoppable.contains("Stop it before"),
+            "asking the user to stop what the app could not is the trap: {unstoppable}"
+        );
+        assert!(
+            unstoppable.contains("File > Disconnect"),
+            "and the remedy it names must be the one that exists: {unstoppable}"
+        );
+
+        assert_eq!(
+            TabWorkObstacle::for_one_tab(TabDbWork::RunningQuery, false),
+            TabWorkObstacle::Stoppable
+        );
+        assert_eq!(
+            TabWorkObstacle::for_one_tab(TabDbWork::UnstoppableStatement, false),
+            TabWorkObstacle::UnstoppableByAsking
+        );
+        for work in [TabDbWork::OpenLazyFetch, TabDbWork::AcceptedExecution] {
+            assert_eq!(
+                TabWorkObstacle::for_one_tab(work, false),
+                TabWorkObstacle::Stoppable
+            );
+        }
+        // The tab's work is not always the EDITOR's: for one connection the
+        // scope asks `has_running_query_or_lazy_fetch_for_tab`, which also
+        // counts a lazy fetch in the tab's PROGRESS CONTEXT — a fetch stays on
+        // the connection it was opened on while the tab's binding can move, so
+        // the editor's own flags read idle. This rule is only ever asked about
+        // a tab the scope has already said has work, so that is what `None`
+        // means here, and it is stoppable.
+        assert_eq!(
+            TabWorkObstacle::for_one_tab(TabDbWork::None, false),
+            TabWorkObstacle::Stoppable,
+            "work the editor's flags cannot see is still work, and a disconnect must refuse on it"
+        );
+        // ...and a result-grid fetch beside the wedged statement makes the tab
+        // stoppable again, for the same reason a lazy fetch in the editor does.
+        assert_eq!(
+            TabWorkObstacle::for_one_tab(TabDbWork::UnstoppableStatement, true),
+            TabWorkObstacle::Stoppable
+        );
+
+        // STOPPABLE DOMINATES across tabs: ending a connection over work that
+        // could still have been stopped is what this gate exists to prevent.
+        assert_eq!(
+            TabWorkObstacle::UnstoppableByAsking.or(TabWorkObstacle::Stoppable),
+            TabWorkObstacle::Stoppable
+        );
+        assert_eq!(
+            TabWorkObstacle::Stoppable.or(TabWorkObstacle::UnstoppableByAsking),
+            TabWorkObstacle::Stoppable
+        );
+        assert_eq!(
+            TabWorkObstacle::None.or(TabWorkObstacle::UnstoppableByAsking),
+            TabWorkObstacle::UnstoppableByAsking
+        );
+        assert_eq!(
+            TabWorkObstacle::None.or(TabWorkObstacle::None),
+            TabWorkObstacle::None
+        );
+    }
+
+    #[test]
+    fn tab_db_work_names_a_running_query_before_a_lazy_fetch() {
+        assert_eq!(
+            TabDbWork::from_flags(true, true, true, false),
+            TabDbWork::RunningQuery
+        );
+        assert_eq!(
+            TabDbWork::from_flags(true, true, true, false).block_message("connecting"),
             Some("A query is running. Stop it before connecting.".to_string())
         );
     }
 
     #[test]
-    fn connection_transition_blocks_active_lazy_fetch() {
+    fn tab_db_work_names_an_open_lazy_fetch_and_stays_silent_when_idle() {
         assert_eq!(
-            connection_transition_block_message(false, true, "disconnecting"),
+            TabDbWork::from_flags(false, true, false, false).block_message("disconnecting"),
             Some(
                 "A lazy fetch is still open. Fetch all rows or cancel it before disconnecting."
                     .to_string()
             )
         );
         assert_eq!(
-            connection_transition_block_message(false, false, "disconnecting"),
+            TabDbWork::from_flags(false, false, false, false),
+            TabDbWork::None
+        );
+        assert_eq!(
+            TabDbWork::from_flags(false, false, false, false).block_message("disconnecting"),
             None
         );
+        assert!(!TabDbWork::None.blocks());
     }
 
+    /// The per-tab SETTING changes refuse on the SAME work every session-ending
+    /// action refuses on — including the third kind.
+    ///
+    /// The third kind is the fix. Both deferred roads tell the user the
+    /// execution started and then run it up to 0.2s later, re-reading the tab's
+    /// pins at startup, so an auto-commit toggle or a transaction-mode pick
+    /// inside that window silently moved the statement the user had ALREADY
+    /// launched onto the other side of it — a DML sent under manual commit
+    /// committing itself. The display checkpoints cannot catch it, because the
+    /// displayed value moves with the pin.
     #[test]
-    fn transaction_option_changes_block_running_work() {
+    fn transaction_option_changes_block_every_kind_of_tab_work() {
         assert_eq!(
-            transaction_option_block_message(true, false, "changing auto-commit"),
+            TabDbWork::from_flags(true, false, false, false).block_message("changing auto-commit"),
             Some("A query is running. Stop it before changing auto-commit.".to_string())
         );
         assert_eq!(
-            transaction_option_block_message(false, true, "changing transaction mode"),
+            TabDbWork::from_flags(false, true, false, false).block_message("changing transaction mode"),
             Some(
                 "A lazy fetch is still open. Fetch all rows or cancel it before changing transaction mode."
                     .to_string()
             )
         );
         assert_eq!(
-            transaction_option_block_message(false, false, "changing auto-commit"),
+            TabDbWork::from_flags(false, false, true, false).block_message("changing auto-commit"),
+            Some(
+                "A statement this tab already accepted has not started yet. Wait for it or cancel it before changing auto-commit."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            TabDbWork::from_flags(false, false, false, false).block_message("changing auto-commit"),
             None
         );
+        // ...and it is the same answer the session-ending gates count, so the
+        // two can never drift apart again.
+        for (running, lazy, accepted) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                TabDbWork::from_flags(running, lazy, accepted, false).blocks(),
+                running || lazy || accepted
+            );
+        }
     }
 
     #[test]
@@ -20167,7 +21065,6 @@ mod tests {
         let snapshot = crate::db::PooledSessionLeaseSnapshot {
             db_type: crate::db::DatabaseType::MySQL,
             pool_context_epoch: 0,
-            transaction_state: crate::db::TransactionSessionState::DecisionRequired,
             retained_state: crate::db::RetainedSessionState::from_transaction_state(
                 crate::db::TransactionSessionState::DecisionRequired,
             ),
@@ -20404,7 +21301,6 @@ mod tests {
         let snapshot = crate::db::PooledSessionLeaseSnapshot {
             db_type: crate::db::DatabaseType::MySQL,
             pool_context_epoch: 0,
-            transaction_state: crate::db::TransactionSessionState::Clean,
             retained_state: crate::db::RetainedSessionState::from_transaction_state(
                 crate::db::TransactionSessionState::Clean,
             ),

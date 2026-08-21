@@ -1959,6 +1959,20 @@ impl RetainedSessionDisposition {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RetainedSessionMutationOutcome {
     NoSession,
+    /// There is nothing about THIS session for the push to change — the tab
+    /// asked for a scope this backend cannot apply to a retained session (an
+    /// empty Oracle schema), or the setting is not a session setting on this
+    /// backend at all (Oracle's auto-commit is client-side).
+    ///
+    /// Distinct from [`Self::NoSession`], which says the slot was EMPTY, and
+    /// from [`Self::Applied`], which says something was done. Both were used
+    /// for this, on different backends, so the same situation reported two
+    /// different facts and neither was true: Oracle's auto-commit push
+    /// answered `Applied` whether or not a session existed, and the scope push
+    /// answered `NoSession` about a session that was sitting right there.
+    /// Neither alerts the user, so nothing was ever wrong on screen — this is
+    /// the log and the next reader.
+    NotApplicable,
     Applied,
     AppliedWithWarning(String),
     DiscardedBecauseStale,
@@ -1974,7 +1988,9 @@ impl RetainedSessionMutationOutcome {
             | Self::BlockedRequiresResolution(message)
             | Self::FailedRestored(message)
             | Self::FailedDiscarded(message) => Some(message.as_str()),
-            Self::NoSession | Self::Applied | Self::DiscardedBecauseStale => None,
+            Self::NoSession | Self::NotApplicable | Self::Applied | Self::DiscardedBecauseStale => {
+                None
+            }
         }
     }
 
@@ -1996,12 +2012,13 @@ impl RetainedSessionMutationOutcome {
     }
 
     pub fn should_alert_user(&self) -> bool {
-        !matches!(self, Self::NoSession | Self::Applied)
+        !matches!(self, Self::NoSession | Self::NotApplicable | Self::Applied)
     }
 
     pub fn status_label(&self) -> &'static str {
         match self {
             Self::NoSession => "no retained session",
+            Self::NotApplicable => "nothing to apply to this session",
             Self::Applied => "applied",
             Self::AppliedWithWarning(_) => "applied with cleanup warning",
             Self::DiscardedBecauseStale => "discarded stale retained session",
@@ -2320,14 +2337,28 @@ pub struct TakenDbSessionLease {
 pub struct PooledSessionLeaseSnapshot {
     pub db_type: DatabaseType,
     pub pool_context_epoch: u64,
-    pub transaction_state: TransactionSessionState,
     pub retained_state: RetainedSessionState,
     pub current_scope: Option<String>,
 }
 
 impl PooledSessionLeaseSnapshot {
+    /// The session's state folded down to the transaction axis alone.
+    ///
+    /// DERIVED, not stored. It used to be a second FIELD beside
+    /// `retained_state`, holding `retained_state.summary_transaction_state()` —
+    /// the same fact, folded so that session residue and a held lock both
+    /// report as `MaybeDirty`. Two fields, and which one a call site read was a
+    /// matter of typing: reading this one gives "the session may have
+    /// uncommitted work" for a session whose only residue is a `SET NAMES`, and
+    /// every message keyed off that offers commit/rollback — a remedy that
+    /// cannot clear session-setting residue. The test constructions had already
+    /// drifted (one built a snapshot whose stored summary said `Clean` over a
+    /// retained state carrying a transaction-mode override, which production
+    /// can never produce) and nothing noticed, because nothing could.
+    ///
+    /// One field, one fact; the fold is a function on it.
     pub fn transaction_state(&self) -> TransactionSessionState {
-        self.transaction_state
+        self.retained_state.summary_transaction_state()
     }
 
     pub fn retained_state(&self) -> RetainedSessionState {
@@ -2348,8 +2379,12 @@ pub struct DbPoolSessionContext {
     pub connection_pool_size: u32,
     pub current_service_name: String,
     pub oracle_current_schema: Option<String>,
-    pub auto_commit: bool,
-    pub transaction_mode: TransactionMode,
+    /// The CONNECTION's own two session options. Private, and named for their
+    /// owner, because a caller preparing a session for a TAB must state the
+    /// tab's settings at the door ([`PooledSessionPurpose`]) instead of
+    /// reaching in and replacing one of them.
+    connection_auto_commit: bool,
+    connection_transaction_mode: TransactionMode,
     pub default_transaction_isolation: TransactionIsolation,
     cache_epoch: u64,
     cache_epoch_token: Arc<AtomicU64>,
@@ -2406,18 +2441,20 @@ impl DbPoolSessionContext {
     /// goes away — with no way for a new call site to opt out.
     pub fn acquire_session_for_current_scope(
         &self,
+        purpose: PooledSessionPurpose,
         activity: &DbActivityGuard,
     ) -> Result<AcquiredPoolSession, String> {
-        self.acquire_session_with_scope_context(self, activity)
+        self.acquire_session_with_scope_context(self, purpose, activity)
     }
 
     pub fn acquire_session_for_scope(
         &self,
         scope: Option<&str>,
+        purpose: PooledSessionPurpose,
         activity: &DbActivityGuard,
     ) -> Result<AcquiredPoolSession, String> {
         let scoped = self.for_scope(scope);
-        self.acquire_session_with_scope_context(&scoped, activity)
+        self.acquire_session_with_scope_context(&scoped, purpose, activity)
     }
 
     /// A pooled session for a caller that applies the scope ITSELF.
@@ -2587,6 +2624,7 @@ impl DbPoolSessionContext {
     fn acquire_session_with_scope_context(
         &self,
         scope_context: &DbPoolSessionContext,
+        purpose: PooledSessionPurpose,
         activity: &DbActivityGuard,
     ) -> Result<AcquiredPoolSession, String> {
         let mut acquired = self.acquire_session_at_the_one_door(activity)?;
@@ -2618,7 +2656,7 @@ impl DbPoolSessionContext {
         let Some(session) = acquired.session_mut() else {
             return Err(STALE_POOL_CONTEXT_MESSAGE.to_string());
         };
-        if let Err(err) = scope_context.apply_current_scope_to_session(session) {
+        if let Err(err) = scope_context.apply_current_scope_to_session(session, purpose) {
             acquired.discard();
             return Err(Self::preparation_failure(err));
         }
@@ -2632,8 +2670,23 @@ impl DbPoolSessionContext {
     pub fn apply_current_scope_to_session(
         &self,
         session: &mut DbPoolSession,
+        purpose: PooledSessionPurpose,
     ) -> Result<(), String> {
-        backend_for(self.connection_info.db_type).apply_current_scope_to_session(self, session)
+        backend_for(self.connection_info.db_type)
+            .apply_current_scope_to_session(self, session, purpose)
+    }
+
+    /// The auto-commit a session acquired from this context for `purpose` is
+    /// prepared with: the connection's default is only ever the FALLBACK, and
+    /// an app read overrides it.
+    fn session_auto_commit_for(&self, purpose: PooledSessionPurpose) -> bool {
+        purpose.auto_commit(self.connection_auto_commit)
+    }
+
+    /// The transaction mode a session acquired from this context for `purpose`
+    /// is prepared with.
+    fn session_transaction_mode_for(&self, purpose: PooledSessionPurpose) -> TransactionMode {
+        purpose.transaction_mode(self.connection_transaction_mode)
     }
 
     /// Throw away a session that was acquired but could not be handed over.
@@ -2703,10 +2756,130 @@ impl CanceledSession {
     /// bookkeeping (File > Disconnect), never a side effect of cancelling one
     /// call. Re-breaking is the strongest tier available for a main session,
     /// and it is not a failure to report.
-    pub fn force_tier_may_destroy_it(self) -> bool {
+    ///
+    /// The PURPOSE is the other half of the question, and leaving it out was a
+    /// hole rather than a simplification: the rule read "a main session is
+    /// never destroyed", so the deliberate action it points at had no way to
+    /// destroy one either. `File > Disconnect` then REFUSED on a statement the
+    /// app had already told the user it could not stop, which left the message
+    /// naming a remedy the app would not perform.
+    pub fn force_tier_may_destroy_it(self, purpose: SessionCancelPurpose) -> bool {
+        match (self, purpose) {
+            (Self::Pooled, _) => true,
+            // THE deliberate action with its own bookkeeping. It ends the
+            // connection, so the objection to destroying its session -- that
+            // the app would be left describing a connection that is gone --
+            // does not apply: the same action marks it disconnected, retires
+            // its pool and re-labels its tabs.
+            (Self::Main, SessionCancelPurpose::EndTheConnection) => true,
+            (Self::Main, SessionCancelPurpose::StopOneCall) => false,
+        }
+    }
+}
+
+/// WHY a tier is reaching a session, and therefore how far it may go.
+///
+/// The missing half of [`CanceledSession::force_tier_may_destroy_it`]. That
+/// rule is a fact about the SESSION; this is the fact about the ACTION, and
+/// only the two together answer "may this be torn down". With the session's
+/// half alone the app could never end a call on the connection's own session at
+/// all -- not even from the action whose whole contract is to end that
+/// connection -- so a statement the cancel tiers could not stop (Oracle thin's
+/// in-band break does not reach a call that is already blocked) left the tab
+/// busy for ever, with `File > Disconnect` refusing on it and telling the user
+/// to stop the query first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionCancelPurpose {
+    /// Stop ONE call and leave the connection usable. Everything the cancel
+    /// button, a query timeout and the stale sweep do.
+    StopOneCall,
+    /// End the CONNECTION: `File > Disconnect`, `Disconnect All`, a reconnect,
+    /// application exit. The connection is not expected to survive, so the
+    /// strongest tier each backend has is available for every session on it.
+    ///
+    /// This is a PERMISSION, not a promise that the driver can carry it out.
+    /// Whether a tear-down lands is a per-driver fact and it travels in the
+    /// answer ([`ForceTierOutcome`] / the `Err`), never in this rule: Oracle
+    /// thin closes its socket and the MySQL family issues `KILL CONNECTION`,
+    /// while OCI refuses to drop-close a connection that did not come from a
+    /// session pool (`DPI-1011`) — live-verified on all four. OCI needs no
+    /// tear-down for this, because its break DOES land on a running call; what
+    /// decides either way is the app's own bounded wait for the work to let go
+    /// of its session (`AppState::ended_work_that_has_not_stopped`).
+    EndTheConnection,
+}
+
+/// What the tier that cannot be taken back actually DID to the session.
+///
+/// A force tier used to answer only [`SessionCancelDelivery`], and that
+/// collapsed two facts a caller draws OPPOSITE conclusions from:
+///
+/// * the session was DESTROYED -- nothing can still be running on it, so the
+///   operation that owned it is over and its registry row may be retired; and
+/// * the session may not be destroyed at all, because it is the connection's
+///   OWN ([`CanceledSession::force_tier_may_destroy_it`]), so the strongest
+///   tier available was a SECOND BREAK and the work may still be running.
+///
+/// Both answered `Ok(Delivered)`. The query tab's force watchdog read that as
+/// the tear-down: it reported `ForceCompleted`, retired the operation's
+/// activity row and ABANDONED the operation -- publishing the tab idle and
+/// clearing its cancel flag -- for a statement that was merely broken again.
+/// From that instant nothing in the app named work that was still running on
+/// the connection's own session, which is exactly what every session-ending
+/// gate asks. It is reachable on all four backends (the Oracle explain plan on
+/// both drivers, the MySQL family's one main-connection execution path, and
+/// everything after a script `CONNECT` on OCI) and worst on Oracle thin, whose
+/// in-band break may not reach a call that is already blocked
+/// (`QueryCancelHandle::graceful_break_may_not_interrupt_a_blocked_call`).
+///
+/// So the tier NAMES what it did, and the conclusion is drawn from the name
+/// rather than from the delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum ForceTierOutcome {
+    /// The tear-down reached the server. Nothing can still be running on that
+    /// session.
+    Destroyed,
+    /// This session may not be destroyed, so it was broken again instead. The
+    /// work MAY STILL BE RUNNING on it, and no caller may conclude otherwise.
+    AskedAgain,
+    /// The session stopped being this work's before the tier could land.
+    /// Nothing was reached, and nothing failed.
+    Withdrawn,
+}
+
+impl ForceTierOutcome {
+    /// Whether the work this tier was aimed at is certainly over.
+    ///
+    /// The ONE question a caller that ends an operation may ask. `AskedAgain`
+    /// and `Withdrawn` both answer no, for different reasons that are both
+    /// "do not conclude the work has stopped".
+    pub fn work_cannot_continue(self) -> bool {
+        matches!(self, Self::Destroyed)
+    }
+
+    /// How far this tier got, for a caller that only needs the delivery --
+    /// [`DbActivityCanceler::force`], whose road draws no conclusion from it.
+    pub fn delivery(self) -> SessionCancelDelivery {
         match self {
-            Self::Pooled => true,
-            Self::Main => false,
+            Self::Destroyed | Self::AskedAgain => SessionCancelDelivery::Delivered,
+            Self::Withdrawn => SessionCancelDelivery::Withdrawn,
+        }
+    }
+
+    /// The answer for a tier that ran the TEAR-DOWN.
+    pub fn after_tear_down(delivery: SessionCancelDelivery) -> Self {
+        match delivery {
+            SessionCancelDelivery::Delivered => Self::Destroyed,
+            SessionCancelDelivery::Withdrawn => Self::Withdrawn,
+        }
+    }
+
+    /// The answer for a tier that could only BREAK THE SESSION AGAIN.
+    pub fn after_re_break(delivery: SessionCancelDelivery) -> Self {
+        match delivery {
+            SessionCancelDelivery::Delivered => Self::AskedAgain,
+            SessionCancelDelivery::Withdrawn => Self::Withdrawn,
         }
     }
 }
@@ -3055,12 +3228,17 @@ impl DbActivityCanceler for PoolSessionCanceler {
         }
     }
 
-    fn force(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
+    fn force(
+        &self,
+        claim: &SessionCancelClaim,
+        purpose: SessionCancelPurpose,
+    ) -> Result<SessionCancelDelivery, String> {
         // How far the force tier may go is a question about WHICH session this
-        // is, not about which driver it is, so it is answered once for all four
-        // backends — and in ONE place for every force tier in the app, not just
-        // this one. See [`CanceledSession::force_tier_may_destroy_it`].
-        if !self.session().force_tier_may_destroy_it() {
+        // is and WHAT the caller is doing, not about which driver it is, so it
+        // is answered once for all four backends — and in ONE place for every
+        // force tier in the app, not just this one. See
+        // [`CanceledSession::force_tier_may_destroy_it`].
+        if !self.session().force_tier_may_destroy_it(purpose) {
             return self.interrupt(claim);
         }
         match self {
@@ -4852,7 +5030,6 @@ impl SharedDbSessionLease {
             .map(|(entry, lease)| PooledSessionLeaseSnapshot {
                 db_type: lease.db_type(),
                 pool_context_epoch: entry.pool_context_epoch,
-                transaction_state: entry.retained_state.summary_transaction_state(),
                 retained_state: entry.retained_state,
                 current_scope: entry.current_scope.clone(),
             })
@@ -5405,6 +5582,7 @@ pub(crate) trait DbBackend: Sync {
         &self,
         context: &DbPoolSessionContext,
         session: &mut DbPoolSession,
+        purpose: PooledSessionPurpose,
     ) -> Result<(), String>;
     fn test_connection(
         &self,
@@ -5676,6 +5854,129 @@ pub enum SessionScopeAssertion {
     /// The scope the tab names is not available on the server; the statements
     /// that follow do not run in it.
     ScopeUnavailable { scope: String },
+}
+
+/// WHOSE session settings a pooled session is prepared with — and therefore
+/// what it is allowed to leave behind on the server.
+///
+/// Asked at the acquire door, by every caller, because the two kinds of work
+/// that borrow a pooled session want opposite things and the door could not
+/// tell them apart:
+///
+/// * **The app's own reads** — object-browser metadata, IntelliSense column
+///   loads, bind-parameter probes, the schema loaders. They run no statement of
+///   the user's, so the tab's auto-commit means nothing to them; what they must
+///   not do is hand a session back to the pool holding an open transaction. The
+///   app already knows this rule and already keeps it for the connection's LIVE
+///   session (`MysqlBackend::connect` pins it to `autocommit=1`, with the
+///   reason written out: "under autocommit=0 every metadata table read leaves
+///   an implicitly opened transaction on it"). Pooled reads had the same
+///   property and no such rule: they were prepared with the connection's
+///   logical auto-commit, which is `false` for the whole life of the GUI, so
+///   every metadata read opened an InnoDB transaction that stayed open — and
+///   held its `MDL_SHARED_READ` on everything it had touched — until that
+///   session happened to be handed out again and rolled back. A user's
+///   `ALTER TABLE` waits behind exactly that.
+///
+/// * **A tab's statements**, which must be prepared with the TAB's own two
+///   settings, never the connection's.
+///
+/// Making it an argument rather than a field is what removes the older trap in
+/// the same place: `DbPoolSessionContext` used to carry `auto_commit` and
+/// `transaction_mode` as two public fields describing the connection, and the
+/// MySQL execution acquire OVERWROTE one of them (the mode) with the tab's
+/// value while leaving the other (auto-commit) as the connection's. One struct,
+/// two fields of the same kind, two different owners — with the neighbouring
+/// comment warning that a connection default reaching that far is "the door the
+/// tab pin overwritten by the connection default bug came through". Now nothing
+/// overwrites anything: the context states the CONNECTION's defaults and the
+/// caller states whose settings this session is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PooledSessionPurpose {
+    /// The app reading on the user's behalf. Never leaves a transaction open.
+    AppRead,
+    /// A query tab's statements, under the tab's own effective settings.
+    TabStatements {
+        auto_commit: bool,
+        transaction_mode: TransactionMode,
+    },
+}
+
+impl PooledSessionPurpose {
+    pub fn tab_statements(auto_commit: bool, transaction_mode: TransactionMode) -> Self {
+        Self::TabStatements {
+            auto_commit,
+            transaction_mode,
+        }
+    }
+
+    /// The auto-commit this session is prepared with.
+    ///
+    /// An app read is ALWAYS prepared auto-commit on, whatever the connection
+    /// default is — that is the whole rule, and it is stated once here instead
+    /// of once per backend.
+    fn auto_commit(self, _connection_default: bool) -> bool {
+        match self {
+            Self::AppRead => true,
+            Self::TabStatements { auto_commit, .. } => auto_commit,
+        }
+    }
+
+    /// The transaction mode this session is prepared with: the connection's for
+    /// an app read (it has no tab to speak for), the tab's own otherwise.
+    fn transaction_mode(self, connection_default: TransactionMode) -> TransactionMode {
+        match self {
+            Self::AppRead => connection_default,
+            Self::TabStatements {
+                transaction_mode, ..
+            } => transaction_mode,
+        }
+    }
+}
+
+/// One statement of an Oracle transaction-mode application, and WHICH of the
+/// two kinds it is.
+///
+/// The kind is carried with the statement instead of beside it because the two
+/// facts are never separately true: only the session-default RESET restores a
+/// state the tab already represents, and only that one must be left out of the
+/// session's recorded residue. Callers used to receive a bare `(String, bool)`
+/// pair built at one site and a bare `Vec<String>` from another, and the rule
+/// about the bool lived in a doc comment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleTransactionModeStatement {
+    sql: String,
+    restores_session_default: bool,
+}
+
+impl OracleTransactionModeStatement {
+    /// `ALTER SESSION SET ISOLATION_LEVEL = <connection default>`: it puts the
+    /// session back where the tab already says it is.
+    fn session_default_reset(sql: String) -> Self {
+        Self {
+            sql,
+            restores_session_default: true,
+        }
+    }
+
+    /// The tab's own mode. Its effects ARE the session's residue.
+    fn tab_mode(sql: String) -> Self {
+        Self {
+            sql,
+            restores_session_default: false,
+        }
+    }
+
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// Whether this statement restores the connection default rather than
+    /// stating the tab's mode — and therefore whether its effects must be left
+    /// out of the session's recorded residue.
+    pub fn restores_session_default(&self) -> bool {
+        self.restores_session_default
+    }
 }
 
 impl SessionScopeAssertion {
@@ -5974,6 +6275,12 @@ impl DbBackend for OracleBackend {
         &self,
         context: &DbPoolSessionContext,
         session: &mut DbPoolSession,
+        // Oracle expresses neither auto-commit (it is client-side) nor the
+        // transaction mode (it is per transaction, applied by the execution
+        // layer) as a session setting a scope apply could carry, so the purpose
+        // changes nothing HERE. It is still taken, so that a future session
+        // setting added to this branch cannot be written without an owner.
+        _purpose: PooledSessionPurpose,
     ) -> Result<(), String> {
         let result = match session {
             DbPoolSession::Oracle(conn) => DatabaseConnection::apply_oracle_current_schema(
@@ -6464,6 +6771,7 @@ impl DbBackend for MysqlBackend {
         &self,
         context: &DbPoolSessionContext,
         session: &mut DbPoolSession,
+        purpose: PooledSessionPurpose,
     ) -> Result<(), String> {
         let DbPoolSession::MySQL { conn, db_type } = session else {
             return Err(format!(
@@ -6492,8 +6800,8 @@ impl DbBackend for MysqlBackend {
             })?;
             return DatabaseConnection::apply_mysql_session_transaction_options(
                 conn,
-                context.auto_commit,
-                context.transaction_mode,
+                context.session_auto_commit_for(purpose),
+                context.session_transaction_mode_for(purpose),
                 context.connection_info.db_type,
                 context.default_transaction_isolation,
             );
@@ -6518,8 +6826,8 @@ impl DbBackend for MysqlBackend {
         })?;
         DatabaseConnection::apply_mysql_session_transaction_options(
             conn,
-            context.auto_commit,
-            context.transaction_mode,
+            context.session_auto_commit_for(purpose),
+            context.session_transaction_mode_for(purpose),
             context.connection_info.db_type,
             context.default_transaction_isolation,
         )
@@ -7446,18 +7754,63 @@ impl DatabaseConnection {
         Ok(())
     }
 
+    /// The current database's default collation, read WITHOUT opening a
+    /// transaction on the session.
+    ///
+    /// This is app bookkeeping — it runs after every scope application, to
+    /// build the `SET NAMES ... COLLATE ...` that follows a database switch —
+    /// and it used to read `INFORMATION_SCHEMA.SCHEMATA`, which on MySQL 8 is a
+    /// view over the InnoDB data dictionary. Under `autocommit = 0`, which is
+    /// the connection default for the whole life of the GUI, a table read opens
+    /// an InnoDB transaction, and nothing ever ended it: the app's own
+    /// bookkeeping made the TAB's session look like it was carrying a
+    /// transaction. The dirty probe then reported that truthfully, the tab went
+    /// to `MaybeDirty`, and every transaction-option gate refused the user's
+    /// next `SET SESSION autocommit = 1` with "Commit, rollback, or discard it
+    /// first" — about a transaction that was entirely the app's own and held
+    /// nothing of theirs. Live-reproduced by
+    /// `execute_mysql_final_hardcore_with_query_timeout`, whose script is
+    /// refused at its sixth statement; the general log is what showed which
+    /// read opened it.
+    ///
+    /// This is the THIRD time the same hazard has been answered in this file,
+    /// and the other two say so in their own words: `MysqlBackend::connect`
+    /// pins the connection's live session to `autocommit=1` because "every
+    /// metadata table read leaves an implicitly opened transaction on it, which
+    /// the dirty probe then truthfully reports", and
+    /// `mysql_innodb_transaction_probe_sql` filters on rows modified or locked
+    /// because "under autocommit=0 every statement — including this probe —
+    /// registers an implicit read-only transaction". Neither could cover this
+    /// one: this read runs on the TAB's session, which must keep the tab's own
+    /// auto-commit, so it cannot be pinned; and it is the FIRST probe in
+    /// MySQL's chain (`performance_schema`, which has no stale entries and
+    /// therefore no filter) that answers.
+    ///
+    /// So the rule is applied where the transaction was actually created: an
+    /// app read that has a transaction-free spelling must use it.
+    /// `@@collation_database` is that spelling — the server sets it whenever
+    /// the default database changes — and it is exactly equivalent once the
+    /// no-database case is spelled out: the variable falls back to
+    /// `collation_server` when there is no default database, where the
+    /// `INFORMATION_SCHEMA` form returned no row. Verified equal for both
+    /// answers on MySQL 8.0 and MariaDB, and verified to leave the session with
+    /// no open transaction.
+    ///
+    /// The `INFORMATION_SCHEMA` read stays as the FALLBACK, for a server that
+    /// cannot answer the variable at all. It can still open a transaction —
+    /// but only when the transaction-free read has already failed, which means
+    /// the session is not in a state the next statement will survive anyway.
     fn mysql_current_database_collation_for_db_type<C: Queryable>(
         conn: &mut C,
         db_type: DatabaseType,
     ) -> Option<String> {
         let display_name = db_type.display_name();
-        match conn.query_first::<String, _>(
-            "SELECT DEFAULT_COLLATION_NAME \
-             FROM INFORMATION_SCHEMA.SCHEMATA \
-             WHERE SCHEMA_NAME = DATABASE()",
-        ) {
-            Ok(Some(collation)) => return Some(collation.trim().to_string()),
-            Ok(None) => {}
+        match conn.query_first::<Option<String>, _>(Self::mysql_database_collation_probe_sql()) {
+            Ok(Some(Some(collation))) => return Some(collation.trim().to_string()),
+            // The session has no current database, exactly as the
+            // `INFORMATION_SCHEMA` form's "no row" meant. `SET NAMES` then goes
+            // out without a `COLLATE`, which is what it has always done here.
+            Ok(Some(None)) | Ok(None) => return None,
             Err(err) => {
                 eprintln!(
                     "Warning: failed to read {display_name} current database collation for session setup: {err}"
@@ -7465,7 +7818,11 @@ impl DatabaseConnection {
             }
         }
 
-        match conn.query_first::<String, _>("SELECT @@collation_database") {
+        match conn.query_first::<String, _>(
+            "SELECT DEFAULT_COLLATION_NAME \
+             FROM INFORMATION_SCHEMA.SCHEMATA \
+             WHERE SCHEMA_NAME = DATABASE()",
+        ) {
             Ok(value) => value.map(|collation| collation.trim().to_string()),
             Err(err) => {
                 eprintln!(
@@ -7474,6 +7831,16 @@ impl DatabaseConnection {
                 None
             }
         }
+    }
+
+    /// The transaction-free spelling of "the current database's default
+    /// collation, or nothing when there is no current database".
+    ///
+    /// Public so a live test can probe with exactly the SQL the app ships
+    /// rather than a copy that could drift — the same reason
+    /// [`Self::mysql_transaction_probe_sql_order`] is public.
+    pub const fn mysql_database_collation_probe_sql() -> &'static str {
+        "SELECT IF(DATABASE() IS NULL, NULL, @@collation_database)"
     }
 
     #[cfg(test)]
@@ -8175,8 +8542,8 @@ impl DatabaseConnection {
             connection_pool_size: self.connection_pool_size,
             current_service_name: self.info.service_name.clone(),
             oracle_current_schema: self.oracle_current_schema.clone(),
-            auto_commit: self.auto_commit,
-            transaction_mode: self.transaction_mode,
+            connection_auto_commit: self.auto_commit,
+            connection_transaction_mode: self.transaction_mode,
             default_transaction_isolation: self.default_transaction_isolation,
             cache_epoch: self.current_pool_context_epoch(),
             cache_epoch_token: Arc::clone(&self.pool_context_epoch),
@@ -8198,7 +8565,10 @@ impl DatabaseConnection {
     /// [`DbConnectionPool::acquire_session`], both of which require an activity
     /// so the work stays visible, cancelable, and sweepable.
     #[cfg(test)]
-    pub fn acquire_pool_session(&self) -> Result<Option<DbPoolSession>, String> {
+    pub fn acquire_pool_session(
+        &self,
+        purpose: PooledSessionPurpose,
+    ) -> Result<Option<DbPoolSession>, String> {
         let mut session = self
             .pool
             .as_ref()
@@ -8207,7 +8577,7 @@ impl DatabaseConnection {
 
         if let Some(session) = session.as_mut() {
             self.pool_session_context()?
-                .apply_current_scope_to_session(session)?;
+                .apply_current_scope_to_session(session, purpose)?;
         }
 
         Ok(session)
@@ -8457,22 +8827,36 @@ impl DatabaseConnection {
 
     /// Every statement an Oracle execution must issue to put the session into
     /// the tab's transaction mode: the session-level reset above (when the tab
-    /// asks for the connection default) followed by the mode itself. Both
-    /// Oracle drivers go through here so they cannot drift apart.
+    /// asks for the connection default) followed by the mode itself.
+    ///
+    /// Both Oracle drivers go through here so they cannot drift apart — and
+    /// that claim used to be false in the direction that always rots. The
+    /// execution layer composed the same two pieces itself, so the rule lived
+    /// in two places and the copy with the unit test was the one PRODUCTION DID
+    /// NOT RUN. Nothing had diverged yet; nothing would have caught it if it
+    /// had.
+    ///
+    /// The pairing is part of the answer rather than a caller's decision: the
+    /// RESET puts the session back into a state the tab already represents, so
+    /// recording its effects as session residue would make the tab's next
+    /// execution stop and ask the user to resolve a session the app itself just
+    /// made clean. A caller that had to derive that from the statement text
+    /// could get it wrong; here it cannot be separated from the statement.
     pub fn oracle_transaction_mode_statements_for_tab(
         tab_selected_mode: Option<TransactionMode>,
         mode: TransactionMode,
         default_isolation: TransactionIsolation,
-    ) -> Result<Vec<String>, String> {
-        let mut statements = Vec::new();
-        statements.extend(Self::oracle_session_isolation_reset_statement(
-            tab_selected_mode,
-            default_isolation,
-        ));
-        statements.extend(Self::transaction_mode_statements_for(
-            DatabaseType::Oracle,
-            mode,
-        )?);
+    ) -> Result<Vec<OracleTransactionModeStatement>, String> {
+        let mut statements: Vec<OracleTransactionModeStatement> =
+            Self::oracle_session_isolation_reset_statement(tab_selected_mode, default_isolation)
+                .into_iter()
+                .map(OracleTransactionModeStatement::session_default_reset)
+                .collect();
+        statements.extend(
+            Self::transaction_mode_statements_for(DatabaseType::Oracle, mode)?
+                .into_iter()
+                .map(OracleTransactionModeStatement::tab_mode),
+        );
         Ok(statements)
     }
 
@@ -9331,8 +9715,8 @@ fn pool_session_context_identity_matches(
         && left.connection_pool_size == right.connection_pool_size
         && left.current_service_name == right.current_service_name
         && left.oracle_current_schema == right.oracle_current_schema
-        && left.auto_commit == right.auto_commit
-        && left.transaction_mode == right.transaction_mode
+        && left.connection_auto_commit == right.connection_auto_commit
+        && left.connection_transaction_mode == right.connection_transaction_mode
         && left.default_transaction_isolation == right.default_transaction_isolation
 }
 
@@ -9660,7 +10044,14 @@ impl DbActivityProgress {
 /// backend from joining the app without answering that.
 pub trait DbActivityCanceler: Send + Sync {
     fn interrupt(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String>;
-    fn force(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String>;
+    /// The tier that cannot be taken back. `purpose` is how far it may go --
+    /// see [`CanceledSession::force_tier_may_destroy_it`], which is the one
+    /// place that decides, for every force tier in the app.
+    fn force(
+        &self,
+        claim: &SessionCancelClaim,
+        purpose: SessionCancelPurpose,
+    ) -> Result<SessionCancelDelivery, String>;
     fn label(&self) -> &'static str;
 }
 
@@ -9820,10 +10211,33 @@ pub struct DbActivityFinishHandle {
 }
 
 impl DbActivityFinishHandle {
+    /// Retire this row because the work it names is OVER.
     pub fn finish(&self) {
         if let Some(inner) = self.inner.upgrade() {
             inner.finish();
         }
+    }
+
+    /// Retire this row for work the app has ENDED but which has not STOPPED.
+    ///
+    /// [`Self::finish`] says the work is over, and a force tier cannot say
+    /// that: it destroys the SESSION, while the worker goes on holding its pool
+    /// slot -- and its frame -- for as long as its unwind takes. Retiring the
+    /// row with `finish` left that job named by nothing at all, so the pool
+    /// rebuild's gate and application exit's wait both answered "there is no DB
+    /// work" about a job the app had just torn a session out from under.
+    ///
+    /// The screen is still right immediately, which is the whole reason a
+    /// cancel retires its row at dispatch; the ledger is what keeps the app
+    /// able to say the work has not let go yet.
+    pub fn finish_for_work_that_has_not_stopped(&self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if inner.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        remove_db_activity_for_work_that_has_not_stopped(inner.id, &self.inner);
     }
 
     /// The row this handle observes, or `None` once the WORK has let go of it.
@@ -10295,6 +10709,43 @@ fn remove_db_activity(id: u64) {
     drop(removed);
 }
 
+/// Remove one row for work the app has ENDED but which has not STOPPED, and
+/// remember it in the SAME acquisition.
+///
+/// The twin of what `cancel_db_activities_where` does for the rows IT retires,
+/// and it exists for the same reason: the ledger stands in for the row exactly
+/// while the row is gone, so filling it in a second acquisition leaves an
+/// instant in which the work is named by NEITHER -- and the questions that then
+/// answer wrongly (`db_activity_names_connection`, whose one caller
+/// DISCONNECTS, application exit's wait, and the pool rebuild's gate) all
+/// answer in the direction that costs a session.
+///
+/// Only a row with a CANCELER is remembered, exactly as in
+/// `cancel_db_activities_where`: that is the kind with a session published
+/// under it, and therefore the only kind whose connection must go on being
+/// named until it has let go.
+fn remove_db_activity_for_work_that_has_not_stopped(id: u64, guard: &Weak<DbActivityGuardInner>) {
+    let removed = {
+        let mut activities = lock_db_activities();
+        let mut still_holding = Vec::new();
+        let removed = activities
+            .iter()
+            .position(|activity| activity.id == id)
+            .map(|index| activities.swap_remove(index));
+        if let Some(tracked) = removed.as_ref() {
+            if !tracked.cancelers.is_empty() {
+                still_holding.push((tracked.connection_id, guard.clone()));
+            }
+        }
+        // In the SAME acquisition that removed it.
+        remember_cancelled_work_still_holding_a_session(&activities, still_holding);
+        removed
+    };
+    // The entry owns caller-supplied values -- the cancel hook's closure and
+    // the session cancelers -- so it is dropped outside the registry lock.
+    drop(removed);
+}
+
 pub fn track_pool_db_activity(
     activity: impl Into<String>,
     db_type: DatabaseType,
@@ -10442,7 +10893,7 @@ pub(crate) fn db_activity_names_connection(connection_id: ConnectionId) -> bool 
     // single acquisition of the registry lock, so a reader that misses it in
     // the first place finds it in the second. There is no order of these two
     // reads in which work that never stopped goes unnamed.
-    a_row_names_it || cancelled_work_still_holds_a_session_on(connection_id)
+    a_row_names_it || cancelled_db_work_still_holds_a_session_on(connection_id)
 }
 
 /// Wait out the graceful tier of a two-tier cancel.
@@ -10516,6 +10967,11 @@ fn run_guarded(what: &str, activity: &str, call: impl FnOnce() -> Result<(), Str
 /// One cancel that has been dispatched and is waiting out its graceful tier.
 struct DispatchedCancel {
     canceler: Arc<dyn DbActivityCanceler>,
+    /// How far this cancel's force tier may go, decided by the ACTION that
+    /// dispatched it and carried with it rather than re-derived at the tier:
+    /// the watchdog runs on its own thread, long after the action that knows
+    /// why the session is being reached.
+    purpose: SessionCancelPurpose,
     /// Dead once the work handed this session back. Asked before BOTH tiers,
     /// because the session stops being this work's the moment the registration
     /// goes -- see [`SessionCancelLifetime`].
@@ -10615,7 +11071,7 @@ impl DispatchedCancel {
         let what = format!("{label} force cancel");
         run_guarded(&what, &self.activity, || {
             self.canceler
-                .force(&claim)
+                .force(&claim, self.purpose)
                 .map(|delivery| self.note_delivery(&what, delivery))
         });
     }
@@ -10699,8 +11155,8 @@ fn spawn_force_cancel_watchdog(dispatched: Vec<DispatchedCancel>, force_timeout:
 /// takes: the breaks run on the watchdog thread, and on the MySQL family the
 /// first one opens a control connection before it can say anything at all.
 ///
-/// Two questions in the app need the difference, and both would otherwise be
-/// answered wrongly in the direction that costs a session:
+/// Three questions in the app need the difference, and all of them would
+/// otherwise be answered wrongly in the direction that costs a session:
 ///
 /// * [`crate::db::ConnectionRuntime::is_idle`], which decides whether a
 ///   transient connection may leave the registry — and that removal
@@ -10714,7 +11170,14 @@ fn spawn_force_cancel_watchdog(dispatched: Vec<DispatchedCancel>, force_timeout:
 ///   cancel the object browser's metadata loads, so the
 ///   `cancel_all_db_activities` it runs a moment later cannot see them — the
 ///   very sessions it says it breaks first. One standing answer, filled by
-///   every cancel road, is what both of them ask.
+///   every road that ends work, is what all of them ask.
+/// * the POOL REBUILD's gate, which is the one action whose whole contract is
+///   that it destroys nothing — it is a preference change. It asked the
+///   activity registry and the query tabs, and BOTH stop naming ended work at
+///   once: a cancel drops its row at dispatch, and the tab's own force tier
+///   publishes the tab idle. So a rebuild could bump every connection's
+///   generation and epoch and retire the old pool while a job the app had
+///   already ended was still holding a session checked out of it.
 ///
 /// Pruned on every read and every write, so it holds only work that is still
 /// running: a `Weak` whose guard is gone is work whose frame has ended, and
@@ -10763,13 +11226,17 @@ fn remember_cancelled_work_still_holding_a_session(
 
 /// Whether work this connection carries was ended but has not let go yet.
 ///
+/// Public because a session-ending action scoped to ONE connection asks it too
+/// (`AppState::db_work_blocking_session_teardown`); the app-wide count is
+/// [`cancelled_db_work_still_holding_a_session`].
+///
 /// Work that names no connection is not counted here, for the same reason
 /// [`db_activity_names_connection`] and [`pool_session_handout_is_held`] do not
 /// count it: work that cannot be attributed to a connection cannot answer a
 /// question about one. It is still REMEMBERED, because application exit waits
 /// for every job the app ended whether or not it can say which connection it
 /// was on — the difference is stated at the reader, so there is one store.
-fn cancelled_work_still_holds_a_session_on(connection_id: ConnectionId) -> bool {
+pub fn cancelled_db_work_still_holds_a_session_on(connection_id: ConnectionId) -> bool {
     let mut ledger = lock_cancelled_work_still_holding_a_session();
     ledger.retain(|(_, guard)| guard.strong_count() > 0);
     ledger.iter().any(|(on, _)| *on == Some(connection_id))
@@ -10800,6 +11267,10 @@ pub fn wait_until_cancelled_db_work_let_go(timeout: Duration) -> usize {
 /// Returns how many were retired.
 fn cancel_db_activities_where(
     force_timeout: Duration,
+    // How far the force tier may go for the rows this call retires. Every
+    // entry point states it, because it is a fact about the ACTION and nothing
+    // further down the road knows what the action was.
+    purpose: SessionCancelPurpose,
     select: impl Fn(&TrackedDbActivity) -> bool,
 ) -> usize {
     // Nothing that can block or re-enter runs while the registry lock is held:
@@ -10870,6 +11341,7 @@ fn cancel_db_activities_where(
             // break and its escalation both happen on the watchdog thread.
             dispatched.push(DispatchedCancel {
                 canceler: canceler.canceler,
+                purpose,
                 still_registered: canceler.still_registered,
                 guard: guard.clone(),
                 activity: activity.clone(),
@@ -10883,7 +11355,12 @@ fn cancel_db_activities_where(
 /// Cancel one activity by id. Used by the cancel button for work that has no
 /// query tab behind it.
 pub fn cancel_db_activity(id: u64, force_timeout: Duration) -> bool {
-    cancel_db_activities_where(force_timeout, |tracked| tracked.id == id) > 0
+    // Stops ONE call: the connection goes on being used afterwards.
+    cancel_db_activities_where(
+        force_timeout,
+        SessionCancelPurpose::StopOneCall,
+        |tracked| tracked.id == id,
+    ) > 0
 }
 
 /// Retire every activity whose connection is gone.
@@ -10892,7 +11369,13 @@ pub fn cancel_db_activity(id: u64, force_timeout: Duration) -> bool {
 /// on the status bar tick, so a disconnect clears within one UI frame no matter
 /// which code path started the work.
 pub fn sweep_stale_db_activities(force_timeout: Duration) -> usize {
-    cancel_db_activities_where(force_timeout, TrackedDbActivity::is_stale)
+    // Runs on the status tick for EVERY connection, including ones nobody asked
+    // to end, so it may only ever stop a call.
+    cancel_db_activities_where(
+        force_timeout,
+        SessionCancelPurpose::StopOneCall,
+        TrackedDbActivity::is_stale,
+    )
 }
 
 /// Retire every activity belonging to a connection that is being closed.
@@ -10900,9 +11383,16 @@ pub fn cancel_db_activities_for_connection(
     connection_id: ConnectionId,
     force_timeout: Duration,
 ) -> usize {
-    cancel_db_activities_where(force_timeout, |tracked| {
-        tracked.connection_id == Some(connection_id)
-    })
+    // The connection is being CLOSED, which is the deliberate action with its
+    // own bookkeeping that `force_tier_may_destroy_it` names — so the strongest
+    // tier is available for every session on it, including its own. Without
+    // that, a statement wedged on the main session could be neither stopped nor
+    // disconnected around.
+    cancel_db_activities_where(
+        force_timeout,
+        SessionCancelPurpose::EndTheConnection,
+        |tracked| tracked.connection_id == Some(connection_id),
+    )
 }
 
 /// Retire every activity in the app, because the app itself is ending.
@@ -10918,7 +11408,13 @@ pub fn cancel_db_activities_for_connection(
 /// reached only because the work would not stop, so the one mechanism able to
 /// end those sessions was destroyed a statement before they needed ending.
 pub fn cancel_all_db_activities(force_timeout: Duration) -> usize {
-    cancel_db_activities_where(force_timeout, |_| true)
+    // Every connection is ending, so this is the same deliberate action as
+    // `cancel_db_activities_for_connection` with every connection named.
+    cancel_db_activities_where(
+        force_timeout,
+        SessionCancelPurpose::EndTheConnection,
+        |_| true,
+    )
 }
 
 pub fn format_connection_busy_message() -> String {
@@ -11600,15 +12096,89 @@ mod tests {
     /// The app's one answer to how far a cancel may go, so both force tiers —
     /// the DB layer's canceler and the query tab's own watchdog — get the same
     /// one.
+    ///
+    /// CHANGED, with its reason: the rule used to be a fact about the SESSION
+    /// alone, and that read as "a main session is never destroyed" — which left
+    /// the deliberate action it points at unable to destroy one either. So
+    /// `File > Disconnect` refused on a statement the app had already told the
+    /// user it could not stop ("Stop it before continuing"), and the message
+    /// the force tier prints named a remedy the app would not perform. The
+    /// PURPOSE is the other half of the question, and the two arms below are
+    /// the two halves of the rule as it was always worded.
     #[test]
     fn a_cancel_may_destroy_a_pooled_session_and_never_the_connections_own() {
+        for purpose in [
+            SessionCancelPurpose::StopOneCall,
+            SessionCancelPurpose::EndTheConnection,
+        ] {
+            assert!(
+                CanceledSession::Pooled.force_tier_may_destroy_it(purpose),
+                "tearing a pooled session down costs exactly that session, whatever the caller \
+                 is doing"
+            );
+        }
         assert!(
-            CanceledSession::Pooled.force_tier_may_destroy_it(),
-            "tearing a pooled session down costs exactly that session"
+            !CanceledSession::Main.force_tier_may_destroy_it(SessionCancelPurpose::StopOneCall),
+            "destroying the connection's own session leaves the app describing a connection \
+             that is gone, and OCI cannot do it at all; ending a connection is File > \
+             Disconnect, which has its own bookkeeping"
         );
         assert!(
-            !CanceledSession::Main.force_tier_may_destroy_it(),
-            "destroying the connection's own session leaves the app describing a connection              that is gone, and OCI cannot do it at all; ending a connection is File >              Disconnect, which has its own bookkeeping"
+            CanceledSession::Main.force_tier_may_destroy_it(SessionCancelPurpose::EndTheConnection),
+            "...and THAT is the action, so it may: it marks the connection disconnected, \
+             retires its pool and re-labels its tabs, which is the whole of the objection above"
+        );
+    }
+
+    /// The DB LAYER's force tier obeys the same rule the query tab's does, and
+    /// the connection-ending purpose reaches its tear-down there too.
+    ///
+    /// Two implementations answer one rule -- `PoolSessionCanceler::force`
+    /// (what the activity registry dispatches, and therefore what
+    /// `File > Disconnect` runs) and `QueryCancelHandle::force_cancel_blocking`
+    /// (what the tab's own watchdog runs). The live harness drives the tab's;
+    /// this drives the registry's, so a purpose that reaches one and not the
+    /// other cannot go unnoticed.
+    ///
+    /// Observed through the tiers' own failures, exactly as the editor-side
+    /// unit does: no server is listening, and only the tear-down labels itself
+    /// (`KILL CONNECTION`).
+    #[test]
+    fn the_db_layers_force_tier_destroys_a_main_session_only_to_end_the_connection() {
+        let canceler = |session| PoolSessionCanceler::MySql {
+            connection_info: Box::new(ConnectionInfo {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+                ..ConnectionInfo::default_for(DatabaseType::MySQL)
+            }),
+            connection_id: 7,
+            db_type: DatabaseType::MySQL,
+            session,
+        };
+        let forced = |session, purpose| {
+            canceler(session)
+                .force(&SessionCancelClaim::owned_outright(), purpose)
+                .expect_err("no server is listening, so both tiers report a failure")
+        };
+
+        let pooled = forced(CanceledSession::Pooled, SessionCancelPurpose::StopOneCall);
+        assert!(
+            pooled.contains("KILL CONNECTION"),
+            "sanity: a pooled session reaches the tier that destroys it: {pooled}"
+        );
+        let cancelled = forced(CanceledSession::Main, SessionCancelPurpose::StopOneCall);
+        assert!(
+            !cancelled.contains("KILL CONNECTION"),
+            "a CANCEL may only break the connection's own session again: {cancelled}"
+        );
+        let ending = forced(
+            CanceledSession::Main,
+            SessionCancelPurpose::EndTheConnection,
+        );
+        assert!(
+            ending.contains("KILL CONNECTION"),
+            "and ENDING THE CONNECTION reaches the tear-down on this road too -- without it, \
+             `File > Disconnect` had no way to end a statement wedged on that session: {ending}"
         );
     }
 
@@ -11657,7 +12227,9 @@ mod tests {
             SessionCancelDelivery::Withdrawn
         );
         assert_eq!(
-            canceler.force(&claim).expect("force"),
+            canceler
+                .force(&claim, SessionCancelPurpose::StopOneCall)
+                .expect("force"),
             SessionCancelDelivery::Withdrawn
         );
         assert!(!canceler.interrupted.load(Ordering::Acquire));
@@ -11728,12 +12300,6 @@ mod tests {
         assert!(retired.0.is_none());
     }
 
-    /// A pooled session still carrying a cancel aimed at whoever held it BEFORE
-    /// is recognised on every backend.
-    ///
-    /// Oracle thin clears such residue for itself — `reset_before_reuse` and
-    /// `pool_session_canceler` both call `reset_pending_cancel` — and OCI and
-    /// the MySQL family have no way to. So the app recognises it at the one
     /// A session with work never disappears in silence -- including down the
     /// road that says DISCARD.
     ///
@@ -11767,6 +12333,12 @@ mod tests {
         assert!(!RetainedSessionDisposition::Retain(clean).carried_work());
     }
 
+    /// A pooled session still carrying a cancel aimed at whoever held it BEFORE
+    /// is recognised on every backend.
+    ///
+    /// Oracle thin clears such residue for itself — `reset_before_reuse` and
+    /// `pool_session_canceler` both call `reset_pending_cancel` — and OCI and
+    /// the MySQL family have no way to. So the app recognises it at the one
     /// acquire door instead, and none of the four hands a user a cancel they
     /// did not ask for.
     #[test]
@@ -13794,7 +14366,7 @@ mod tests {
                     .expect("pool session context");
                 let activity = track_pool_db_activity(label.to_string(), DatabaseType::Oracle);
                 let mut acquired = context
-                    .acquire_session_for_current_scope(&activity)
+                    .acquire_session_for_current_scope(PooledSessionPurpose::AppRead, &activity)
                     .expect("acquire a pooled session");
                 let answer = use_session(
                     acquired
@@ -14224,7 +14796,7 @@ mod tests {
         };
         let acquire = |context: &DbPoolSessionContext| {
             context
-                .acquire_session_for_current_scope(&activity)
+                .acquire_session_for_current_scope(PooledSessionPurpose::AppRead, &activity)
                 .expect("acquire a pooled session")
                 // The census holds the LEASE and counts server sessions; there
                 // is no call to break, so the reach ends with the take.
@@ -14883,7 +15455,11 @@ mod tests {
             )
         }
 
-        fn force(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
+        fn force(
+            &self,
+            claim: &SessionCancelClaim,
+            _purpose: SessionCancelPurpose,
+        ) -> Result<SessionCancelDelivery, String> {
             claim.deliver(
                 || Ok(()),
                 |()| {
@@ -14962,6 +15538,55 @@ mod tests {
             !db_activity_names_connection(connection_id),
             "with nothing of it left"
         );
+    }
+
+    /// The FORCE tier retires its own row, and that is not the same as the work
+    /// being over.
+    ///
+    /// A cancel road fills the ledger for the rows IT retires; the query tab's
+    /// and lazy fetch's force watchdogs retire their row themselves, with
+    /// `finish()`, after tearing the SESSION down. The worker is not over at
+    /// that point — it goes on holding its pool slot and its frame for as long
+    /// as its unwind takes — so `finish()` left the job named by nothing at
+    /// all, and the two questions that then answer wrongly (the pool rebuild's
+    /// gate and application exit's wait) both answer in the direction that
+    /// costs a session.
+    #[test]
+    fn a_row_retired_for_work_that_has_not_stopped_is_still_named_by_the_app() {
+        let _test_guard = db_activity_test_lock();
+        let connection_id = ConnectionId::for_test(4245);
+        let activity =
+            track_db_activity_for_connection("a force-cancelled job", None, connection_id);
+        let registration = activity
+            .attach_canceler(Arc::new(TestCanceler::default()))
+            .attached()
+            .expect("the canceler should attach");
+        let id = activity.id();
+        let finish_handle = activity.finish_handle();
+
+        finish_handle.finish_for_work_that_has_not_stopped();
+
+        assert!(
+            !activity_is_registered(id),
+            "the screen is right immediately: the row goes the moment the session is torn down"
+        );
+        assert!(
+            cancelled_db_work_still_holding_a_session() > 0
+                && db_activity_names_connection(connection_id),
+            "but the app must still be able to say the work has not let go — with `finish()` \
+             here, a pool rebuild's gate saw nothing and retired the pool this worker's slot \
+             is checked out of"
+        );
+
+        // The worker's frame ends, and only then does the app stop naming it.
+        drop(registration);
+        drop(activity);
+        assert_eq!(
+            wait_until_cancelled_db_work_let_go(Duration::from_secs(5)),
+            0,
+            "the ledger is pruned by the guard going, so it is self-clearing"
+        );
+        assert!(!db_activity_names_connection(connection_id));
     }
 
     /// A cancel that lands while a session is being PREPARED is reported as a
@@ -15179,7 +15804,11 @@ mod tests {
     /// the registry is process-wide and the suite is multi-threaded, so
     /// `cancel_all_db_activities` here would end whatever else is running.
     fn cancel_db_activity_for_test(id: u64) -> usize {
-        cancel_db_activities_where(Duration::from_secs(60), |tracked| tracked.id == id)
+        cancel_db_activities_where(
+            Duration::from_secs(60),
+            SessionCancelPurpose::StopOneCall,
+            |tracked| tracked.id == id,
+        )
     }
 
     fn activity_is_cancelable(id: u64) -> bool {
@@ -15780,7 +16409,11 @@ mod tests {
             panic!("driver exploded during interrupt");
         }
 
-        fn force(&self, _claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
+        fn force(
+            &self,
+            _claim: &SessionCancelClaim,
+            _purpose: SessionCancelPurpose,
+        ) -> Result<SessionCancelDelivery, String> {
             panic!("driver exploded during force");
         }
 
@@ -15888,7 +16521,11 @@ mod tests {
             Ok(SessionCancelDelivery::Delivered)
         }
 
-        fn force(&self, _claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
+        fn force(
+            &self,
+            _claim: &SessionCancelClaim,
+            _purpose: SessionCancelPurpose,
+        ) -> Result<SessionCancelDelivery, String> {
             Ok(SessionCancelDelivery::Delivered)
         }
 
@@ -16620,8 +17257,8 @@ mod tests {
             connection_pool_size: MIN_CONNECTION_POOL_SIZE,
             current_service_name: connection_info.service_name.clone(),
             oracle_current_schema: None,
-            auto_commit: true,
-            transaction_mode: TransactionMode::default(),
+            connection_auto_commit: true,
+            connection_transaction_mode: TransactionMode::default(),
             default_transaction_isolation: TransactionIsolation::RepeatableRead,
             connection_info,
             cache_epoch,
@@ -16677,8 +17314,8 @@ mod tests {
             connection_pool_size: MIN_CONNECTION_POOL_SIZE,
             current_service_name: String::new(),
             oracle_current_schema: None,
-            auto_commit: true,
-            transaction_mode: TransactionMode::default(),
+            connection_auto_commit: true,
+            connection_transaction_mode: TransactionMode::default(),
             default_transaction_isolation: TransactionIsolation::RepeatableRead,
             cache_epoch: 0,
             cache_epoch_token: Arc::new(AtomicU64::new(0)),
@@ -16690,6 +17327,7 @@ mod tests {
                 acquired
                     .session_mut()
                     .expect("the acquired session is still held"),
+                PooledSessionPurpose::tab_statements(true, TransactionMode::default()),
             )
             .expect("empty MySQL current scope should reset stale database state");
 
@@ -16784,7 +17422,9 @@ mod tests {
         let context = mysql_pool_session_context_for_cache_test(7, epoch_token);
 
         let activity = track_pool_db_activity("stale acquire test", DatabaseType::MySQL);
-        let err = match context.acquire_session_for_current_scope(&activity) {
+        let err = match context
+            .acquire_session_for_current_scope(PooledSessionPurpose::AppRead, &activity)
+        {
             Ok(_) => panic!("stale context must not acquire a pooled session"),
             Err(err) => err,
         };
@@ -16820,7 +17460,7 @@ mod tests {
         let epoch_token = Arc::new(AtomicU64::new(0));
         let context = mysql_pool_session_context_for_cache_test(0, epoch_token);
         let mut changed = context.clone();
-        changed.auto_commit = !context.auto_commit;
+        changed.connection_auto_commit = !context.connection_auto_commit;
 
         cache_pool_session_context_for_shared_connection(&connection, &context);
 
@@ -17316,24 +17956,36 @@ mod tests {
             TransactionIsolation::Serializable,
             TransactionAccessMode::ReadWrite,
         );
+        // What each statement SAYS, so the cases below read as SQL. The kind of
+        // each one is asserted separately, below, because it is the half a
+        // caller cannot derive from the text.
+        let sql_of = |tab_selected, mode, default_isolation| {
+            DatabaseConnection::oracle_transaction_mode_statements_for_tab(
+                tab_selected,
+                mode,
+                default_isolation,
+            )
+            .map(|statements| {
+                statements
+                    .iter()
+                    .map(|statement| statement.sql().to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
 
         // A tab that never selected anything cannot have adopted a session
         // level change, so it needs no reset — and Oracle's statement list for
         // the default mode stays empty.
         assert_eq!(
-            DatabaseConnection::oracle_transaction_mode_statements_for_tab(
-                None,
-                default_mode,
-                TransactionIsolation::ReadCommitted,
-            )
-            .expect("the default mode is always supported"),
+            sql_of(None, default_mode, TransactionIsolation::ReadCommitted)
+                .expect("the default mode is always supported"),
             Vec::<String>::new()
         );
 
         // A tab that selected the default explicitly may be sitting on a
         // session an ALTER SESSION left elsewhere; put it back.
         assert_eq!(
-            DatabaseConnection::oracle_transaction_mode_statements_for_tab(
+            sql_of(
                 Some(default_mode),
                 default_mode,
                 TransactionIsolation::ReadCommitted,
@@ -17344,7 +17996,7 @@ mod tests {
 
         // The reset comes first, so the mode statements apply on top of it.
         assert_eq!(
-            DatabaseConnection::oracle_transaction_mode_statements_for_tab(
+            sql_of(
                 Some(read_only),
                 read_only,
                 TransactionIsolation::ReadCommitted,
@@ -17359,13 +18011,120 @@ mod tests {
         // An explicit isolation is issued per transaction and overrides the
         // session anyway, so no reset is needed.
         assert_eq!(
-            DatabaseConnection::oracle_transaction_mode_statements_for_tab(
+            sql_of(
                 Some(serializable),
                 serializable,
                 TransactionIsolation::ReadCommitted,
             )
             .expect("serializable is supported"),
             vec!["SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"]
+        );
+
+        // The other half of the answer, and the reason it is part of it: only
+        // the RESET restores a state the tab already represents, so only the
+        // reset's effects may be left out of the session's recorded residue.
+        // Recording them re-creates the modal-resolution hang this rule was
+        // written for. The composition used to hand back a bare `(String,
+        // bool)` from the execution layer's own copy of this list; the kind now
+        // travels with the statement, from here.
+        let mixed = DatabaseConnection::oracle_transaction_mode_statements_for_tab(
+            Some(read_only),
+            read_only,
+            TransactionIsolation::ReadCommitted,
+        )
+        .expect("read-only with the default isolation is supported");
+        assert!(
+            mixed[0].restores_session_default(),
+            "the ALTER SESSION reset restores the connection default"
+        );
+        assert!(
+            !mixed[1].restores_session_default(),
+            "SET TRANSACTION READ ONLY states the tab's own mode"
+        );
+    }
+
+    #[test]
+    fn a_pooled_sessions_settings_have_exactly_one_owner() {
+        let connection_mode = TransactionMode::new(
+            TransactionIsolation::ReadCommitted,
+            TransactionAccessMode::ReadWrite,
+        );
+        let pinned = TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadOnly,
+        );
+
+        // An app read is prepared auto-commit ON whatever the connection's
+        // logical setting is — and the GUI's is `false` for the life of the
+        // process, which is the case that mattered.
+        assert!(PooledSessionPurpose::AppRead.auto_commit(false));
+        assert!(PooledSessionPurpose::AppRead.auto_commit(true));
+
+        // A tab's session is prepared with the TAB's value, and the connection
+        // default is not consulted at all — in either direction.
+        assert!(!PooledSessionPurpose::tab_statements(false, pinned).auto_commit(true));
+        assert!(PooledSessionPurpose::tab_statements(true, pinned).auto_commit(false));
+
+        // The transaction mode follows the same ownership. An app read has no
+        // tab to speak for, so it takes the connection's; a tab's session takes
+        // the tab's, which is what the MySQL acquire used to state by
+        // OVERWRITING one field of the context while leaving the auto-commit
+        // field beside it holding the connection's.
+        assert_eq!(
+            PooledSessionPurpose::AppRead.transaction_mode(connection_mode),
+            connection_mode
+        );
+        assert_eq!(
+            PooledSessionPurpose::tab_statements(false, pinned).transaction_mode(connection_mode),
+            pinned
+        );
+    }
+
+    #[test]
+    fn a_lease_snapshot_folds_its_transaction_state_from_the_one_state_it_stores() {
+        // A session whose only residue is a session SETTING: there is no
+        // transaction, so there is nothing a commit or a rollback could
+        // resolve.
+        let post_processor = crate::db::statement_session_post_processor_for(DatabaseType::MySQL);
+        let residue_only = crate::db::retained_session_state_after_statement(
+            post_processor,
+            RetainedSessionState::default(),
+            post_processor.effects_for_sql("SET NAMES utf8mb4"),
+            false,
+            false,
+            false,
+            false,
+        );
+        let snapshot = PooledSessionLeaseSnapshot {
+            db_type: DatabaseType::MySQL,
+            pool_context_epoch: 0,
+            retained_state: residue_only,
+            current_scope: None,
+        };
+
+        // The two views DISAGREE, by design — which is exactly why keeping both
+        // as stored fields was a trap. The fold reports `MaybeDirty` because
+        // the session carries residue; the precise state says the transaction
+        // axis itself is clean. A caller that read the fold and offered
+        // "commit, rollback, or discard" would be naming a remedy that cannot
+        // clear a `SET NAMES`.
+        assert_eq!(
+            snapshot.transaction_state(),
+            TransactionSessionState::MaybeDirty
+        );
+        assert_eq!(
+            snapshot.retained_state().transaction_state(),
+            TransactionSessionState::Clean
+        );
+
+        // And the fold is COMPUTED from the state the snapshot stores, so no
+        // construction — production or test — can put the two out of step. The
+        // test snapshots in the execution layer already had: one built a
+        // snapshot whose stored summary said `Clean` over a retained state
+        // carrying a transaction-mode override.
+        assert_eq!(
+            snapshot.transaction_state(),
+            snapshot.retained_state().summary_transaction_state()
         );
     }
 
@@ -18600,7 +19359,10 @@ mod tests {
             .expect("Direct localhost Oracle connection should succeed");
 
         let Some(DbPoolSession::Oracle(conn)) = connection
-            .acquire_pool_session()
+            .acquire_pool_session(PooledSessionPurpose::tab_statements(
+                connection.auto_commit(),
+                connection.transaction_mode(),
+            ))
             .expect("Oracle pool session should be acquired")
         else {
             panic!("expected Oracle pool session");
@@ -18637,7 +19399,10 @@ mod tests {
             .expect("Direct localhost Oracle Thin connection should succeed");
 
         let Some(DbPoolSession::OracleThin(mut conn)) = connection
-            .acquire_pool_session()
+            .acquire_pool_session(PooledSessionPurpose::tab_statements(
+                connection.auto_commit(),
+                connection.transaction_mode(),
+            ))
             .expect("Oracle Thin pool session should be acquired")
         else {
             panic!("expected Oracle Thin pool session");
@@ -19115,7 +19880,10 @@ mod tests {
             .expect("MariaDB connection should succeed");
 
         let Some(DbPoolSession::MySQL { mut conn, .. }) = connection
-            .acquire_pool_session()
+            .acquire_pool_session(PooledSessionPurpose::tab_statements(
+                connection.auto_commit(),
+                connection.transaction_mode(),
+            ))
             .expect("MySQL pool session should be acquired")
         else {
             panic!("expected MySQL pool session");
@@ -19168,7 +19936,10 @@ mod tests {
             .expect("MySQL/MariaDB connection should succeed");
 
         let Some(DbPoolSession::MySQL { mut conn, .. }) = connection
-            .acquire_pool_session()
+            .acquire_pool_session(PooledSessionPurpose::tab_statements(
+                connection.auto_commit(),
+                connection.transaction_mode(),
+            ))
             .expect("MySQL pool session should be acquired")
         else {
             panic!("expected MySQL pool session");
@@ -19219,10 +19990,13 @@ mod tests {
         let context = connection
             .pool_session_context()
             .expect("MySQL pool context should be available");
-        assert!(!context.auto_commit);
+        assert!(!context.connection_auto_commit);
 
         let Some(DbPoolSession::MySQL { mut conn, .. }) = connection
-            .acquire_pool_session()
+            .acquire_pool_session(PooledSessionPurpose::tab_statements(
+                connection.auto_commit(),
+                connection.transaction_mode(),
+            ))
             .expect("MySQL pool session should be acquired")
         else {
             panic!("expected MySQL pool session");
@@ -19233,6 +20007,141 @@ mod tests {
             .expect("autocommit variable should be available");
 
         assert_eq!(autocommit, 0);
+        drop(conn);
+
+        // The other purpose, on the same connection and the same pool: a
+        // session the APP borrows to read metadata is prepared auto-commit ON
+        // whatever the connection's logical setting is.
+        //
+        // This is the rule the connection's LIVE session has had since the
+        // "auto-commit toggle refused indefinitely" bug, written out in
+        // `MysqlBackend::connect`: under `autocommit=0` every metadata read
+        // leaves an implicitly opened transaction behind. Pooled reads had the
+        // same property and no such rule — they took the connection's logical
+        // setting, which is `false` for the whole life of the GUI — so every
+        // object-browser refresh, IntelliSense column load and bind probe left
+        // an InnoDB transaction open, holding `MDL_SHARED_READ` on everything
+        // it had touched, until that session happened to be handed out again.
+        // A user's `ALTER TABLE` waits behind exactly that.
+        let Some(DbPoolSession::MySQL { mut conn, .. }) = connection
+            .acquire_pool_session(PooledSessionPurpose::AppRead)
+            .expect("MySQL pool session should be acquired")
+        else {
+            panic!("expected MySQL pool session");
+        };
+        let app_read_autocommit = conn
+            .query_first::<u8, _>("SELECT @@autocommit")
+            .expect("read MySQL/MariaDB autocommit")
+            .expect("autocommit variable should be available");
+        assert_eq!(
+            app_read_autocommit, 1,
+            "an app-read pooled session must never be prepared to leave a transaction open"
+        );
+
+        // And it really does not leave one: a metadata read on it opens no
+        // transaction the server still counts once the statement is over.
+        conn.query_drop("SELECT COUNT(*) FROM information_schema.tables")
+            .expect("an app read should succeed");
+        let open_transactions = conn
+            .query_first::<u64, _>(
+                "SELECT COUNT(*) FROM information_schema.innodb_trx \
+                 WHERE trx_mysql_thread_id = CONNECTION_ID()",
+            )
+            .expect("read innodb_trx")
+            .expect("count should be available");
+        assert_eq!(
+            open_transactions, 0,
+            "an app read must hand its session back with no transaction open"
+        );
+    }
+
+    /// The app's own bookkeeping must not make the user's session look dirty.
+    ///
+    /// Under `autocommit = 0` — the GUI's connection default for the whole life
+    /// of the process — a TABLE read opens an InnoDB transaction. The app runs
+    /// one of its own after every scope application, to build the `SET NAMES
+    /// ... COLLATE ...` that follows a database switch, and it used to read
+    /// `INFORMATION_SCHEMA.SCHEMATA`. Nothing ended that transaction, the dirty
+    /// probe reported it truthfully, and the tab went to `MaybeDirty` — so the
+    /// user's next `SET SESSION autocommit = 1` was refused with "Commit,
+    /// rollback, or discard it first", about a transaction the app itself had
+    /// opened and that held nothing of theirs.
+    ///
+    /// FAILS before the fix on MySQL 8: the probe answers `true` right after
+    /// the encoding apply.
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_app_bookkeeping_reads_leave_no_transaction_on_a_tabs_session() {
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(mysql_test_connection_info_from_env())
+            .expect("MySQL/MariaDB connection should succeed");
+        // The case that mattered: the GUI never turns this on.
+        assert!(
+            !connection.auto_commit(),
+            "the connection default this test is about is manual commit"
+        );
+        let advanced = connection.get_info().advanced.clone();
+        let transaction_mode = connection.transaction_mode();
+
+        let Some(DbPoolSession::MySQL { mut conn, db_type }) = connection
+            .acquire_pool_session(PooledSessionPurpose::tab_statements(
+                false,
+                transaction_mode,
+            ))
+            .expect("MySQL pool session should be acquired")
+        else {
+            panic!("expected MySQL pool session");
+        };
+
+        // Start from a transaction boundary, so what the probe sees afterwards
+        // can only have been opened by the app's own read below.
+        conn.query_drop("ROLLBACK")
+            .expect("a tab session should start from a boundary");
+        assert!(
+            !DatabaseConnection::mysql_session_may_have_uncommitted_work(
+                &mut conn,
+                "collation bookkeeping test",
+                true,
+                db_type,
+            ),
+            "the session must start clean for this test to mean anything"
+        );
+
+        DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type(
+            &mut conn, &advanced, db_type,
+        )
+        .expect("the app's encoding bookkeeping should succeed");
+
+        assert!(
+            !DatabaseConnection::mysql_session_may_have_uncommitted_work(
+                &mut conn,
+                "collation bookkeeping test",
+                true,
+                db_type,
+            ),
+            "the app's own collation read must not leave the tab's session looking dirty"
+        );
+
+        // And it answers the same thing the INFORMATION_SCHEMA form did,
+        // including the no-current-database case, which is why the swap is
+        // safe. (This read is the one that opens a transaction, so it comes
+        // last.)
+        let transaction_free: Option<Option<String>> = conn
+            .query_first(DatabaseConnection::mysql_database_collation_probe_sql())
+            .expect("the transaction-free collation read should succeed");
+        let information_schema: Option<String> = conn
+            .query_first(
+                "SELECT DEFAULT_COLLATION_NAME \
+                 FROM INFORMATION_SCHEMA.SCHEMATA \
+                 WHERE SCHEMA_NAME = DATABASE()",
+            )
+            .expect("the INFORMATION_SCHEMA collation read should succeed");
+        assert_eq!(
+            transaction_free.flatten(),
+            information_schema,
+            "the transaction-free spelling must give the same answer it replaced"
+        );
     }
 
     #[test]

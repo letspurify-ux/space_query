@@ -1093,7 +1093,10 @@ fn verify(target: Target) -> Result<bool, String> {
             .map_err(|err| format!("T14 pool context: {err}"))?;
     let read_activity = read_context.track_activity("T14 metadata read");
     let mut read_session = read_context
-        .acquire_session_for_current_scope(&read_activity)
+        .acquire_session_for_current_scope(
+            space_query::db::PooledSessionPurpose::AppRead,
+            &read_activity,
+        )
         .map_err(|err| format!("T14 acquire: {err}"))?;
     report.check_flag(
         "T14 a connection with a pooled read still running does not leave the registry",
@@ -1183,7 +1186,10 @@ fn verify(target: Target) -> Result<bool, String> {
             Err(_) => return,
         };
         let activity = context.track_activity("T17 metadata read");
-        let Ok(mut acquired) = context.acquire_session_for_current_scope(&activity) else {
+        let Ok(mut acquired) = context.acquire_session_for_current_scope(
+            space_query::db::PooledSessionPurpose::AppRead,
+            &activity,
+        ) else {
             return;
         };
         read_running_in_thread.store(true, Ordering::Release);
@@ -1291,7 +1297,10 @@ fn verify(target: Target) -> Result<bool, String> {
         .map_err(|err| format!("T15 pool context: {err}"))?;
         let idle_activity = idle_context.track_activity("T15 idle pooled session");
         let mut idle_session = idle_context
-            .acquire_session_for_current_scope(&idle_activity)
+            .acquire_session_for_current_scope(
+                space_query::db::PooledSessionPurpose::AppRead,
+                &idle_activity,
+            )
             .map_err(|err| format!("T15 acquire: {err}"))?;
         report.check_flag(
             "T15 the session that will be left idle in the pool answers first",
@@ -1403,7 +1412,10 @@ fn verify(target: Target) -> Result<bool, String> {
             Err(_) => return,
         };
         let activity = context.track_activity("T16 background read");
-        let Ok(mut acquired) = context.acquire_session_for_current_scope(&activity) else {
+        let Ok(mut acquired) = context.acquire_session_for_current_scope(
+            space_query::db::PooledSessionPurpose::AppRead,
+            &activity,
+        ) else {
             return;
         };
         worker_running_in_thread.store(true, Ordering::Release);

@@ -7,8 +7,16 @@ use crate::db::DatabaseType;
 use mysql::prelude::Queryable;
 use tns_thin::{ConnectTarget, OracleThinConfig, OracleThinSession};
 
-fn assert_catalog(db_type: DatabaseType, names: &[&str], expected_len: usize) {
-    assert_eq!(names.len(), expected_len);
+/// Everything a catalog must be, EXCEPT how big it is.
+///
+/// The size is a fact about the catalog, and it belongs to exactly one test —
+/// `builtin_signature_catalogs_match_official_manual_indices`, which runs
+/// without a database and therefore actually runs. The three LIVE tests used to
+/// re-state it, and their copies went stale as the catalogs grew: MariaDB
+/// asserted 475 against 481 and Oracle 464 against 474, so both failed on the
+/// count before they had executed a single signature. A catalog that grows must
+/// not be able to silence its own live verification.
+fn assert_catalog_shape(db_type: DatabaseType, names: &[&str]) {
     assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
     for name in names {
         let label = builtin_signature_label(db_type, name)
@@ -28,11 +36,17 @@ fn assert_catalog(db_type: DatabaseType, names: &[&str], expected_len: usize) {
     }
 }
 
+/// The ONE owner of every catalog's size, and the only test that states one.
 #[test]
 fn builtin_signature_catalogs_match_official_manual_indices() {
-    assert_catalog(DatabaseType::Oracle, ORACLE_FUNCTIONS, 474);
-    assert_catalog(DatabaseType::MySQL, MYSQL_FUNCTIONS, 408);
-    assert_catalog(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 481);
+    for (db_type, names, expected_len) in [
+        (DatabaseType::Oracle, ORACLE_FUNCTIONS, 474),
+        (DatabaseType::MySQL, MYSQL_FUNCTIONS, 408),
+        (DatabaseType::MariaDB, MARIADB_FUNCTIONS, 481),
+    ] {
+        assert_eq!(names.len(), expected_len, "{db_type:?} catalog size");
+        assert_catalog_shape(db_type, names);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,8 +358,8 @@ fn mysql_connection_from_env() -> mysql::Conn {
     mysql::Conn::new(opts).expect("connect to MySQL-family live test database")
 }
 
-fn run_mysql_catalog_live(db_type: DatabaseType, names: &[&str], expected_len: usize) {
-    assert_catalog(db_type, names, expected_len);
+fn run_mysql_catalog_live(db_type: DatabaseType, names: &[&str]) {
+    assert_catalog_shape(db_type, names);
     let mut conn = mysql_connection_from_env();
     conn.query_drop("DROP TEMPORARY TABLE IF EXISTS sq_builtin_signature_probe")
         .expect("drop stale temporary built-in probe table");
@@ -417,6 +431,17 @@ fn run_mysql_catalog_live(db_type: DatabaseType, names: &[&str], expected_len: u
                         }
                         (DatabaseType::MariaDB, "VEC_DISTANCE") => {
                             message.contains("4206") || message.contains("index is not found")
+                        }
+                        // `VALUE(col)` / `VALUES(col)` are legal ONLY inside an
+                        // `INSERT ... ON DUPLICATE KEY UPDATE` clause, so the
+                        // probe's `SELECT <expr> FROM ... WHERE 0` shape cannot
+                        // reach them at all. The signature is right; the probe
+                        // has nowhere to put it. Oracle has had the same
+                        // exemption since it was written
+                        // (`oracle_context_only_name`); the MySQL family never
+                        // needed one because this live test had never run.
+                        (DatabaseType::MySQL | DatabaseType::MariaDB, "VALUE" | "VALUES") => {
+                            message.contains("1064")
                         }
                         _ => false,
                     };
@@ -873,6 +898,22 @@ fn oracle_expected_prerequisite_error(name: &str, message: &str) -> bool {
         "POWERMULTISET" | "POWERMULTISET_BY_CARDINALITY" => message.contains("ORA-22957"),
         "TO_LOB" => message.contains("ORA-24856"),
         "DEPTH" | "PATH" => message.contains("ORA-29909"),
+        // The five below need a PREREQUISITE the probe's bare
+        // `SELECT <expr> FROM DUAL` cannot supply, so the server refuses the
+        // shape rather than the signature. They were missing because this live
+        // test asserted a stale catalog SIZE and failed before it reached a
+        // single probe -- see `assert_catalog_shape`.
+        //
+        // `CONTAINS` is an Oracle Text operator and needs a CONTEXT index;
+        // `SCORE` is its ancillary operator and needs the literal label of a
+        // `CONTAINS` in the same query; `JSON_ID` and `JSON_VALUE` need a
+        // document and a path the boundary probe has no way to build; and
+        // `SYS_ROW_ETAG` needs a real ETAG value.
+        "CONTAINS" => message.contains("ORA-29900"),
+        "SCORE" => message.contains("ORA-29909"),
+        "JSON_ID" => message.contains("ORA-00938"),
+        "JSON_VALUE" => message.contains("ORA-00917"),
+        "SYS_ROW_ETAG" => message.contains("ORA-40618"),
         "SYS_CONNECT_BY_PATH" => message.contains("ORA-30003"),
         "CV" | "PRESENTNNV" | "PRESENTV" | "PREVIOUS" => message.contains("ORA-32644"),
         "CUBE_TABLE" => message.contains("ORA-33262"),
@@ -906,7 +947,7 @@ fn oracle_connection_from_env() -> OracleThinSession {
 #[test]
 #[ignore = "requires local Oracle 26ai via ORACLE_TEST_* environment variables"]
 fn oracle_builtin_function_signatures_execute_live() {
-    assert_catalog(DatabaseType::Oracle, ORACLE_FUNCTIONS, 464);
+    assert_catalog_shape(DatabaseType::Oracle, ORACLE_FUNCTIONS);
     let mut session = oracle_connection_from_env();
     let mut failures = Vec::new();
     for name in ORACLE_FUNCTIONS {
@@ -955,11 +996,11 @@ fn oracle_builtin_function_signatures_execute_live() {
 #[test]
 #[ignore = "requires local MySQL 8.0 via SPACE_QUERY_TEST_MYSQL_* environment variables"]
 fn mysql_builtin_function_signatures_execute_live() {
-    run_mysql_catalog_live(DatabaseType::MySQL, MYSQL_FUNCTIONS, 408);
+    run_mysql_catalog_live(DatabaseType::MySQL, MYSQL_FUNCTIONS);
 }
 
 #[test]
 #[ignore = "requires local MariaDB 12.2 via SPACE_QUERY_TEST_MYSQL_* environment variables"]
 fn mariadb_builtin_function_signatures_execute_live() {
-    run_mysql_catalog_live(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 475);
+    run_mysql_catalog_live(DatabaseType::MariaDB, MARIADB_FUNCTIONS);
 }

@@ -4566,8 +4566,11 @@ impl ObjectBrowserWidget {
         // long as the action's use of the session and ends BEFORE it goes back
         // to the pool -- `AcquiredPoolSession`'s own drop, which runs after
         // this frame's borrow of the session ends.
-        let mut acquired =
-            base_context.acquire_session_for_scope(selected_scope, &activity_guard)?;
+        let mut acquired = base_context.acquire_session_for_scope(
+            selected_scope,
+            crate::db::PooledSessionPurpose::AppRead,
+            &activity_guard,
+        )?;
         if !crate::db::cached_pool_session_context_matches_shared_connection(
             connection,
             &base_context,
@@ -4614,7 +4617,9 @@ impl ObjectBrowserWidget {
             return None;
         }
         context.ensure_current().ok()?;
-        match context.acquire_session_for_current_scope(activity) {
+        match context
+            .acquire_session_for_current_scope(crate::db::PooledSessionPurpose::AppRead, activity)
+        {
             Ok(acquired) => match acquired.into_oracle() {
                 Ok(conn) => Some(conn),
                 Err(other) => {
@@ -4644,7 +4649,9 @@ impl ObjectBrowserWidget {
             return None;
         }
         context.ensure_current().ok()?;
-        match context.acquire_session_for_current_scope(activity) {
+        match context
+            .acquire_session_for_current_scope(crate::db::PooledSessionPurpose::AppRead, activity)
+        {
             Ok(acquired) => match acquired.into_oracle_thin() {
                 Ok(conn) => Some(conn),
                 Err(other) => {
@@ -4675,7 +4682,9 @@ impl ObjectBrowserWidget {
         context.ensure_current().ok()?;
         let expected_db_type = context.connection_info.db_type;
         let display_name = expected_db_type.display_name();
-        let mut mysql_conn = match context.acquire_session_for_current_scope(activity) {
+        let mut mysql_conn = match context
+            .acquire_session_for_current_scope(crate::db::PooledSessionPurpose::AppRead, activity)
+        {
             Ok(acquired) => match acquired.into_mysql(expected_db_type) {
                 Ok(conn) => conn,
                 Err(other) => {
@@ -8673,7 +8682,9 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     )> {
         let db_type = context.connection_info.db_type;
         context.ensure_current().ok()?;
-        let acquired = match context.acquire_session_for_current_scope(activity) {
+        let acquired = match context
+            .acquire_session_for_current_scope(crate::db::PooledSessionPurpose::AppRead, activity)
+        {
             Ok(acquired) => acquired,
             Err(err) => {
                 eprintln!(
@@ -9360,7 +9371,9 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         let requested_scope = requested_scope
             .map(|scope| scope.trim().to_string())
             .filter(|scope| !scope.is_empty());
-        let mut mysql_conn = match context.acquire_session_for_current_scope(activity) {
+        let mut mysql_conn = match context
+            .acquire_session_for_current_scope(crate::db::PooledSessionPurpose::AppRead, activity)
+        {
             Ok(acquired) => match acquired.into_mysql(db_type) {
                 Ok(conn) => conn,
                 Err(other) => {

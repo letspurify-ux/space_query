@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::db::{
     CanceledSession, ColumnInfo, ConnectionAdvancedSettings, ConnectionInfo, DatabaseType,
-    DbConnection, DbSessionLease, ExecutionOrigin, QueryExecutor, QueryResult,
+    DbConnection, DbSessionLease, ExecutionOrigin, ForceTierOutcome, QueryExecutor, QueryResult,
     RetainedSessionDisposition, RetainedSessionMutationOutcome, RetainedSessionPreflightAction,
     RetainedSessionPreflightDecision, RetainedSessionResolutionAction, RetainedSessionState,
     ScriptItem, SessionCancelClaim, SessionCancelDelivery, SharedConnection, SharedDbSessionLease,
@@ -745,7 +745,18 @@ pub enum QueryCancelOutcome {
     AlreadyFinished,
     StoppedBeforeInterrupt,
     ForceStarted,
+    /// The force tier tore the session down. The work cannot continue.
     ForceCompleted,
+    /// The force tier reached the connection's OWN session, which a cancel may
+    /// never destroy ([`crate::db::CanceledSession::force_tier_may_destroy_it`]),
+    /// so it broke the session again instead — and the statement may still be
+    /// running.
+    ///
+    /// Its own answer rather than `ForceCompleted`, because the two lead to
+    /// opposite conclusions: `ForceCompleted` ends the operation, and doing
+    /// that here published the tab idle for a statement the server was still
+    /// executing. See [`crate::db::ForceTierOutcome`].
+    ForceAskedAgain,
     InterruptFailed(String),
     Failed(String),
     ForceFailed(String),
@@ -1062,6 +1073,18 @@ pub(crate) enum QueryCancelHandle {
         started: Arc<AtomicBool>,
         release: Arc<AtomicBool>,
     },
+    /// A double that speaks for the connection's OWN session.
+    ///
+    /// The other two carry no session kind at all (`canceled_session()`
+    /// answers `None`), so every force through them is a tear-down — which is
+    /// exactly the half of [`CanceledSession::force_tier_may_destroy_it`] that
+    /// was already covered. This one drives the other half, and keeps the two
+    /// tiers apart so a test can say WHICH one reached the session.
+    #[cfg(test)]
+    TestMainSession {
+        interrupted: Arc<AtomicBool>,
+        destroyed: Arc<AtomicBool>,
+    },
 }
 
 /// How many indirections a cancel handle may be nested behind before a tier
@@ -1088,6 +1111,11 @@ enum ConcreteCancelSession {
         started: Arc<AtomicBool>,
         release: Arc<AtomicBool>,
     },
+    #[cfg(test)]
+    TestMainSession {
+        interrupted: Arc<AtomicBool>,
+        destroyed: Arc<AtomicBool>,
+    },
 }
 
 impl ConcreteCancelSession {
@@ -1099,6 +1127,8 @@ impl ConcreteCancelSession {
             }
             #[cfg(test)]
             Self::Test(_) | Self::TestBlockingForce { .. } => None,
+            #[cfg(test)]
+            Self::TestMainSession { .. } => Some(CanceledSession::Main),
         }
     }
 
@@ -1121,6 +1151,14 @@ impl ConcreteCancelSession {
                 || Ok(()),
                 |()| {
                     started.store(true, Ordering::Relaxed);
+                    Ok(())
+                },
+            ),
+            #[cfg(test)]
+            Self::TestMainSession { interrupted, .. } => claim.deliver(
+                || Ok(()),
+                |()| {
+                    interrupted.store(true, Ordering::Relaxed);
                     Ok(())
                 },
             ),
@@ -1157,6 +1195,16 @@ impl ConcreteCancelSession {
                     Ok(())
                 },
                 |()| Ok(()),
+            ),
+            // Reachable only if the rule above is ever removed, which is what
+            // the unit that drives this double asserts about.
+            #[cfg(test)]
+            Self::TestMainSession { destroyed, .. } => claim.deliver(
+                || Ok(()),
+                |()| {
+                    destroyed.store(true, Ordering::Relaxed);
+                    Ok(())
+                },
             ),
         }
     }
@@ -1300,34 +1348,48 @@ impl QueryCancelTarget {
         }
     }
 
-    /// Hold the force deadline open for a break that is still on its way to
-    /// the server — once per publication, spent as part of asking, exactly as
-    /// [`OperationCancelTarget::force_pass_decision`] spends the operation
-    /// slot's. Answers whether the hold was granted; a target with nothing
-    /// published grants none (there is nothing a tear-down could be early
-    /// for), and a break that has answered grants none either (escalation is
-    /// honest from there).
-    fn hold_force_deadline_for_break_in_flight(&self) -> bool {
+    /// Decide ONE force-deadline pass for the session published here, spending
+    /// the claim or the hold as part of deciding.
+    ///
+    /// The withdrawable twin of [`OperationCancelTarget::force_pass_decision`],
+    /// and — since the rule itself is
+    /// [`GracefulBreakProgress::force_pass_decision`] — literally the same
+    /// answer rather than a second one shaped like it. It replaced a narrower
+    /// question, "is a break in flight?", which could only say hold or do not
+    /// hold: `NotAsked` and `Answered` both said DO NOT HOLD, so a publication
+    /// nothing had ever asked to stop was torn down without a break ever being
+    /// sent. The operation road has had the third answer since round 8 (`FORCE
+    /// IS NEVER THE FIRST THING A SESSION SEES`); this is that rule reaching
+    /// the road that needed it most, because the lazy cancel road sends NO DB
+    /// break at all for a fetch that is not mid-fill
+    /// (`cancel_lazy_fetch_handle_for_session`).
+    ///
+    /// A target with nothing published answers `Withdrawn`: a lazy fetch
+    /// publishes from the moment its session is in hand and withdraws at
+    /// `SqlEditorWidget::release_lazy_fetch_session`, so "nothing published"
+    /// is "given back" — and the tier that acts on it answers
+    /// [`SessionCancelDelivery::Withdrawn`] for itself.
+    fn force_pass_decision(&self) -> ForcePassDecision {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.published.is_none() {
-            return false;
+            return ForcePassDecision::Withdrawn;
         }
-        match &mut state.graceful_break {
-            GracefulBreakProgress::Sending {
-                force_deadline_held: held @ false,
-            } => {
-                *held = true;
-                true
-            }
-            GracefulBreakProgress::NotAsked
-            | GracefulBreakProgress::Sending {
-                force_deadline_held: true,
-            }
-            | GracefulBreakProgress::Answered => false,
-        }
+        state.graceful_break.force_pass_decision()
+    }
+
+    /// How far the break for the session published here has got, without
+    /// spending anything. Read-only, for [`SqlEditorWidget::
+    /// lazy_fetch_graceful_break_progress_for_probe`]; every decision that
+    /// ACTS on this state takes it through [`Self::force_pass_decision`].
+    fn graceful_break_progress(&self) -> Option<GracefulBreakProgress> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.published.is_some().then_some(state.graceful_break)
     }
 
     /// Send the graceful break for the session published here, through the one
@@ -1347,6 +1409,31 @@ impl QueryCancelTarget {
         claim: &crate::db::SessionCancelClaim,
     ) -> Result<crate::db::SessionCancelDelivery, String> {
         let claimed = self.claim_graceful_break() == GracefulBreakClaim::Claimed;
+        self.send_claimed_graceful_break(claim, claimed)
+    }
+
+    /// The same door for the sender that CLAIMED as part of DECIDING — the
+    /// force watchdog's [`ForcePassDecision::SendGracefulBreak`].
+    ///
+    /// Splitting the claim out is what lets that watchdog take its whole pass
+    /// in ONE locked look at the publication and still send through the one
+    /// door that answers the claim it took. Claiming again here would answer
+    /// `AlreadySent` about its own claim and leave the break marked as still
+    /// travelling forever.
+    fn send_graceful_break_already_claimed(
+        &self,
+        claim: &crate::db::SessionCancelClaim,
+    ) -> Result<crate::db::SessionCancelDelivery, String> {
+        self.send_claimed_graceful_break(claim, true)
+    }
+
+    /// The body both senders share: send through the target's own at-send
+    /// re-resolve, and answer the claim if this caller took it.
+    fn send_claimed_graceful_break(
+        &self,
+        claim: &crate::db::SessionCancelClaim,
+        claimed: bool,
+    ) -> Result<crate::db::SessionCancelDelivery, String> {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             self.as_handle().cancel_interrupt(claim)
         }))
@@ -1618,7 +1705,7 @@ impl std::ops::Deref for OperationActivity {
 /// its grace measures time after delivery. The tab road could not, because its
 /// break is sent by a different thread from the one that watches the deadline.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(crate) enum GracefulBreakProgress {
+pub enum GracefulBreakProgress {
     /// Nothing has asked the session published here to stop.
     #[default]
     NotAsked,
@@ -1658,7 +1745,7 @@ pub(crate) enum GracefulBreakProgress {
 /// fell through to the tear-down while the KILL QUERY was still being
 /// connected. One locked decision has no second read to disagree with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ForcePassDecision {
+pub(crate) enum ForcePassDecision {
     /// The published session has never been asked to stop. The claim has been
     /// taken as part of deciding; this pass sends the break and gives the
     /// session the same grace every other one gets. This is what stops the
@@ -1690,6 +1777,175 @@ enum ForcePassDecision {
     /// deadline, returns quietly instead of reporting a failure the user would
     /// be invited to retry.
     Withdrawn,
+}
+
+impl GracefulBreakProgress {
+    /// Decide ONE force-deadline pass for the publication this progress belongs
+    /// to, spending the claim or the hold as part of deciding.
+    ///
+    /// The whole rule, in one place, because it is a rule about a PUBLICATION
+    /// and not about which road published it. Both watchdogs reach it:
+    /// [`OperationCancelTarget::force_pass_decision`] for a tab operation and
+    /// [`QueryCancelTarget::force_pass_decision`] for a lazy fetch. It used to
+    /// live only on the operation road, and the lazy road answered a narrower
+    /// question of its own -- "is a break in flight?" -- which folded
+    /// `NotAsked` into `Answered`: both said "do not hold", so a session that
+    /// had NEVER BEEN ASKED met the tear-down as the first thing that ever
+    /// reached it. That is reachable, not theoretical: a lazy fetch cancelled
+    /// while it is WAITING between chunks (every result-tab close, and the
+    /// cancel button whenever the fetch is paused) is sent a `GracefulClose`
+    /// and NO DB break at all, so a close that wedges destroyed the tab's
+    /// retained transaction that `Cancel` had promised to keep.
+    ///
+    /// Callers state whether anything is published; a publication that is gone
+    /// has no break to send and nothing to hold for.
+    fn force_pass_decision(&mut self) -> ForcePassDecision {
+        match self {
+            Self::NotAsked => {
+                *self = Self::Sending {
+                    force_deadline_held: false,
+                };
+                ForcePassDecision::SendGracefulBreak
+            }
+            Self::Sending {
+                force_deadline_held: held @ false,
+            } => {
+                *held = true;
+                ForcePassDecision::HoldForBreakInFlight
+            }
+            Self::Sending {
+                force_deadline_held: true,
+            }
+            | Self::Answered => ForcePassDecision::Force,
+        }
+    }
+}
+
+/// The DB work a query tab has, as ONE answer.
+///
+/// THREE things count, not two. Besides a running statement and a live lazy
+/// fetch there is an execution the tab has already ACCEPTED but not started:
+/// both deferred roads tell the user the execution started and then run it up
+/// to 0.2s later (`SESSION_POOL_SLOT_EXECUTION_DELAY_SECONDS` and
+/// `LAZY_FETCH_CANCEL_RETRY_DELAY_SECONDS`), and in that window the tab reads
+/// perfectly idle — no query running, no batch begun.
+///
+/// It is a VALUE and not three booleans because the question was assembled at
+/// the asking site, and the askers assembled it differently. Every
+/// session-ending action and the per-tab SCOPE gate counted all three; the
+/// auto-commit and transaction-mode gates counted the first two. So a
+/// statement the user had already launched could run under an auto-commit or a
+/// transaction mode they changed AFTER launching it — and the screen/behaviour
+/// checkpoints (`auto_commit_display_mismatch_error`,
+/// `transaction_mode_display_mismatch_error`) cannot catch that, because the
+/// displayed value moves with the pin. One derivation, so a fourth asker
+/// cannot invent a fourth answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabDbWork {
+    /// Nothing is running and nothing is coming.
+    None,
+    RunningQuery,
+    OpenLazyFetch,
+    /// Accepted by this tab and not started yet.
+    AcceptedExecution,
+    /// A running statement the APP has already spent its strongest cancel tier
+    /// on, and nothing else.
+    ///
+    /// Its own answer rather than a flag beside `RunningQuery`, because the two
+    /// owe the user OPPOSITE instructions: a running statement can be stopped,
+    /// and this one cannot -- the session is the connection's own, a cancel may
+    /// never destroy one, and on Oracle thin an in-band break does not reach a
+    /// call that is already blocked. Every gate that refused with "Stop it
+    /// before ..." was then asking for something the app had already proven
+    /// impossible, and the ONE derivation is the only place that can stop them
+    /// all saying it.
+    ///
+    /// Only when it is the tab's WHOLE work: a lazy fetch or an accepted
+    /// execution beside it can still be stopped by asking, so the tab can be.
+    UnstoppableStatement,
+}
+
+impl TabDbWork {
+    /// The one derivation. `AppState::tab_has_unfinished_db_work` is this
+    /// answer as a `bool`, so the gate that refuses and the gate that only
+    /// counts cannot disagree.
+    pub(crate) fn for_editor(editor: &SqlEditorWidget) -> Self {
+        Self::from_flags(
+            editor.is_query_running(),
+            editor.has_open_lazy_fetch(),
+            editor.has_deferred_execution(),
+            editor.db_work_the_app_could_not_stop(),
+        )
+    }
+
+    /// Which of the three the tab is asked about first, apart from the widget
+    /// that answers them — so the PRECEDENCE (a running statement is what the
+    /// user is told about even when a fetch is open behind it) is pinned by a
+    /// unit rather than by an FLTK widget nothing can build in a test.
+    pub(crate) fn from_flags(
+        running_query: bool,
+        open_lazy_fetch: bool,
+        accepted_execution: bool,
+        the_app_could_not_stop_the_statement: bool,
+    ) -> Self {
+        if running_query {
+            if the_app_could_not_stop_the_statement && !open_lazy_fetch && !accepted_execution {
+                Self::UnstoppableStatement
+            } else {
+                Self::RunningQuery
+            }
+        } else if open_lazy_fetch {
+            Self::OpenLazyFetch
+        } else if accepted_execution {
+            Self::AcceptedExecution
+        } else {
+            Self::None
+        }
+    }
+
+    pub(crate) fn blocks(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Why this work refuses `action`, in the user's words, or `None` when
+    /// there is nothing to refuse on.
+    /// The kinds a caller that has its OWN answer for a running statement must
+    /// still refuse on.
+    ///
+    /// `SqlEditorWidget::spawn_tracked_transaction_action` reserves the tab's
+    /// running flag, and that reservation answers for a statement already
+    /// running -- but it cannot see one the tab has ACCEPTED and not started.
+    /// Both deferred roads tell the user the execution started and run it up to
+    /// 0.2s later, so a COMMIT/ROLLBACK accepted inside that window took the
+    /// flag and the statement the user had already launched was refused when it
+    /// came to start.
+    pub(crate) fn block_message_beside_a_running_statement(self, action: &str) -> Option<String> {
+        match self {
+            Self::RunningQuery | Self::UnstoppableStatement => None,
+            other => other.block_message(action),
+        }
+    }
+
+    pub(crate) fn block_message(self, action: &str) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::RunningQuery => Some(format!("A query is running. Stop it before {action}.")),
+            Self::OpenLazyFetch => Some(format!(
+                "A lazy fetch is still open. Fetch all rows or cancel it before {action}."
+            )),
+            // It has not begun, so there is nothing to fetch and nothing to
+            // stop yet — only something to wait for or give up.
+            Self::AcceptedExecution => Some(format!(
+                "A statement this tab already accepted has not started yet. Wait for it or cancel it before {action}."
+            )),
+            // The ONE case where "stop it first" is not an instruction the user
+            // can follow, so it must not be the one they are given.
+            Self::UnstoppableStatement => Some(format!(
+                "A statement could not be stopped: it is running on its connection's own \
+                 session. End that connection with File > Disconnect before {action}."
+            )),
+        }
+    }
 }
 
 /// What one tab operation currently has published for a cancel to reach.
@@ -1730,6 +1986,30 @@ pub(crate) enum OperationCancelTarget {
         /// fetch road never had this: its handle exists from the moment the
         /// fetch is registered, so its watchdog always breaks before it forces.
         graceful_break: GracefulBreakProgress,
+        /// Whether the app has already spent the strongest tier it is ALLOWED
+        /// to spend on this publication and the work did not stop.
+        ///
+        /// True only after a force tier answered
+        /// [`ForceTierOutcome::AskedAgain`]: the session is the connection's
+        /// OWN, a cancel may never destroy one
+        /// ([`CanceledSession::force_tier_may_destroy_it`]), so the strongest
+        /// thing a cancel could do was break it again -- and on Oracle thin an
+        /// in-band break does not reach a call that is already blocked.
+        ///
+        /// It is a fact the SESSION-ENDING actions need, and nothing else in
+        /// the app could answer it: a tab whose statement will not stop reads
+        /// exactly like a tab whose statement is merely slow, so
+        /// `File > Disconnect` refused on it with "Stop it before continuing"
+        /// -- the remedy the app itself had just named, refusing on the one
+        /// state in which the user cannot possibly comply.
+        ///
+        /// Per PUBLICATION, like `graceful_break` beside it, and that is the
+        /// right lifetime rather than a convenience: the MySQL family
+        /// re-acquires the tab's session for every statement and a script
+        /// `CONNECT` replaces it mid-batch, so a break that DID work leaves the
+        /// operation republishing -- and the new publication starts false,
+        /// which is the truth about it.
+        the_app_could_not_stop_it: bool,
     },
     /// The work handed the session back. Nothing may reach it any more.
     Withdrawn,
@@ -1742,7 +2022,34 @@ impl OperationCancelTarget {
         Self::Published {
             handle,
             graceful_break: GracefulBreakProgress::NotAsked,
+            the_app_could_not_stop_it: false,
         }
+    }
+
+    /// Record that the app spent its strongest cancel tier on this publication
+    /// and the work did not stop. See the field's own header.
+    fn note_the_app_could_not_stop_it(&mut self) {
+        if let Self::Published {
+            the_app_could_not_stop_it,
+            ..
+        } = self
+        {
+            *the_app_could_not_stop_it = true;
+        }
+    }
+
+    /// Whether this publication is work no amount of ASKING will end.
+    ///
+    /// `NotPublished` and `Withdrawn` both answer no, and for the same reason:
+    /// there is no session here for a tier to have failed on.
+    fn the_app_could_not_stop_it(&self) -> bool {
+        matches!(
+            self,
+            Self::Published {
+                the_app_could_not_stop_it: true,
+                ..
+            }
+        )
     }
 
     /// The session a cancel may act on right now, if any.
@@ -1766,6 +2073,7 @@ impl OperationCancelTarget {
         Self::Published {
             handle,
             graceful_break: GracefulBreakProgress::Answered,
+            the_app_could_not_stop_it: false,
         }
     }
 
@@ -1779,6 +2087,7 @@ impl OperationCancelTarget {
             graceful_break: GracefulBreakProgress::Sending {
                 force_deadline_held: false,
             },
+            the_app_could_not_stop_it: false,
         }
     }
 
@@ -1788,24 +2097,10 @@ impl OperationCancelTarget {
     /// state it spends must be one step.
     fn force_pass_decision(&mut self) -> ForcePassDecision {
         match self {
-            Self::Published { graceful_break, .. } => match graceful_break {
-                GracefulBreakProgress::NotAsked => {
-                    *graceful_break = GracefulBreakProgress::Sending {
-                        force_deadline_held: false,
-                    };
-                    ForcePassDecision::SendGracefulBreak
-                }
-                GracefulBreakProgress::Sending {
-                    force_deadline_held: held @ false,
-                } => {
-                    *held = true;
-                    ForcePassDecision::HoldForBreakInFlight
-                }
-                GracefulBreakProgress::Sending {
-                    force_deadline_held: true,
-                }
-                | GracefulBreakProgress::Answered => ForcePassDecision::Force,
-            },
+            // The rule itself is [`GracefulBreakProgress::force_pass_decision`],
+            // shared with the lazy road so the two watchdogs cannot answer the
+            // same question differently.
+            Self::Published { graceful_break, .. } => graceful_break.force_pass_decision(),
             Self::NotPublished => ForcePassDecision::NotPublished,
             Self::Withdrawn => ForcePassDecision::Withdrawn,
         }
@@ -2788,6 +3083,12 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         }
     }
 
+    /// Oracle's auto-commit is the APP's, not the session's: there is no
+    /// server-side setting to push, and the tab's pin is what every execution
+    /// resolves against. So this answers "nothing to apply here" rather than
+    /// `Applied`, which claimed a push onto a session that may not even exist.
+    /// Neither answer alerts the user; the difference is what the app SAYS
+    /// happened.
     fn apply_auto_commit_to_retained_session(
         &self,
         _connection: &SharedConnection,
@@ -2797,7 +3098,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         _enabled: bool,
         _db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
-        RetainedSessionMutationOutcome::Applied
+        RetainedSessionMutationOutcome::NotApplicable
     }
 
     fn apply_transaction_mode_to_retained_session(
@@ -2893,6 +3194,10 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
         // A transaction action of its own: one call, so its report has nothing
         // to latch against but itself.
         let scope_report = crate::ui::sql_editor::execution::SessionScopeReport::default();
+        // A COMMIT/ROLLBACK never moves the session's database, so nothing is
+        // asked and nothing is recorded.
+        let session_landed_scope =
+            crate::ui::sql_editor::execution::MySqlSessionLandedScope::default();
         SqlEditorWidget::run_mysql_pooled_action_with_timeout(
             connection,
             pooled_db_session,
@@ -2909,6 +3214,7 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             auto_commit,
             transaction_mode,
             false,
+            &session_landed_scope,
             true,
             Some(resolution_action),
             mysql_sql,
@@ -3260,8 +3566,18 @@ impl crate::db::DbActivityCanceler for QueryCancelHandle {
         self.cancel_interrupt(claim)
     }
 
-    fn force(&self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
-        self.clone().force_cancel_blocking(claim)
+    fn force(
+        &self,
+        claim: &SessionCancelClaim,
+        purpose: crate::db::SessionCancelPurpose,
+    ) -> Result<SessionCancelDelivery, String> {
+        // The DB layer's road draws no conclusion from WHICH tier ran -- it
+        // breaks, waits and moves on, and the work it ended is named by the
+        // cancelled-work ledger until it lets go. So it takes the delivery and
+        // leaves [`ForceTierOutcome`] to the caller that ends an operation.
+        self.clone()
+            .force_cancel_blocking(claim, purpose)
+            .map(ForceTierOutcome::delivery)
     }
 
     fn label(&self) -> &'static str {
@@ -3362,7 +3678,9 @@ impl QueryCancelHandle {
             QueryCancelHandle::OperationSlot(slot) => Self::operation_slot_published(slot)
                 .is_some_and(|handle| handle.graceful_break_may_not_interrupt_a_blocked_call()),
             #[cfg(test)]
-            QueryCancelHandle::Test(_) | QueryCancelHandle::TestBlockingForce { .. } => false,
+            QueryCancelHandle::Test(_)
+            | QueryCancelHandle::TestBlockingForce { .. }
+            | QueryCancelHandle::TestMainSession { .. } => false,
         }
     }
 
@@ -3386,6 +3704,14 @@ impl QueryCancelHandle {
             QueryCancelHandle::TestBlockingForce { started, release } => {
                 Some(ConcreteCancelSession::TestBlockingForce { started, release })
             }
+            #[cfg(test)]
+            QueryCancelHandle::TestMainSession {
+                interrupted,
+                destroyed,
+            } => Some(ConcreteCancelSession::TestMainSession {
+                interrupted,
+                destroyed,
+            }),
         }
     }
 
@@ -3458,8 +3784,12 @@ impl QueryCancelHandle {
         }
     }
 
-    fn force_cancel(self, claim: &SessionCancelClaim) -> Result<SessionCancelDelivery, String> {
-        self.force_cancel_blocking(claim)
+    fn force_cancel(
+        self,
+        claim: &SessionCancelClaim,
+        purpose: crate::db::SessionCancelPurpose,
+    ) -> Result<ForceTierOutcome, String> {
+        self.force_cancel_blocking(claim, purpose)
     }
 
     /// The force tier, with the app's one rule about it asked HERE and nowhere
@@ -3473,17 +3803,29 @@ impl QueryCancelHandle {
     pub(crate) fn force_cancel_blocking(
         self,
         claim: &SessionCancelClaim,
-    ) -> Result<SessionCancelDelivery, String> {
+        purpose: crate::db::SessionCancelPurpose,
+    ) -> Result<ForceTierOutcome, String> {
         let (session, claim) = match self.resolve_for_action(claim) {
             Ok(resolved) => resolved,
-            Err(delivery) => return Ok(delivery),
+            // A resolution refuses only with a withdraw, and the answer says
+            // so: nothing was reached, and nothing failed.
+            Err(delivery) => return Ok(ForceTierOutcome::after_tear_down(delivery)),
         };
         if let Some(kind) = session.canceled_session() {
-            if !kind.force_tier_may_destroy_it() {
-                return session.interrupt(&claim);
+            if !kind.force_tier_may_destroy_it(purpose) {
+                // Re-breaking is the strongest tier a MAIN session has, and the
+                // ANSWER names that rather than looking like the tear-down: a
+                // caller that ends its operation on the strength of this would
+                // publish the tab idle and retire the row for a statement that
+                // is still running. See [`ForceTierOutcome`].
+                return session
+                    .interrupt(&claim)
+                    .map(ForceTierOutcome::after_re_break);
             }
         }
-        session.destroy(&claim)
+        session
+            .destroy(&claim)
+            .map(ForceTierOutcome::after_tear_down)
     }
 
     pub(crate) fn label(&self) -> &'static str {
@@ -3497,7 +3839,9 @@ impl QueryCancelHandle {
             QueryCancelHandle::OperationSlot(slot) => Self::operation_slot_published(slot)
                 .map_or("query session", |handle| handle.label()),
             #[cfg(test)]
-            QueryCancelHandle::Test(_) | QueryCancelHandle::TestBlockingForce { .. } => "test",
+            QueryCancelHandle::Test(_)
+            | QueryCancelHandle::TestBlockingForce { .. }
+            | QueryCancelHandle::TestMainSession { .. } => "test",
         }
     }
 }
@@ -3641,9 +3985,9 @@ pub enum HandBackForceProbe {
     ReachWithdrawn,
     /// The tier still had a session to act on AFTER the hand-back: the tab's
     /// own retained transaction, or one the pool has already given to another
-    /// tab. What it then did with it is the payload — `Ok(Delivered)` means it
+    /// tab. What it then did with it is the payload — `Ok(Destroyed)` means it
     /// really was torn down.
-    ForcedAfterHandBack(Result<SessionCancelDelivery, String>),
+    ForcedAfterHandBack(Result<ForceTierOutcome, String>),
 }
 
 impl SqlEditorWidget {
@@ -4146,6 +4490,38 @@ impl SqlEditorWidget {
         Self::has_active_lazy_fetch(&self.active_lazy_fetch)
     }
 
+    /// Whether this tab's DB work is work no amount of ASKING will end.
+    ///
+    /// True only after the tab's force watchdog spent the strongest tier a
+    /// CANCEL is allowed to spend and the work did not stop: the session is the
+    /// connection's own, so the tier could only break it again
+    /// ([`ForceTierOutcome::AskedAgain`]), and on Oracle thin an in-band break
+    /// does not reach a call that is already blocked.
+    ///
+    /// A session-ending action asks it because its refusal — "Stop it before
+    /// continuing" — is unsatisfiable here: the app has already tried, and the
+    /// user has nothing stronger. Ending the connection is what is left, and
+    /// that is exactly the deliberate action
+    /// [`crate::db::CanceledSession::force_tier_may_destroy_it`] points at.
+    pub(crate) fn db_work_the_app_could_not_stop(&self) -> bool {
+        // The publication is cloned out from under the slot's lock and only
+        // then asked, so the two are never held at once: the force watchdog
+        // holds the publication's own lock and reads nothing of the slot's, and
+        // one nesting is all it takes to have two.
+        let published = self
+            .current_operation_cancel_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|slot| slot.handle.clone());
+        published.is_some_and(|handle| {
+            handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .the_app_could_not_stop_it()
+        })
+    }
+
     /// Whether this tab cannot accept a transaction-mode change right now: a
     /// query or lazy fetch of its own is still running, or its retained DB
     /// session is in a state that has to be resolved first. The toolbar
@@ -4153,7 +4529,13 @@ impl SqlEditorWidget {
     /// lives here — where the state does — instead of being re-derived by each
     /// caller.
     pub fn transaction_mode_change_blocked_now(&self, db_type: crate::db::DatabaseType) -> bool {
-        if self.is_query_running() || self.has_open_lazy_fetch() {
+        // THE SAME ANSWER the callback beside these combos refuses on
+        // ([`TabDbWork`]), because a control that says "you may change this"
+        // and a callback that then says "no" are one question. This listed two
+        // of the three kinds, so during the window a DEFERRED execution waits
+        // -- up to 0.2s on both roads, longer while a lazy-fetch cancel is
+        // retried -- the combos stayed live and the pick was alerted away.
+        if TabDbWork::for_editor(self).blocks() {
             return true;
         }
         self.pooled_session_activity_snapshot()
@@ -4179,6 +4561,20 @@ impl SqlEditorWidget {
     /// resolution disagrees with this value.
     pub(crate) fn record_displayed_transaction_mode(&self, displayed: Option<TransactionMode>) {
         store_mutex_transaction_mode_option(&self.ui_displayed_transaction_mode, displayed);
+    }
+
+    /// What the app RECORDED the screen as saying for this tab, which is the
+    /// one source of truth for putting the toolbar's combos back after a pick
+    /// the app did not apply.
+    ///
+    /// The combos themselves are an INPUT -- the user moves them and the
+    /// callback decides -- so they cannot answer this: after a refused pick
+    /// they hold the refused value. Reading it here rather than re-deriving the
+    /// effective mode is deliberate: a re-derivation needs the connection, and
+    /// the road that needs this most is the one where the connection could not
+    /// be read.
+    pub(crate) fn displayed_transaction_mode(&self) -> Option<TransactionMode> {
+        load_mutex_transaction_mode_option(&self.ui_displayed_transaction_mode)
     }
 
     /// Clears the tab's pinned auto-commit so it falls back to the connection
@@ -4889,7 +5285,10 @@ impl SqlEditorWidget {
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         let target_scope = target_scope.trim();
         if target_scope.is_empty() && !db_type.can_apply_empty_scope_to_retained_session() {
-            return RetainedSessionMutationOutcome::NoSession;
+            // Not "there is no session" — there may well be one, sitting in the
+            // slot. There is nothing this backend can apply to it: Oracle has
+            // no statement for "no schema".
+            return RetainedSessionMutationOutcome::NotApplicable;
         }
 
         // Row and connection info from ONE resolution of the pool context: this
@@ -5625,17 +6024,35 @@ impl SqlEditorWidget {
         session_id: u64,
         configured_timeout: Duration,
     ) -> Duration {
-        let graceful_break_needs_the_force_tier_early = active_lazy_fetch
+        let published = active_lazy_fetch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .is_some_and(|handle| {
+            .filter(|handle| {
                 handle.session_id == session_id
                     && handle.db_cancel_requested.load(Ordering::Relaxed)
-                    && handle.cancel_handle.as_ref().is_some_and(|cancel_handle| {
-                        cancel_handle.graceful_break_may_not_interrupt_a_blocked_call()
-                    })
-            });
+            })
+            .and_then(|handle| handle.cancel_handle.clone());
+        Self::lazy_fetch_force_grace_after_a_db_break(published.as_ref(), configured_timeout)
+    }
+
+    /// The same derivation, for a caller that already knows a DB break has been
+    /// asked for.
+    ///
+    /// Two callers now, and that is why it is one function:
+    /// [`Self::lazy_fetch_cancel_watchdog_timeout_for`] asks it when the CANCEL
+    /// ROAD sent the break before the watchdog started, and the watchdog itself
+    /// asks it again after it has sent a break of its own
+    /// ([`ForcePassDecision::SendGracefulBreak`]). Both are "this session has
+    /// now been asked to stop", so both must give the same grace — a second
+    /// derivation is how the thin shortening would have applied to one break
+    /// and not the other.
+    fn lazy_fetch_force_grace_after_a_db_break(
+        cancel_handle: Option<&LazyFetchCancelHandle>,
+        configured_timeout: Duration,
+    ) -> Duration {
+        let graceful_break_needs_the_force_tier_early = cancel_handle
+            .is_some_and(QueryCancelHandle::graceful_break_may_not_interrupt_a_blocked_call);
         if graceful_break_needs_the_force_tier_early {
             configured_timeout.min(ORACLE_THIN_LAZY_FETCH_DB_CANCEL_FORCE_TIMEOUT)
         } else {
@@ -5697,25 +6114,88 @@ impl SqlEditorWidget {
                                 && handle.cancel_requested.load(Ordering::Relaxed)
                         })
                 };
-                // The same rule the operation watchdog applies at its force
-                // deadline: a graceful break another thread is still delivering
-                // holds the deadline open — once per publication, spent in the
-                // publication's own state — because escalating during it would
-                // KILL CONNECTION the very session the KILL QUERY was on its
-                // way to spare, and on the MySQL family that delivery spends
-                // seconds opening a control connection. The hold is bounded by
-                // the same grace every other session gets, so a sender that
-                // never answers cannot postpone the tier that exists for work
-                // which will not stop.
+                // EXACTLY the pass the operation watchdog takes, through the
+                // SAME decision (`GracefulBreakProgress::force_pass_decision`):
+                // ONE locked look at the publication that spends the claim or
+                // the hold as part of deciding.
+                //
+                // It used to ask a narrower question — "is a break in flight?"
+                // — which folded NotAsked into Answered, so a session nothing
+                // had ever asked to stop was torn down without a break. That is
+                // the ordinary shape of a lazy cancel, not a corner case: a
+                // fetch that is WAITING between chunks (every result-tab close,
+                // and the cancel button whenever the fetch is paused) is sent a
+                // `GracefulClose` and NO DB break at all, because
+                // `cancel_lazy_fetch_handle_for_session` breaks only a fetch
+                // that is mid-fill. A close that wedged therefore met KILL
+                // CONNECTION / a drop-close as the first thing that ever
+                // reached its session — destroying the tab's own retained
+                // transaction that `Cancel` had promised to keep.
+                //
+                // Bounded exactly as the operation road is: a publication
+                // enters `Sending` once and holds once, so at most two extra
+                // grace periods, and neither a sender that never answers nor a
+                // break that never lands can postpone the tier that exists for
+                // work which will not stop.
+                let mut force_grace = timeout;
                 let escalate = loop {
-                    if !crate::db::wait_for_graceful_cancel(timeout, still_pending) {
+                    if !crate::db::wait_for_graceful_cancel(force_grace, still_pending) {
                         break false;
                     }
-                    let held = break_progress
+                    let decision = break_progress
                         .as_ref()
-                        .is_some_and(QueryCancelTarget::hold_force_deadline_for_break_in_flight);
-                    if !held {
-                        break true;
+                        .map_or(ForcePassDecision::Withdrawn, |target| {
+                            target.force_pass_decision()
+                        });
+                    match decision {
+                        // FORCE IS NEVER THE FIRST THING A SESSION SEES.
+                        // Deciding so CLAIMED the break, so it is sent through
+                        // the door that answers a claim already taken.
+                        ForcePassDecision::SendGracefulBreak => {
+                            let Some(target) = break_progress.as_ref() else {
+                                break true;
+                            };
+                            match target.send_graceful_break_already_claimed(
+                                &SessionCancelClaim::owned_outright(),
+                            ) {
+                                Ok(SessionCancelDelivery::Delivered) => {}
+                                // The fetch gave its session back before the
+                                // break could land. Nothing failed; the loop
+                                // keeps watching and the next pass answers
+                                // `Withdrawn`.
+                                Ok(SessionCancelDelivery::Withdrawn) => {}
+                                Err(message) => crate::utils::logging::log_error(
+                                    "lazy fetch cancel",
+                                    &format!(
+                                        "Graceful cancel failed from the lazy watchdog: {message}"
+                                    ),
+                                ),
+                            }
+                            // This session has now been asked, so it gets the
+                            // grace a session that has been asked gets —
+                            // derived the ONE way, so Oracle thin's shortening
+                            // applies to the break this watchdog sent exactly
+                            // as it does to the one the cancel road sends.
+                            force_grace = Self::lazy_fetch_force_grace_after_a_db_break(
+                                Some(&target.as_handle()),
+                                timeout,
+                            );
+                            continue;
+                        }
+                        // A break another thread claimed is still on its way to
+                        // the server, and deciding so spent this publication's
+                        // one hold. Escalating during it would KILL CONNECTION
+                        // the very session the KILL QUERY was on its way to
+                        // spare, and on the MySQL family that delivery spends
+                        // seconds opening a control connection.
+                        ForcePassDecision::HoldForBreakInFlight => continue,
+                        // Asked and answered — escalation is honest. `NotPublished`
+                        // and `Withdrawn` reach the tier too and it answers
+                        // `SessionCancelDelivery::Withdrawn` for itself, which
+                        // is what tells the fetch worker to stop as well.
+                        ForcePassDecision::Force
+                        | ForcePassDecision::NotPublished
+                        | ForcePassDecision::Withdrawn => break true,
                     }
                 };
                 if !escalate {
@@ -5741,9 +6221,15 @@ impl SqlEditorWidget {
                 };
 
                 let command_dispatched = handle.sender.send(LazyFetchCommand::ForceCancel).is_ok();
-                let force_result = if let Some(cancel_handle) = handle.cancel_handle.clone() {
+                let mut force_result = if let Some(cancel_handle) = handle.cancel_handle.clone() {
                     panic::catch_unwind(AssertUnwindSafe(|| {
-                        cancel_handle.force_cancel(&SessionCancelClaim::owned_outright())
+                        cancel_handle.force_cancel(
+                            &SessionCancelClaim::owned_outright(),
+                            // A CANCEL: the connection must survive it. The tier
+                            // that ends a connection is a session-ending action's
+                            // own, never a lazy fetch watchdog's.
+                            crate::db::SessionCancelPurpose::StopOneCall,
+                        )
                     }))
                     .unwrap_or_else(|payload| {
                         Err(format!(
@@ -5756,7 +6242,7 @@ impl SqlEditorWidget {
                 } else {
                     Err("Lazy fetch worker is no longer available for force cancel".to_string())
                 };
-                if let Ok(SessionCancelDelivery::Withdrawn) = force_result {
+                if let Ok(ForceTierOutcome::Withdrawn) = force_result {
                     // The fetch gave its session back before the tear-down
                     // could land. `release_lazy_fetch_session` withdraws first
                     // and then reports the close, so there is nothing to do and
@@ -5769,6 +6255,19 @@ impl SqlEditorWidget {
                          acting; the session is no longer this fetch's",
                     );
                     return;
+                }
+                // A lazy fetch always publishes a POOLED session
+                // (`CanceledSession::Pooled`), so the tier that destroys is
+                // always available to it -- but the ANSWER is asked rather than
+                // assumed, so a future road that lets a fetch run on the
+                // connection's own session cannot close the result tab for a
+                // statement that was only broken again. Reported as a cancel
+                // that did not stop the fetch, which is what it is.
+                if let Ok(ForceTierOutcome::AskedAgain) = force_result {
+                    force_result = Err("The lazy fetch runs on the connection's own session, \
+                                        which a cancel may not tear down; it was broken again \
+                                        instead and may still be running"
+                        .to_string());
                 }
                 if let Err(message) = force_result {
                     let completion_deadline = Instant::now() + Duration::from_secs(1);
@@ -5793,7 +6292,10 @@ impl SqlEditorWidget {
                     return;
                 }
                 if let Some(status_activity) = handle.status_activity.as_ref() {
-                    status_activity.finish();
+                    // Same reason as the operation watchdog's: the session is
+                    // destroyed, the fetch worker is not, and until it lets go
+                    // its slot the app must go on being able to say so.
+                    status_activity.finish_for_work_that_has_not_stopped();
                 }
                 // Make the terminal state visible before waking the UI. A
                 // cancel click racing with this event must not target the
@@ -6776,12 +7278,14 @@ impl SqlEditorWidget {
     ) {
         let activity_label = action.activity_label();
         let panic_context = action.panic_context();
-        if let Some(message) =
-            transaction_action_block_message(Self::has_active_lazy_fetch(&self.active_lazy_fetch))
+        // The app's ONE answer about this tab's work, minus the half the
+        // reservation below already owns. The lazy-fetch wording is unchanged
+        // (it is the same sentence); the accepted-but-unstarted execution is
+        // what this gate could not see.
+        if let Some(message) = TabDbWork::for_editor(self)
+            .block_message_beside_a_running_statement("transaction control")
         {
-            let _ = self
-                .ui_action_sender
-                .send(action.ui_result(Err(message.to_string())));
+            let _ = self.ui_action_sender.send(action.ui_result(Err(message)));
             app::awake();
             return;
         }
@@ -7327,11 +7831,20 @@ impl SqlEditorWidget {
     /// it proves is what the watchdog does, including the one rule about how
     /// far the tier may go.
     ///
-    /// `None` means no session is published for this tab right now.
+    /// `None` means no session is published for this tab right now; otherwise
+    /// the answer is what the tier DID ([`ForceTierOutcome`]), which is the
+    /// fact the watchdog acts on.
+    ///
+    /// `purpose` is the caller's own, because the tier's reach depends on it
+    /// and the harness drives BOTH: a cancel
+    /// ([`crate::db::SessionCancelPurpose::StopOneCall`]) may never destroy the
+    /// connection's own session, and the action that ends the connection may.
+    /// One probe rather than two, so the two roads cannot drift apart.
     #[doc(hidden)]
     pub fn force_cancel_published_session_for_probe(
         &self,
-    ) -> Option<Result<SessionCancelDelivery, String>> {
+        purpose: crate::db::SessionCancelPurpose,
+    ) -> Option<Result<ForceTierOutcome, String>> {
         // The OPERATION's slot, which is the one the watchdog reads.
         let published = self
             .current_operation_cancel_handle
@@ -7342,7 +7855,38 @@ impl SqlEditorWidget {
         Self::clone_current_query_cancel_handle(&published)
             .published()
             .cloned()
-            .map(|handle| handle.force_cancel_blocking(&SessionCancelClaim::owned_outright()))
+            .map(|handle| {
+                handle.force_cancel_blocking(&SessionCancelClaim::owned_outright(), purpose)
+            })
+    }
+
+    /// How far the graceful break for this tab's LAZY FETCH publication has
+    /// got, or `None` when nothing is published for it.
+    ///
+    /// `#[doc(hidden)]`, for the live verification harness, and READ-ONLY: it
+    /// spends neither the claim nor the deadline hold, so watching it cannot
+    /// change what the watchdog decides.
+    ///
+    /// What it is for: `cancel_lazy_fetch_handle_for_session` sends a DB break
+    /// only for a fetch that is MID-FILL. A fetch cancelled while it is WAITING
+    /// between chunks — every result-tab close, and the cancel button whenever
+    /// the fetch is paused — is sent a `GracefulClose` and nothing else, so its
+    /// publication sits at `NotAsked` for the whole close. That is the premise
+    /// the force tier used to act on: `NotAsked` and `Answered` both said "do
+    /// not hold", so a close that wedged met the tear-down as the first thing
+    /// that ever reached its session. The premise is a per-backend fact, so the
+    /// harness checks it per backend.
+    #[doc(hidden)]
+    pub fn lazy_fetch_graceful_break_progress_for_probe(&self) -> Option<GracefulBreakProgress> {
+        let handle = self
+            .active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        match handle.cancel_handle.as_ref()? {
+            QueryCancelHandle::Withdrawable(target) => target.graceful_break_progress(),
+            _ => None,
+        }
     }
 
     /// Drive the tab's published cancel with a claim that LAPSES between the
@@ -7483,9 +8027,10 @@ impl SqlEditorWidget {
             .cloned()
         {
             None => HandBackForceProbe::ReachWithdrawn,
-            Some(handle) => HandBackForceProbe::ForcedAfterHandBack(
-                handle.force_cancel_blocking(&SessionCancelClaim::owned_outright()),
-            ),
+            Some(handle) => HandBackForceProbe::ForcedAfterHandBack(handle.force_cancel_blocking(
+                &SessionCancelClaim::owned_outright(),
+                crate::db::SessionCancelPurpose::StopOneCall,
+            )),
         }
     }
 
@@ -8074,7 +8619,15 @@ impl SqlEditorWidget {
                             outcome: QueryCancelOutcome::ForceStarted,
                         });
                         let force_result = panic::catch_unwind(AssertUnwindSafe(|| {
-                            handle.force_cancel(&SessionCancelClaim::owned_outright())
+                            handle.force_cancel(
+                                &SessionCancelClaim::owned_outright(),
+                                // A CANCEL stops ONE call: the connection must
+                                // survive it, so the connection's own session is
+                                // broken again rather than torn down. Ending the
+                                // connection is a session-ending action's own
+                                // tier -- see `SessionCancelPurpose`.
+                                crate::db::SessionCancelPurpose::StopOneCall,
+                            )
                         }))
                         .unwrap_or_else(|payload| {
                             Err(format!(
@@ -8082,7 +8635,7 @@ impl SqlEditorWidget {
                                 Self::panic_payload_to_string(payload.as_ref())
                             ))
                         });
-                        if let Ok(SessionCancelDelivery::Withdrawn) = force_result {
+                        if let Ok(ForceTierOutcome::Withdrawn) = force_result {
                             // The session was handed back between the read
                             // above and the tear-down reaching the server: it
                             // is the tab's retained session now, or the pool's,
@@ -8094,6 +8647,67 @@ impl SqlEditorWidget {
                                 "Cancel target was withdrawn while the force tier was \
                                  acting; the session is no longer this operation's",
                             );
+                            return;
+                        }
+                        if let Ok(ForceTierOutcome::AskedAgain) = force_result {
+                            // THE SESSION WAS NOT TORN DOWN, so nothing here may
+                            // say the work has stopped.
+                            //
+                            // This publication is the connection's OWN session
+                            // -- the Oracle explain plan on both drivers, the
+                            // MySQL family's one main-connection execution path,
+                            // and everything after a script `CONNECT` on OCI --
+                            // and destroying it is a deliberate action with its
+                            // own bookkeeping (File > Disconnect), never a side
+                            // effect of cancelling one call
+                            // (`CanceledSession::force_tier_may_destroy_it`). So
+                            // the strongest tier available was a second break,
+                            // and the statement may still be running: on Oracle
+                            // thin an in-band break does not even reach a call
+                            // that is already blocked.
+                            //
+                            // Everything the `Destroyed` road does below would
+                            // be a lie here. Retiring the activity row would
+                            // leave the still-running statement named by
+                            // nothing, which is what every session-ending gate
+                            // asks -- the pool rebuild, application exit's wait,
+                            // and `ConnectionRuntime::is_idle`, whose one caller
+                            // DISCONNECTS. Abandoning the operation would
+                            // publish the tab idle and CLEAR its cancel flag,
+                            // which is what stops the batch at its next safe
+                            // point. So neither happens: the row stays, the
+                            // operation stays, the cancel stays requested, and
+                            // the user is told what really happened.
+                            //
+                            // The watchdog returns rather than re-breaking for
+                            // ever: its claim is released first, so pressing
+                            // Cancel again starts a fresh watchdog that asks
+                            // again -- the same shape every other retryable
+                            // answer on this road uses.
+                            crate::utils::logging::log_warning(
+                                "sql_editor::cancel",
+                                "The force tier reached the connection's own session, which a \
+                                 cancel may not tear down; it was broken again and the \
+                                 statement may still be running",
+                            );
+                            // RECORD IT ON THE PUBLICATION. Until this existed
+                            // nothing in the app could tell a statement that
+                            // will not stop from one that is merely slow, so
+                            // every session-ending action refused on it with
+                            // "Stop it before continuing" -- including
+                            // `File > Disconnect`, the remedy the message below
+                            // names. See
+                            // `OperationCancelTarget::the_app_could_not_stop_it`.
+                            current_query_cancel_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .note_the_app_could_not_stop_it();
+                            drop(watchdog_claim);
+                            let _ = progress_sender.send(QueryProgress::CancelOutcome {
+                                token: operation_token,
+                                outcome: QueryCancelOutcome::ForceAskedAgain,
+                            });
+                            app::awake();
                             return;
                         }
                         if let Err(message) = force_result {
@@ -8125,12 +8739,25 @@ impl SqlEditorWidget {
                             app::awake();
                             return;
                         }
+                        // Only `ForceTierOutcome::Destroyed` reaches here, and
+                        // that is the whole licence for what follows: the
+                        // session is gone, so the operation really is over.
                         let _ = progress_sender.send(QueryProgress::CancelOutcome {
                             token: operation_token,
                             outcome: QueryCancelOutcome::ForceCompleted,
                         });
                         if let Some(status_activity) = status_activity.as_ref() {
-                            status_activity.finish();
+                            // The SESSION is destroyed; the WORKER is not. It
+                            // goes on holding its pool slot and its frame for as
+                            // long as its unwind takes, so the row is retired
+                            // through the door that remembers work the app has
+                            // ended but which has not stopped -- the same one
+                            // `cancel_db_activities_where` fills. `finish()`
+                            // here left the job named by nothing, and the two
+                            // questions that then answer wrongly (the pool
+                            // rebuild's gate and application exit's wait) both
+                            // answer in the direction that costs a session.
+                            status_activity.finish_for_work_that_has_not_stopped();
                         }
                         if !Self::abandon_query_cancel_operation_if_matches(
                             &current_query_connection,
@@ -11595,9 +12222,9 @@ mod cancel_watchdog_tests {
         assert_eq!(
             handle
                 .clone()
-                .force_cancel(&claim)
+                .force_cancel(&claim, crate::db::SessionCancelPurpose::StopOneCall)
                 .expect("not a failure either"),
-            SessionCancelDelivery::Withdrawn
+            ForceTierOutcome::Withdrawn
         );
 
         // Published, then taken back: both tiers must answer the same way they
@@ -11624,8 +12251,10 @@ mod cancel_watchdog_tests {
             SessionCancelDelivery::Withdrawn
         );
         assert_eq!(
-            handle.force_cancel(&claim).expect("not a failure"),
-            SessionCancelDelivery::Withdrawn
+            handle
+                .force_cancel(&claim, crate::db::SessionCancelPurpose::StopOneCall)
+                .expect("not a failure"),
+            ForceTierOutcome::Withdrawn
         );
         assert!(
             !touched.load(Ordering::Relaxed),
@@ -11653,8 +12282,12 @@ mod cancel_watchdog_tests {
         });
 
         let handle = target.as_handle();
-        let forced =
-            thread::spawn(move || handle.force_cancel(&SessionCancelClaim::owned_outright()));
+        let forced = thread::spawn(move || {
+            handle.force_cancel(
+                &SessionCancelClaim::owned_outright(),
+                crate::db::SessionCancelPurpose::StopOneCall,
+            )
+        });
 
         for _ in 0..400 {
             if started.load(Ordering::Relaxed) {
@@ -11674,8 +12307,75 @@ mod cancel_watchdog_tests {
 
         assert_eq!(
             forced.join().expect("force thread").expect("not a failure"),
-            SessionCancelDelivery::Withdrawn,
+            ForceTierOutcome::Withdrawn,
             "a cancel that is still travelling when its session is handed back must not land"
+        );
+    }
+
+    /// A force tier that may only RE-BREAK says so, and a caller cannot read
+    /// that as the tear-down.
+    ///
+    /// Both answered `Ok(SessionCancelDelivery::Delivered)` before, and the
+    /// query tab's force watchdog acted on it: it reported `ForceCompleted`,
+    /// retired the operation's activity row and ABANDONED the operation —
+    /// publishing the tab idle and clearing the cancel flag that stops the
+    /// batch at its next safe point — for a statement the server was still
+    /// executing. Reachable on all four backends, because the connection's own
+    /// session is what the Oracle explain plan runs on (both drivers), what the
+    /// MySQL family's one main-connection execution path uses, and what
+    /// everything after a script `CONNECT` runs on under OCI.
+    #[test]
+    fn a_force_tier_that_may_not_destroy_a_session_never_answers_the_tear_down() {
+        let claim = SessionCancelClaim::owned_outright();
+
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let main_slot = Arc::new(Mutex::new(
+            OperationCancelTarget::published_after_graceful_break(
+                QueryCancelHandle::TestMainSession {
+                    interrupted: interrupted.clone(),
+                    destroyed: destroyed.clone(),
+                },
+            ),
+        ));
+        let outcome = QueryCancelHandle::OperationSlot(main_slot)
+            .force_cancel_blocking(&claim, crate::db::SessionCancelPurpose::StopOneCall)
+            .expect("re-breaking is not a failure");
+        assert_eq!(
+            outcome,
+            ForceTierOutcome::AskedAgain,
+            "the connection's own session is broken again, never torn down"
+        );
+        assert!(interrupted.load(Ordering::Relaxed) && !destroyed.load(Ordering::Relaxed));
+        assert!(
+            !outcome.work_cannot_continue(),
+            "and nothing may conclude the statement has stopped"
+        );
+
+        // A POOLED publication still reaches the tier that destroys, and says
+        // THAT — the rule is unchanged, only the answer is no longer shared.
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let pooled_slot = Arc::new(Mutex::new(
+            OperationCancelTarget::published_after_graceful_break(QueryCancelHandle::Test(
+                torn_down.clone(),
+            )),
+        ));
+        let outcome = QueryCancelHandle::OperationSlot(pooled_slot)
+            .force_cancel_blocking(&claim, crate::db::SessionCancelPurpose::StopOneCall)
+            .expect("the tear-down is not a failure either");
+        assert_eq!(outcome, ForceTierOutcome::Destroyed);
+        assert!(torn_down.load(Ordering::Relaxed));
+        assert!(outcome.work_cannot_continue());
+
+        // The DB layer's own road reads only how far the tier got, and both
+        // tiers really did reach the server, so that road is unchanged.
+        assert_eq!(
+            ForceTierOutcome::AskedAgain.delivery(),
+            SessionCancelDelivery::Delivered
+        );
+        assert_eq!(
+            ForceTierOutcome::Withdrawn.delivery(),
+            SessionCancelDelivery::Withdrawn
         );
     }
 
@@ -11751,26 +12451,45 @@ mod cancel_watchdog_tests {
                 session,
             )
         };
-        let forced_through_slot = |session| {
+        let forced_through_slot = |session, purpose| {
             let slot = Arc::new(Mutex::new(OperationCancelTarget::newly_published(handle(
                 session,
             ))));
             QueryCancelHandle::OperationSlot(slot)
-                .force_cancel_blocking(&SessionCancelClaim::owned_outright())
+                .force_cancel_blocking(&SessionCancelClaim::owned_outright(), purpose)
                 .expect_err("no server is listening, so both tiers report a failure")
         };
 
-        let pooled = forced_through_slot(CanceledSession::Pooled);
+        let pooled = forced_through_slot(
+            CanceledSession::Pooled,
+            crate::db::SessionCancelPurpose::StopOneCall,
+        );
         assert!(
             pooled.contains("KILL CONNECTION"),
             "sanity: a POOLED session reaches the tier that destroys it, and that tier labels \
              its own failure: {pooled}"
         );
-        let main = forced_through_slot(CanceledSession::Main);
+        let main = forced_through_slot(
+            CanceledSession::Main,
+            crate::db::SessionCancelPurpose::StopOneCall,
+        );
         assert!(
             !main.contains("KILL CONNECTION"),
-            "a slot holding the connection's OWN session must be re-broken, never destroyed: \
-             {main}"
+            "a CANCEL on a slot holding the connection's OWN session must re-break it, never \
+             destroy it: {main}"
+        );
+        // ...and the action the rule points at REACHES that tier, which is the
+        // half that was missing. Without it the app could not end a call on the
+        // connection's own session at all, so `File > Disconnect` refused on a
+        // statement the app had already said it could not stop.
+        let ending = forced_through_slot(
+            CanceledSession::Main,
+            crate::db::SessionCancelPurpose::EndTheConnection,
+        );
+        assert!(
+            ending.contains("KILL CONNECTION"),
+            "ending the CONNECTION may destroy the connection's own session -- that is the \
+             deliberate action with its own bookkeeping: {ending}"
         );
     }
 
@@ -11978,8 +12697,12 @@ mod cancel_watchdog_tests {
         // into the driver as a `SessionCancelClaim`, so it can be told the
         // session was handed back while the break was still travelling -- and
         // that is still not a failure and still not the end of the operation.
-        let mid_break = source
+        // Anchored AFTER the graceful gate found above: the lazy watchdog has
+        // an arm of the same shape earlier in the file, and a search from the
+        // top of the source would assert about that one instead.
+        let mid_break = source[start..]
             .find("Ok(SessionCancelDelivery::Withdrawn) => {")
+            .map(|at| start + at)
             .expect("the graceful tier must have an answer for a withdraw that lands mid-break");
         let mid_break = &source[mid_break..mid_break + 200];
         assert!(
@@ -12087,6 +12810,33 @@ mod cancel_watchdog_tests {
             Some(LAZY_FETCH_TRANSACTION_CONTROL_BLOCK_MESSAGE)
         );
         assert_eq!(transaction_action_block_message(false), None);
+        // The UI gate asks the app's ONE answer now, and its lazy-fetch wording
+        // is the same sentence. What it adds is the kind the reservation below
+        // it cannot see: a statement the tab has ACCEPTED and not started.
+        assert_eq!(
+            TabDbWork::from_flags(false, true, false, false)
+                .block_message_beside_a_running_statement("transaction control")
+                .as_deref(),
+            Some(LAZY_FETCH_TRANSACTION_CONTROL_BLOCK_MESSAGE)
+        );
+        assert!(TabDbWork::from_flags(false, false, true, false)
+            .block_message_beside_a_running_statement("transaction control")
+            .is_some_and(|message| message.contains("has not started yet")));
+        // ...and NOT the half the running-flag reservation owns, or a
+        // COMMIT would be refused twice with two different answers.
+        for running in [
+            TabDbWork::from_flags(true, false, false, false),
+            TabDbWork::from_flags(true, false, false, true),
+        ] {
+            assert_eq!(
+                running.block_message_beside_a_running_statement("transaction control"),
+                None
+            );
+        }
+        assert_eq!(
+            TabDbWork::None.block_message_beside_a_running_statement("transaction control"),
+            None
+        );
     }
 }
 
