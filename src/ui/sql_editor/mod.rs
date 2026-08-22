@@ -1022,8 +1022,156 @@ pub enum LazyFetchRequest {
     More,
     MoreRows(usize),
     All,
+    /// Stop the fetch; the SESSION stays the tab's, whatever it carries.
     Cancel,
-    CancelAndDiscard,
+    /// Stop the fetch and give the pool its slot back — unless the session
+    /// carries something the tab still needs. See [`LazyFetchSessionPolicy`].
+    CancelAndDiscardIdleSession,
+}
+
+/// What a lazy-fetch cancel may do to the SESSION under the fetch.
+///
+/// A lazy fetch TAKES THE TAB'S SESSION over, so the transaction the tab opened
+/// before the SELECT is on it — which is why
+/// `SqlEditorWidget::discard_lazy_fetch_session` has to report a loss at all.
+/// Which policy a road may ask for is a fact about the ROAD; what granting it
+/// would COST is a fact about the SESSION. They used to be one boolean chosen
+/// at the call site, and the call sites that chose "discard" — closing a result
+/// tab, "Clear results", and the pool-slot eviction, which takes ANOTHER TAB's
+/// fetch — had no way of knowing what it cost. Every other session-ending
+/// action in the app resolves the tab's transaction first (`Self::
+/// resolve_pooled_sessions_before_retained_action`: *a tab it does not name is
+/// a tab whose work is destroyed without being asked about*); these three
+/// destroyed it and reported the loss afterwards.
+///
+/// So the two facts are resolved together, once, at the one door that writes
+/// the flag ([`SqlEditorWidget::cancel_lazy_fetch_handle_for_session`]), and
+/// "throw away the tab's work without asking" is no longer expressible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LazyFetchSessionPolicy {
+    /// The session stays the tab's. What the cancel button and the
+    /// pre-execution cancel ask for: the tab goes on using it.
+    Retain,
+    /// The pool gets its slot back if — and only if — the session carries
+    /// nothing the tab still needs. When it does, this is exactly
+    /// [`Self::Retain`]: the session goes back to the tab's lease with its work
+    /// on it, which is where it was before the fetch took it, and every
+    /// session-ending action still asks the user about it there.
+    DiscardIdleSession,
+}
+
+impl LazyFetchSessionPolicy {
+    /// THE rule, in one place.
+    ///
+    /// `session_carries_tab_work` is the FETCH's own answer, stated once when
+    /// it takes the session over
+    /// (`LazyFetchHandle::session_carries_tab_work`) — never re-derived by a
+    /// caller, because the UI cannot see the retained state a worker holds.
+    ///
+    /// Only a term: the worker still asks everything else it asked before
+    /// (the close succeeded, the health check passed, the scope re-applied), so
+    /// a session that CANNOT be kept is still discarded and its loss still
+    /// reported.
+    pub(crate) fn keeps_session(self, session_carries_tab_work: bool) -> bool {
+        match self {
+            Self::Retain => true,
+            Self::DiscardIdleSession => session_carries_tab_work,
+        }
+    }
+}
+
+/// What became of a lazy fetch's session after the app BROKE it.
+///
+/// **A break the app sent does not decide the session's fate; the handshake
+/// that follows it does.** All three lazy workers used to AND a bare
+/// `!db_cancel_requested` into their keep decision, so "we asked the server to
+/// stop" was on its own enough to throw the session away — and the tab's open
+/// transaction with it — on EVERY road, including the cancel button's
+/// [`LazyFetchSessionPolicy::Retain`], whose whole promise is to keep it.
+///
+/// The STATEMENT road has never worked that way. A cancelled SELECT there is
+/// retained once the health check passes
+/// (`oracle_thin_general_cancel_with_select_error_can_retain_after_health_check`),
+/// and the app's own central policy says the same for a lazy fetch:
+/// `crate::db::session_policy::decide_session_after_interrupt` ends at
+/// *cursor closed + worker done + health check ok → `ReuseSamePhysicalSession`*.
+/// Same driver, same break, opposite answers — the blanket term is what stopped
+/// the shared policy ever being reached.
+///
+/// So each road states its own EVIDENCE and the rule lives here. Only ONE road
+/// can answer the third variant without a round trip, and that is the point of
+/// naming it: Oracle thin's driver marks the session broken when the
+/// break/reset drain cannot complete, so it knows before it asks. Oracle OCI
+/// (whose driver resets the connection inside the break, and whose `ResultSet`
+/// is released when the fetch closure returns) and the MySQL family (whose
+/// crate drains the killed result set as the `QueryResult` drops) have no
+/// separate answer and need none: the cursor close and the health check that
+/// follow are the round trips that prove it, and they run either way. Each
+/// road's own evidence is stated where that road builds this value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LazyFetchBreakRecovery {
+    /// Nothing asked this session to stop, so there is nothing to recover from.
+    NoBreakWasSent,
+    /// A break was sent and the driver has no complaint: as far as it can tell
+    /// the wire is back at a request boundary.
+    ///
+    /// NOT a promise that the session works — it is the point at which asking
+    /// becomes worthwhile, and the cursor close, the health check and the
+    /// interrupt policy still have to agree before anything is kept.
+    BreakLeftTheSessionUsable,
+    /// A break was sent and the driver says the session did not come back from
+    /// it. Nothing further may be asked of it, and the cursor it still holds
+    /// goes with it.
+    BreakLeftTheSessionUnusable,
+}
+
+impl LazyFetchBreakRecovery {
+    /// Whether this session may still be USED — asked by everything a cleanup
+    /// does after a break: closing the fetch's cursor, checking the session's
+    /// health, and keeping it for the tab.
+    ///
+    /// One method rather than one per reader, so the cursor close and the keep
+    /// decision cannot drift apart: closing a cursor on a session nobody may
+    /// keep is a wasted round trip on a broken wire, and keeping a session
+    /// whose cursor could not be closed leaks that cursor into the tab.
+    pub(crate) fn may_go_on_using_the_session(self) -> bool {
+        match self {
+            Self::NoBreakWasSent | Self::BreakLeftTheSessionUsable => true,
+            Self::BreakLeftTheSessionUnusable => false,
+        }
+    }
+
+    /// Whether a break the app sent may still be on its way to this session —
+    /// so the FIRST thing asked of it can be answered by that break instead of
+    /// by the session.
+    ///
+    /// True on exactly the roads whose driver cannot clear the break itself,
+    /// which is the same set that answers
+    /// [`Self::after_a_break_the_driver_does_not_judge`] and for the same
+    /// reason. A break interrupts the call that is RUNNING; when the call has
+    /// already finished, OCI remembers it and aborts the next one, and a MySQL
+    /// `KILL QUERY` lands on whatever that thread runs next. Oracle thin drains
+    /// its own break/reset handshake, so nothing is left travelling and it
+    /// never answers `BreakLeftTheSessionUsable` while one is.
+    ///
+    /// See `SqlEditorWidget::session_health_after_a_break`, which is what asks.
+    pub(crate) fn a_break_may_still_be_landing(self) -> bool {
+        matches!(self, Self::BreakLeftTheSessionUsable)
+    }
+
+    /// The answer for a road whose driver cannot say more than "a break was
+    /// sent": the evidence is the round trips that follow.
+    ///
+    /// Oracle OCI and the MySQL family both take this. Named rather than
+    /// written out at each of them so a new backend has to decide whether it
+    /// belongs here or has a real answer of its own like Oracle thin's.
+    pub(crate) fn after_a_break_the_driver_does_not_judge(db_cancel_requested: bool) -> Self {
+        if db_cancel_requested {
+            Self::BreakLeftTheSessionUsable
+        } else {
+            Self::NoBreakWasSent
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1626,6 +1774,22 @@ pub(crate) struct LazyFetchHandle {
     pub db_type: DatabaseType,
     pub sender: mpsc::Sender<LazyFetchCommand>,
     pub cancel_handle: Option<LazyFetchCancelHandle>,
+    /// Whether giving this fetch's session up would cost the tab something it
+    /// still needs — an open transaction, a pending transaction-mode override,
+    /// a session lock.
+    ///
+    /// Stated ONCE, by the worker that took the session over, from the state
+    /// the tab handed it (`RetainedSessionState::
+    /// requires_physical_session_preservation` — the same predicate
+    /// `oracle_lazy_fetch_success_loses_required_session` calls "the session
+    /// was required"). It is a constant for the life of the fetch: nothing else
+    /// can run on a session a fetch is holding.
+    ///
+    /// It lives on the HANDLE because both readers need it and neither can
+    /// derive it: the cancel door resolves [`LazyFetchSessionPolicy`] against
+    /// it, and the pool-slot eviction needs it to pick a victim whose session
+    /// it may actually take.
+    pub session_carries_tab_work: bool,
     pub cancel_requested: Arc<AtomicBool>,
     pub retain_session_on_cancel: Arc<AtomicBool>,
     pub db_cancel_requested: Arc<AtomicBool>,
@@ -5675,7 +5839,10 @@ impl SqlEditorWidget {
 
     pub fn clear_pooled_db_session(&self) {
         let _ = self.release_pooled_db_session();
-        self.cancel_active_lazy_fetch(false);
+        // Same answer as every other road that wants the slot back: the fetch
+        // stops and the session goes, unless it carries something the tab still
+        // needs — which no road decides for the user.
+        self.cancel_active_lazy_fetch(LazyFetchSessionPolicy::DiscardIdleSession);
     }
 
     pub fn set_lazy_fetch_batch_size(&self, size: u32) {
@@ -5707,6 +5874,22 @@ impl SqlEditorWidget {
         AppConfig::runtime_cancel_timeout()
     }
 
+    /// Which cancels a request is, and what it may do to the session.
+    ///
+    /// One mapping, so the two cancel variants cannot mean one thing here and
+    /// another in the command match below.
+    fn lazy_fetch_cancel_session_policy(
+        request: LazyFetchRequest,
+    ) -> Option<LazyFetchSessionPolicy> {
+        match request {
+            LazyFetchRequest::Cancel => Some(LazyFetchSessionPolicy::Retain),
+            LazyFetchRequest::CancelAndDiscardIdleSession => {
+                Some(LazyFetchSessionPolicy::DiscardIdleSession)
+            }
+            LazyFetchRequest::More | LazyFetchRequest::MoreRows(_) | LazyFetchRequest::All => None,
+        }
+    }
+
     pub fn request_lazy_fetch(&self, session_id: u64, request: LazyFetchRequest) -> bool {
         let handle = self
             .active_lazy_fetch
@@ -5719,12 +5902,8 @@ impl SqlEditorWidget {
         if handle.session_id != session_id {
             return false;
         }
-        if matches!(
-            request,
-            LazyFetchRequest::Cancel | LazyFetchRequest::CancelAndDiscard
-        ) {
-            let retain_session_on_cancel = request == LazyFetchRequest::Cancel;
-            if self.cancel_lazy_fetch_session(session_id, retain_session_on_cancel) {
+        if let Some(policy) = Self::lazy_fetch_cancel_session_policy(request) {
+            if self.cancel_lazy_fetch_session(session_id, policy) {
                 let _ = self
                     .progress_sender
                     .send(QueryProgress::LazyFetchCanceling { session_id });
@@ -5742,7 +5921,10 @@ impl SqlEditorWidget {
                 LazyFetchCommand::FetchMore(Self::normalized_requested_lazy_fetch_rows(row_count))
             }
             LazyFetchRequest::All => LazyFetchCommand::FetchAll,
-            LazyFetchRequest::Cancel | LazyFetchRequest::CancelAndDiscard => {
+            // Unreachable: `lazy_fetch_cancel_session_policy` answered `Some`
+            // for both cancels above and returned. Named rather than caught by
+            // a wildcard so a new request variant has to say what it is.
+            LazyFetchRequest::Cancel | LazyFetchRequest::CancelAndDiscardIdleSession => {
                 LazyFetchCommand::GracefulClose
             }
         };
@@ -5803,6 +5985,25 @@ impl SqlEditorWidget {
             .as_ref()
             .filter(|handle| handle.connection_id == Some(connection_id))
             .map(|handle| handle.session_id)
+    }
+
+    /// Whether this tab's live lazy fetch holds `session_id` AND giving that
+    /// session up would cost the tab something it still needs.
+    ///
+    /// `None` when this tab does not have that fetch, so a caller walking every
+    /// tab can tell "not mine" from "mine and free to take".
+    ///
+    /// The pool-slot eviction is the caller: it takes a fetch's session away to
+    /// make room for another statement, which is the one road in the app that
+    /// ends a session belonging to a tab OTHER than the one that asked. It may
+    /// only ever take one that costs nothing.
+    pub(crate) fn lazy_fetch_session_carries_tab_work(&self, session_id: u64) -> Option<bool> {
+        self.active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|handle| handle.session_id == session_id)
+            .map(|handle| handle.session_carries_tab_work)
     }
 
     pub fn lazy_fetch_progress_event_is_current(
@@ -5875,41 +6076,41 @@ impl SqlEditorWidget {
         )
     }
 
-    fn cancel_active_lazy_fetch(&self, retain_session_on_cancel: bool) -> bool {
-        Self::cancel_lazy_fetch_handle(
-            &self.active_lazy_fetch,
-            &self.pooled_db_session,
-            retain_session_on_cancel,
-        )
+    fn cancel_active_lazy_fetch(&self, policy: LazyFetchSessionPolicy) -> bool {
+        Self::cancel_lazy_fetch_handle(&self.active_lazy_fetch, &self.pooled_db_session, policy)
     }
 
-    fn cancel_lazy_fetch_session(&self, session_id: u64, retain_session_on_cancel: bool) -> bool {
+    fn cancel_lazy_fetch_session(&self, session_id: u64, policy: LazyFetchSessionPolicy) -> bool {
         Self::cancel_lazy_fetch_handle_for_session(
             &self.active_lazy_fetch,
             &self.pooled_db_session,
             Some(session_id),
-            retain_session_on_cancel,
+            policy,
         )
     }
 
     fn cancel_lazy_fetch_handle(
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         _pooled_db_session: &SharedDbSessionLease,
-        retain_session_on_cancel: bool,
+        policy: LazyFetchSessionPolicy,
     ) -> bool {
         Self::cancel_lazy_fetch_handle_for_session(
             active_lazy_fetch,
             _pooled_db_session,
             None,
-            retain_session_on_cancel,
+            policy,
         )
     }
 
+    /// THE door: every lazy-fetch cancel in the app writes
+    /// `retain_session_on_cancel` here and nowhere else, which is what makes
+    /// [`LazyFetchSessionPolicy::keeps_session`] the only rule about the
+    /// session under a fetch.
     fn cancel_lazy_fetch_handle_for_session(
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         _pooled_db_session: &SharedDbSessionLease,
         expected_session_id: Option<u64>,
-        retain_session_on_cancel: bool,
+        policy: LazyFetchSessionPolicy,
     ) -> bool {
         let cancel_request = active_lazy_fetch
             .lock()
@@ -5919,14 +6120,26 @@ impl SqlEditorWidget {
                 if expected_session_id.is_some_and(|session_id| handle.session_id != session_id) {
                     return None;
                 }
+                // The policy resolved against the fetch's own fact, which is
+                // what stops a road from writing `false` over a session that
+                // carries the tab's work.
+                let keeps_session = policy.keeps_session(handle.session_carries_tab_work);
                 let cancel_already_requested = handle.cancel_requested.load(Ordering::Relaxed);
-                if retain_session_on_cancel {
+                if keeps_session {
                     if !cancel_already_requested {
                         handle
                             .retain_session_on_cancel
                             .store(true, Ordering::Relaxed);
                     }
                 } else {
+                    // A DOWNGRADE, and it is allowed only because the line
+                    // above has already established that this session carries
+                    // nothing the tab needs: a second road (the user closes the
+                    // grid after pressing Cancel) may free a slot the first
+                    // road left checked out, and may never cost work by doing
+                    // it. The UPGRADE stays refused once a cancel is under way:
+                    // the worker may already have acted on the answer it was
+                    // given.
                     handle
                         .retain_session_on_cancel
                         .store(false, Ordering::Relaxed);
@@ -8073,8 +8286,10 @@ impl SqlEditorWidget {
             snapshot.lazy_state,
             crate::db::session_policy::LazyFetchState::None
         ) {
-            let lazy_fetch_cancel_requested =
-                self.cancel_lazy_fetch_session(snapshot.operation_id, true);
+            // The cancel button: the session is the tab's and stays the
+            // tab's -- `Cancel` promises to keep whatever is open on it.
+            let lazy_fetch_cancel_requested = self
+                .cancel_lazy_fetch_session(snapshot.operation_id, LazyFetchSessionPolicy::Retain);
             if lazy_fetch_cancel_requested {
                 let _ = self
                     .progress_sender

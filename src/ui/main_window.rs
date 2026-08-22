@@ -3445,7 +3445,7 @@ impl AppState {
     /// What a POOL REBUILD asks: it is a preference change, so it must not
     /// destroy anything — neither half. The disconnect family asks the two
     /// halves separately instead, because ending the connection is what the
-    /// user asked for there: it refuses on [`Self::tab_work_blocking_session_teardown`]
+    /// user asked for there: it refuses on [`Self::tab_work_obstacle_for_session_teardown`]
     /// and CANCELS [`Self::background_work_blocking_session_teardown`]
     /// deliberately, rather than letting the stale sweep force it afterwards.
     fn db_work_blocking_session_teardown(
@@ -4073,15 +4073,41 @@ impl AppState {
         Ok(released_any)
     }
 
-    fn oldest_lazy_fetch_session_for_tab(&self, tab_id: QueryTabId) -> Option<u64> {
+    /// The oldest lazy fetch on this tab's connection that a pool-slot
+    /// eviction may actually take.
+    ///
+    /// See [`oldest_evictable_lazy_fetch_session`] for what "may take" excludes
+    /// and why.
+    fn oldest_evictable_lazy_fetch_session_for_tab(&self, tab_id: QueryTabId) -> Option<u64> {
         let connection_id = self
             .editor_tabs
             .iter()
             .find(|tab| tab.tab_id == tab_id)
             .and_then(|tab| tab.connection_binding.snapshot().connection_id())?;
-        self.lazy_fetch_sessions_for_connection(connection_id)
-            .into_iter()
-            .min()
+        self.oldest_evictable_lazy_fetch_session_on_connection(connection_id)
+    }
+
+    /// [`oldest_evictable_lazy_fetch_session`] asked of this window's state:
+    /// the fetches holding a slot on `connection_id`
+    /// ([`Self::lazy_fetch_sessions_for_connection`], which counts them all
+    /// because they all hold one), which of them is already being cancelled,
+    /// and which of them is holding the tab's work.
+    fn oldest_evictable_lazy_fetch_session_on_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Option<u64> {
+        oldest_evictable_lazy_fetch_session(
+            &self.lazy_fetch_sessions_for_connection(connection_id),
+            |session_id| {
+                self.pending_lazy_fetch_canceling_sessions
+                    .contains(&session_id)
+            },
+            |session_id| {
+                self.editors_that_can_own_db_work().any(|editor| {
+                    editor.lazy_fetch_session_carries_tab_work(session_id) == Some(true)
+                })
+            },
+        )
     }
 
     fn mark_lazy_fetch_cancelled_without_status(&mut self, session_id: u64) {
@@ -4360,6 +4386,19 @@ impl AppState {
         marked
     }
 
+    /// A cancel that did not land, said in the ONE way that is true of the
+    /// fetch it is about.
+    ///
+    /// The pending entry goes, so the user can press Cancel again — that half
+    /// was always right. What was not is the STATUS: this used to put the tab
+    /// back to Fetching/Waiting, and a cancelled fetch never fetches again
+    /// (`SqlEditorWidget::request_lazy_fetch` refuses every `More`/`All` once
+    /// `cancel_requested` is set, and it stays set). So the grid read as
+    /// fetchable, the table widget went on asking for the next page as the user
+    /// scrolled, and every one of those requests was refused in silence — a tab
+    /// that says "Fetching" for ever. It is still CANCELING: the command is
+    /// with the worker, the retry is available, and the close event settles it
+    /// either way.
     fn mark_lazy_fetch_cancel_failed(&mut self, session_id: u64) -> bool {
         let was_pending = self
             .pending_lazy_fetch_canceling_sessions
@@ -4371,11 +4410,7 @@ impl AppState {
             else {
                 continue;
             };
-            let status = if context.waiting_lazy_fetch_sessions.contains(&session_id) {
-                ResultTabStatus::Waiting
-            } else {
-                ResultTabStatus::Fetching
-            };
+            let status = ResultTabStatus::Canceling;
             context.state_label = status.label().to_string();
             context.update_status_activity(status.label());
             if let Some(result_tab_id) = context.result_tab_id_for_statement(statement_index) {
@@ -6587,6 +6622,41 @@ enum SessionPoolSlotAction {
     CancelLazyFetch,
 }
 
+/// Which of the lazy fetches holding a pool slot an eviction may actually take,
+/// and the oldest of those.
+///
+/// The rule apart from the state that answers it, because it is the one thing
+/// this road can get wrong in two different directions.
+///
+/// * **A fetch whose session carries the tab's work is not evictable.** The
+///   eviction is the ONE road in the app that ends a session belonging to a tab
+///   other than the one that asked, and it asks nobody: a Ctrl+Enter in tab B
+///   used to roll back tab A's open transaction and report the loss afterwards,
+///   while every other session-ending action resolves the transaction first
+///   (`MainWindow::resolve_pooled_sessions_before_retained_action`).
+/// * **A fetch whose cancel is already pending is not evictable either.**
+///   Asking it again frees nothing —
+///   `SqlEditorWidget::cancel_lazy_fetch_handle_for_session` answers a second
+///   request without sending anything — while this road reports "canceling the
+///   oldest" and waits, so the execution failed as pool-exhausted with other
+///   evictable fetches sitting beside it.
+///
+/// A fetch nothing can answer for — one the window still lists but no editor
+/// holds a handle for — stays evictable: that fetch is over, so the request
+/// only clears the window's own bookkeeping, which is what it did before.
+fn oldest_evictable_lazy_fetch_session(
+    sessions_holding_a_slot: &[u64],
+    cancel_already_pending: impl Fn(u64) -> bool,
+    session_carries_tab_work: impl Fn(u64) -> bool,
+) -> Option<u64> {
+    sessions_holding_a_slot
+        .iter()
+        .copied()
+        .filter(|session_id| !cancel_already_pending(*session_id))
+        .filter(|session_id| !session_carries_tab_work(*session_id))
+        .min()
+}
+
 fn session_pool_slot_action(
     active_lazy_fetches: usize,
     connection_pool_size: u32,
@@ -6605,7 +6675,7 @@ fn request_lazy_fetch_cancel_for_session_pool(
     let requested = AppState::request_lazy_fetch_on_editors(
         state,
         session_id,
-        crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
+        crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscardIdleSession,
     );
     let mut guard = state
         .lock()
@@ -6709,15 +6779,25 @@ fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -
     };
 
     let session_id = {
-        let guard = state
+        let mut guard = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Counted over EVERY fetch on the connection, because every one of them
+        // holds a slot; the victim is picked from the ones this road may
+        // actually take. See `evictable_lazy_fetch_sessions_for_connection`.
         let active_sessions = guard.lazy_fetch_sessions_for_connection(connection_id);
         match session_pool_slot_action(active_sessions.len(), connection_pool_size) {
             SessionPoolSlotAction::None => return false,
             SessionPoolSlotAction::CancelLazyFetch => {}
         }
-        let Some(session_id) = active_sessions.into_iter().min() else {
+        let Some(session_id) =
+            guard.oldest_evictable_lazy_fetch_session_on_connection(connection_id)
+        else {
+            // The pool is full and nothing here may be taken. Said, rather than
+            // left to the driver's pool-exhausted error: the remedy is the
+            // user's (commit, roll back, or close a grid) and nothing else in
+            // the app is going to name it.
+            guard.set_status_message(SESSION_POOL_FULL_OF_WORK_STATUS);
             return false;
         };
         session_id
@@ -6743,6 +6823,15 @@ fn run_sql_execution_request_on(editor: &SqlEditorWidget, request: SqlExecutionR
         SqlExecutionRequest::Selected => editor.execute_selected(),
     }
 }
+
+/// What the pool-slot road says when the pool is full and every open fetch on
+/// the connection is one it may not take.
+///
+/// The two reasons a fetch is not evictable are both the user's to clear, and
+/// only one of them is visible in the grid, so the sentence names both.
+const SESSION_POOL_FULL_OF_WORK_STATUS: &str =
+    "Session pool is full; the open result grids are holding uncommitted work or are already \
+     being cancelled. Commit or roll back, or close a grid, and try again.";
 
 /// How long the pool-slot road waits for the lazy fetch it cancelled to give
 /// its session back before starting the execution it accepted.
@@ -7791,7 +7880,7 @@ impl MainWindow {
             AppState::request_lazy_fetch_on_editors(
                 state,
                 session_id,
-                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
+                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscardIdleSession,
             );
         }
     }
@@ -7835,7 +7924,7 @@ impl MainWindow {
             AppState::request_lazy_fetch_on_editors(
                 state,
                 session_id,
-                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
+                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscardIdleSession,
             );
         }
     }
@@ -11015,7 +11104,7 @@ impl MainWindow {
         for session_id in &lazy_fetch_sessions {
             editor_to_cleanup.request_lazy_fetch(
                 *session_id,
-                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
+                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscardIdleSession,
             );
         }
         editor_to_cleanup.cleanup_for_close();
@@ -12466,7 +12555,7 @@ impl MainWindow {
                         AppState::request_lazy_fetch_on_editors(
                             &state_for_progress,
                             session_id,
-                            crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
+                            crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscardIdleSession,
                         );
                     }
                 }
@@ -12781,7 +12870,7 @@ impl MainWindow {
                             AppState::request_lazy_fetch_on_editors(
                                 &state_for_progress,
                                 session_id,
-                                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
+                                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscardIdleSession,
                             );
                             return;
                         };
@@ -13102,7 +13191,7 @@ impl MainWindow {
                 }
                 QueryProgress::PromptInput { .. } => {}
                 QueryProgress::RequestCancelOldestLazyFetchForSessionPool { response } => {
-                    if let Some(session_id) = s.oldest_lazy_fetch_session_for_tab(tab_id) {
+                    if let Some(session_id) = s.oldest_evictable_lazy_fetch_session_for_tab(tab_id) {
                         drop(s);
                         let requested = request_lazy_fetch_cancel_for_session_pool(
                             &state_for_progress,
@@ -13115,7 +13204,7 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::NotifyCancelOldestLazyFetchForSessionPool => {
-                    if let Some(session_id) = s.oldest_lazy_fetch_session_for_tab(tab_id) {
+                    if let Some(session_id) = s.oldest_evictable_lazy_fetch_session_for_tab(tab_id) {
                         drop(s);
                         let _ = request_lazy_fetch_cancel_for_session_pool(
                             &state_for_progress,
@@ -20001,6 +20090,52 @@ mod tests {
         assert_eq!(
             transaction_isolation_from_choice_index(DatabaseType::MySQL, 3),
             TransactionIsolation::RepeatableRead
+        );
+    }
+
+    /// The eviction may only take a fetch it may actually have, and the two
+    /// exclusions are for opposite failures: taking one costs the user their
+    /// transaction, and re-taking one frees no slot at all.
+    #[test]
+    fn a_pool_slot_eviction_takes_the_oldest_fetch_it_may_actually_have() {
+        let holding_a_slot = [11u64, 22, 33];
+
+        assert_eq!(
+            oldest_evictable_lazy_fetch_session(&holding_a_slot, |_| false, |_| false),
+            Some(11),
+            "with nothing in the way the oldest is the victim, as it always was"
+        );
+        assert_eq!(
+            oldest_evictable_lazy_fetch_session(
+                &holding_a_slot,
+                |_| false,
+                |session_id| session_id == 11
+            ),
+            Some(22),
+            "a fetch holding the tab's work is passed over, not rolled back"
+        );
+        assert_eq!(
+            oldest_evictable_lazy_fetch_session(
+                &holding_a_slot,
+                |session_id| session_id == 11,
+                |_| false
+            ),
+            Some(22),
+            "a fetch already being cancelled frees no slot, so asking it again is not the answer"
+        );
+        assert_eq!(
+            oldest_evictable_lazy_fetch_session(
+                &holding_a_slot,
+                |session_id| session_id == 22,
+                |session_id| session_id == 11
+            ),
+            Some(33),
+            "the two exclusions compose"
+        );
+        assert_eq!(
+            oldest_evictable_lazy_fetch_session(&holding_a_slot, |_| false, |_| true),
+            None,
+            "and when nothing may be taken the road declines instead of inventing a victim"
         );
     }
 

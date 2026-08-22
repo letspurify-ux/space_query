@@ -5121,6 +5121,11 @@ impl SqlEditorWidget {
         db_type: crate::db::DatabaseType,
         sender: mpsc::Sender<LazyFetchCommand>,
         cancel_handle: Option<LazyFetchCancelHandle>,
+        // What this fetch took the session over WITH. Taken as the retained
+        // state itself rather than as a bool so every backend answers the one
+        // question the same way -- see
+        // `LazyFetchHandle::session_carries_tab_work`.
+        prior_retained_state: RetainedSessionState,
         status_activity: Option<crate::db::DbActivityFinishHandle>,
     ) {
         *active_lazy_fetch
@@ -5134,6 +5139,7 @@ impl SqlEditorWidget {
             db_type,
             sender,
             cancel_handle,
+            session_carries_tab_work: prior_retained_state.requires_physical_session_preservation(),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -5645,13 +5651,20 @@ impl SqlEditorWidget {
         (cursor_closed, true)
     }
 
+    /// The close event a worker reports, from the same facts its keep decision
+    /// used.
+    ///
+    /// `break_recovery` rather than "was a break sent": a break the session
+    /// came back from leaves the fetch's cursor released like any other close
+    /// (see [`LazyFetchBreakRecovery`]), and reporting it as still open said
+    /// the opposite of what the keep decision had just concluded.
     fn lazy_close_outcome_for_worker(
         close_cancelled: bool,
         close_error_kind: InterruptKind,
-        db_cancel_requested: bool,
+        break_recovery: LazyFetchBreakRecovery,
     ) -> LazyFetchCloseOutcome {
         let (mut cursor_closed, fetch_worker_done) = Self::lazy_close_event_flags(close_error_kind);
-        if db_cancel_requested && close_cancelled {
+        if !break_recovery.may_go_on_using_the_session() && close_cancelled {
             cursor_closed = false;
         }
         LazyFetchCloseOutcome::new(
@@ -5668,12 +5681,21 @@ impl SqlEditorWidget {
         error_kind: InterruptKind,
         cleanup_failed: bool,
         db_cancel_requested: bool,
+        break_recovery: LazyFetchBreakRecovery,
     ) -> (bool, bool, InterruptKind) {
-        let cursor_closed = if db_cancel_requested && close_cancelled {
+        // What the cleanup actually managed is `cursor_closed`; a break the
+        // session came back from no longer overrides it. See
+        // `lazy_close_outcome_for_worker`.
+        let cursor_closed = if !break_recovery.may_go_on_using_the_session() && close_cancelled {
             false
         } else {
             cursor_closed
         };
+        // A break the app ASKED for still names the interrupt a cancel,
+        // whatever became of the session: that is what the user did. What it no
+        // longer decides is the CURSOR — a cleanup that ran to the end on a
+        // session that came back from the break really did close it, and saying
+        // otherwise contradicted the keep decision made from the same facts.
         if db_cancel_requested
             && close_cancelled
             && matches!(
@@ -5681,7 +5703,11 @@ impl SqlEditorWidget {
                 InterruptKind::Cancelled | InterruptKind::UnsafeOrUnknown
             )
         {
-            return (true, false, InterruptKind::Cancelled);
+            return (
+                true,
+                cursor_closed && !cleanup_failed,
+                InterruptKind::Cancelled,
+            );
         }
         if cleanup_failed && close_cancelled && matches!(error_kind, InterruptKind::Cancelled) {
             return (true, false, InterruptKind::Cancelled);
@@ -6251,6 +6277,7 @@ impl SqlEditorWidget {
             crate::db::DatabaseType::Oracle,
             command_sender,
             Some(lazy_force_target.as_handle()),
+            prior_retained_state,
             sender.status_finish_handle(),
         );
         let _ = sender.send(QueryProgress::LazyFetchSession {
@@ -6544,12 +6571,21 @@ impl SqlEditorWidget {
                     let mut error_result = None;
                     let db_cancel_requested =
                         Self::lazy_fetch_db_cancel_requested(&active_lazy_fetch, session_id);
+                    // ODPI-C resets the connection as part of the break, and
+                    // the `ResultSet` this fetch held was released when the
+                    // fetch closure returned just above, so this driver has
+                    // nothing further to say: the health check below is the
+                    // round trip that decides. See `LazyFetchBreakRecovery`.
+                    let break_recovery =
+                        LazyFetchBreakRecovery::after_a_break_the_driver_does_not_judge(
+                            db_cancel_requested,
+                        );
                     match result {
                         Ok(LazyFetchWorkerOutcome::Completed) => {}
                         Ok(LazyFetchWorkerOutcome::Interrupted(error_kind)) => {
                             close_cancelled = true;
                             close_error_kind = error_kind;
-                            if !db_cancel_requested
+                            if break_recovery.may_go_on_using_the_session()
                                 && Self::lazy_fetch_interruption_can_retain_session(
                                     &active_lazy_fetch,
                                     session_id,
@@ -6562,7 +6598,7 @@ impl SqlEditorWidget {
                         Err(err) => {
                             close_cancelled = true;
                             close_error_kind = Self::oracle_interrupt_kind_for_error(&err);
-                            if !db_cancel_requested
+                            if break_recovery.may_go_on_using_the_session()
                                 && Self::oracle_select_error_allows_session_reuse(&err)
                             {
                                 keep_session = true;
@@ -6597,11 +6633,16 @@ impl SqlEditorWidget {
                         }
                     };
                     let should_keep_session = keep_session
-                        && !db_cancel_requested
+                        && break_recovery.may_go_on_using_the_session()
                         && timeout_reset_ok
-                        && Self::oracle_pooled_session_health_check(
-                            conn.as_ref(),
+                        && Self::session_health_after_a_break(
+                            break_recovery,
                             "oracle lazy fetch cleanup",
+                            || {
+                                crate::db::session_policy::health_check_oracle_session_reporting(
+                                    conn.as_ref(),
+                                )
+                            },
                         )
                         && Self::apply_oracle_schema_to_pooled_session_if_current(
                             &shared_connection,
@@ -6700,7 +6741,7 @@ impl SqlEditorWidget {
                         Self::lazy_close_outcome_for_worker(
                             close_cancelled,
                             close_error_kind,
-                            db_cancel_requested,
+                            break_recovery,
                         ),
                     );
                 }));
@@ -6823,6 +6864,7 @@ impl SqlEditorWidget {
             crate::db::DatabaseType::Oracle,
             command_sender,
             Some(lazy_force_target.as_handle()),
+            prior_retained_state,
             sender.status_finish_handle(),
         );
         let _ = sender.send(QueryProgress::LazyFetchSession {
@@ -7343,6 +7385,19 @@ impl SqlEditorWidget {
 
                     let db_cancel_requested =
                         Self::lazy_fetch_db_cancel_requested(&active_lazy_fetch, session_id);
+                    // The ONE road whose driver can answer without a round
+                    // trip: `finish_cancelled_read` completes the break/reset
+                    // handshake and marks the session broken when it cannot, so
+                    // a session that is not broken is back at a request
+                    // boundary — where closing the fetch's cursor is an
+                    // ordinary call again. See `LazyFetchBreakRecovery`.
+                    let break_recovery = if !db_cancel_requested {
+                        LazyFetchBreakRecovery::NoBreakWasSent
+                    } else if conn.is_broken() {
+                        LazyFetchBreakRecovery::BreakLeftTheSessionUnusable
+                    } else {
+                        LazyFetchBreakRecovery::BreakLeftTheSessionUsable
+                    };
                     let lazy_cancel_requested_for_close =
                         Self::lazy_fetch_cancel_requested(&active_lazy_fetch, session_id);
                     if close_cancelled
@@ -7371,9 +7426,16 @@ impl SqlEditorWidget {
                             false
                         }
                     };
+                    // Skipped only for a session that did not come back from
+                    // the break: there is nothing to close it on. A session
+                    // that DID come back closes its cursor like any other, so
+                    // keeping it costs the tab nothing — leaving the cursor
+                    // open on a retained session is exactly what would make
+                    // keeping it worse than losing it (ORA-01000).
                     let skip_cursor_close_after_db_cancel = close_cancelled
                         && matches!(close_error_kind, InterruptKind::Cancelled)
-                        && db_cancel_requested;
+                        && db_cancel_requested
+                        && !break_recovery.may_go_on_using_the_session();
                     let cleanup_timeout = Self::oracle_thin_lazy_cleanup_timeout(query_timeout);
                     let cleanup_timeout_applied = if timeout_reset_ok {
                         match cleanup_timeout {
@@ -7433,7 +7495,7 @@ impl SqlEditorWidget {
 
                     let can_check_session_health =
                         keep_session
-                            && !db_cancel_requested
+                            && break_recovery.may_go_on_using_the_session()
                             && cleanup_timeout_applied
                             && cursor_closed
                             && !conn.is_broken();
@@ -7478,7 +7540,7 @@ impl SqlEditorWidget {
                         timeout_reset_ok
                     };
                     let should_keep_session = keep_session
-                        && !db_cancel_requested
+                        && break_recovery.may_go_on_using_the_session()
                         && cleanup_timeout_applied
                         && cleanup_timeout_reset_ok
                         && cursor_closed
@@ -7594,6 +7656,7 @@ impl SqlEditorWidget {
                             close_error_kind,
                             cleanup_failed,
                             db_cancel_requested,
+                            break_recovery,
                         );
                     Self::clear_lazy_fetch_and_emit_closed(
                         &sender,
@@ -7721,6 +7784,7 @@ impl SqlEditorWidget {
             connection_info.db_type,
             command_sender,
             Some(lazy_force_target.as_handle()),
+            prior_retained_state,
             sender.status_finish_handle(),
         );
         let _ = sender.send(QueryProgress::LazyFetchSession {
@@ -8222,11 +8286,23 @@ impl SqlEditorWidget {
                         Self::lazy_close_event_flags(close_error_kind);
                     let db_cancel_requested =
                         Self::lazy_fetch_db_cancel_requested(&active_lazy_fetch, session_id);
-                    if db_cancel_requested && close_cancelled {
+                    // There is no cursor object here: the crate drains the
+                    // killed result set as the `QueryResult` drops and marks
+                    // the connection unusable when it cannot, so this driver
+                    // has nothing further to say either. What proves it is the
+                    // session-info sync below, which is a real round trip, and
+                    // the shared interrupt policy after it — which has always
+                    // ended at *cursor closed + worker done + health check ok →
+                    // reuse the same physical session* and could never be
+                    // reached from here. See `LazyFetchBreakRecovery`.
+                    let break_recovery = LazyFetchBreakRecovery::after_a_break_the_driver_does_not_judge(
+                        db_cancel_requested,
+                    );
+                    if !break_recovery.may_go_on_using_the_session() && close_cancelled {
                         cursor_closed = false;
                     }
                     should_retain_session =
-                        !db_cancel_requested
+                        break_recovery.may_go_on_using_the_session()
                             && Self::lazy_fetch_can_keep_session(&active_lazy_fetch, session_id)
                             && matches!(
                                 session_decision.reuse_decision,
@@ -8257,6 +8333,23 @@ impl SqlEditorWidget {
                         } else {
                             timeout_settings_restored = true;
                         }
+                    }
+                    if should_retain_session && break_recovery.a_break_may_still_be_landing() {
+                        // The cheap question first, so a `KILL QUERY` still on
+                        // its way is answered by THIS round trip rather than by
+                        // the session-info sync below — which is several
+                        // statements, reports its own failure, and would file
+                        // this session as unusable for a cancel the app itself
+                        // sent. See `session_health_after_a_break`.
+                        should_retain_session = Self::session_health_after_a_break(
+                            break_recovery,
+                            "mysql lazy fetch cleanup",
+                            || {
+                                crate::db::session_policy::health_check_mysql_session_reporting(
+                                    conn,
+                                )
+                            },
+                        );
                     }
                     if should_retain_session {
                         let preserve_session_state_after_action =
@@ -11669,7 +11762,12 @@ impl SqlEditorWidget {
                 LazyFetchCancelBeforeExecutionDecision::RequestCancelAndRetry {
                     next_retry_attempt,
                 } => {
-                    if self.cancel_lazy_fetch_session(session_id, true) {
+                    // The tab's own next statement is about to run on this
+                    // session, so it stays the tab's.
+                    if self.cancel_lazy_fetch_session(
+                        session_id,
+                        crate::ui::sql_editor::LazyFetchSessionPolicy::Retain,
+                    ) {
                         self.start_lazy_fetch_cancel_watchdog(session_id);
                         self.emit_status("Canceling previous lazy fetch...");
                         let _ = self
@@ -27632,6 +27730,56 @@ impl SqlEditorWidget {
         unit_moves_session_database && matches!(result, Ok(Ok(_)))
     }
 
+    /// Ask a session the app has just BROKEN whether it is healthy, and do not
+    /// mistake the app's own break for its answer.
+    ///
+    /// The break interrupts the call that is RUNNING. When the fetch finished
+    /// first — which is the ordinary outcome of cancelling a fetch that was
+    /// nearly done — there is no call to interrupt, so OCI remembers the break
+    /// and aborts the NEXT one, and a MySQL `KILL QUERY` lands on whatever that
+    /// thread runs next. The next call is this health check, so a session that
+    /// was perfectly fine failed it, was discarded, and took the tab's
+    /// transaction with it — live-observed on Oracle OCI as roughly one round
+    /// in three.
+    ///
+    /// Asking again is what CONSUMES the break: the same medicine
+    /// `DbConnectionPool::acquire_session_untracked` applies to a cancel that
+    /// outlived the work it was aimed at, recognised by the same predicate. And
+    /// once, not in a loop — a second cancel answer is not residue, it is the
+    /// session refusing to work.
+    ///
+    /// Only for a road that says a break may still be landing: Oracle thin
+    /// drains its own handshake before it ever gets here, so it re-asks nothing.
+    fn session_health_after_a_break(
+        break_recovery: LazyFetchBreakRecovery,
+        log_context: &str,
+        mut health_check: impl FnMut() -> Result<(), String>,
+    ) -> bool {
+        let Err(first) = health_check() else {
+            return true;
+        };
+        if !break_recovery.a_break_may_still_be_landing()
+            || !crate::db::session_policy::message_indicates_query_cancel(&first)
+        {
+            crate::utils::logging::log_error(log_context, &first);
+            return false;
+        }
+        crate::utils::logging::log_warning(
+            log_context,
+            &format!(
+                "The break this cancel sent landed on the health check rather than on the \
+                 fetch ({first}); asking the session again"
+            ),
+        );
+        match health_check() {
+            Ok(()) => true,
+            Err(second) => {
+                crate::utils::logging::log_error(log_context, &second);
+                false
+            }
+        }
+    }
+
     fn oracle_pooled_session_health_check(conn: &Connection, log_context: &str) -> bool {
         crate::db::session_policy::health_check_session(
             crate::db::session_policy::PhysicalSession::Oracle(conn),
@@ -29954,11 +30102,11 @@ mod oracle_current_schema_statement_tests {
 mod query_execution_cleanup_tests {
     use super::{
         lazy_fetch_all_timeout_for_fetch_all, InterruptKind, LazyFetchAllTimeout,
-        LazyFetchCancelBeforeExecutionDecision, LazyFetchCancelHandle, LazyFetchCloseOutcome,
-        LazyFetchCommand, LazyFetchHandle, MySqlQueryCancelContext, OracleThinQueryResult,
-        QueryCancelHandle, QueryCancelTarget, QueryExecutionCleanupGuard, QueryProgress,
-        QueryProgressSender, ScriptExecutionFrame, SqlEditorWidget, LAZY_FETCH_CANCEL_RETRY_LIMIT,
-        ORACLE_THIN_LAZY_CLEANUP_FALLBACK_TIMEOUT,
+        LazyFetchBreakRecovery, LazyFetchCancelBeforeExecutionDecision, LazyFetchCancelHandle,
+        LazyFetchCloseOutcome, LazyFetchCommand, LazyFetchHandle, LazyFetchSessionPolicy,
+        MySqlQueryCancelContext, OracleThinQueryResult, QueryCancelHandle, QueryCancelTarget,
+        QueryExecutionCleanupGuard, QueryProgress, QueryProgressSender, ScriptExecutionFrame,
+        SqlEditorWidget, LAZY_FETCH_CANCEL_RETRY_LIMIT, ORACLE_THIN_LAZY_CLEANUP_FALLBACK_TIMEOUT,
     };
     use crate::db::{
         connection::{ConnectionInfo, DatabaseType},
@@ -34866,6 +35014,7 @@ mod query_execution_cleanup_tests {
                 InterruptKind::None,
                 true,
                 false,
+                LazyFetchBreakRecovery::NoBreakWasSent,
             ),
             (true, false, InterruptKind::UnsafeOrUnknown)
         );
@@ -34876,6 +35025,7 @@ mod query_execution_cleanup_tests {
                 InterruptKind::Cancelled,
                 true,
                 false,
+                LazyFetchBreakRecovery::NoBreakWasSent,
             ),
             (true, false, InterruptKind::Cancelled)
         );
@@ -34886,6 +35036,7 @@ mod query_execution_cleanup_tests {
                 InterruptKind::ConnectionError,
                 true,
                 false,
+                LazyFetchBreakRecovery::NoBreakWasSent,
             ),
             (true, false, InterruptKind::ConnectionError)
         );
@@ -34896,6 +35047,7 @@ mod query_execution_cleanup_tests {
                 InterruptKind::Cancelled,
                 true,
                 true,
+                LazyFetchBreakRecovery::BreakLeftTheSessionUnusable,
             ),
             (true, false, InterruptKind::Cancelled)
         );
@@ -34906,6 +35058,7 @@ mod query_execution_cleanup_tests {
                 InterruptKind::UnsafeOrUnknown,
                 true,
                 true,
+                LazyFetchBreakRecovery::BreakLeftTheSessionUnusable,
             ),
             (true, false, InterruptKind::Cancelled)
         );
@@ -34920,6 +35073,7 @@ mod query_execution_cleanup_tests {
                 InterruptKind::Cancelled,
                 false,
                 false,
+                LazyFetchBreakRecovery::NoBreakWasSent,
             ),
             (true, true, InterruptKind::Cancelled)
         );
@@ -34930,8 +35084,175 @@ mod query_execution_cleanup_tests {
                 InterruptKind::Cancelled,
                 false,
                 true,
+                LazyFetchBreakRecovery::BreakLeftTheSessionUnusable,
             ),
             (true, false, InterruptKind::Cancelled)
+        );
+    }
+
+    /// A break the app sent does not decide the session's fate; the handshake
+    /// that follows it does.
+    #[test]
+    fn a_break_the_session_came_back_from_does_not_end_it() {
+        assert!(LazyFetchBreakRecovery::NoBreakWasSent.may_go_on_using_the_session());
+        assert!(LazyFetchBreakRecovery::BreakLeftTheSessionUsable.may_go_on_using_the_session());
+        assert!(
+            !LazyFetchBreakRecovery::BreakLeftTheSessionUnusable.may_go_on_using_the_session(),
+            "a session the break took away may not be asked for anything else"
+        );
+        // The answer for a driver that cannot judge without a round trip: a
+        // break was sent, and what follows decides.
+        assert_eq!(
+            LazyFetchBreakRecovery::after_a_break_the_driver_does_not_judge(true),
+            LazyFetchBreakRecovery::BreakLeftTheSessionUsable
+        );
+        assert_eq!(
+            LazyFetchBreakRecovery::after_a_break_the_driver_does_not_judge(false),
+            LazyFetchBreakRecovery::NoBreakWasSent
+        );
+    }
+
+    /// The app's own break must not be mistaken for the session's answer — and
+    /// must not be re-asked for ever either.
+    #[test]
+    fn a_health_check_answered_by_our_own_break_asks_the_session_again() {
+        let cancelled = || Err(crate::db::query::result_messages::QUERY_CANCELLED.to_string());
+        let asks = std::cell::Cell::new(0u32);
+
+        asks.set(0);
+        assert!(SqlEditorWidget::session_health_after_a_break(
+            LazyFetchBreakRecovery::BreakLeftTheSessionUsable,
+            "test",
+            || {
+                asks.set(asks.get() + 1);
+                Ok(())
+            }
+        ));
+        assert_eq!(asks.get(), 1, "a session that answers is not asked twice");
+
+        asks.set(0);
+        assert!(SqlEditorWidget::session_health_after_a_break(
+            LazyFetchBreakRecovery::BreakLeftTheSessionUsable,
+            "test",
+            || {
+                asks.set(asks.get() + 1);
+                if asks.get() == 1 {
+                    cancelled()
+                } else {
+                    Ok(())
+                }
+            }
+        ));
+        assert_eq!(
+            asks.get(),
+            2,
+            "the first answer was the break being consumed, so the session is asked again"
+        );
+
+        asks.set(0);
+        assert!(!SqlEditorWidget::session_health_after_a_break(
+            LazyFetchBreakRecovery::BreakLeftTheSessionUsable,
+            "test",
+            || {
+                asks.set(asks.get() + 1);
+                cancelled()
+            }
+        ));
+        assert_eq!(
+            asks.get(),
+            2,
+            "once, not in a loop: a second cancel answer is the session refusing to work"
+        );
+
+        asks.set(0);
+        assert!(!SqlEditorWidget::session_health_after_a_break(
+            LazyFetchBreakRecovery::BreakLeftTheSessionUsable,
+            "test",
+            || {
+                asks.set(asks.get() + 1);
+                Err("ORA-03113: end-of-file on communication channel".to_string())
+            }
+        ));
+        assert_eq!(
+            asks.get(),
+            1,
+            "a failure that is not our break is the answer"
+        );
+
+        // The road whose driver drains its own handshake re-asks nothing:
+        // nothing can still be travelling to this session.
+        asks.set(0);
+        assert!(!SqlEditorWidget::session_health_after_a_break(
+            LazyFetchBreakRecovery::NoBreakWasSent,
+            "test",
+            || {
+                asks.set(asks.get() + 1);
+                cancelled()
+            }
+        ));
+        assert_eq!(asks.get(), 1);
+    }
+
+    /// The close event says what the cleanup MANAGED, and a cleanup that ran to
+    /// the end on a session that came back from the break really did close its
+    /// cursor.
+    #[test]
+    fn a_cancelled_fetch_that_closed_its_cursor_reports_it_closed() {
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_lazy_cleanup_close_flags(
+                true,
+                true,
+                InterruptKind::Cancelled,
+                false,
+                true,
+                LazyFetchBreakRecovery::BreakLeftTheSessionUsable,
+            ),
+            (true, true, InterruptKind::Cancelled)
+        );
+        // The two reasons it may not say so, each on its own: the session did
+        // not come back, or the cleanup did not finish.
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_lazy_cleanup_close_flags(
+                true,
+                true,
+                InterruptKind::Cancelled,
+                false,
+                true,
+                LazyFetchBreakRecovery::BreakLeftTheSessionUnusable,
+            ),
+            (true, false, InterruptKind::Cancelled)
+        );
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_lazy_cleanup_close_flags(
+                true,
+                true,
+                InterruptKind::Cancelled,
+                true,
+                true,
+                LazyFetchBreakRecovery::BreakLeftTheSessionUsable,
+            ),
+            (true, false, InterruptKind::Cancelled)
+        );
+    }
+
+    /// The same, for the event every OTHER lazy worker emits.
+    #[test]
+    fn the_shared_close_event_reports_the_cursor_the_break_recovery_allows() {
+        assert!(
+            SqlEditorWidget::lazy_close_outcome_for_worker(
+                true,
+                InterruptKind::Cancelled,
+                LazyFetchBreakRecovery::BreakLeftTheSessionUsable,
+            )
+            .cursor_closed
+        );
+        assert!(
+            !SqlEditorWidget::lazy_close_outcome_for_worker(
+                true,
+                InterruptKind::Cancelled,
+                LazyFetchBreakRecovery::BreakLeftTheSessionUnusable,
+            )
+            .cursor_closed
         );
     }
 
@@ -35291,6 +35612,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -35339,6 +35661,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -35368,6 +35691,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -35380,7 +35704,7 @@ mod query_execution_cleanup_tests {
         assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
             &active,
             &pooled_db_session,
-            false,
+            LazyFetchSessionPolicy::DiscardIdleSession,
         ));
 
         assert!(SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
@@ -35408,6 +35732,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: Some(LazyFetchCancelHandle::Test(db_cancel_called.clone())),
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -35420,7 +35745,7 @@ mod query_execution_cleanup_tests {
         assert!(!SqlEditorWidget::cancel_lazy_fetch_handle(
             &active,
             &pooled_db_session,
-            false,
+            LazyFetchSessionPolicy::DiscardIdleSession,
         ));
 
         assert!(!SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
@@ -35440,6 +35765,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: Some(LazyFetchCancelHandle::Test(db_cancel_called.clone())),
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -35452,7 +35778,7 @@ mod query_execution_cleanup_tests {
         assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
             &active,
             &pooled_db_session,
-            true,
+            LazyFetchSessionPolicy::Retain,
         ));
 
         assert!(SqlEditorWidget::lazy_fetch_cancel_requested(&active, 42));
@@ -35480,6 +35806,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: Some(LazyFetchCancelHandle::Test(db_cancel_called.clone())),
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -35492,7 +35819,7 @@ mod query_execution_cleanup_tests {
         assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
             &active,
             &pooled_db_session,
-            true,
+            LazyFetchSessionPolicy::Retain,
         ));
 
         for _ in 0..20 {
@@ -35524,6 +35851,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender: command_sender,
             cancel_handle: Some(LazyFetchCancelHandle::Test(db_cancel_called.clone())),
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(true)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(true)),
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
@@ -35607,6 +35935,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::MySQL,
             sender: command_sender,
             cancel_handle: Some(lazy_force_target.as_handle()),
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(true)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(true)),
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
@@ -35690,8 +36019,9 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::MySQL,
             sender: command_sender,
             cancel_handle: Some(lazy_force_target.as_handle()),
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(true)),
-            // `Cancel`, not `CancelAndDiscard`: the session is the tab's and
+            // `Cancel`, not `CancelAndDiscardIdleSession`: the session is the tab's and
             // the cancel promised to keep it.
             retain_session_on_cancel: Arc::new(AtomicBool::new(true)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -35839,6 +36169,7 @@ mod query_execution_cleanup_tests {
                 started: force_started.clone(),
                 release: force_release.clone(),
             }),
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(true)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(true)),
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
@@ -35914,6 +36245,7 @@ mod query_execution_cleanup_tests {
             // answering, not a cancel that failed -- see
             // `lazy_fetch_force_on_a_withdrawn_target_is_not_a_failure`.
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(true)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
@@ -35969,6 +36301,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::MySQL,
             sender: command_sender,
             cancel_handle: Some(target.as_handle()),
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(true)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
@@ -36027,6 +36360,7 @@ mod query_execution_cleanup_tests {
             // The production shape: the handle is the fetch's own withdrawable
             // target, and the backend-concrete handle is what it publishes.
             cancel_handle: Some(lazy_force_target.as_handle()),
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(true)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(true)),
             db_cancel_requested: db_cancel_requested.clone(),
@@ -36148,6 +36482,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -36161,13 +36496,13 @@ mod query_execution_cleanup_tests {
             &active,
             &pooled_db_session,
             Some(42),
-            false,
+            LazyFetchSessionPolicy::DiscardIdleSession,
         ));
         assert!(SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
             &active,
             &pooled_db_session,
             Some(42),
-            false,
+            LazyFetchSessionPolicy::DiscardIdleSession,
         ));
 
         assert!(SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
@@ -36230,6 +36565,135 @@ mod query_execution_cleanup_tests {
         );
     }
 
+    /// A fetch handle whose session carries (or does not carry) the tab's work,
+    /// for the tests that are about exactly that difference.
+    fn lazy_fetch_handle_carrying_tab_work(
+        session_carries_tab_work: bool,
+    ) -> (
+        Arc<Mutex<Option<LazyFetchHandle>>>,
+        mpsc::Receiver<LazyFetchCommand>,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            index: 0,
+            session_id: 42,
+            operation_id: 42,
+            connection_generation: 7,
+            connection_id: None,
+            db_type: crate::db::DatabaseType::Oracle,
+            sender,
+            cancel_handle: None,
+            session_carries_tab_work,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
+            db_cancel_requested: Arc::new(AtomicBool::new(false)),
+            // WAITING between chunks: the ordinary state a result grid sits in,
+            // and the one every close road meets.
+            fetch_in_progress: Arc::new(AtomicBool::new(false)),
+            cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            status_activity: None,
+        })));
+        (active, receiver)
+    }
+
+    /// THE rule: a road that wants the pool slot back may not take a session
+    /// that carries the tab's own work.
+    ///
+    /// Closing a result tab, "Clear results" and the pool-slot eviction all ask
+    /// for the slot, and a lazy fetch holds the TAB'S session -- so before
+    /// `LazyFetchSessionPolicy` they rolled the tab's open transaction back and
+    /// reported the loss afterwards. The eviction is the worst of the three: it
+    /// takes ANOTHER tab's fetch, so a Ctrl+Enter in tab B ended tab A's
+    /// transaction.
+    #[test]
+    fn a_road_that_wants_the_pool_slot_back_may_not_take_a_session_carrying_the_tabs_work() {
+        let pooled_db_session = crate::db::SharedDbSessionLease::new();
+        let (carrying_work, _carrying_rx) = lazy_fetch_handle_carrying_tab_work(true);
+
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
+            &carrying_work,
+            &pooled_db_session,
+            Some(42),
+            LazyFetchSessionPolicy::DiscardIdleSession,
+        ));
+        assert!(
+            SqlEditorWidget::lazy_fetch_can_keep_session(&carrying_work, 42),
+            "the session goes back to the tab it belongs to, exactly as `Cancel` would leave it"
+        );
+
+        // The other half of the rule, so this is not simply "never discard":
+        // a fetch holding nothing still gives the pool its slot back.
+        let (idle, _idle_rx) = lazy_fetch_handle_carrying_tab_work(false);
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
+            &idle,
+            &pooled_db_session,
+            Some(42),
+            LazyFetchSessionPolicy::DiscardIdleSession,
+        ));
+        assert!(
+            !SqlEditorWidget::lazy_fetch_can_keep_session(&idle, 42),
+            "a fetch whose session carries nothing must still free its pool slot"
+        );
+    }
+
+    /// The rule holds for a SECOND road arriving after the first.
+    ///
+    /// The door refuses to UPGRADE a cancel already under way (the worker may
+    /// have acted on the answer it was given) but has always allowed the
+    /// DOWNGRADE -- so pressing Cancel, which promises to keep the session, and
+    /// then closing the grid turned that promise into a discard. It may still
+    /// downgrade, because freeing a slot the first road left checked out is
+    /// worth doing; it may not cost work while doing it.
+    #[test]
+    fn a_cancel_that_promised_to_keep_the_session_is_not_downgraded_into_losing_work() {
+        let pooled_db_session = crate::db::SharedDbSessionLease::new();
+        let (carrying_work, _carrying_rx) = lazy_fetch_handle_carrying_tab_work(true);
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
+            &carrying_work,
+            &pooled_db_session,
+            Some(42),
+            LazyFetchSessionPolicy::Retain,
+        ));
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
+            &carrying_work,
+            &pooled_db_session,
+            Some(42),
+            LazyFetchSessionPolicy::DiscardIdleSession,
+        ));
+        assert!(
+            SqlEditorWidget::lazy_fetch_can_keep_session(&carrying_work, 42),
+            "closing the grid after a Cancel must not turn the promise to keep the session \
+             into a rollback"
+        );
+
+        let (idle, _idle_rx) = lazy_fetch_handle_carrying_tab_work(false);
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
+            &idle,
+            &pooled_db_session,
+            Some(42),
+            LazyFetchSessionPolicy::Retain,
+        ));
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
+            &idle,
+            &pooled_db_session,
+            Some(42),
+            LazyFetchSessionPolicy::DiscardIdleSession,
+        ));
+        assert!(
+            !SqlEditorWidget::lazy_fetch_can_keep_session(&idle, 42),
+            "a second road may still free a slot the first left checked out"
+        );
+    }
+
+    /// The rule itself, stated once so both roads answer the same way.
+    #[test]
+    fn the_session_policy_answers_what_a_cancel_may_do_to_the_session() {
+        assert!(LazyFetchSessionPolicy::Retain.keeps_session(false));
+        assert!(LazyFetchSessionPolicy::Retain.keeps_session(true));
+        assert!(!LazyFetchSessionPolicy::DiscardIdleSession.keeps_session(false));
+        assert!(LazyFetchSessionPolicy::DiscardIdleSession.keeps_session(true));
+    }
+
     #[test]
     fn cancelling_lazy_fetch_with_stale_session_id_is_ignored() {
         let (sender, receiver) = mpsc::channel();
@@ -36243,6 +36707,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: cancel_requested.clone(),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -36256,7 +36721,7 @@ mod query_execution_cleanup_tests {
             &active,
             &pooled_db_session,
             Some(43),
-            false,
+            LazyFetchSessionPolicy::DiscardIdleSession,
         ));
 
         assert!(SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
@@ -36277,6 +36742,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: cancel_requested.clone(),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -36304,6 +36770,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -36316,7 +36783,7 @@ mod query_execution_cleanup_tests {
         assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
             &active,
             &pooled_db_session,
-            false,
+            LazyFetchSessionPolicy::DiscardIdleSession,
         ));
 
         assert!(SqlEditorWidget::lazy_fetch_cancel_requested(&active, 42));
@@ -36340,6 +36807,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -36352,14 +36820,14 @@ mod query_execution_cleanup_tests {
         assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
             &active,
             &pooled_db_session,
-            true,
+            LazyFetchSessionPolicy::Retain,
         ));
         assert!(SqlEditorWidget::lazy_fetch_should_retain_session_after_cancel(&active, 42));
 
         assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
             &active,
             &pooled_db_session,
-            false,
+            LazyFetchSessionPolicy::DiscardIdleSession,
         ));
         assert!(!SqlEditorWidget::lazy_fetch_should_retain_session_after_cancel(&active, 42));
         assert!(!SqlEditorWidget::lazy_fetch_can_keep_session(&active, 42));
@@ -36377,6 +36845,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -36389,12 +36858,12 @@ mod query_execution_cleanup_tests {
         assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
             &active,
             &pooled_db_session,
-            false,
+            LazyFetchSessionPolicy::DiscardIdleSession,
         ));
         assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
             &active,
             &pooled_db_session,
-            true,
+            LazyFetchSessionPolicy::Retain,
         ));
 
         assert!(!SqlEditorWidget::lazy_fetch_should_retain_session_after_cancel(&active, 42));
@@ -36413,6 +36882,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -36425,7 +36895,7 @@ mod query_execution_cleanup_tests {
         assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
             &active,
             &pooled_db_session,
-            true,
+            LazyFetchSessionPolicy::Retain,
         ));
 
         assert!(SqlEditorWidget::lazy_fetch_cancel_requested(&active, 42));
@@ -36449,6 +36919,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(true)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(true)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -36478,6 +36949,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -39300,6 +39772,7 @@ mod query_execution_cleanup_tests {
             db_type: crate::db::DatabaseType::Oracle,
             sender: command_sender,
             cancel_handle: None,
+            session_carries_tab_work: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -43170,8 +43643,8 @@ mod query_running_reservation_tests {
 #[cfg(test)]
 mod mysql_transaction_feedback_tests {
     use super::{
-        load_mutex_bool, store_mutex_bool, InterruptKind, OracleValue, QueryProgress,
-        SqlEditorWidget,
+        load_mutex_bool, store_mutex_bool, InterruptKind, LazyFetchSessionPolicy, OracleValue,
+        QueryProgress, SqlEditorWidget,
     };
     use crate::db::{
         BindDataType, BindValue, BindVar, ConnectionInfo, DatabaseType, OracleDriverMode,
@@ -44556,7 +45029,7 @@ mod mysql_transaction_feedback_tests {
                             &active_lazy_fetch,
                             &pooled_db_session,
                             Some(session_id),
-                            true,
+                            LazyFetchSessionPolicy::Retain,
                         ));
                         let timeout = SqlEditorWidget::lazy_fetch_cancel_watchdog_timeout_for(
                             &active_lazy_fetch,
@@ -44648,7 +45121,7 @@ mod mysql_transaction_feedback_tests {
                             &active_lazy_fetch,
                             &pooled_db_session,
                             Some(session_id),
-                            true,
+                            LazyFetchSessionPolicy::Retain,
                         ));
                         cancel_sent = true;
                     }
@@ -46499,7 +46972,7 @@ mod mysql_transaction_feedback_tests {
                             &active_lazy_fetch,
                             &pooled_db_session,
                             Some(session_id),
-                            true,
+                            LazyFetchSessionPolicy::Retain,
                         ));
                         cancel_sent = true;
                     }

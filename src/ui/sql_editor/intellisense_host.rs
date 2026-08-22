@@ -325,7 +325,15 @@ impl SqlEditorWidget {
         // tab that no longer exists. The close road already asks the cancel
         // road first; this is the backstop for every other way a tab goes away.
         self.abandon_deferred_executions();
-        self.cancel_active_lazy_fetch(false);
+        // The tab is going away, so the pool should get its slot back -- but
+        // this is a BACKSTOP, not the road that asked the user anything, so it
+        // may not throw the tab's work away on its own. When the session
+        // carries some, it goes back through the hand-back door instead, which
+        // finds the lease slot closed below, closes the session and REPORTS the
+        // loss. See `LazyFetchSessionPolicy`.
+        self.cancel_active_lazy_fetch(
+            crate::ui::sql_editor::LazyFetchSessionPolicy::DiscardIdleSession,
+        );
         // Close, not clear: a statement that outlives this tab (a cancel that
         // never landed) hands its session back later, and a closed slot is
         // what makes that hand-back close the session instead of retaining it

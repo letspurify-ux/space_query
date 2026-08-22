@@ -149,6 +149,12 @@ impl Target {
     }
 }
 
+/// How many times the "cancel a fetch that is on the wire" scenario runs.
+///
+/// More than one because the cursor check needs a trend: one leaked cursor is
+/// indistinguishable from the query the check itself runs.
+const CANCEL_ON_THE_WIRE_ROUNDS: u64 = 5;
+
 fn progress_inner(event: &QueryProgress) -> &QueryProgress {
     match event {
         QueryProgress::Operation { progress, .. }
@@ -160,6 +166,10 @@ fn progress_inner(event: &QueryProgress) -> &QueryProgress {
 struct Harness {
     editor: SqlEditorWidget,
     done: Arc<AtomicBool>,
+    /// The rows of the last statement, so a scenario can read a scalar back
+    /// OFF THE TAB'S OWN SESSION — which is the only session whose open cursors
+    /// the cursor check is about.
+    last_rows: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 impl Harness {
@@ -184,11 +194,53 @@ impl Harness {
         Ok(())
     }
 
+    /// Pump the event loop for a fixed span, for the one thing a predicate
+    /// cannot express: letting a fetch get genuinely onto the wire before it is
+    /// broken.
+    fn pump_for(&self, span: Duration) {
+        let deadline = Instant::now() + span;
+        while Instant::now() < deadline {
+            if !app::wait() {
+                app::check();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
     fn run(&mut self, sql: &str) -> Result<(), String> {
         self.done.store(false, Ordering::SeqCst);
         self.editor.execute_sql_text(sql);
         let done = Arc::clone(&self.done);
         self.pump_until("statement to finish", || done.load(Ordering::SeqCst))
+    }
+
+    /// How many cursors this tab's session has open, asked ON that session.
+    ///
+    /// `None` when the count could not be read at all, which is not a failure:
+    /// the check that uses it says so and moves on.
+    fn session_open_cursor_count(&mut self) -> Result<Option<u64>, String> {
+        self.last_rows
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.run(
+            "SELECT COUNT(*) AS C FROM v$open_cursor              WHERE sid = SYS_CONTEXT('USERENV', 'SID')",
+        )?;
+        if let Some(sid) = self.editor.active_lazy_fetch_session() {
+            self.editor
+                .request_lazy_fetch(sid, space_query::ui::sql_editor::LazyFetchRequest::All);
+            self.pump_until("open-cursor count to drain", || {
+                self.editor.active_lazy_fetch_session().is_none()
+            })?;
+        }
+        let count = self
+            .last_rows
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|cell| cell.trim().parse::<u64>().ok());
+        Ok(count)
     }
 
     fn retained_transaction_state(&self) -> Option<TransactionSessionState> {
@@ -288,10 +340,16 @@ fn verify(target: Target) -> Result<bool, String> {
     // Every progress Message the editor reports, so a scenario can assert WHAT
     // was said — the dead-session scenario below is about the message itself.
     let messages: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let last_rows: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let done = Arc::clone(&done);
         let messages = Arc::clone(&messages);
+        let last_rows = Arc::clone(&last_rows);
         editor.set_progress_callback(move |event| {
+            if let QueryProgress::Rows { rows, .. } = progress_inner(&event) {
+                let mut captured = last_rows.lock().unwrap_or_else(|p| p.into_inner());
+                captured.extend(rows.iter().cloned());
+            }
             if std::env::var("SQ_TRACE_EVENTS").is_ok() {
                 let name = match progress_inner(&event) {
                     QueryProgress::Message { .. } => "Message",
@@ -325,7 +383,11 @@ fn verify(target: Target) -> Result<bool, String> {
             }
         });
     }
-    let mut h = Harness { editor, done };
+    let mut h = Harness {
+        editor,
+        done,
+        last_rows: Arc::clone(&last_rows),
+    };
 
     println!(
         "(auto_commit={})",
@@ -522,6 +584,157 @@ fn verify(target: Target) -> Result<bool, String> {
         h.editor.clear_pooled_db_session();
     }
 
+    // CLOSING A RESULT GRID MUST NOT ROLL BACK THE TAB'S TRANSACTION.
+    //
+    // A lazy fetch takes the TAB'S session over, so a SELECT run after a DML is
+    // fetching on the very session that holds the uncommitted work. Closing the
+    // result tab asks for the pool slot back
+    // (`LazyFetchRequest::CancelAndDiscardIdleSession`, which is the request
+    // `MainWindow::close_result_tab_by_target` sends), and that used to CLOSE
+    // the session: the transaction was rolled back by the server and the app
+    // reported the loss afterwards. Every other session-ending action in the
+    // app resolves the transaction first.
+    //
+    // Same steps on all four targets; the only per-backend difference is the
+    // DML text, which `Target::dml` already answers.
+    println!("  --- DML + open lazy fetch, then close the result grid ---");
+    h.run(target.dml())?;
+    h.run("SELECT * FROM SQ_TXCLOSE_T")?;
+    let fetch_session = h.editor.active_lazy_fetch_session();
+    if fetch_session.is_none() {
+        return Err("expected an open lazy fetch after the big SELECT".into());
+    }
+    h.report("after DML + open lazy fetch");
+    messages.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    if let Some(sid) = fetch_session {
+        h.editor.request_lazy_fetch(
+            sid,
+            space_query::ui::sql_editor::LazyFetchRequest::CancelAndDiscardIdleSession,
+        );
+        h.pump_until("the closed grid's fetch to finish", || {
+            h.editor.active_lazy_fetch_session().is_none()
+        })?;
+    }
+    h.report("after closing the result grid");
+    let said = messages
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join(" | ");
+    let kept_the_transaction = h
+        .retained_transaction_state()
+        .is_some_and(|state| state.may_have_uncommitted_work());
+    if kept_the_transaction
+        && !said.contains(space_query::db::result_messages::RETAINED_SESSION_LOST_WITH_WORK)
+    {
+        println!("    OK: the tab kept its session and its open transaction");
+    } else {
+        println!(
+            ">>> BUG REPRODUCED: closing the result grid took the tab's transaction with it \
+             (retained={:?}, said: {said})",
+            h.retained_transaction_state()
+        );
+        reproduced = true;
+    }
+    // And the work is really still there on that session, not merely believed
+    // to be: the row count only reads back if the session survived.
+    h.run("SELECT COUNT(*) AS C FROM SQ_TXCLOSE_T")?;
+    if let Some(sid) = h.editor.active_lazy_fetch_session() {
+        h.editor
+            .request_lazy_fetch(sid, space_query::ui::sql_editor::LazyFetchRequest::All);
+        h.pump_until("verification fetch to drain", || {
+            h.editor.active_lazy_fetch_session().is_none()
+        })?;
+    }
+    if h.close_would_prompt() != Some(true) {
+        println!(">>> BUG REPRODUCED: the tab no longer holds work a close would have to resolve");
+        reproduced = true;
+    }
+    h.toolbar_action("rollback")?;
+    let _ = h.run("COMMIT");
+
+    // CANCELLING A FETCH THAT IS ON THE WIRE MUST NOT ROLL THE TRANSACTION BACK.
+    //
+    // The other half of the same promise. `LazyFetchRequest::Cancel` retains the
+    // session by policy, but all three workers used to AND a bare
+    // `!db_cancel_requested` into their keep decision — and a fetch that is
+    // MID-FILL is exactly the one a cancel breaks on the wire, so the promise
+    // was kept only for a paused grid. The cross join is what makes the fetch
+    // slow enough to still be running when the cancel reaches it.
+    println!("  --- DML + a fetch that is on the wire, then Cancel ---");
+    let mut open_cursors_before = None;
+    if target.is_oracle() {
+        open_cursors_before = h.session_open_cursor_count()?;
+    }
+    for round in 1..=CANCEL_ON_THE_WIRE_ROUNDS {
+        h.run(target.dml())?;
+        h.run("SELECT a.V AS A, b.V AS B FROM SQ_TXCLOSE_T a, SQ_TXCLOSE_T b")?;
+        let Some(sid) = h.editor.active_lazy_fetch_session() else {
+            return Err("expected an open lazy fetch after the cross join".into());
+        };
+        messages.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        h.editor
+            .request_lazy_fetch(sid, space_query::ui::sql_editor::LazyFetchRequest::All);
+        // On the wire now, not merely requested.
+        h.pump_for(Duration::from_millis(150));
+        h.editor
+            .request_lazy_fetch(sid, space_query::ui::sql_editor::LazyFetchRequest::Cancel);
+        h.pump_until("the broken fetch to finish", || {
+            h.editor.active_lazy_fetch_session().is_none()
+        })?;
+        let said = messages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join(" | ");
+        let kept = h
+            .retained_transaction_state()
+            .is_some_and(|state| state.may_have_uncommitted_work());
+        if !kept || said.contains(space_query::db::result_messages::RETAINED_SESSION_LOST_WITH_WORK)
+        {
+            println!(
+                ">>> BUG REPRODUCED: cancelling a fetch on the wire took the tab's transaction \
+                 with it (round {round}, retained={:?}, said: {said})",
+                h.retained_transaction_state()
+            );
+            reproduced = true;
+            break;
+        }
+        // The session is not merely believed to be there: it answers.
+        h.run("SELECT COUNT(*) AS C FROM SQ_TXCLOSE_T")?;
+        if let Some(sid) = h.editor.active_lazy_fetch_session() {
+            h.editor
+                .request_lazy_fetch(sid, space_query::ui::sql_editor::LazyFetchRequest::All);
+            h.pump_until("verification fetch to drain", || {
+                h.editor.active_lazy_fetch_session().is_none()
+            })?;
+        }
+        h.toolbar_action("rollback")?;
+    }
+    if !reproduced {
+        println!("    OK: the tab kept its session and its transaction through {CANCEL_ON_THE_WIRE_ROUNDS} broken fetches");
+    }
+    // And the cursors the broken fetches held were really closed on it. A
+    // retained session never goes back to the pool, so a cursor left open by
+    // each cancel would stay open on the tab's own session (ORA-01000).
+    if target.is_oracle() {
+        let after = h.session_open_cursor_count()?;
+        match (open_cursors_before, after) {
+            (Some(before), Some(after)) => {
+                println!("    open cursors on the tab's session: {before} -> {after}");
+                if after > before + CANCEL_ON_THE_WIRE_ROUNDS {
+                    println!(
+                        ">>> BUG REPRODUCED: the broken fetches leaked cursors onto the retained \
+                         session ({before} -> {after} over {CANCEL_ON_THE_WIRE_ROUNDS} rounds)"
+                    );
+                    reproduced = true;
+                } else {
+                    println!("    OK: no cursor was left open per cancelled fetch");
+                }
+            }
+            _ => println!("    (open cursor count unavailable)"),
+        }
+    }
+    let _ = h.run("COMMIT");
+
     if !target.is_oracle() {
         // A toolbar COMMIT pressed on a tab whose work-carrying session the
         // server has closed must answer the LOSS
@@ -624,7 +837,11 @@ fn make_harness(info: ConnectionInfo) -> Result<Harness, String> {
             }
         });
     }
-    Ok(Harness { editor, done })
+    Ok(Harness {
+        editor,
+        done,
+        last_rows: Arc::new(Mutex::new(Vec::new())),
+    })
 }
 
 /// Live repro: DROP DATABASE of the current database, then COMMIT/ROLLBACK/USE.

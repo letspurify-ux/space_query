@@ -1975,7 +1975,7 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                 editor.transcript()
             )),
             Some(session_id) => {
-                // `Cancel`, not `CancelAndDiscard`: the road that promises to
+                // `Cancel`, not `CancelAndDiscardIdleSession`: the road that promises to
                 // KEEP the tab's session.
                 let requested = editor
                     .editor

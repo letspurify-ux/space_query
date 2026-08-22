@@ -13829,3 +13829,301 @@ fn every_action_on_a_retained_session_says_which_connection_it_is_on() {
         "a caller that has a context has both facts, so it publishes through it: {probe}"
     );
 }
+
+/// A ROAD THAT WANTS A POOL SLOT MAY NOT THROW AWAY THE TAB'S WORK.
+///
+/// A lazy fetch takes the TAB'S session over, so the transaction the tab opened
+/// before the SELECT is on it. Which policy a road may ask for is a fact about
+/// the road; what granting it would COST is a fact about the session. They used
+/// to be one boolean chosen at the call site — and the three call sites that
+/// chose "discard" (closing a result tab, "Clear results", and the pool-slot
+/// eviction, which takes ANOTHER TAB's fetch) had no way of knowing the cost.
+/// Every other session-ending action in the app resolves the transaction first.
+///
+/// So the two facts are resolved together, once, at the one door that writes
+/// the flag — and this guard is what keeps that the only place.
+#[test]
+fn a_lazy_fetch_cancel_resolves_its_session_policy_at_one_door() {
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+
+    // THE rule, on the policy itself, so both answers exist in one place and a
+    // third road cannot invent a third meaning.
+    let rule = editor
+        .find("impl LazyFetchSessionPolicy {")
+        .map(|at| slice_to_end_of_item(&editor, at))
+        .expect("the session policy must carry its own rule");
+    let rule = compact_for_pattern(rule);
+    assert!(
+        rule.contains("fnkeeps_session(self,session_carries_tab_work:bool)->bool")
+            && rule.contains("Self::Retain=>true")
+            && rule.contains("Self::DiscardIdleSession=>session_carries_tab_work"),
+        "the policy must answer what a cancel may do to the session it is about: {rule}"
+    );
+
+    // ONE writer of the flag the workers read, and it resolves the policy
+    // against the fetch's own fact rather than storing the caller's wish.
+    let door = editor
+        .find("fn cancel_lazy_fetch_handle_for_session(")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the lazy-fetch cancel door should exist");
+    assert!(
+        compact_for_pattern(door)
+            .contains("letkeeps_session=policy.keeps_session(handle.session_carries_tab_work);"),
+        "the door must resolve the policy against what the session carries: {door}"
+    );
+    assert_eq!(
+        compact_for_pattern(&editor)
+            .matches(".retain_session_on_cancel.store(")
+            .count(),
+        2,
+        "and it must be the only writer -- both stores are the two arms of that one decision"
+    );
+    assert_eq!(
+        compact_for_pattern(door)
+            .matches(".retain_session_on_cancel.store(")
+            .count(),
+        2,
+        "which means both of them live in this door"
+    );
+    assert!(
+        compact_for_pattern(door).contains("ifkeeps_session{"),
+        "the arms are the decision's, not a second reading of the request: {door}"
+    );
+
+    // The fact itself is stated by the fetch, once, from the state the tab
+    // handed it -- never re-derived by a UI caller, which cannot see it.
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let registration = execution
+        .find("fn register_lazy_fetch_handle(")
+        .map(|at| slice_to_end_of_fn(&execution, at))
+        .expect("the lazy-fetch registration should exist");
+    assert!(
+        compact_for_pattern(registration).contains(
+            "session_carries_tab_work:prior_retained_state.requires_physical_session_preservation()"
+        ),
+        "the fetch states what its session carries when it takes it over: {registration}"
+    );
+    assert_eq!(
+        execution
+            .matches(
+                "            prior_retained_state,\n            sender.status_finish_handle(),"
+            )
+            .count(),
+        3,
+        "and all three backends' lazy fetches state it -- Oracle OCI, Oracle thin and the \
+         MySQL family"
+    );
+
+    // The eviction is the road that ends ANOTHER tab's session, so it asks for
+    // a victim it may actually have.
+    let window = read_source("src/ui/main_window.rs");
+    for road in [
+        "fn oldest_evictable_lazy_fetch_session_on_connection(",
+        "fn cancel_oldest_lazy_fetch_if_session_pool_full(",
+    ] {
+        let body = window
+            .find(road)
+            .map(|at| slice_to_end_of_fn(&window, at))
+            .unwrap_or_else(|| panic!("{road} should exist"));
+        let body = compact_for_pattern(body);
+        assert!(
+            !body.contains("lazy_fetch_sessions_for_connection(connection_id).into_iter().min()"),
+            "{road} must not pick the oldest fetch without asking whether it may take it"
+        );
+    }
+    let victim_rule = window
+        .find("fn oldest_evictable_lazy_fetch_session(")
+        .map(|at| slice_to_end_of_item(&window, at))
+        .expect("the eviction's victim rule should exist");
+    let victim_rule = compact_for_pattern(victim_rule);
+    assert!(
+        victim_rule.contains(".filter(|session_id|!cancel_already_pending(*session_id))")
+            && victim_rule.contains(".filter(|session_id|!session_carries_tab_work(*session_id))"),
+        "both exclusions belong to the rule, not to its callers: {victim_rule}"
+    );
+
+    // And a cancel that did not land may not put the grid back into a state it
+    // will refuse to serve.
+    let failed = window
+        .find("fn mark_lazy_fetch_cancel_failed(")
+        .map(|at| slice_to_end_of_fn(&window, at))
+        .expect("the failed-cancel road should exist");
+    let failed = compact_for_pattern(failed);
+    assert!(
+        failed.contains("letstatus=ResultTabStatus::Canceling;"),
+        "a cancelled fetch never fetches again, so the tab may not read as fetchable: {failed}"
+    );
+    assert!(
+        !failed.contains("ResultTabStatus::Fetching")
+            && !failed.contains("ResultTabStatus::Waiting"),
+        "and the two fetchable labels must not come back: {failed}"
+    );
+}
+
+/// A BREAK THE APP SENT DOES NOT DECIDE THE SESSION'S FATE.
+///
+/// All three lazy workers used to AND a bare `!db_cancel_requested` into their
+/// keep decision, so "we asked the server to stop" was on its own enough to
+/// throw the session away — and the tab's open transaction with it — on every
+/// road, including the cancel button's `LazyFetchSessionPolicy::Retain`, whose
+/// whole promise is to keep it. The STATEMENT road never worked that way
+/// (`oracle_thin_general_cancel_with_select_error_can_retain_after_health_check`),
+/// and neither does the app's own central policy, which ends at *cursor closed,
+/// worker done and health check ok → reuse the same physical session*. The
+/// blanket term is what stopped that ever being reached from a lazy fetch.
+#[test]
+fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    // THE rule, with its own home and its own three answers.
+    let rule = editor
+        .find("impl LazyFetchBreakRecovery {")
+        .map(|at| slice_to_end_of_item(&editor, at))
+        .expect("the break-recovery rule must live on the value it is about");
+    let rule = compact_for_pattern(rule);
+    assert!(
+        rule.contains("Self::NoBreakWasSent|Self::BreakLeftTheSessionUsable=>true")
+            && rule.contains("Self::BreakLeftTheSessionUnusable=>false"),
+        "only a session the break took away may not be used again: {rule}"
+    );
+
+    // No keep decision may read the raw flag again. It survives ONLY where it
+    // is still the right question: deriving the recovery, and naming the
+    // interrupt the user asked for.
+    for (worker, marker) in [
+        (
+            "Oracle OCI",
+            "let should_keep_session = keep_session\n                        && ",
+        ),
+        (
+            "Oracle thin",
+            "let should_keep_session = keep_session\n                        && ",
+        ),
+    ] {
+        let _ = worker;
+        assert!(
+            !execution.contains(&format!("{marker}!db_cancel_requested")),
+            "no lazy worker may keep-or-discard on the raw break flag"
+        );
+    }
+    assert!(
+        !execution
+            .contains("should_retain_session =\n                        !db_cancel_requested"),
+        "and neither may the MySQL family's"
+    );
+    // The whole census, so a road cannot quietly stop asking: the two shared
+    // close-event helpers, Oracle OCI's two keep terms and its final one,
+    // Oracle thin's cursor-close skip and its two keep terms, and the MySQL
+    // family's cursor flag and its retain term.
+    let production = &execution[..execution
+        .find("\nmod query_execution_cleanup_tests {")
+        .or_else(|| execution.find("\n#[cfg(test)]"))
+        .unwrap_or(execution.len())];
+    assert_eq!(
+        production
+            .matches("break_recovery.may_go_on_using_the_session()")
+            .count(),
+        10,
+        "the rule is asked on every road it governs, and nowhere is the raw flag asked instead"
+    );
+
+    // Each road states its own EVIDENCE, and only the one driver that can
+    // answer without a round trip does.
+    let thin = execution
+        .find("let break_recovery = if !db_cancel_requested {")
+        .map(|at| slice_from(&execution, at, 400))
+        .expect("Oracle thin must derive the recovery from its driver");
+    assert!(
+        compact_for_pattern(thin)
+            .contains("elseifconn.is_broken(){LazyFetchBreakRecovery::BreakLeftTheSessionUnusable"),
+        "thin's driver marks the session broken when the break/reset drain cannot complete, \
+         so that is what it asks: {thin}"
+    );
+    assert_eq!(
+        production
+            .matches("LazyFetchBreakRecovery::after_a_break_the_driver_does_not_judge(")
+            .count(),
+        2,
+        "the other two roads say they cannot judge, rather than each writing out an answer"
+    );
+
+    // The cursor must actually be closed on a session that came back — keeping
+    // one whose cursor was left open is what would make keeping it worse than
+    // losing it.
+    let skip = execution
+        .find("let skip_cursor_close_after_db_cancel = close_cancelled")
+        .map(|at| slice_from(&execution, at, 260))
+        .expect("thin's cursor-close skip should exist");
+    assert!(
+        compact_for_pattern(skip).contains("&&!break_recovery.may_go_on_using_the_session()"),
+        "the cursor close is skipped only for a session there is nothing to close it on: {skip}"
+    );
+
+    // AND THE APP'S OWN BREAK IS NOT THE SESSION'S ANSWER.
+    //
+    // A break interrupts the call that is RUNNING; when the fetch finished
+    // first, OCI remembers it and aborts the NEXT call and a MySQL `KILL QUERY`
+    // lands on whatever that thread runs next — which is the health check. So a
+    // perfectly good session failed it and was discarded with the tab's
+    // transaction on it (live-observed on Oracle OCI as roughly one round in
+    // three). Asking again is what consumes the break.
+    let after_break = execution
+        .find("fn session_health_after_a_break(")
+        .map(|at| slice_to_end_of_fn(&execution, at))
+        .expect("the after-a-break health check should exist");
+    let after_break_body = compact_for_pattern(after_break);
+    assert!(
+        after_break_body.contains("if!break_recovery.a_break_may_still_be_landing()")
+            && after_break_body
+                .contains("||!crate::db::session_policy::message_indicates_query_cancel(&first)"),
+        "only a road with a break still travelling re-asks, and only about the break: \
+         {after_break}"
+    );
+    assert_eq!(
+        after_break_body.matches("health_check()").count(),
+        2,
+        "once, not in a loop: a second cancel answer is the session refusing to work"
+    );
+    assert!(
+        !after_break.contains("while ")
+            && !after_break.contains("loop ")
+            && !after_break.contains("for "),
+        "and it must be straight-line: a session that answers every ask with a cancel would \
+         hold this cleanup for ever: {after_break}"
+    );
+    // Both roads whose driver cannot clear the break ask it, and Oracle thin --
+    // which drains its own handshake -- does not.
+    assert_eq!(
+        production
+            .matches("Self::session_health_after_a_break(")
+            .count(),
+        2,
+        "Oracle OCI's keep chain and the MySQL family's, and nothing else"
+    );
+    for (road, reporting) in [
+        (
+            "oracle lazy fetch cleanup",
+            "health_check_oracle_session_reporting(",
+        ),
+        (
+            "mysql lazy fetch cleanup",
+            "health_check_mysql_session_reporting(",
+        ),
+    ] {
+        assert!(
+            production.contains(reporting),
+            "{road} must ask the check that says WHY it failed, or the break cannot be \
+             recognised"
+        );
+    }
+    let mysql_probe = execution
+        .find("if should_retain_session && break_recovery.a_break_may_still_be_landing() {")
+        .map(|at| slice_from(&execution, at, 700))
+        .expect("the MySQL family must consume a late KILL before its session-info sync");
+    assert!(
+        compact_for_pattern(mysql_probe)
+            .contains("should_retain_session=Self::session_health_after_a_break("),
+        "the cheap question goes first, so the sync is not what the KILL lands on: {mysql_probe}"
+    );
+}

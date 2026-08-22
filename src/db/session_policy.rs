@@ -609,61 +609,60 @@ pub fn health_check_session(session: PhysicalSession<'_>, log_context: &str) -> 
 
 /// Oracle-specific health check used by [`health_check_session`].
 pub fn health_check_oracle_session(conn: &OracleConnection, log_context: &str) -> bool {
-    if let Err(err) = conn.ping() {
-        crate::utils::logging::log_error(
-            log_context,
-            &format!("Oracle pooled session ping failed: {err}"),
-        );
-        return false;
-    }
-    match conn.query_row_as::<i64>("SELECT 1 FROM dual", &[]) {
-        Ok(1) => true,
-        Ok(value) => {
-            crate::utils::logging::log_error(
-                log_context,
-                &format!("Oracle pooled session health check returned {value}"),
-            );
-            false
-        }
-        Err(err) => {
-            crate::utils::logging::log_error(
-                log_context,
-                &format!("Oracle pooled session health check failed: {err}"),
-            );
+    match health_check_oracle_session_reporting(conn) {
+        Ok(()) => true,
+        Err(message) => {
+            crate::utils::logging::log_error(log_context, &message);
             false
         }
     }
 }
 
+/// [`health_check_oracle_session`], with WHY it failed.
+///
+/// A caller that has just BROKEN this session needs the reason, not only the
+/// verdict: a break the app sent can be what answered, and that is not the
+/// session's answer. See
+/// `SqlEditorWidget::session_health_after_a_break`.
+pub fn health_check_oracle_session_reporting(conn: &OracleConnection) -> Result<(), String> {
+    if let Err(err) = conn.ping() {
+        return Err(format!("Oracle pooled session ping failed: {err}"));
+    }
+    match conn.query_row_as::<i64>("SELECT 1 FROM dual", &[]) {
+        Ok(1) => Ok(()),
+        Ok(value) => Err(format!(
+            "Oracle pooled session health check returned {value}"
+        )),
+        Err(err) => Err(format!("Oracle pooled session health check failed: {err}")),
+    }
+}
+
 /// MySQL/MariaDB health check used by [`health_check_session`].
 pub fn health_check_mysql_session(conn: &mut mysql::PooledConn, log_context: &str) -> bool {
-    if conn.as_mut().ping().is_err() {
-        crate::utils::logging::log_error(log_context, "MySQL/MariaDB pooled session ping failed");
-        return false;
+    match health_check_mysql_session_reporting(conn) {
+        Ok(()) => true,
+        Err(message) => {
+            crate::utils::logging::log_error(log_context, &message);
+            false
+        }
+    }
+}
+
+/// [`health_check_mysql_session`], with WHY it failed — the twin of
+/// [`health_check_oracle_session_reporting`], for the same caller.
+pub fn health_check_mysql_session_reporting(conn: &mut mysql::PooledConn) -> Result<(), String> {
+    if let Err(err) = conn.as_mut().ping() {
+        return Err(format!("MySQL/MariaDB pooled session ping failed: {err}"));
     }
     match conn.query_first::<u8, _>("SELECT 1") {
-        Ok(Some(1)) => true,
-        Ok(Some(value)) => {
-            crate::utils::logging::log_error(
-                log_context,
-                &format!("MySQL/MariaDB pooled session health check returned {value}"),
-            );
-            false
-        }
-        Ok(None) => {
-            crate::utils::logging::log_error(
-                log_context,
-                "MySQL/MariaDB pooled session health check returned no rows",
-            );
-            false
-        }
-        Err(err) => {
-            crate::utils::logging::log_error(
-                log_context,
-                &format!("MySQL/MariaDB pooled session health check failed: {err}"),
-            );
-            false
-        }
+        Ok(Some(1)) => Ok(()),
+        Ok(Some(value)) => Err(format!(
+            "MySQL/MariaDB pooled session health check returned {value}"
+        )),
+        Ok(None) => Err("MySQL/MariaDB pooled session health check returned no rows".to_string()),
+        Err(err) => Err(format!(
+            "MySQL/MariaDB pooled session health check failed: {err}"
+        )),
     }
 }
 

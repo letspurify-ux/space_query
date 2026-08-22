@@ -462,7 +462,7 @@ impl Tab {
     fn close(&mut self) {
         if let Some(session_id) = self.editor.active_lazy_fetch_session() {
             self.editor
-                .request_lazy_fetch(session_id, LazyFetchRequest::CancelAndDiscard);
+                .request_lazy_fetch(session_id, LazyFetchRequest::CancelAndDiscardIdleSession);
         }
         self.editor.cleanup_for_close();
         pump(Duration::from_millis(250));
@@ -867,7 +867,7 @@ fn verify(target: Target) -> Result<bool, String> {
     }
     if let Some(session_id) = tab.editor.active_lazy_fetch_session() {
         tab.editor
-            .request_lazy_fetch(session_id, LazyFetchRequest::CancelAndDiscard);
+            .request_lazy_fetch(session_id, LazyFetchRequest::CancelAndDiscardIdleSession);
     }
     let worker_released = wait_until(Duration::from_secs(45), || {
         !tab.editor.has_open_lazy_fetch()
