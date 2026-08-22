@@ -597,6 +597,25 @@ impl RetainedSessionState {
         self.with_transaction_state(TransactionSessionState::Clean)
     }
 
+    /// What the user can actually DO about a session that is blocking a
+    /// transaction-option change, as the sentence that follows the refusal.
+    ///
+    /// Derived from the state instead of written into the message, because the
+    /// two are not the same answer and the single sentence named the wrong one
+    /// for three of the four blocking states. A session lock, session residue
+    /// the pool cannot restate, and a pending one-shot `SET TRANSACTION` are
+    /// none of them a transaction: commit and rollback leave all three exactly
+    /// where they were, so "Commit, rollback, or discard it first" told the
+    /// user to perform a remedy that cannot work — the class round 27 closed
+    /// for work the app could not stop, in the one place that still had it.
+    pub fn blocked_option_change_remedy(self) -> &'static str {
+        if self.transaction_resolution_action_allowed() {
+            "Commit, rollback, or discard it first."
+        } else {
+            "A commit or rollback cannot clear it; discard the session (closing the tab does) first."
+        }
+    }
+
     pub(crate) fn conservative_merge(self, other: Self) -> Self {
         Self {
             transaction_state: self
@@ -3991,6 +4010,38 @@ fn mysql_load_index_statement(analysis: &SqlStatementAnalysis<'_>) -> bool {
 /// MariaDB's statement-scoped `SET STATEMENT transaction_read_only=0 FOR
 /// <write>`. A value that is not literally true is refused conservatively: the
 /// server rejects invalid values anyway, so nothing runnable is lost.
+/// Whether this statement explicitly asks for a READ WRITE TRANSACTION — the
+/// one thing that turns a tab's Read only pin off, on every backend.
+///
+/// Asked of all four, because the hole it closes is the same on all four and
+/// was closed on two: the server honours an explicit per-transaction READ
+/// WRITE over whatever the session (MySQL) or the app's own opening statement
+/// (Oracle) said, so the escape statement itself has to be refused by the
+/// client.
+///
+/// Oracle looked safe because every statement that WRITES is refused by its own
+/// allowlist afterwards. A locking READ is not: `SELECT … FOR UPDATE` is a
+/// query, so the allowlist admits it, and the only thing that had been refusing
+/// it was the read-only transaction the app opened — which this statement ends.
+/// So `COMMIT; SET TRANSACTION READ WRITE; SELECT … FOR UPDATE` took locks
+/// other sessions wait for on a tab pinned to Read only, which is precisely
+/// what [`read_only_shared_refusal`] exists to refuse.
+pub(crate) fn statement_forces_read_write_transaction(db_type: DatabaseType, sql: &str) -> bool {
+    match db_type {
+        DatabaseType::MySQL | DatabaseType::MariaDB => {
+            mysql_statement_escapes_read_only_transaction_for_db_type(db_type, sql)
+        }
+        DatabaseType::Oracle => {
+            let analysis = SqlStatementAnalysis::new_for_db_type(db_type, sql);
+            let words = analysis.words();
+            oracle_set_transaction_statement_for_words(words)
+                && words
+                    .windows(2)
+                    .any(|pair| pair[0] == "READ" && pair[1] == "WRITE")
+        }
+    }
+}
+
 pub(crate) fn mysql_statement_escapes_read_only_transaction_for_db_type(
     db_type: DatabaseType,
     sql: &str,
@@ -4505,6 +4556,42 @@ pub(crate) fn mysql_statement_server_probe_requires_transaction_preservation_for
         analysis.classify_for_db_type(db_type),
         SqlKind::Dml | SqlKind::PlsqlOrProcedure | SqlKind::Script | SqlKind::Unknown
     )
+}
+
+/// Whether a transaction-mode change must return this session to a TRANSACTION
+/// BOUNDARY before it can take effect — and may.
+///
+/// One rule for all four backends, because it comes from a property both
+/// families share: the mode is latched when a transaction STARTS. MySQL fixes a
+/// transaction's isolation and access mode at its start, so a `SET SESSION
+/// TRANSACTION …` over an already-open transaction governs only the one after
+/// it. Oracle is the same fact with a different spelling: `SET TRANSACTION`
+/// must be the first statement of its transaction (ORA-01453), and a plain
+/// query has already begun one — so the pin the tab now shows would not reach
+/// the user's next statement either.
+///
+/// The condition is the same on both, and it is the whole safety argument: only
+/// a session with no uncommitted WORK may be ended this way. Work belongs to
+/// the user; MySQL and Oracle both apply the new characteristics from the
+/// user's own next transaction anyway, and the option gate has already refused
+/// while any work is outstanding.
+///
+/// Stated here rather than at the two call sites because it used to be stated
+/// on ONE of them: the MySQL family ended the residual transaction in place,
+/// while Oracle expressed the same need by DESTROYING the tab's session (its
+/// only way back to a boundary), which silently took everything else the
+/// session carried — global temporary table rows, `DBMS_OUTPUT` state, session
+/// settings — with it.
+///
+/// What the two call sites do with a FAILING `ROLLBACK` is deliberately not the
+/// same, and must not be unified: on the MySQL family the mode has already been
+/// applied by the `SET SESSION` before it, so the boundary is a tidy-up and its
+/// failure is logged; on Oracle the boundary IS the application, so its failure
+/// is what the user is told.
+pub(crate) fn transaction_mode_change_returns_session_to_boundary(
+    retained_state: RetainedSessionState,
+) -> bool {
+    !retained_state.may_have_uncommitted_work()
 }
 
 pub(crate) fn mysql_server_probe_reports_uncommitted_work_for_statement(
@@ -5729,6 +5816,108 @@ impl StatementSessionPostProcessor for MysqlStatementSessionPostProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read that OPENS with a parenthesis is a read: the transaction it opens
+    /// under manual commit is the server's bookkeeping, not the user's work.
+    ///
+    /// The probe answers truthfully that a transaction is open — it is. What
+    /// decides is whether the app BELIEVES it about this statement, and the
+    /// forgiving arm reads the leading keyword. With the classifier blind to a
+    /// leading `(`, an ordinary `(SELECT …) UNION (SELECT …)` classified
+    /// `Unknown`, the probe was believed, and the tab was marked as carrying
+    /// uncommitted work after a pure read: the auto-commit and transaction-mode
+    /// changes were then refused and the tab prompted for a commit on close.
+    #[test]
+    fn a_parenthesised_read_is_not_uncommitted_work() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let post_processor = statement_session_post_processor_for(db_type);
+            for sql in [
+                "(SELECT id FROM t)",
+                "(SELECT id FROM t) UNION (SELECT id FROM u)",
+                "(SELECT a FROM t ORDER BY a LIMIT 1) UNION ALL (SELECT b FROM u)",
+            ] {
+                assert!(
+                    !mysql_server_probe_reports_uncommitted_work_for_statement(
+                        db_type,
+                        sql,
+                        RetainedSessionState::default(),
+                        post_processor.effects_for_sql(sql),
+                        false,
+                        true,
+                    ),
+                    "{db_type}: {sql:?} left a read transaction, not the user's work"
+                );
+            }
+            // The other half: seeing into the parentheses must not forgive a
+            // read that really does hold something.
+            for sql in [
+                "(SELECT id FROM t FOR UPDATE)",
+                "(SELECT id FROM t) UNION (SELECT id FROM u FOR UPDATE)",
+            ] {
+                assert!(
+                    mysql_server_probe_reports_uncommitted_work_for_statement(
+                        db_type,
+                        sql,
+                        RetainedSessionState::default(),
+                        post_processor.effects_for_sql(sql),
+                        false,
+                        true,
+                    ),
+                    "{db_type}: {sql:?} holds locks the tab must be told about"
+                );
+            }
+        }
+    }
+
+    /// A refusal must name a remedy that works. Commit and rollback end a
+    /// TRANSACTION; they do nothing about a session lock, session residue the
+    /// pool cannot restate, or a pending one-shot `SET TRANSACTION`.
+    #[test]
+    fn a_blocked_option_change_names_the_remedy_that_works() {
+        let dirty =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+        assert!(
+            dirty.blocked_option_change_remedy().starts_with("Commit"),
+            "an open transaction is exactly what commit and rollback are for"
+        );
+
+        let residue = RetainedSessionState::from_parts(
+            TransactionSessionState::Clean,
+            SessionResidueState::new(true),
+            SessionLockState::default(),
+        );
+        let lock = RetainedSessionState::from_parts(
+            TransactionSessionState::Clean,
+            SessionResidueState::default(),
+            SessionLockState::new(false, true),
+        );
+        let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
+        let pending_one_shot = retained_session_state_after_statement(
+            post_processor,
+            RetainedSessionState::default(),
+            post_processor.effects_for_sql("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+            false,
+            false,
+            false,
+            false,
+        );
+        for state in [residue, lock, pending_one_shot] {
+            assert!(
+                !state.allows_transaction_option_change(),
+                "this state is one of the ones that blocks: {state:?}"
+            );
+            let remedy = state.blocked_option_change_remedy();
+            assert!(
+                !remedy.starts_with("Commit"),
+                "{state:?} cannot be resolved by a commit or a rollback, so the refusal \
+                 must not ask for one: {remedy}"
+            );
+            assert!(
+                remedy.contains("discard"),
+                "{state:?} must be told what does work: {remedy}"
+            );
+        }
+    }
 
     /// One executor unit can hold several statements, and what the LATER ones
     /// leave on the session is not the leading statement's to hide.

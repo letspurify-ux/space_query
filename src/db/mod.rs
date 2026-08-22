@@ -18,5 +18,6 @@ pub use transaction::*;
 pub(crate) use transaction::{
     retained_session_state_after_statement, statement_cancel_can_reuse_session,
     statement_interruption_requires_transaction_decision, statement_session_post_processor_for,
-    StatementInterruption, StatementSessionEffects, TransactionStatementStateHint,
+    transaction_mode_change_returns_session_to_boundary, StatementInterruption,
+    StatementSessionEffects, TransactionStatementStateHint,
 };

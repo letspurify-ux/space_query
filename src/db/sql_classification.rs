@@ -468,6 +468,7 @@ impl<'a> SqlStatementAnalysis<'a> {
     fn from_prepared_sql(stripped_sql: Cow<'a, str>, mysql_compatible_comments: bool) -> Self {
         let stripped_sql =
             strip_leading_plsql_block_labels(stripped_sql, mysql_compatible_comments);
+        let stripped_sql = strip_leading_open_parens(stripped_sql, mysql_compatible_comments);
         let words = statement_words(stripped_sql.as_ref(), mysql_compatible_comments);
         let has_multiple_statements =
             contains_multiple_statements(stripped_sql.as_ref(), mysql_compatible_comments);
@@ -596,6 +597,64 @@ fn find_top_level_word(
 
 pub(crate) fn strip_leading_comments_and_whitespace(sql: &str) -> &str {
     strip_leading_comments_and_whitespace_with_mode(sql, false)
+}
+
+/// The statement seen from INSIDE the parentheses that open it.
+///
+/// The LEADING parens go, and nothing else: every rule that scans the
+/// statement at any depth — the locking clauses, `INTO OUTFILE` — still sees
+/// all of it, because only the opening run is removed and the whole remainder
+/// is kept. The words and the text have to be ONE reading of the statement:
+/// stripping for the words alone left `leading_keyword()` saying `WITH` while
+/// the classification helpers re-scanned the raw text, skipped the leading
+/// paren group and answered `Unknown` — the same two-readings defect this
+/// function exists to close, one level in.
+///
+/// Only a query can start with `(`: `(SELECT …) UNION (SELECT …)`, which MySQL
+/// requires whenever a branch carries its own `ORDER BY`/`LIMIT`, and the
+/// parenthesised `INTERSECT`/`MINUS` chains Oracle users write. The word
+/// scanner is TOP-LEVEL by design (a subquery must not answer for the statement
+/// that contains it), so without this those statements had no leading keyword
+/// at all — `(SELECT …)` — or the set operator as their leading keyword —
+/// `UNION`. Both classified `SqlKind::Unknown`, and Unknown is the answer the
+/// safety gates lean on:
+///
+///   * a READ-ONLY connection refuses "a statement it could not classify as
+///     read-only", so an ordinary parenthesised set query could not be run at
+///     all;
+///   * the MySQL-family transaction probe is BELIEVED for an unclassified
+///     statement, so the read transaction such a query opens under
+///     `autocommit = 0` marked the tab as carrying uncommitted work — blocking
+///     the auto-commit and transaction-mode changes and prompting for a
+///     commit/rollback on close, after a pure read.
+///
+/// The executor has always seen through these parentheses
+/// (`QueryExecutor::is_select_statement` →
+/// `parenthesized_statement_starts_with_query`, with its own test). This is the
+/// same fact for the classification side, so "what statement is this?" has one
+/// answer again.
+fn strip_leading_open_parens(sql: Cow<'_, str>, mysql_compatible_comments: bool) -> Cow<'_, str> {
+    let stripped = {
+        let mut remaining = strip_leading_comments_and_whitespace_with_mode(
+            sql.as_ref(),
+            mysql_compatible_comments,
+        );
+        while let Some(after_open) = remaining.strip_prefix('(') {
+            remaining = strip_leading_comments_and_whitespace_with_mode(
+                after_open,
+                mysql_compatible_comments,
+            );
+        }
+        remaining.len()
+    };
+    if stripped == sql.len() {
+        return sql;
+    }
+    let start = sql.len() - stripped;
+    match sql {
+        Cow::Borrowed(sql) => Cow::Borrowed(&sql[start..]),
+        Cow::Owned(sql) => Cow::Owned(sql[start..].to_string()),
+    }
 }
 
 fn strip_leading_comments_and_whitespace_with_mode(
@@ -1655,9 +1714,31 @@ fn classify_xa_sql(sql: &str, mysql_compatible_comments: bool) -> SqlKind {
     }
 }
 
+/// What a `WITH` statement IS, decided by its MAIN query.
+///
+/// The `SELECT` answer is the EXECUTOR's own
+/// ([`QueryExecutor::with_clause_starts_with_select`]), not a second walk of the
+/// same clause. The walk below reads the CTE list and then expects the main
+/// query immediately after it, which is true of the plain form and of nothing
+/// else: Oracle's recursive `SEARCH DEPTH FIRST BY … SET …` / `CYCLE … SET … TO
+/// …` and the MySQL family's `CYCLE … RESTRICT` sit exactly there, so every
+/// recursive CTE written with them answered `SqlKind::Unknown` — the answer the
+/// safety gates lean on. A READ-ONLY connection refused those queries, the
+/// MySQL-family transaction probe was believed about the read transaction they
+/// open under manual commit (tab marked as carrying work, close prompting for a
+/// commit), and a cancelled one asked the user to resolve a session that held
+/// nothing. The app's own fixture corpus carries fifteen of them, across all
+/// three families.
+///
+/// The same relationship as
+/// [`strip_leading_open_parens`]: the executor could always read these; the
+/// classifier could not, and the classifier is what the gates ask.
 fn classify_with_sql_for_db_type(db_type: DatabaseType, sql: &str) -> SqlKind {
     let mysql_compatible_comments =
         classification_profile_for_db_type(db_type).mysql_compatible_comments();
+    if crate::db::query::QueryExecutor::with_clause_starts_with_select(sql) {
+        return classify_select_sql_for_db_type(db_type, sql, mysql_compatible_comments);
+    }
     let Some((with_token, _, mut pos)) = next_top_level_word(sql, 0, mysql_compatible_comments)
     else {
         return SqlKind::Unknown;
@@ -2720,6 +2801,284 @@ mod tests {
 
     fn blocked(db_type: DatabaseType, sql: &str) -> Option<String> {
         read_only_block_reason(db_type, sql, None)
+    }
+
+    /// A query that OPENS with a parenthesis is a query, on every backend.
+    ///
+    /// The word scanner is top-level by design, so `(SELECT …) UNION (SELECT …)`
+    /// answered `UNION` and `(SELECT …)` answered nothing at all — both
+    /// `SqlKind::Unknown`, which is what the read-only guard refuses and what
+    /// makes the MySQL-family transaction probe believed. The executor has
+    /// always run these as queries
+    /// (`test_is_select_statement_with_parenthesized_set_query_is_select`), so
+    /// this is the same statement being read two ways.
+    /// Every statement the EXECUTOR runs as a query must READ as one.
+    ///
+    /// The two answers come from different code — `QueryExecutor` decides how
+    /// to run a statement, `SqlStatementAnalysis` decides what the safety gates
+    /// may do with it — and a statement the executor happily runs as a query
+    /// while the classifier calls it `Unknown` is the shape both of this
+    /// round's classification defects had: a READ-ONLY connection refuses it,
+    /// the MySQL-family transaction probe is believed about the read
+    /// transaction it opens, and a cancelled one asks the user to resolve a
+    /// session that holds nothing.
+    ///
+    /// Asked of the app's OWN fixture corpus, which is where both defects were
+    /// found: parenthesised set queries, and every recursive CTE carrying an
+    /// Oracle `SEARCH`/`CYCLE` or a MySQL-family `CYCLE … RESTRICT` clause.
+    #[test]
+    fn every_statement_the_executor_runs_as_a_query_classifies_as_one() {
+        use crate::db::query::{QueryExecutor, ScriptItem};
+        let mut disagreements: Vec<String> = Vec::new();
+        let mut statements = 0usize;
+        for (dir, db_type) in [
+            ("test", DatabaseType::Oracle),
+            ("test_mysql", DatabaseType::MySQL),
+            ("test_mariadb", DatabaseType::MariaDB),
+        ] {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                // The corpus travels with the repo; a checkout without it must
+                // not fail this test, but it must not pass it silently either.
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if !path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| matches!(extension, "sql" | "txt"))
+                {
+                    continue;
+                }
+                let Ok(source) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for item in QueryExecutor::split_script_items_for_db_type_with_mysql_delimiter(
+                    &source,
+                    Some(db_type),
+                    None,
+                ) {
+                    let ScriptItem::Statement(statement) = item else {
+                        continue;
+                    };
+                    if !QueryExecutor::is_select_statement(&statement) {
+                        continue;
+                    }
+                    statements += 1;
+                    let analysis = SqlStatementAnalysis::new_for_db_type(db_type, &statement);
+                    if analysis.classify_for_db_type(db_type) == SqlKind::Unknown {
+                        let head: String = statement.chars().take(80).collect();
+                        disagreements.push(format!(
+                            "{}: {}",
+                            path.display(),
+                            head.split_whitespace().collect::<Vec<_>>().join(" ")
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            statements > 100,
+            "the corpus should hold plenty of queries to ask about; found {statements}"
+        );
+        disagreements.sort();
+        disagreements.dedup();
+        assert!(
+            disagreements.is_empty(),
+            "{} statement(s) the executor runs as a query read as unclassifiable:\n{}",
+            disagreements.len(),
+            disagreements.join("\n")
+        );
+    }
+
+    #[test]
+    fn parenthesised_queries_are_reads_on_every_backend() {
+        for db_type in EVERY_DB_TYPE {
+            for sql in [
+                "(SELECT id FROM t)",
+                "((SELECT id FROM t))",
+                "  /* leading comment */ ( SELECT id FROM t )",
+                "(SELECT id FROM t) UNION (SELECT id FROM u)",
+                "(SELECT id FROM t) UNION ALL (SELECT id FROM u) ORDER BY id",
+            ] {
+                let analysis = SqlStatementAnalysis::new_for_db_type(db_type, sql);
+                assert_eq!(
+                    analysis.leading_keyword(),
+                    Some("SELECT"),
+                    "{db_type:?} could not see the query inside the parentheses: {sql:?}"
+                );
+                assert_eq!(
+                    analysis.classify_for_db_type(db_type),
+                    SqlKind::SelectLike,
+                    "{db_type:?} did not classify {sql:?} as a read"
+                );
+                assert_eq!(
+                    blocked(db_type, sql),
+                    None,
+                    "{db_type:?} refused a parenthesised read: {sql:?}"
+                );
+                // The invariant in its general form: the parentheses change
+                // where the query is written, not what it IS. Every gate that
+                // reads a statement asks one of these two questions.
+                let bare = sql.trim().trim_start_matches(['(', ' ']);
+                let bare = bare.trim_end().trim_end_matches([')', ' ']);
+                let bare_analysis = SqlStatementAnalysis::new_for_db_type(db_type, bare);
+                assert_eq!(
+                    analysis.classify_for_db_type(db_type),
+                    bare_analysis.classify_for_db_type(db_type),
+                    "{db_type:?} read {sql:?} differently from {bare:?}"
+                );
+            }
+        }
+
+        // A CTE inside the parentheses is the same question one level down: the
+        // classification helpers re-scan the statement TEXT, so the text and its
+        // words have to be the same reading of it — two readings is the defect
+        // this whole change is about.
+        for (db_type, sql) in [
+            (
+                DatabaseType::Oracle,
+                "(WITH q AS (SELECT id FROM t) SELECT id FROM q) UNION (SELECT id FROM u)",
+            ),
+            (
+                DatabaseType::MySQL,
+                "(WITH q AS (SELECT id FROM t) SELECT id FROM q) UNION (SELECT id FROM u)",
+            ),
+            (
+                DatabaseType::MariaDB,
+                "(WITH q AS (SELECT id FROM t) SELECT id FROM q)",
+            ),
+        ] {
+            let analysis = SqlStatementAnalysis::new_for_db_type(db_type, sql);
+            assert_eq!(
+                analysis.leading_keyword(),
+                Some("WITH"),
+                "{db_type:?} could not see the CTE inside the parentheses: {sql:?}"
+            );
+            assert_eq!(
+                analysis.classify_for_db_type(db_type),
+                SqlKind::SelectLike,
+                "{db_type:?} did not classify {sql:?} as a read"
+            );
+            assert_eq!(blocked(db_type, sql), None, "{db_type:?} refused {sql:?}");
+        }
+
+        // The dialect-specific spellings each family actually writes.
+        for (db_type, sql) in [
+            (
+                DatabaseType::Oracle,
+                "(SELECT id FROM a) INTERSECT (SELECT id FROM b) MINUS (SELECT id FROM c)",
+            ),
+            (
+                DatabaseType::MySQL,
+                "(SELECT a FROM t ORDER BY a LIMIT 1) UNION (SELECT b FROM u ORDER BY b LIMIT 1)",
+            ),
+            (
+                DatabaseType::MariaDB,
+                "(SELECT a FROM t ORDER BY a LIMIT 1) UNION (SELECT b FROM u ORDER BY b LIMIT 1)",
+            ),
+        ] {
+            assert_eq!(
+                SqlStatementAnalysis::new_for_db_type(db_type, sql).classify_for_db_type(db_type),
+                SqlKind::SelectLike,
+                "{db_type:?} did not classify {sql:?} as a read"
+            );
+            assert_eq!(blocked(db_type, sql), None, "{db_type:?} refused {sql:?}");
+        }
+    }
+
+    /// A recursive CTE's `SEARCH` / `CYCLE` clause sits between the CTE list and
+    /// the main query, which is exactly where the classifier's own walk expected
+    /// the main query — so every recursive CTE written with one read as
+    /// unclassifiable. Both families, both spellings.
+    #[test]
+    fn a_recursive_ctes_search_and_cycle_clauses_are_still_a_read() {
+        for (db_type, sql) in [
+            (
+                DatabaseType::Oracle,
+                "WITH hops (n, o, t) AS (SELECT 1, o, t FROM r UNION ALL SELECT h.n + 1, r.o, r.t \
+                 FROM hops h JOIN r ON r.o = h.t) \
+                 SEARCH DEPTH FIRST BY o ASC NULLS LAST SET walk_order \
+                 CYCLE t SET is_cycle TO 'Y' DEFAULT 'N' \
+                 SELECT * FROM hops",
+            ),
+            (
+                DatabaseType::MySQL,
+                "WITH RECURSIVE nodes(id, parent) AS (SELECT 1, NULL UNION ALL \
+                 SELECT n.id, n.parent FROM nodes n) \
+                 SELECT * FROM nodes",
+            ),
+            (
+                DatabaseType::MariaDB,
+                "WITH RECURSIVE org(dept_id, parent_dept_id) AS (SELECT 1, NULL UNION ALL \
+                 SELECT d.dept_id, d.parent_dept_id FROM org o JOIN mf_department d \
+                 ON d.parent_dept_id = o.dept_id) \
+                 CYCLE dept_id RESTRICT \
+                 SELECT * FROM org",
+            ),
+        ] {
+            let analysis = SqlStatementAnalysis::new_for_db_type(db_type, sql);
+            assert_eq!(
+                analysis.classify_for_db_type(db_type),
+                SqlKind::SelectLike,
+                "{db_type:?} did not read its own recursive CTE as a query"
+            );
+            assert_eq!(
+                blocked(db_type, sql),
+                None,
+                "{db_type:?} refused a recursive CTE as a write"
+            );
+        }
+
+        // And a WITH whose main query really does write is still a write.
+        for (db_type, sql) in [
+            (
+                DatabaseType::Oracle,
+                "WITH src AS (SELECT 1 AS id FROM dual) \
+                 MERGE INTO t d USING src s ON (d.id = s.id) WHEN MATCHED THEN UPDATE SET d.id = s.id",
+            ),
+            (
+                DatabaseType::MySQL,
+                "WITH src AS (SELECT 1 AS id) DELETE FROM t WHERE id IN (SELECT id FROM src)",
+            ),
+        ] {
+            assert!(
+                blocked(db_type, sql).is_some(),
+                "{db_type:?} let a WITH ... write through as a read: {sql:?}"
+            );
+        }
+    }
+
+    /// Seeing INTO the parentheses must not stop the statement being read as a
+    /// WHOLE: everything the guards look for beyond the leading word is still
+    /// scanned over the full text.
+    #[test]
+    fn a_parenthesised_query_is_still_read_whole() {
+        for (db_type, sql) in [
+            (DatabaseType::Oracle, "(SELECT id FROM t FOR UPDATE)"),
+            (DatabaseType::MySQL, "(SELECT id FROM t FOR UPDATE)"),
+            (
+                DatabaseType::MariaDB,
+                "(SELECT id FROM t LOCK IN SHARE MODE)",
+            ),
+            (
+                DatabaseType::MySQL,
+                "(SELECT id FROM t) UNION (SELECT id FROM u FOR UPDATE)",
+            ),
+        ] {
+            assert!(
+                blocked(db_type, sql).is_some(),
+                "{db_type:?} let a locking read through as a plain read: {sql:?}"
+            );
+        }
+        assert!(
+            blocked(
+                DatabaseType::MySQL,
+                "(SELECT id INTO OUTFILE '/tmp/x' FROM t)"
+            )
+            .is_some(),
+            "a parenthesised SELECT ... INTO OUTFILE writes a file on the server"
+        );
     }
 
     #[test]

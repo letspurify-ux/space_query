@@ -1870,9 +1870,25 @@ impl TabDbWork {
     /// answer as a `bool`, so the gate that refuses and the gate that only
     /// counts cannot disagree.
     pub(crate) fn for_editor(editor: &SqlEditorWidget) -> Self {
+        Self::for_editor_with_progress_lazy_fetch(editor, false)
+    }
+
+    /// The same answer, plus a lazy fetch the tab's PROGRESS CONTEXT still
+    /// holds.
+    ///
+    /// The window tracks a tab's live fetch sessions beside the editor, and a
+    /// gate that asked only the editor answered "no work" for one of them. The
+    /// extra fact enters through `from_flags` rather than being OR-ed onto the
+    /// result, so the PRECEDENCE stays in one place: a running statement is
+    /// still what the user is told about, and a statement the app could not
+    /// stop stops being the tab's whole work when a fetch sits beside it.
+    pub(crate) fn for_editor_with_progress_lazy_fetch(
+        editor: &SqlEditorWidget,
+        progress_lazy_fetch: bool,
+    ) -> Self {
         Self::from_flags(
             editor.is_query_running(),
-            editor.has_open_lazy_fetch(),
+            editor.has_open_lazy_fetch() || progress_lazy_fetch,
             editor.has_deferred_execution(),
             editor.db_work_the_app_could_not_stop(),
         )
@@ -2508,6 +2524,12 @@ trait TransactionActionBackend: Sync {
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome;
 
+    /// `query_timeout` is the tab's, and it is taken by every backend for the
+    /// reason the close-path commit/rollback takes it: this runs on the FLTK
+    /// thread, and the Oracle drivers' way of applying a mode change to a
+    /// retained session is a call to the server. The MySQL family has no
+    /// per-call timeout to apply it to (see `DbSessionLease::with_call_timeout`)
+    /// and ignores it, which is a documented limitation rather than a claim.
     fn apply_transaction_mode_to_retained_session(
         &self,
         connection: &SharedConnection,
@@ -2515,6 +2537,7 @@ trait TransactionActionBackend: Sync {
         connection_generation: u64,
         pool_context_epoch: u64,
         mode: TransactionMode,
+        query_timeout: Option<Duration>,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome;
 }
@@ -3101,45 +3124,30 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         RetainedSessionMutationOutcome::NotApplicable
     }
 
+    /// Oracle's mode change is applied to the tab's session IN PLACE, like the
+    /// MySQL twin — see
+    /// [`SqlEditorWidget::apply_oracle_transaction_mode_to_reusable_pooled_session`]
+    /// for what "applied" means on this backend and for what the discard this
+    /// replaces used to cost. The gate it asks is the app's one option-change
+    /// rule, on the state the take really found.
     fn apply_transaction_mode_to_retained_session(
         &self,
-        _connection: &SharedConnection,
+        connection: &SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
         connection_generation: u64,
-        _pool_context_epoch: u64,
+        pool_context_epoch: u64,
         _mode: TransactionMode,
-        _db_activity: &str,
+        query_timeout: Option<Duration>,
+        db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
-        if let Some(snapshot) = pooled_db_session.snapshot() {
-            // The same question step 1 asked before the tab was pinned. Asking a
-            // different one here (this used to be
-            // `requires_physical_session_preservation`) is how a step 1 that
-            // allows and a step 3 that refuses get written, and the two only
-            // agreed because Oracle's classifier happens to produce a narrower
-            // kind of residue than the MySQL one.
-            if let Err(message) = SqlEditorWidget::ensure_retained_session_option_change_allowed(
-                DatabaseType::Oracle,
-                snapshot.retained_state(),
-                crate::db::TransactionOptionKind::TransactionMode,
-            ) {
-                return RetainedSessionMutationOutcome::BlockedRequiresResolution(message);
-            }
-        }
-        // Oracle applies the mode to the NEXT transaction, so dropping the
-        // clean retained session is how the change takes effect. The
-        // generation is validated because the toolbar reads it lock-free and
-        // applies later: without the check a connect/reconnect/pool resize
-        // landing in between would close the fresh session the tab was already
-        // handed on the new generation.
-        if pooled_db_session.clear_if_generation_matches(connection_generation) {
-            RetainedSessionMutationOutcome::Applied
-        } else if pooled_db_session.snapshot().is_some() {
-            RetainedSessionMutationOutcome::DiscardedBecauseStale
-        } else {
-            // Nothing retained: the tab's next acquisition prepares a session
-            // at the new mode anyway.
-            RetainedSessionMutationOutcome::Applied
-        }
+        SqlEditorWidget::apply_oracle_transaction_mode_to_reusable_pooled_session(
+            connection,
+            pooled_db_session,
+            connection_generation,
+            pool_context_epoch,
+            query_timeout,
+            db_activity,
+        )
     }
 }
 
@@ -3343,6 +3351,9 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
         connection_generation: u64,
         pool_context_epoch: u64,
         mode: TransactionMode,
+        // The MySQL family has no per-call timeout to bound this with; see the
+        // trait method.
+        _query_timeout: Option<Duration>,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
         SqlEditorWidget::apply_mysql_transaction_mode_to_reusable_pooled_session(
@@ -5280,148 +5291,140 @@ impl SqlEditorWidget {
         target_scope: &str,
         advanced: &ConnectionAdvancedSettings,
     ) -> RetainedSessionMutationOutcome {
-        // This runs on the FLTK thread, so the tab's timeout has to bound it
-        // like it bounds the close-path commit/rollback.
-        let query_timeout = Self::parse_timeout(&self.timeout_input.value());
-        let target_scope = target_scope.trim();
-        if target_scope.is_empty() && !db_type.can_apply_empty_scope_to_retained_session() {
-            // Not "there is no session" — there may well be one, sitting in the
-            // slot. There is nothing this backend can apply to it: Oracle has
-            // no statement for "no schema".
-            return RetainedSessionMutationOutcome::NotApplicable;
-        }
+        SqlEditorWidget::ui_action_on_retained_session(|loss| {
+            // This runs on the FLTK thread, so the tab's timeout has to bound it
+            // like it bounds the close-path commit/rollback.
+            let query_timeout = Self::parse_timeout(&self.timeout_input.value());
+            let target_scope = target_scope.trim();
+            if target_scope.is_empty() && !db_type.can_apply_empty_scope_to_retained_session() {
+                // Not "there is no session" — there may well be one, sitting in the
+                // slot. There is nothing this backend can apply to it: Oracle has
+                // no statement for "no schema".
+                return RetainedSessionMutationOutcome::NotApplicable;
+            }
 
-        // Row and connection info from ONE resolution of the pool context: this
-        // action publishes a real session canceler over the tab's session, and
-        // the row it publishes under has to say which connection that is (a
-        // disconnect matches on it) and when the connection's sessions are gone
-        // (`is_stale` cannot answer without it). Both used to be left out here.
-        let (scope_activity, scope_connection_info) = match self
-            .bound_connection()
-            .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
-            .and_then(|connection| {
-                crate::db::pool_session_context_for_shared_connection(&connection, None)
-            }) {
-            Ok(context) => (
-                context.track_operation_activity(format!(
-                    "Applying scope to retained {db_type} session"
-                )),
-                context.connection_info,
-            ),
-            Err(_) => (
-                crate::db::track_db_activity(
-                    format!("Applying scope to retained {db_type} session"),
-                    Some(db_type),
+            // Row and connection info from ONE resolution of the pool context: this
+            // action publishes a real session canceler over the tab's session, and
+            // the row it publishes under has to say which connection that is (a
+            // disconnect matches on it) and when the connection's sessions are gone
+            // (`is_stale` cannot answer without it). Both used to be left out here.
+            let (scope_activity, scope_connection_info) = match self
+                .bound_connection()
+                .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                .and_then(|connection| {
+                    crate::db::pool_session_context_for_shared_connection(&connection, None)
+                }) {
+                Ok(context) => (
+                    context.track_operation_activity(format!(
+                        "Applying scope to retained {db_type} session"
+                    )),
+                    context.connection_info,
                 ),
-                crate::db::ConnectionInfo::default(),
-            ),
-        };
-        // Same rule as the auto-commit and transaction-mode pushes: a take that
-        // could not reach the tab's session closed it, and saying `NoSession`
-        // about that loses the user's work in silence.
-        // The scope statement runs on this session inside this function.
-        let scope_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
-        let scope_hand_back_owner = crate::db::SessionHandBackOwner::untracked(
-            WorkerSessionCancelReach::for_registration_holder(None, scope_registration.clone()),
-        );
-        let mut retained_session = match self
-            .pooled_db_session
-            .take_reusable_lease_for_context_update(
-                // The UI thread, with the tab idle: the scope-change gate
-                // refuses while an execution is running, so there is no newer
-                // operation this session could belong to.
-                &scope_hand_back_owner,
-                connection_generation,
-                db_type,
-                &scope_connection_info,
-                &scope_activity,
-                scope_registration.as_ref(),
-            ) {
-            crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
-            crate::db::RetainedLeaseTake::Empty => {
-                return RetainedSessionMutationOutcome::NoSession;
-            }
-            crate::db::RetainedLeaseTake::Unreachable { retained_state } => {
-                return RetainedSessionMutationOutcome::for_unreachable_take(retained_state);
-            }
-        };
-        let retained_state = retained_session.retained_state();
-        if crate::db::retained_scope_matches_target(
-            db_type,
-            retained_session.current_scope(),
-            target_scope,
-        ) {
-            return Self::scope_apply_outcome(
-                retained_session.restore_with_context_epoch_and_scope(
-                    pool_context_epoch,
-                    retained_state,
-                    Some(target_scope.to_string()),
+                Err(_) => (
+                    crate::db::track_db_activity(
+                        format!("Applying scope to retained {db_type} session"),
+                        Some(db_type),
+                    ),
+                    crate::db::ConnectionInfo::default(),
                 ),
+            };
+            // Same rule as the auto-commit and transaction-mode pushes: a take that
+            // could not reach the tab's session closed it, and saying `NoSession`
+            // about that loses the user's work in silence.
+            // The scope statement runs on this session inside this function.
+            let scope_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
+            let scope_hand_back_owner = crate::db::SessionHandBackOwner::untracked(
+                WorkerSessionCancelReach::for_registration_holder(None, scope_registration.clone()),
             );
-        }
-
-        // Scope is applied in place (USE / ALTER SESSION SET CURRENT_SCHEMA):
-        // an open transaction or session residue survives it, so no retained
-        // state blocks the change — the resolution decision belongs to tab
-        // close. `apply_scope` receives the preservation flag and a failed
-        // apply on a work-carrying session restores it unless the error says
-        // the session itself is gone.
-        let result = retained_session
-            .lease_mut()
-            .ok_or_else(|| "No retained DB session for this tab.".to_string())
-            .and_then(|lease| {
-                lease.apply_scope(
+            let mut retained_session = match self
+                .pooled_db_session
+                .take_reusable_lease_for_context_update(
+                    // The UI thread, with the tab idle: the scope-change gate
+                    // refuses while an execution is running, so there is no newer
+                    // operation this session could belong to.
+                    &scope_hand_back_owner,
+                    connection_generation,
                     db_type,
-                    target_scope,
-                    advanced,
-                    retained_state.requires_physical_session_preservation(),
-                    query_timeout,
-                )
-            });
-        match result {
-            Ok(()) => {
-                Self::scope_apply_outcome(retained_session.restore_with_context_epoch_and_scope(
-                    pool_context_epoch,
-                    retained_state,
-                    Some(target_scope.to_string()),
-                ))
+                    &scope_connection_info,
+                    &scope_activity,
+                    scope_registration.as_ref(),
+                ) {
+                crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
+                crate::db::RetainedLeaseTake::Empty => {
+                    return RetainedSessionMutationOutcome::NoSession;
+                }
+                crate::db::RetainedLeaseTake::Unreachable { retained_state } => {
+                    return RetainedSessionMutationOutcome::for_unreachable_take(retained_state);
+                }
+            };
+            let retained_state = retained_session.retained_state();
+            if crate::db::retained_scope_matches_target(
+                db_type,
+                retained_session.current_scope(),
+                target_scope,
+            ) {
+                return Self::retained_session_hand_back_outcome(
+                    retained_session.restore_with_context_epoch_and_scope(
+                        pool_context_epoch,
+                        retained_state,
+                        Some(target_scope.to_string()),
+                    ),
+                    loss,
+                );
             }
-            Err(message) => {
-                let session_is_usable = retained_session.session_is_usable();
-                if retained_state.requires_physical_session_preservation()
-                    && Self::retained_scope_error_allows_session_reuse(
+
+            // Scope is applied in place (USE / ALTER SESSION SET CURRENT_SCHEMA):
+            // an open transaction or session residue survives it, so no retained
+            // state blocks the change — the resolution decision belongs to tab
+            // close. `apply_scope` receives the preservation flag and a failed
+            // apply on a work-carrying session restores it unless the error says
+            // the session itself is gone.
+            let result = retained_session
+                .lease_mut()
+                .ok_or_else(|| "No retained DB session for this tab.".to_string())
+                .and_then(|lease| {
+                    lease.apply_scope(
                         db_type,
-                        &message,
-                        session_is_usable,
+                        target_scope,
+                        advanced,
+                        retained_state.requires_physical_session_preservation(),
+                        query_timeout,
                     )
-                {
-                    let hand_back = retained_session.restore();
-                    if hand_back.lost_work() {
-                        return RetainedSessionMutationOutcome::FailedDiscarded(format!(
-                            "{message}\n{}",
-                            crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK
-                        ));
-                    }
-                    RetainedSessionMutationOutcome::FailedRestored(message)
-                } else {
-                    let discarded_work = retained_state.may_have_uncommitted_work();
-                    let _ = retained_session.discard();
-                    // Picking a schema in the object browser is not a request to
-                    // throw a transaction away. When the session really cannot
-                    // be kept, the user hears that the work went with it — the
-                    // same promise every other path that closes a work-carrying
-                    // session makes.
-                    RetainedSessionMutationOutcome::FailedDiscarded(if discarded_work {
-                        format!(
-                            "{message}\n{}",
-                            crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK
+                });
+            match result {
+                Ok(()) => Self::retained_session_hand_back_outcome(
+                    retained_session.restore_with_context_epoch_and_scope(
+                        pool_context_epoch,
+                        retained_state,
+                        Some(target_scope.to_string()),
+                    ),
+                    loss,
+                ),
+                Err(message) => {
+                    let session_is_usable = retained_session.session_is_usable();
+                    if retained_state.requires_physical_session_preservation()
+                        && Self::retained_scope_error_allows_session_reuse(
+                            db_type,
+                            &message,
+                            session_is_usable,
                         )
+                    {
+                        let hand_back = retained_session.restore();
+                        loss.record_lost_work(hand_back.lost_work());
+                        RetainedSessionMutationOutcome::FailedRestored(message)
                     } else {
-                        message
-                    })
+                        // Picking a schema in the object browser is not a request to
+                        // throw a transaction away. When the session really cannot
+                        // be kept, the user hears that the work went with it — the
+                        // same promise every other path that closes a work-carrying
+                        // session makes, said in the one place that says it.
+                        loss.record_lost_work(retained_state.may_have_uncommitted_work());
+                        let _ = retained_session.discard();
+                        RetainedSessionMutationOutcome::FailedDiscarded(message)
+                    }
                 }
             }
-        }
+        })
     }
 
     /// Put a session back in the tab's slot, through the one hand-back door.
@@ -5451,21 +5454,23 @@ impl SqlEditorWidget {
         )
     }
 
-    /// What a scope apply that reached the server should report, given what
-    /// became of the session on the way back into the tab's slot.
+    /// What a hand-back that carried the tab's session says about itself, and
+    /// what it cost recorded for the push's answer.
     ///
     /// The store can be REFUSED — the tab closed while this ran, or a newer
     /// execution's session got there first — and the refusal closes the
     /// session physically. A bare `Applied` for that told the user their scope
     /// change succeeded while the transaction it was carrying was destroyed.
-    fn scope_apply_outcome(
+    ///
+    /// The cost goes into `loss` rather than into the value returned here,
+    /// because a push has several hand-backs and only ONE answer: the fold in
+    /// [`SqlEditorWidget::ui_action_on_retained_session`] is where the sentence
+    /// is written, once, for all four backends.
+    fn retained_session_hand_back_outcome(
         hand_back: crate::db::SessionHandBack,
+        loss: &crate::ui::sql_editor::execution::UiActionSessionLoss,
     ) -> RetainedSessionMutationOutcome {
-        if hand_back.lost_work() {
-            return RetainedSessionMutationOutcome::FailedDiscarded(
-                crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK.to_string(),
-            );
-        }
+        loss.record_lost_work(hand_back.lost_work());
         RetainedSessionMutationOutcome::Applied
     }
 
@@ -5855,12 +5860,17 @@ impl SqlEditorWidget {
         let Some(connection) = self.bound_connection() else {
             return RetainedSessionMutationOutcome::NoSession;
         };
+        // The tab's own timeout, resolved here because this is where the tab
+        // is: the same value the close-path commit/rollback and the scope push
+        // are bounded by.
+        let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         transaction_action_backend_for(db_type).apply_transaction_mode_to_retained_session(
             &connection,
             &self.pooled_db_session,
             connection_generation,
             pool_context_epoch,
             mode,
+            query_timeout,
             db_activity,
         )
     }

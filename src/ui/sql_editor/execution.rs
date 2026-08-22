@@ -276,7 +276,25 @@ struct OracleThinStatementOutcome {
 
 struct OracleThinBatchOutcome {
     retained_state: RetainedSessionState,
-    had_error: bool,
+    /// Whether this batch saw a failure a pending CANCEL could have caused.
+    ///
+    /// Not "did anything go wrong". Both consumers ask it beside
+    /// `cancel_requested` — the user cancelled AND something failed, so ask the
+    /// session policy whether the session survived — and a refusal the APP made
+    /// cannot be what a cancel hit: it never reached the server, so it left the
+    /// session exactly as it found it. That is the same fact
+    /// `OracleTransactionBoundaryStep::refused` states for the transaction
+    /// tracker, and the OCI twin has always agreed with it: it asks whether the
+    /// session was INVALIDATED or a decision is REQUIRED
+    /// (`oracle_cancel_affects_session_policy`), neither of which a refusal
+    /// sets.
+    ///
+    /// It used to be `had_error` and counted the refusals too, so a Read only
+    /// tab refusing a write — or the transaction-option gate refusing a
+    /// `SET TRANSACTION` — while the user happened to press Cancel put a
+    /// healthy session through the interrupt policy, which can end in a
+    /// resolution demand or a discard for a statement the server never saw.
+    server_side_failure: bool,
     /// No `timed_out` here any more. The worker used to OR it into
     /// "is this session broken?", which is the driver's question and only the
     /// driver's; what a timeout DID to the statement is reported by the
@@ -1046,10 +1064,76 @@ impl SessionScopeReport {
     }
 }
 
+/// Where a session that went away WITH THE USER'S WORK IN IT is reported.
+///
+/// Two audiences, because the app has two kinds of road and only one of them
+/// has a channel to the tab:
+///
+///   * a batch owns an operation, so its progress sender is how the tab hears
+///     everything, this included;
+///   * a toolbar/menu push runs on the UI thread with no operation at all, so
+///     the only place the user can hear it is the push's own RETURN VALUE.
+///
+/// It is an enum rather than an `Option<&sender>` because `None` made the
+/// second case indistinguishable from "nobody needs to know". The report then
+/// looked like it had been made — it went to the log — while the MySQL-family
+/// toolbar pushes destroyed a session carrying a transaction and answered only
+/// "the option cannot change". The Oracle twin says it, so the same action on
+/// two backends told the user two different things.
+#[derive(Clone, Copy)]
+pub(super) enum SessionLossAudience<'a> {
+    /// The operation's own channel. `None` is still representable HERE because
+    /// some batch roads legitimately hold no sender; what is not representable
+    /// is a road with no operation quietly choosing it.
+    Operation(Option<&'a QueryProgressSender>),
+    /// A UI-thread push: the loss is recorded and becomes the answer, through
+    /// [`SqlEditorWidget::ui_action_on_retained_session`].
+    UiAction(&'a UiActionSessionLoss),
+}
+
+/// What a UI-thread push on the tab's retained session learned about the
+/// session it gave back, waiting to become part of the answer.
+///
+/// Written by the hand-back doors, read exactly once by
+/// [`SqlEditorWidget::ui_action_on_retained_session`], which is the only way
+/// these pushes can be entered — so a road cannot return an outcome that
+/// forgets it.
+#[derive(Default)]
+pub(super) struct UiActionSessionLoss {
+    lost_work: std::cell::Cell<bool>,
+}
+
+impl UiActionSessionLoss {
+    /// A hand-back destroyed the session it was given; `carried` is what went
+    /// with it.
+    fn record(&self, carried: RetainedSessionState, log_context: &str) {
+        if !carried.may_have_uncommitted_work() {
+            return;
+        }
+        crate::utils::logging::log_warning(
+            log_context,
+            result_messages::RETAINED_SESSION_LOST_WITH_WORK,
+        );
+        self.lost_work.set(true);
+    }
+
+    /// A hand-back DOOR answered; the door has already logged what it
+    /// destroyed, so this only carries the fact into the answer.
+    pub(super) fn record_lost_work(&self, lost_work: bool) {
+        if lost_work {
+            self.lost_work.set(true);
+        }
+    }
+
+    fn lost_work(&self) -> bool {
+        self.lost_work.get()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct BatchSessionHandBack<'a> {
     owner: &'a crate::db::SessionHandBackOwner,
-    sender: Option<&'a QueryProgressSender>,
+    audience: SessionLossAudience<'a>,
 }
 
 impl<'a> BatchSessionHandBack<'a> {
@@ -1057,7 +1141,38 @@ impl<'a> BatchSessionHandBack<'a> {
         owner: &'a crate::db::SessionHandBackOwner,
         sender: Option<&'a QueryProgressSender>,
     ) -> Self {
-        Self { owner, sender }
+        Self {
+            owner,
+            audience: SessionLossAudience::Operation(sender),
+        }
+    }
+
+    /// The hand-back of a UI-thread push: it has no operation, so what it
+    /// destroys is recorded for the answer instead of sent to a channel that
+    /// does not exist.
+    fn for_ui_action(
+        owner: &'a crate::db::SessionHandBackOwner,
+        loss: &'a UiActionSessionLoss,
+    ) -> Self {
+        Self {
+            owner,
+            audience: SessionLossAudience::UiAction(loss),
+        }
+    }
+
+    /// Say that a session went away with the user's work in it, to whichever
+    /// audience this hand-back has. One call, so no road can have half of it.
+    fn report_loss(&self, carried: RetainedSessionState, log_context: &str) {
+        match self.audience {
+            SessionLossAudience::Operation(sender) => {
+                SqlEditorWidget::report_retained_session_lost_with_work(
+                    sender,
+                    carried,
+                    log_context,
+                );
+            }
+            SessionLossAudience::UiAction(loss) => loss.record(carried, log_context),
+        }
     }
 
     /// Whether the tab is still on the execution this value speaks for.
@@ -1069,15 +1184,31 @@ impl<'a> BatchSessionHandBack<'a> {
         self.owner.is_current()
     }
 
-    /// Where to tell the user about a session that went away with work in it.
-    fn sender(&self) -> Option<&'a QueryProgressSender> {
-        self.sender
-    }
-
     /// Which execution this value speaks for, for the takes that have to stamp
     /// it onto the session they hand over.
     fn owner(&self) -> &'a crate::db::SessionHandBackOwner {
         self.owner
+    }
+
+    /// A TAKE that closed a stale session says what that cost, through this
+    /// hand-back's audience.
+    ///
+    /// The free function beside this one takes an `Option<&sender>`, and a
+    /// UI-thread push has none — so handing it this value's sender filed the
+    /// loss in the log and nowhere else, which is exactly the hole
+    /// `SessionLossAudience` exists to close. A road that HAS a hand-back asks
+    /// the hand-back, and this value no longer exposes a sender at all: the
+    /// only way to report through it is `report_loss`, which always has an
+    /// audience.
+    fn stale_take_reported(
+        &self,
+        outcome: crate::db::RetainedSessionTakeOutcome,
+        log_context: &str,
+    ) -> crate::db::RetainedSessionTakeOutcome {
+        if let Some(retained_state) = outcome.discarded_retained_state() {
+            self.report_loss(retained_state, log_context);
+        }
+        outcome
     }
 
     /// Give a session up WITHOUT reaching a hand-back door: end what this
@@ -1100,7 +1231,7 @@ impl<'a> BatchSessionHandBack<'a> {
     /// cannot happen — and where it can, the caller cannot forget.
     fn release_without_door(&self, carried: RetainedSessionState, log_context: &str) {
         self.owner.cancel_reach().end_before_release();
-        SqlEditorWidget::report_retained_session_lost_with_work(self.sender, carried, log_context);
+        self.report_loss(carried, log_context);
     }
 
     /// Hand the session back to the tab. Answers whether it reached the slot.
@@ -1133,11 +1264,7 @@ impl<'a> BatchSessionHandBack<'a> {
             current_scope,
         );
         if outcome.lost_work() {
-            SqlEditorWidget::report_retained_session_lost_with_work(
-                self.sender,
-                retained_state,
-                log_context,
-            );
+            self.report_loss(retained_state, log_context);
         }
         outcome.stored()
     }
@@ -1147,12 +1274,17 @@ impl<'a> BatchSessionHandBack<'a> {
     /// ended disconnected). Same currency rule as `apply`: an abandoned batch
     /// must not clear the slot a newer execution already owns.
     fn clear(&self, pooled_db_session: &SharedDbSessionLease, log_context: &str) {
-        SqlEditorWidget::clear_worker_session_for_batch(
-            pooled_db_session,
-            self.sender,
-            self.owner,
-            log_context,
-        );
+        if let crate::db::WorkerSlotClear::Cleared { carried_work: true } =
+            pooled_db_session.clear_worker_session(self.owner, log_context)
+        {
+            // Through the audience, like every other road out of this value: a
+            // clear that took the user's work with it is the same news whether
+            // a batch or a UI-thread push made it.
+            self.report_loss(
+                RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty),
+                log_context,
+            );
+        }
     }
 }
 
@@ -2001,7 +2133,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
         );
 
         let cancel_requested = load_mutex_bool(cancel_flag);
-        let cancel_affects_session = cancel_requested && batch_outcome.had_error;
+        let cancel_affects_session = cancel_requested && batch_outcome.server_side_failure;
         // The DRIVER says whether a timeout cost the session, and it is the only
         // thing that can: a thin call timeout now completes the same break/reset
         // handshake a cancel completes, so the wire is back at a clean request
@@ -2026,7 +2158,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
         let final_auto_commit = current_operation_autocommit.get();
         let disposition = SqlEditorWidget::oracle_thin_execution_disposition(
             cancel_requested,
-            batch_outcome.had_error,
+            batch_outcome.server_side_failure,
             session_broken,
             batch_outcome.retained_state,
             batch_outcome.interrupted_sql_kind.unwrap_or_else(|| {
@@ -2967,20 +3099,6 @@ impl QueryExecutionCleanupGuard {
             self.oracle_current_retained_state(current_session_may_have_uncommitted_work),
             option,
         )
-    }
-
-    fn ensure_oracle_statement_transaction_option_change_allowed(
-        &self,
-        statement_effects: crate::db::StatementSessionEffects,
-        current_session_may_have_uncommitted_work: bool,
-    ) -> Result<(), String> {
-        if let Some(option) = statement_effects.transaction_option_change_kind() {
-            self.ensure_oracle_retained_option_change_allowed(
-                current_session_may_have_uncommitted_work,
-                option,
-            )?;
-        }
-        Ok(())
     }
 
     fn oracle_connection_transition_requires_resolution(
@@ -5932,9 +6050,17 @@ impl SqlEditorWidget {
                 || Self::oracle_error_message_allows_session_reuse(message))
     }
 
+    /// What becomes of the tab's session when the thin batch ends.
+    ///
+    /// `server_side_failure` is the batch's answer to "did anything a CANCEL
+    /// could have caused go wrong" — see
+    /// [`OracleThinBatchOutcome::server_side_failure`]. A refusal the app made
+    /// itself is deliberately not one, so a cancel racing a refused statement
+    /// no longer puts a session the server never heard from through the
+    /// interrupt policy.
     fn oracle_thin_execution_disposition(
         cancel_requested: bool,
-        had_error: bool,
+        server_side_failure: bool,
         session_broken: bool,
         retained_state: RetainedSessionState,
         sql_kind: crate::db::session_policy::SqlKind,
@@ -5948,7 +6074,7 @@ impl SqlEditorWidget {
             return crate::db::RetainedSessionDisposition::DiscardPhysical(retained_state);
         }
 
-        if cancel_requested && had_error {
+        if cancel_requested && server_side_failure {
             let decision = crate::db::session_policy::decide_session_after_interrupt(
                 crate::db::session_policy::InterruptDecisionContext {
                     operation_matches: true,
@@ -14600,11 +14726,23 @@ impl SqlEditorWidget {
                                 }
                             }
 
+                            // Both Oracle drivers ask ONE preflight, in the same
+                            // position: after the tab's mode has been applied,
+                            // so a refused batch leaves the session in the same
+                            // state on both.
                             if let Some(message) =
-                                SqlEditorWidget::transaction_mode_refusal_for_statement(
-                                    crate::db::DatabaseType::Oracle,
+                                SqlEditorWidget::oracle_statement_preflight_refusal(
                                     active_transaction_mode,
                                     &sql_text,
+                                    statement_effects,
+                                    || {
+                                        cleanup.oracle_current_retained_state(
+                                            SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+                                                conn.as_ref(),
+                                                &db_activity,
+                                            ),
+                                        )
+                                    },
                                 )
                             {
                                 let emitted = SqlEditorWidget::emit_non_select_result(
@@ -14636,39 +14774,6 @@ impl SqlEditorWidget {
                                     crate::db::DatabaseType::Oracle,
                                     &sql_text,
                                 );
-                            if statement_effects.transaction_option_change_kind().is_some() {
-                                let live_may_have_uncommitted_work =
-                                    SqlEditorWidget::oracle_session_may_have_uncommitted_work(
-                                        conn.as_ref(),
-                                        &db_activity,
-                                    );
-                                if let Err(message) = cleanup
-                                    .ensure_oracle_statement_transaction_option_change_allowed(
-                                        statement_effects,
-                                        live_may_have_uncommitted_work,
-                                    )
-                                {
-                                    let emitted = SqlEditorWidget::emit_non_select_result(
-                                        &sender,
-                                        &session,
-                                        &conn_name,
-                                        result_index,
-                                        &sql_text,
-                                        format!("Error: {message}"),
-                                        false,
-                                        false,
-                                        script_mode,
-                                    );
-                                    if emitted {
-                                        result_index += 1;
-                                    }
-                                    if !continue_on_error {
-                                        stop_execution = true;
-                                    }
-                                    boundary_step.refused();
-                                    continue;
-                                }
-                            }
 
                             if QueryExecutor::is_plain_commit(&sql_text) {
                                 let index = result_index;
@@ -19526,7 +19631,7 @@ impl SqlEditorWidget {
         if items.is_empty() {
             return OracleThinBatchOutcome {
                 retained_state: prior_retained_state,
-                had_error: false,
+                server_side_failure: false,
                 interrupted_sql_kind: None,
                 interrupted_state_hint: None,
                 refreshed_pool_context_epoch: None,
@@ -19558,7 +19663,7 @@ impl SqlEditorWidget {
                 retained_state: RetainedSessionState::from_transaction_state(
                     TransactionSessionState::InvalidSession,
                 ),
-                had_error: true,
+                server_side_failure: true,
                 interrupted_sql_kind: None,
                 interrupted_state_hint: None,
                 refreshed_pool_context_epoch: None,
@@ -19590,7 +19695,10 @@ impl SqlEditorWidget {
         // Oracle OCI (`DPI-1067`) and MySQL/MariaDB (`ERROR 3024`) cost only
         // the statement.
         let mut invalid_session = false;
-        let mut had_error = false;
+        // See `OracleThinBatchOutcome::server_side_failure`: only a failure the
+        // SERVER could have produced belongs here, because the only question
+        // asked of it is whether a pending cancel may have cost the session.
+        let mut server_side_failure = false;
         let mut timed_out = false;
         let mut interrupted_sql_kind = None;
         let mut interrupted_state_hint = None;
@@ -20725,7 +20833,7 @@ impl SqlEditorWidget {
                         }
                     }
                     if let Some(message) = command_error {
-                        had_error = true;
+                        server_side_failure = true;
                         invalid_session |= conn.is_broken();
                         Self::emit_non_select_result(
                             sender,
@@ -20749,7 +20857,8 @@ impl SqlEditorWidget {
                         .as_deref()
                         .is_some_and(|context| !context.connected)
                     {
-                        had_error = true;
+                        // Refused by the app: nothing was sent, so this is not
+                        // a failure a cancel could have caused.
                         Self::emit_non_select_result(
                             sender,
                             session,
@@ -20777,7 +20886,8 @@ impl SqlEditorWidget {
                         match Self::apply_define_substitution(&sql_to_execute, session, sender) {
                             Ok(sql) => sql_to_execute = sql,
                             Err(message) => {
-                                had_error = true;
+                                // Substitution happens in the client: the
+                                // statement never reached the server.
                                 Self::emit_non_select_result(
                                     sender,
                                     session,
@@ -20850,7 +20960,7 @@ impl SqlEditorWidget {
                             ) {
                                 Ok(message) => confirmation = message,
                                 Err(message) => {
-                                    had_error = true;
+                                    server_side_failure = true;
                                     statement_error = Some(message);
                                 }
                             },
@@ -20984,7 +21094,7 @@ impl SqlEditorWidget {
                                     .note_transaction_mode_stated(active_transaction_mode);
                             }
                             Ok(OracleTransactionModeApplied::Failed(message)) => {
-                                had_error = true;
+                                server_side_failure = true;
                                 let (error_message, statement_timed_out) =
                                     Self::oracle_thin_message_after_interrupt(
                                         message,
@@ -21036,7 +21146,9 @@ impl SqlEditorWidget {
                             // which did exactly that while the OCI twin
                             // stopped.
                             Err(message) => {
-                                had_error = true;
+                                // A mode this database cannot EXPRESS: the app
+                                // composed no statement, so nothing reached the
+                                // server and a cancel cannot have caused it.
                                 Self::emit_non_select_result(
                                     sender,
                                     session,
@@ -21056,20 +21168,36 @@ impl SqlEditorWidget {
                         }
                     }
 
-                    // A Read only tab must refuse writes on BOTH Oracle
-                    // drivers. The server's own ORA-01456 is not enough on its
-                    // own: READ ONLY is a property of the TRANSACTION, so a
-                    // COMMIT inside the user's own batch ends it and every
-                    // statement after would run read-write. This is the gate
-                    // the OCI path has always had, in the same position:
-                    // after the mode has been applied, so a refused batch
-                    // leaves the session in the same state on both drivers.
-                    if let Some(message) = Self::transaction_mode_refusal_for_statement(
-                        crate::db::DatabaseType::Oracle,
+                    // Both Oracle drivers ask ONE preflight, in the same
+                    // position: after the mode has been applied, so a refused
+                    // batch leaves the session in the same state on both.
+                    //
+                    // A Read only tab must refuse writes on BOTH drivers — the
+                    // server's own ORA-01456 is not enough on its own, because
+                    // READ ONLY is a property of the TRANSACTION and a COMMIT
+                    // inside the user's own batch ends it. And a statement that
+                    // changes a transaction option must meet the app's one
+                    // option-change rule on both, which this road did not ask
+                    // at all: see `oracle_statement_preflight_refusal`.
+                    //
+                    // The live answer is free here — thin reads the wire's
+                    // end-of-call transaction flag — so the closure only merges
+                    // it into the state the batch has tracked.
+                    let live_transaction_in_progress = conn.transaction_in_progress();
+                    if let Some(message) = Self::oracle_statement_preflight_refusal(
                         active_transaction_mode,
                         &execution_sql,
+                        statement_effects,
+                        || {
+                            Self::oracle_retained_state_for_option_change(
+                                retained_state,
+                                live_transaction_in_progress,
+                            )
+                        },
                     ) {
-                        had_error = true;
+                        // Refused by the app, so it never reached the server —
+                        // the same fact `boundary_step.refused()` states below,
+                        // and the reason this is not a `server_side_failure`.
                         Self::emit_non_select_result(
                             sender,
                             session,
@@ -21106,7 +21234,7 @@ impl SqlEditorWidget {
                             );
                         }
                         Err(message) => {
-                            had_error = true;
+                            server_side_failure = true;
                             Self::emit_non_select_result(
                                 sender,
                                 session,
@@ -21176,7 +21304,7 @@ impl SqlEditorWidget {
                                     interrupted_state_hint = Some(statement_effects.state_hint);
                                 }
                                 if !result_success_before_commit {
-                                    had_error = true;
+                                    server_side_failure = true;
                                     timed_out |= statement_timed_out;
                                     invalid_session |= conn.is_broken();
                                     retained_state =
@@ -21218,7 +21346,7 @@ impl SqlEditorWidget {
                                         }
                                         Err(err) => {
                                             let message = format!("Auto-commit failed: {err}");
-                                            had_error = true;
+                                            server_side_failure = true;
                                             invalid_session |= conn.is_broken();
                                             retained_state = retained_state.with_transaction_state(
                                                 TransactionSessionState::DecisionRequired,
@@ -21442,7 +21570,7 @@ impl SqlEditorWidget {
                                         }
                                     }
                                     if !statement_success {
-                                        had_error = true;
+                                        server_side_failure = true;
                                         if !continue_on_error {
                                             stop_execution = true;
                                         }
@@ -21523,7 +21651,7 @@ impl SqlEditorWidget {
                                                 }
                                             }
                                             Err(message) => {
-                                                had_error = true;
+                                                server_side_failure = true;
                                                 let (error_message, statement_timed_out) =
                                                     Self::oracle_thin_message_after_interrupt(
                                                         message,
@@ -21583,7 +21711,7 @@ impl SqlEditorWidget {
                                                 }
                                             }
                                             Err(message) => {
-                                                had_error = true;
+                                                server_side_failure = true;
                                                 let (error_message, statement_timed_out) =
                                                     Self::oracle_thin_message_after_interrupt(
                                                         message,
@@ -21622,7 +21750,7 @@ impl SqlEditorWidget {
                     }
 
                     if let Some(message) = statement_error {
-                        had_error = true;
+                        server_side_failure = true;
                         invalid_session |= conn.is_broken();
                         // Match the oci path: a cancelled statement surfaces as
                         // "Query cancelled" instead of the raw ORA-01013 text so
@@ -21702,7 +21830,7 @@ impl SqlEditorWidget {
                                 }
                                 Ok(_) => {}
                                 Err(message) => {
-                                    had_error = true;
+                                    server_side_failure = true;
                                     invalid_session |= conn.is_broken();
                                     eprintln!(
                                         "Warning: failed to drain Oracle thin DBMS_OUTPUT: {message}"
@@ -21711,7 +21839,7 @@ impl SqlEditorWidget {
                             }
                         }
                         if let Err(err) = conn.flush_pending_cursor_closes() {
-                            had_error = true;
+                            server_side_failure = true;
                             invalid_session = true;
                             eprintln!("Warning: failed to flush Oracle thin cursor closes: {err}");
                         }
@@ -21754,7 +21882,7 @@ impl SqlEditorWidget {
         };
         OracleThinBatchOutcome {
             retained_state,
-            had_error,
+            server_side_failure,
             interrupted_sql_kind,
             interrupted_state_hint,
             refreshed_pool_context_epoch,
@@ -23817,18 +23945,24 @@ impl SqlEditorWidget {
         {
             return Some(Self::read_only_shared_block_message(reason));
         }
+        // An explicit per-transaction READ WRITE is the one statement that
+        // turns the pin off, and the server HONOURS it over whatever opened the
+        // transaction — the session characteristic on the MySQL family, the
+        // app's own `SET TRANSACTION READ ONLY` on Oracle. So it is refused on
+        // every backend, from one answer.
+        //
+        // It used to be asked on the MySQL family only, because Oracle's own
+        // allowlist below refuses everything that WRITES anyway. A locking READ
+        // is the case that argument misses: `SELECT … FOR UPDATE` is a query,
+        // so the allowlist admits it, and the only thing refusing it was the
+        // read-only transaction this statement ends.
+        if crate::db::transaction::statement_forces_read_write_transaction(db_type, sql) {
+            return Some(Self::read_only_escape_block_message());
+        }
         if !db_type.transaction_mode_requires_first_statement(mode) {
-            // The SESSION carries the mode here and the server refuses the
-            // writes, with one exception it HONOURS instead: an explicit
-            // per-transaction `SET TRANSACTION READ WRITE` /
-            // `START TRANSACTION READ WRITE`. That refusal used to be spelled
-            // at the MySQL batch's own gate, which is why that gate answered
-            // only half the question — and why the half above never reached
-            // the family's execution path at all.
-            return crate::db::transaction::mysql_statement_escapes_read_only_transaction_for_db_type(
-                db_type, sql,
-            )
-            .then(Self::mysql_read_only_escape_block_message);
+            // Everything else on this family is the SESSION's to refuse: the
+            // characteristic is set and the server answers the data question.
+            return None;
         }
         (!Self::oracle_read_only_allows_statement(sql)).then(Self::oracle_read_only_block_message)
     }
@@ -23844,18 +23978,21 @@ impl SqlEditorWidget {
         )
     }
 
-    /// The MySQL-family twin of the Oracle read-only client gate, for the one
-    /// hole the SESSION characteristic cannot cover: the server lets a
-    /// one-shot `SET TRANSACTION READ WRITE` and `START TRANSACTION READ
-    /// WRITE` override READ ONLY for their transaction, so a pinned tab must
-    /// refuse the escape statement itself.
+    /// The refusal for the one hole no backend's own mechanism covers: the
+    /// server lets an explicit per-transaction `SET TRANSACTION READ WRITE` /
+    /// `START TRANSACTION READ WRITE` override the READ ONLY the session (or
+    /// the app's opening statement) asked for, so a pinned tab must refuse the
+    /// escape statement itself.
+    ///
+    /// One sentence for all four backends, because it is one rule
+    /// ([`crate::db::transaction::statement_forces_read_write_transaction`]).
     ///
     /// Prefixed like every other refusal the batch shows, which it was not
     /// while it lived at a gate of its own: both answers now come from
     /// `transaction_mode_refusal_for_statement`, so one tab can show both, and
     /// two refusals from one gate must not read as two different kinds of
     /// event.
-    fn mysql_read_only_escape_block_message() -> String {
+    fn read_only_escape_block_message() -> String {
         "Error: Read only mode blocks an explicit READ WRITE transaction. Switch to Read write to run this statement."
             .to_string()
     }
@@ -24317,7 +24454,7 @@ impl SqlEditorWidget {
     /// The one backend-specific part stays backend-dispatched: the MySQL family
     /// can REPLACE a pending one-shot on a session it would otherwise refuse,
     /// because the replacement consumes it (`can_replace_retained_transaction_mode`).
-    pub(super) fn ensure_retained_session_option_change_allowed(
+    pub(crate) fn ensure_retained_session_option_change_allowed(
         db_type: crate::db::DatabaseType,
         prior_retained_state: RetainedSessionState,
         option: crate::db::TransactionOptionKind,
@@ -24388,36 +24525,84 @@ impl SqlEditorWidget {
         )
     }
 
+    /// Oracle's statement road asks [`Self::ensure_retained_session_option_change_allowed`]
+    /// — the app's ONE option-change rule — like every other road.
+    ///
+    /// It used to answer for itself, with the one rule MINUS its session-residue
+    /// term: `Clean && !lock && !mode_override`. So a script `SET AUTOCOMMIT` or
+    /// `ALTER SESSION SET ISOLATION_LEVEL` after a PL/SQL block, a `CALL` or a
+    /// `SET ROLE` — statements whose body the app cannot read, which is exactly
+    /// when it cannot know whether the session's transaction semantics have
+    /// been changed under it — was ALLOWED on Oracle while the identical
+    /// MySQL-family script was refused, and while Oracle's OWN toolbar refused
+    /// it. The thin branch's comment claimed "Same contract as the OCI and
+    /// MySQL branches" over the difference. Its unit tests pinned only the
+    /// dirty case, so nothing could notice.
+    ///
+    /// The residue term is not decoration: an anonymous block may have opened a
+    /// transaction no Oracle write probe can see, and `SET AUTOCOMMIT ON` then
+    /// commits it on the next statement — the silent commit the guard exists to
+    /// prevent, and the reason residue keeps blocking option CHANGES (a
+    /// deliberate rule) long after it stopped blocking the next EXECUTION.
     fn ensure_oracle_retained_state_option_change_allowed(
         retained_state: RetainedSessionState,
         option: crate::db::TransactionOptionKind,
     ) -> Result<(), String> {
-        if retained_state.transaction_state() == TransactionSessionState::Clean
-            && !retained_state.may_hold_session_lock()
-            && !retained_state.may_have_transaction_mode_override()
-        {
-            return Ok(());
-        }
-        crate::db::DatabaseConnection::ensure_retained_session_option_change_allowed(
+        Self::ensure_retained_session_option_change_allowed(
+            crate::db::DatabaseType::Oracle,
             retained_state,
-            option.label(),
+            option,
         )
     }
 
-    #[cfg(test)]
-    fn ensure_oracle_statement_transaction_option_change_allowed(
-        prior_retained_state: RetainedSessionState,
+    /// Every refusal an Oracle statement must pass before it reaches the
+    /// server, as ONE answer that both drivers ask.
+    ///
+    /// It exists because the two refusals were two blocks written into each
+    /// batch loop, and the OCI loop had both while the thin loop had only the
+    /// first. So a script `SET TRANSACTION READ ONLY` or `ALTER SESSION SET
+    /// ISOLATION_LEVEL` after a PL/SQL block, a `CALL` or a `SET ROLE` — the
+    /// statements whose body the app cannot read, which is exactly when it
+    /// cannot know whether the session's transaction semantics moved under it
+    /// — was refused on OCI and ran on thin. One script, two clients.
+    ///
+    /// The rule they disagreed about is the app's ONE option-change rule,
+    /// which round 32 had just made answer the same on all four backends *for
+    /// every road that asks it*. Thin's statement road did not ask it at all,
+    /// and the unit tests pinned the shared FUNCTION rather than the ROAD, so
+    /// nothing could notice — the same shape as the two composers round 31
+    /// found one file over. A refusal that only one driver makes is a
+    /// difference the user meets as two different products.
+    ///
+    /// The order is part of the answer: the read-only pin is a question about
+    /// the STATEMENT and the option gate is a question about the SESSION, so a
+    /// statement a Read only tab refuses never costs the live probe. That is
+    /// what `retained_state_for_option_change` is a closure for — on OCI it is
+    /// a round trip to the server, and it must only happen for a statement
+    /// that really changes a transaction option.
+    ///
+    /// Both messages come back worded exactly as the batch shows them, so a
+    /// caller cannot prefix one refusal and not the other.
+    fn oracle_statement_preflight_refusal(
+        active_transaction_mode: crate::db::TransactionMode,
+        sql: &str,
         statement_effects: crate::db::StatementSessionEffects,
-        live_may_have_uncommitted_work: bool,
-    ) -> Result<(), String> {
-        if let Some(option) = statement_effects.transaction_option_change_kind() {
-            Self::ensure_oracle_retained_option_change_allowed(
-                prior_retained_state,
-                live_may_have_uncommitted_work,
-                option,
-            )?;
+        retained_state_for_option_change: impl FnOnce() -> RetainedSessionState,
+    ) -> Option<String> {
+        if let Some(message) = Self::transaction_mode_refusal_for_statement(
+            crate::db::DatabaseType::Oracle,
+            active_transaction_mode,
+            sql,
+        ) {
+            return Some(message);
         }
-        Ok(())
+        let option = statement_effects.transaction_option_change_kind()?;
+        Self::ensure_oracle_retained_state_option_change_allowed(
+            retained_state_for_option_change(),
+            option,
+        )
+        .err()
+        .map(|message| format!("Error: {message}"))
     }
 
     fn apply_oracle_db_statement_effects(
@@ -24960,7 +25145,7 @@ impl SqlEditorWidget {
         // before this function returns, so the cancel button's reach over it
         // ends exactly here.
         let finalize_registration = crate::db::ActionSessionCancelRegistration::new();
-        let retained_session = match Self::stale_take_reported(
+        let retained_session = match hand_back.stale_take_reported(
             pooled_db_session.take_reusable_lease(
                 hand_back.owner(),
                 connection_generation,
@@ -24970,7 +25155,6 @@ impl SqlEditorWidget {
                 &finalize_activity,
                 &finalize_registration,
             ),
-            hand_back.sender(),
             db_activity,
         ) {
             crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => retained_session,
@@ -24997,11 +25181,7 @@ impl SqlEditorWidget {
                 db_activity,
                 "MySQL batch retained-session finalization took a lease that is not a MySQL session",
             );
-            Self::report_retained_session_lost_with_work(
-                hand_back.sender(),
-                taken_retained_state,
-                db_activity,
-            );
+            hand_back.report_loss(taken_retained_state, db_activity);
             return;
         };
         let prior_may_have_uncommitted_work = prior_retained_state.may_have_uncommitted_work();
@@ -25863,7 +26043,7 @@ impl SqlEditorWidget {
         // same context and `preserve = false`, so the tail below must not
         // repeat that work (COM_INIT_DB + encoding round trips).
         let (mut conn, prior_retained_state, mut session_scope, scope_already_prepared) =
-            match Self::stale_take_reported(
+            match hand_back.stale_take_reported(
                 pooled_db_session.take_reusable_lease(
                     hand_back.owner(),
                     context.connection_generation,
@@ -25873,7 +26053,6 @@ impl SqlEditorWidget {
                     &activity,
                     registration_holder,
                 ),
-                session_pool_sender,
                 db_activity,
             ) {
                 crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => {
@@ -25886,11 +26065,7 @@ impl SqlEditorWidget {
                     let Some((mut conn, prior_retained_state, retained_scope)) =
                         retained_session.into_mysql_connection_with_retained_state_and_scope()
                     else {
-                        Self::report_retained_session_lost_with_work(
-                            hand_back.sender(),
-                            taken_retained_state,
-                            db_activity,
-                        );
+                        hand_back.report_loss(taken_retained_state, db_activity);
                         return Err(format!(
                             "Expected {} pool session",
                             context.connection_info.db_type
@@ -26391,15 +26566,19 @@ impl SqlEditorWidget {
 
     /// Ends the residual bookkeeping transaction left over from before a
     /// session-scoped transaction-mode change, so the change takes effect from
-    /// the next statement instead of one transaction later. Only when the
-    /// session carries no user work — work belongs to the user, and MySQL
-    /// applies the new characteristics from their next transaction anyway.
+    /// the next statement instead of one transaction later.
+    ///
+    /// Whether it may is [`crate::db::transaction_mode_change_returns_session_to_boundary`]'s
+    /// answer, not this function's: Oracle needs the same act for the same
+    /// reason (ORA-01453 rather than MySQL's start-of-transaction latch), and
+    /// the condition — no uncommitted work — has to be the same on all four
+    /// backends or one of them ends a transaction another would keep.
     fn end_mysql_residual_transaction_after_session_mode_change(
         conn: &mut mysql::PooledConn,
         retained_state: RetainedSessionState,
         log_context: &str,
     ) {
-        if retained_state.may_have_uncommitted_work() {
+        if !crate::db::transaction_mode_change_returns_session_to_boundary(retained_state) {
             return;
         }
         if let Err(err) = conn.query_drop("ROLLBACK") {
@@ -26704,292 +26883,98 @@ impl SqlEditorWidget {
         enabled: bool,
         db_activity: &str,
     ) -> crate::db::RetainedSessionMutationOutcome {
-        // A toolbar/menu option change runs on the UI thread with no batch of
-        // its own: the option gate has already refused it while the tab is
-        // executing, so there is no newer operation this session could belong
-        // to. It still states its reach: the round trips it makes are published
-        // to the cancel button, and that reach has to end when the session goes
-        // back to the tab's slot.
-        let mutation_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
-        let hand_back_owner = crate::db::SessionHandBackOwner::untracked(
-            crate::ui::sql_editor::WorkerSessionCancelReach::for_registration_holder(
-                None,
-                mutation_registration.clone(),
-            ),
-        );
-        let hand_back = BatchSessionHandBack::new(&hand_back_owner, None);
-        let Some(db_type) = Self::mysql_pooled_session_db_type_for_generation(
-            shared_connection,
-            connection_generation,
-            db_activity,
-        ) else {
-            return crate::db::RetainedSessionMutationOutcome::NoSession;
-        };
-        let RetainedSessionAction {
-            activity: mutation_activity,
-            connection_info: mutation_connection_info,
-        } = Self::begin_retained_session_action(shared_connection, db_activity, db_type);
-        // The option change runs on the session inside this function, so its
-        // cancel reach begins and ends here.
-
-        // A take that could not reach the tab's session CLOSED it, so this push
-        // has to say so rather than answer `NoSession` about a session that was
-        // there a moment ago.
-        let retained_session = match pooled_db_session.take_reusable_lease_for_context_update(
-            &hand_back_owner,
-            connection_generation,
-            db_type,
-            &mutation_connection_info,
-            &mutation_activity,
-            mutation_registration.as_ref(),
-        ) {
-            crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
-            crate::db::RetainedLeaseTake::Empty => {
+        Self::ui_action_on_retained_session(|loss| {
+            // A toolbar/menu option change runs on the UI thread with no batch of
+            // its own: the option gate has already refused it while the tab is
+            // executing, so there is no newer operation this session could belong
+            // to. It still states its reach: the round trips it makes are published
+            // to the cancel button, and that reach has to end when the session goes
+            // back to the tab's slot.
+            let mutation_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
+            let hand_back_owner = crate::db::SessionHandBackOwner::untracked(
+                crate::ui::sql_editor::WorkerSessionCancelReach::for_registration_holder(
+                    None,
+                    mutation_registration.clone(),
+                ),
+            );
+            let hand_back = BatchSessionHandBack::for_ui_action(&hand_back_owner, loss);
+            let Some(db_type) = Self::mysql_pooled_session_db_type_for_generation(
+                shared_connection,
+                connection_generation,
+                db_activity,
+            ) else {
                 return crate::db::RetainedSessionMutationOutcome::NoSession;
-            }
-            crate::db::RetainedLeaseTake::Unreachable { retained_state } => {
-                return crate::db::RetainedSessionMutationOutcome::for_unreachable_take(
-                    retained_state,
-                );
-            }
-        };
-        // The take handed the session over, so it is out of the slot: a lease
-        // that is not a MySQL session after all is GONE, and answering
-        // `NoSession` — the one answer that does not alert — would describe an
-        // empty slot instead of the loss. Same answer the unreachable take
-        // gives, stated once.
-        let taken_retained_state = retained_session.retained_state();
-        let Some((mut conn, prior_retained_state, session_scope)) =
-            retained_session.into_mysql_connection_with_retained_state_and_scope()
-        else {
-            return crate::db::RetainedSessionMutationOutcome::for_unreachable_take(
-                taken_retained_state,
-            );
-        };
+            };
+            let RetainedSessionAction {
+                activity: mutation_activity,
+                connection_info: mutation_connection_info,
+            } = Self::begin_retained_session_action(shared_connection, db_activity, db_type);
+            // The option change runs on the session inside this function, so its
+            // cancel reach begins and ends here.
 
-        if let Err(err) =
-            crate::db::DatabaseConnection::ensure_retained_session_option_change_allowed(
-                prior_retained_state,
-                "auto-commit",
-            )
-        {
-            Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
-                shared_connection,
-                pooled_db_session,
+            // A take that could not reach the tab's session CLOSED it, so this push
+            // has to say so rather than answer `NoSession` about a session that was
+            // there a moment ago.
+            let retained_session = match pooled_db_session.take_reusable_lease_for_context_update(
+                &hand_back_owner,
                 connection_generation,
-                pool_context_epoch,
-                conn,
-                prior_retained_state,
-                db_activity,
-                session_scope,
-                hand_back,
-            );
-            return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(err);
-        }
-
-        if let Err(err) = conn.query_drop(if enabled {
-            "SET autocommit=1"
-        } else {
-            "SET autocommit=0"
-        }) {
-            let message = SqlEditorWidget::mysql_error_message(&err, None);
-            let message = Self::discard_mysql_retained_session_after_option_change_error(
-                shared_connection,
-                pooled_db_session,
-                connection_generation,
-                pool_context_epoch,
-                conn,
-                prior_retained_state,
-                db_activity,
-                message,
-                session_scope,
-                hand_back,
-            );
-            return crate::db::RetainedSessionMutationOutcome::FailedDiscarded(message);
-        }
-
-        let state_hint = MySqlSessionStateHint {
-            clears_session_state: enabled,
-            may_leave_session_bound_state: !enabled,
-            may_leave_untracked_session_state: false,
-            may_hold_session_lock: false,
-            requires_retention_when_autocommit_off: false,
-            requires_transaction_decision_after_success: false,
-            changes_auto_commit: true,
-        };
-        let retained_state = Self::mysql_retained_session_state_after_statement(
-            db_type,
-            &mut conn,
-            db_activity,
-            prior_retained_state,
-            Self::mysql_autocommit_command_sql(enabled),
-            crate::db::StatementSessionEffects::from_state_hint(state_hint),
-            !enabled,
-            false,
-            prior_retained_state.may_have_uncommitted_work(),
-            false,
-        );
-        Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
-            shared_connection,
-            pooled_db_session,
-            connection_generation,
-            pool_context_epoch,
-            conn,
-            retained_state,
-            db_activity,
-            session_scope,
-            hand_back,
-        );
-        crate::db::RetainedSessionMutationOutcome::Applied
-    }
-
-    pub(super) fn apply_mysql_transaction_mode_to_reusable_pooled_session(
-        shared_connection: &crate::db::SharedConnection,
-        pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-        pool_context_epoch: u64,
-        mode: crate::db::TransactionMode,
-        db_activity: &str,
-    ) -> crate::db::RetainedSessionMutationOutcome {
-        // A toolbar/menu option change runs on the UI thread with no batch of
-        // its own: the option gate has already refused it while the tab is
-        // executing, so there is no newer operation this session could belong
-        // to. See the auto-commit twin for why the reach is still stated.
-        let mutation_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
-        let hand_back_owner = crate::db::SessionHandBackOwner::untracked(
-            crate::ui::sql_editor::WorkerSessionCancelReach::for_registration_holder(
-                None,
-                mutation_registration.clone(),
-            ),
-        );
-        let hand_back = BatchSessionHandBack::new(&hand_back_owner, None);
-        let Some((db_type, default_transaction_isolation)) = ({
-            let conn_guard =
-                lock_connection_with_activity(shared_connection, db_activity.to_string());
-            let db_type = conn_guard.db_type();
-            conn_guard
-                .can_reuse_pool_session(connection_generation, db_type)
-                .then_some((db_type, conn_guard.default_transaction_isolation()))
-        }) else {
-            return crate::db::RetainedSessionMutationOutcome::NoSession;
-        };
-        let RetainedSessionAction {
-            activity: mutation_activity,
-            connection_info: mutation_connection_info,
-        } = Self::begin_retained_session_action(shared_connection, db_activity, db_type);
-        // The option change runs on the session inside this function, so its
-        // cancel reach begins and ends here.
-
-        // A take that could not reach the tab's session CLOSED it, so this push
-        // has to say so rather than answer `NoSession` about a session that was
-        // there a moment ago.
-        let retained_session = match pooled_db_session.take_reusable_lease_for_context_update(
-            &hand_back_owner,
-            connection_generation,
-            db_type,
-            &mutation_connection_info,
-            &mutation_activity,
-            mutation_registration.as_ref(),
-        ) {
-            crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
-            crate::db::RetainedLeaseTake::Empty => {
-                return crate::db::RetainedSessionMutationOutcome::NoSession;
-            }
-            crate::db::RetainedLeaseTake::Unreachable { retained_state } => {
-                return crate::db::RetainedSessionMutationOutcome::for_unreachable_take(
-                    retained_state,
-                );
-            }
-        };
-        // The take handed the session over, so it is out of the slot: a lease
-        // that is not a MySQL session after all is GONE, and answering
-        // `NoSession` — the one answer that does not alert — would describe an
-        // empty slot instead of the loss. Same answer the unreachable take
-        // gives, stated once.
-        let taken_retained_state = retained_session.retained_state();
-        let Some((mut conn, prior_retained_state, session_scope)) =
-            retained_session.into_mysql_connection_with_retained_state_and_scope()
-        else {
-            return crate::db::RetainedSessionMutationOutcome::for_unreachable_take(
-                taken_retained_state,
-            );
-        };
-
-        if let Err(err) = Self::ensure_mysql_retained_session_statement_option_change_allowed(
-            prior_retained_state,
-            crate::db::TransactionOptionKind::TransactionMode,
-        ) {
-            Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
-                shared_connection,
-                pooled_db_session,
-                connection_generation,
-                pool_context_epoch,
-                conn,
-                prior_retained_state,
-                db_activity,
-                session_scope,
-                hand_back,
-            );
-            return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(err);
-        }
-
-        let apply_result = (|| {
-            // Replacing the mode clears the tracked override residue below, so
-            // a pending server-side one-shot SET TRANSACTION must actually be
-            // consumed first — a session-scope SET does not cancel it, and the
-            // next transaction would otherwise silently run under the stale
-            // one-shot instead of the mode the toolbar now shows. Safe here:
-            // the replaceable state carries no user work, so an empty
-            // rolled-back transaction discards nothing.
-            if prior_retained_state.may_have_transaction_mode_override() {
-                use mysql::prelude::Queryable;
-                for statement in ["ROLLBACK", "START TRANSACTION", "ROLLBACK"] {
-                    conn.query_drop(statement).map_err(|err| {
-                        format!("Failed to supersede the pending transaction mode: {err}")
-                    })?;
-                }
-            }
-            crate::db::DatabaseConnection::apply_mysql_transaction_mode_for_db_with_default(
-                &mut conn,
-                mode,
                 db_type,
-                default_transaction_isolation,
-            )?;
-            // MySQL fixes a transaction's isolation and access mode at its
-            // START, and the statements this tab has already run have usually
-            // left a transaction open on this session (a plain read under
-            // manual commit is enough). The SET above changes the session, not
-            // that transaction — and the next statement's setup skips its own
-            // ROLLBACK precisely because the session now reads as correct, so
-            // the user's next statement would run under the mode the toolbar
-            // has just replaced (live-observed on MySQL 8.0: the INSERT after
-            // a Read only pin succeeded). End it here, on the same "no user
-            // work" condition the adopted-statement path uses.
-            Self::end_mysql_residual_transaction_after_session_mode_change(
-                &mut conn,
+                &mutation_connection_info,
+                &mutation_activity,
+                mutation_registration.as_ref(),
+            ) {
+                crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
+                crate::db::RetainedLeaseTake::Empty => {
+                    return crate::db::RetainedSessionMutationOutcome::NoSession;
+                }
+                crate::db::RetainedLeaseTake::Unreachable { retained_state } => {
+                    return crate::db::RetainedSessionMutationOutcome::for_unreachable_take(
+                        retained_state,
+                    );
+                }
+            };
+            // The take handed the session over, so it is out of the slot: a lease
+            // that is not a MySQL session after all is GONE, and answering
+            // `NoSession` — the one answer that does not alert — would describe an
+            // empty slot instead of the loss. Same answer the unreachable take
+            // gives, stated once.
+            let taken_retained_state = retained_session.retained_state();
+            let Some((mut conn, prior_retained_state, session_scope)) =
+                retained_session.into_mysql_connection_with_retained_state_and_scope()
+            else {
+                return crate::db::RetainedSessionMutationOutcome::for_unreachable_take(
+                    taken_retained_state,
+                );
+            };
+
+            // The one gate, named by the OPTION rather than by a label string: the
+            // backend escape it dispatches on is part of the rule, and a road that
+            // calls the DB layer directly has quietly opted out of it.
+            if let Err(err) = Self::ensure_retained_session_option_change_allowed(
+                db_type,
                 prior_retained_state,
-                db_activity,
-            );
-            Ok(())
-        })();
-        match apply_result {
-            Ok(()) => {
+                crate::db::TransactionOptionKind::AutoCommit,
+            ) {
                 Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                     shared_connection,
                     pooled_db_session,
                     connection_generation,
                     pool_context_epoch,
                     conn,
-                    prior_retained_state
-                        .with_transaction_state(TransactionSessionState::Clean)
-                        .with_transaction_mode_override_cleared(),
+                    prior_retained_state,
                     db_activity,
                     session_scope,
                     hand_back,
                 );
-                crate::db::RetainedSessionMutationOutcome::Applied
+                return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(err);
             }
-            Err(message) => {
+
+            if let Err(err) = conn.query_drop(if enabled {
+                "SET autocommit=1"
+            } else {
+                "SET autocommit=0"
+            }) {
+                let message = SqlEditorWidget::mysql_error_message(&err, None);
                 let message = Self::discard_mysql_retained_session_after_option_change_error(
                     shared_connection,
                     pooled_db_session,
@@ -27002,9 +26987,386 @@ impl SqlEditorWidget {
                     session_scope,
                     hand_back,
                 );
-                crate::db::RetainedSessionMutationOutcome::FailedDiscarded(message)
+                return crate::db::RetainedSessionMutationOutcome::FailedDiscarded(message);
             }
-        }
+
+            let state_hint = MySqlSessionStateHint {
+                clears_session_state: enabled,
+                may_leave_session_bound_state: !enabled,
+                may_leave_untracked_session_state: false,
+                may_hold_session_lock: false,
+                requires_retention_when_autocommit_off: false,
+                requires_transaction_decision_after_success: false,
+                changes_auto_commit: true,
+            };
+            let retained_state = Self::mysql_retained_session_state_after_statement(
+                db_type,
+                &mut conn,
+                db_activity,
+                prior_retained_state,
+                Self::mysql_autocommit_command_sql(enabled),
+                crate::db::StatementSessionEffects::from_state_hint(state_hint),
+                !enabled,
+                false,
+                prior_retained_state.may_have_uncommitted_work(),
+                false,
+            );
+            Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
+                shared_connection,
+                pooled_db_session,
+                connection_generation,
+                pool_context_epoch,
+                conn,
+                retained_state,
+                db_activity,
+                session_scope,
+                hand_back,
+            );
+            crate::db::RetainedSessionMutationOutcome::Applied
+        })
+    }
+
+    /// Run a UI-thread push on the tab's retained session, and make what it
+    /// COST part of the answer.
+    ///
+    /// These pushes — the object browser's scope pick, the auto-commit toggle,
+    /// the transaction-mode pick — run on the FLTK thread with no operation of
+    /// their own, so they have no progress channel: the one place the user can
+    /// hear "the session you were holding is gone, and your transaction with
+    /// it" is the value they return. Three of the four roads wrote that
+    /// sentence out themselves and the two MySQL-family ones did not, so the
+    /// same action reported the same event on Oracle and stayed silent on
+    /// MySQL and MariaDB.
+    ///
+    /// So no road writes it any more. Each records through its hand-back's
+    /// audience ([`SessionLossAudience::UiAction`]) or through
+    /// [`UiActionSessionLoss::record_lost_work`], and THIS is the only way into
+    /// them — an early `return` on a refusal cannot skip a fold that happens
+    /// after the closure returns.
+    pub(super) fn ui_action_on_retained_session(
+        run: impl FnOnce(&UiActionSessionLoss) -> crate::db::RetainedSessionMutationOutcome,
+    ) -> crate::db::RetainedSessionMutationOutcome {
+        let loss = UiActionSessionLoss::default();
+        let outcome = run(&loss);
+        outcome.with_session_loss(loss.lost_work())
+    }
+
+    /// The Oracle half of the toolbar's transaction-mode write path, and what
+    /// "apply" means on this backend.
+    ///
+    /// Neither of Oracle's two mode statements is a setting to push onto a
+    /// retained session the way MySQL's `SET SESSION TRANSACTION …` is: the
+    /// access mode is per TRANSACTION (`SET TRANSACTION READ ONLY`) and the
+    /// isolation level is stated by every batch before its first statement, on
+    /// whichever session it runs on, unconditionally
+    /// (`OracleTransactionModeApplication`, both drivers). So the pin alone
+    /// would be enough — except for one thing, which is the whole reason this
+    /// road exists: in Oracle a query has already BEGUN the transaction, and
+    /// `SET TRANSACTION` must be the first statement of its own (ORA-01453).
+    /// A tab that has just read a table would therefore keep running under the
+    /// mode the toolbar has just replaced.
+    ///
+    /// This used to be expressed by DISCARDING the tab's session — the only
+    /// other way back to a transaction boundary, and one that also threw away
+    /// everything else the session carried (global temporary table rows,
+    /// `DBMS_OUTPUT` state, session settings, the residue the app itself
+    /// models) while reporting `Applied`. It also forced two Oracle-only rules
+    /// beside it: a toolbar pre-block asking `requires_physical_session_
+    /// preservation` (the right question for a road that destroys), and a
+    /// statement road that answered the option gate leniently. Ending the
+    /// transaction IN PLACE — the same act, and now under the same rule, as the
+    /// MySQL twin's `end_mysql_residual_transaction_after_session_mode_change`
+    /// — removes all three.
+    pub(super) fn apply_oracle_transaction_mode_to_reusable_pooled_session(
+        shared_connection: &crate::db::SharedConnection,
+        pooled_db_session: &SharedDbSessionLease,
+        connection_generation: u64,
+        pool_context_epoch: u64,
+        query_timeout: Option<Duration>,
+        db_activity: &str,
+    ) -> crate::db::RetainedSessionMutationOutcome {
+        Self::ui_action_on_retained_session(|loss| {
+            // Same reach as the MySQL twin: a UI-thread action on the tab's own
+            // session, published so a cancel or a disconnect can reach it.
+            let mutation_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
+            let hand_back_owner = crate::db::SessionHandBackOwner::untracked(
+                crate::ui::sql_editor::WorkerSessionCancelReach::for_registration_holder(
+                    None,
+                    mutation_registration.clone(),
+                ),
+            );
+            let Some(db_type) = ({
+                let conn_guard =
+                    lock_connection_with_activity(shared_connection, db_activity.to_string());
+                let db_type = conn_guard.db_type();
+                conn_guard
+                    .can_reuse_pool_session(connection_generation, db_type)
+                    .then_some(db_type)
+            }) else {
+                return crate::db::RetainedSessionMutationOutcome::NoSession;
+            };
+            let RetainedSessionAction {
+                activity: mutation_activity,
+                connection_info: mutation_connection_info,
+            } = Self::begin_retained_session_action(shared_connection, db_activity, db_type);
+
+            let mut retained_session = match pooled_db_session
+                .take_reusable_lease_for_context_update(
+                    &hand_back_owner,
+                    connection_generation,
+                    db_type,
+                    &mutation_connection_info,
+                    &mutation_activity,
+                    mutation_registration.as_ref(),
+                ) {
+                crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
+                crate::db::RetainedLeaseTake::Empty => {
+                    // Nothing retained: the tab's next acquisition prepares a
+                    // session at the new mode anyway.
+                    return crate::db::RetainedSessionMutationOutcome::NoSession;
+                }
+                crate::db::RetainedLeaseTake::Unreachable { retained_state } => {
+                    return crate::db::RetainedSessionMutationOutcome::for_unreachable_take(
+                        retained_state,
+                    );
+                }
+            };
+            let retained_state = retained_session.retained_state();
+
+            // The same gate the toolbar asked before the tab was pinned, on the
+            // state this take actually found. One rule, asked twice about one
+            // session — never two rules.
+            if let Err(message) = Self::ensure_retained_session_option_change_allowed(
+                db_type,
+                retained_state,
+                crate::db::TransactionOptionKind::TransactionMode,
+            ) {
+                // The refusal is about the session, so it goes back — and if it
+                // could not, the loss is the bigger fact. Both reach the user,
+                // because the fold outranks the refusal rather than replacing it.
+                let hand_back =
+                    retained_session.restore_with_context_epoch(pool_context_epoch, retained_state);
+                loss.record_lost_work(hand_back.lost_work());
+                return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(
+                    message,
+                );
+            }
+
+            if !crate::db::transaction_mode_change_returns_session_to_boundary(retained_state) {
+                // Unreachable through the gate above, and stated rather than
+                // assumed: work belongs to the user, and Oracle applies the new
+                // mode from their own next transaction.
+                return Self::retained_session_hand_back_outcome(
+                    retained_session.restore_with_context_epoch(pool_context_epoch, retained_state),
+                    loss,
+                );
+            }
+
+            let result = retained_session
+                .lease_mut()
+                .ok_or_else(|| "No retained DB session for this tab.".to_string())
+                .and_then(|lease| lease.end_transaction_for_mode_change(query_timeout));
+            match result {
+                Ok(()) => {
+                    // The transaction is over, so the session is Clean whatever the
+                    // gate let through; residue and locks are not the transaction
+                    // and stay exactly where they were. The hand-back still ANSWERS
+                    // — a slot that has been closed under this action discards what
+                    // it is given, and every road that ends a session says what it
+                    // cost.
+                    Self::retained_session_hand_back_outcome(
+                        retained_session.restore_with_context_epoch(
+                            pool_context_epoch,
+                            retained_state.with_transaction_state(TransactionSessionState::Clean),
+                        ),
+                        loss,
+                    )
+                }
+                Err(message) => {
+                    let session_is_usable = retained_session.session_is_usable();
+                    if session_is_usable
+                        && Self::oracle_error_message_allows_session_reuse(&message)
+                    {
+                        let hand_back = retained_session
+                            .restore_with_context_epoch(pool_context_epoch, retained_state);
+                        loss.record_lost_work(hand_back.lost_work());
+                        return crate::db::RetainedSessionMutationOutcome::FailedRestored(message);
+                    }
+                    // The session cannot be spoken to any more. It goes, and the
+                    // caller hears what that cost — the promise every other road
+                    // that closes a session makes.
+                    loss.record_lost_work(retained_state.may_have_uncommitted_work());
+                    let _ = retained_session.discard();
+                    crate::db::RetainedSessionMutationOutcome::FailedDiscarded(message)
+                }
+            }
+        })
+    }
+
+    pub(super) fn apply_mysql_transaction_mode_to_reusable_pooled_session(
+        shared_connection: &crate::db::SharedConnection,
+        pooled_db_session: &SharedDbSessionLease,
+        connection_generation: u64,
+        pool_context_epoch: u64,
+        mode: crate::db::TransactionMode,
+        db_activity: &str,
+    ) -> crate::db::RetainedSessionMutationOutcome {
+        Self::ui_action_on_retained_session(|loss| {
+            // A toolbar/menu option change runs on the UI thread with no batch of
+            // its own: the option gate has already refused it while the tab is
+            // executing, so there is no newer operation this session could belong
+            // to. See the auto-commit twin for why the reach is still stated.
+            let mutation_registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
+            let hand_back_owner = crate::db::SessionHandBackOwner::untracked(
+                crate::ui::sql_editor::WorkerSessionCancelReach::for_registration_holder(
+                    None,
+                    mutation_registration.clone(),
+                ),
+            );
+            let hand_back = BatchSessionHandBack::for_ui_action(&hand_back_owner, loss);
+            let Some((db_type, default_transaction_isolation)) = ({
+                let conn_guard =
+                    lock_connection_with_activity(shared_connection, db_activity.to_string());
+                let db_type = conn_guard.db_type();
+                conn_guard
+                    .can_reuse_pool_session(connection_generation, db_type)
+                    .then_some((db_type, conn_guard.default_transaction_isolation()))
+            }) else {
+                return crate::db::RetainedSessionMutationOutcome::NoSession;
+            };
+            let RetainedSessionAction {
+                activity: mutation_activity,
+                connection_info: mutation_connection_info,
+            } = Self::begin_retained_session_action(shared_connection, db_activity, db_type);
+            // The option change runs on the session inside this function, so its
+            // cancel reach begins and ends here.
+
+            // A take that could not reach the tab's session CLOSED it, so this push
+            // has to say so rather than answer `NoSession` about a session that was
+            // there a moment ago.
+            let retained_session = match pooled_db_session.take_reusable_lease_for_context_update(
+                &hand_back_owner,
+                connection_generation,
+                db_type,
+                &mutation_connection_info,
+                &mutation_activity,
+                mutation_registration.as_ref(),
+            ) {
+                crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
+                crate::db::RetainedLeaseTake::Empty => {
+                    return crate::db::RetainedSessionMutationOutcome::NoSession;
+                }
+                crate::db::RetainedLeaseTake::Unreachable { retained_state } => {
+                    return crate::db::RetainedSessionMutationOutcome::for_unreachable_take(
+                        retained_state,
+                    );
+                }
+            };
+            // The take handed the session over, so it is out of the slot: a lease
+            // that is not a MySQL session after all is GONE, and answering
+            // `NoSession` — the one answer that does not alert — would describe an
+            // empty slot instead of the loss. Same answer the unreachable take
+            // gives, stated once.
+            let taken_retained_state = retained_session.retained_state();
+            let Some((mut conn, prior_retained_state, session_scope)) =
+                retained_session.into_mysql_connection_with_retained_state_and_scope()
+            else {
+                return crate::db::RetainedSessionMutationOutcome::for_unreachable_take(
+                    taken_retained_state,
+                );
+            };
+
+            if let Err(err) = Self::ensure_mysql_retained_session_statement_option_change_allowed(
+                prior_retained_state,
+                crate::db::TransactionOptionKind::TransactionMode,
+            ) {
+                Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
+                    shared_connection,
+                    pooled_db_session,
+                    connection_generation,
+                    pool_context_epoch,
+                    conn,
+                    prior_retained_state,
+                    db_activity,
+                    session_scope,
+                    hand_back,
+                );
+                return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(err);
+            }
+
+            let apply_result = (|| {
+                // Replacing the mode clears the tracked override residue below, so
+                // a pending server-side one-shot SET TRANSACTION must actually be
+                // consumed first — a session-scope SET does not cancel it, and the
+                // next transaction would otherwise silently run under the stale
+                // one-shot instead of the mode the toolbar now shows. Safe here:
+                // the replaceable state carries no user work, so an empty
+                // rolled-back transaction discards nothing.
+                if prior_retained_state.may_have_transaction_mode_override() {
+                    use mysql::prelude::Queryable;
+                    for statement in ["ROLLBACK", "START TRANSACTION", "ROLLBACK"] {
+                        conn.query_drop(statement).map_err(|err| {
+                            format!("Failed to supersede the pending transaction mode: {err}")
+                        })?;
+                    }
+                }
+                crate::db::DatabaseConnection::apply_mysql_transaction_mode_for_db_with_default(
+                    &mut conn,
+                    mode,
+                    db_type,
+                    default_transaction_isolation,
+                )?;
+                // MySQL fixes a transaction's isolation and access mode at its
+                // START, and the statements this tab has already run have usually
+                // left a transaction open on this session (a plain read under
+                // manual commit is enough). The SET above changes the session, not
+                // that transaction — and the next statement's setup skips its own
+                // ROLLBACK precisely because the session now reads as correct, so
+                // the user's next statement would run under the mode the toolbar
+                // has just replaced (live-observed on MySQL 8.0: the INSERT after
+                // a Read only pin succeeded). End it here, on the same "no user
+                // work" condition the adopted-statement path uses.
+                Self::end_mysql_residual_transaction_after_session_mode_change(
+                    &mut conn,
+                    prior_retained_state,
+                    db_activity,
+                );
+                Ok(())
+            })();
+            match apply_result {
+                Ok(()) => {
+                    Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
+                        shared_connection,
+                        pooled_db_session,
+                        connection_generation,
+                        pool_context_epoch,
+                        conn,
+                        prior_retained_state
+                            .with_transaction_state(TransactionSessionState::Clean)
+                            .with_transaction_mode_override_cleared(),
+                        db_activity,
+                        session_scope,
+                        hand_back,
+                    );
+                    crate::db::RetainedSessionMutationOutcome::Applied
+                }
+                Err(message) => {
+                    let message = Self::discard_mysql_retained_session_after_option_change_error(
+                        shared_connection,
+                        pooled_db_session,
+                        connection_generation,
+                        pool_context_epoch,
+                        conn,
+                        prior_retained_state,
+                        db_activity,
+                        message,
+                        session_scope,
+                        hand_back,
+                    );
+                    crate::db::RetainedSessionMutationOutcome::FailedDiscarded(message)
+                }
+            }
+        })
     }
 
     fn mysql_pooled_action_can_reuse_session<T>(
@@ -30925,18 +31287,114 @@ mod query_execution_cleanup_tests {
         assert!(err.contains(clean_with_lock.label()));
     }
 
-    #[test]
-    fn oracle_statement_transaction_option_change_blocks_dirty_retained_state() {
+    /// The Oracle statement preflight as BOTH batch loops ask it, for a tab
+    /// that has pinned no transaction mode — so what comes back is the option
+    /// gate's answer alone.
+    ///
+    /// Asked through the production function rather than a test-only twin of
+    /// it: a rule with a test-only spelling is the rule production stops
+    /// running, which is how the thin loop came to have no option gate at all
+    /// while these tests passed.
+    fn oracle_statement_option_change_refusal(
+        prior_retained_state: RetainedSessionState,
+        sql: &str,
+        live_may_have_uncommitted_work: bool,
+    ) -> Option<String> {
         let effects =
             crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
-                .effects_for_sql("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE");
+                .effects_for_sql(sql);
+        SqlEditorWidget::oracle_statement_preflight_refusal(
+            crate::db::TransactionMode::default(),
+            sql,
+            effects,
+            || {
+                SqlEditorWidget::oracle_retained_state_for_option_change(
+                    prior_retained_state,
+                    live_may_have_uncommitted_work,
+                )
+            },
+        )
+    }
+
+    /// A UI-thread push that lost the tab's work-carrying session says so,
+    /// whatever else it was going to answer — on every backend.
+    ///
+    /// The MySQL-family twins used to build their hand-back with no progress
+    /// sender, and `report_retained_session_lost_with_work` treats "no sender"
+    /// as "nothing to do": the loss reached the log and stopped there, while
+    /// the Oracle twin answered it. The audience makes that unrepresentable,
+    /// and the fold is where the sentence lives.
+    #[test]
+    fn a_ui_push_answers_the_session_it_lost_whatever_else_it_says() {
+        use crate::db::RetainedSessionMutationOutcome;
+
+        let dirty =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+        let clean = RetainedSessionState::default();
+
+        // A refusal is not an alternative to the loss: the user gets both, and
+        // the outcome is the one that alerts.
+        let refused = SqlEditorWidget::ui_action_on_retained_session(|loss| {
+            loss.record_lost_work(dirty.may_have_uncommitted_work());
+            RetainedSessionMutationOutcome::BlockedRequiresResolution(
+                "Cannot change transaction mode".to_string(),
+            )
+        });
+        let message = refused
+            .message()
+            .expect("a refusal that also lost the session must carry both facts");
+        assert!(message.contains("Cannot change transaction mode"));
+        assert!(
+            message.contains(crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK)
+        );
+        assert!(matches!(
+            refused,
+            RetainedSessionMutationOutcome::FailedDiscarded(_)
+        ));
+        assert!(refused.should_alert_user());
+
+        // A push that lost nothing keeps its own answer exactly.
+        let kept = SqlEditorWidget::ui_action_on_retained_session(|loss| {
+            loss.record_lost_work(clean.may_have_uncommitted_work());
+            RetainedSessionMutationOutcome::Applied
+        });
+        assert!(matches!(kept, RetainedSessionMutationOutcome::Applied));
+
+        // And the road the MySQL family really takes: the hand-back's own
+        // audience records it, because that road never sees a `lost_work()`
+        // boolean of its own.
+        let registration = Arc::new(crate::db::ActionSessionCancelRegistration::new());
+        let owner = crate::db::SessionHandBackOwner::untracked(
+            crate::ui::sql_editor::WorkerSessionCancelReach::for_registration_holder(
+                None,
+                registration.clone(),
+            ),
+        );
+        let through_audience = SqlEditorWidget::ui_action_on_retained_session(|loss| {
+            crate::ui::sql_editor::execution::BatchSessionHandBack::for_ui_action(&owner, loss)
+                .release_without_door(dirty, "test::ui_push_loss");
+            RetainedSessionMutationOutcome::Applied
+        });
+        assert!(
+            matches!(
+                through_audience,
+                RetainedSessionMutationOutcome::FailedDiscarded(_)
+            ),
+            "a hand-back with no operation to send on must still reach the answer"
+        );
+    }
+
+    #[test]
+    fn oracle_statement_transaction_option_change_blocks_dirty_retained_state() {
         let prior =
             RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
 
-        let err = SqlEditorWidget::ensure_oracle_statement_transaction_option_change_allowed(
-            prior, effects, false,
+        let err = oracle_statement_option_change_refusal(
+            prior,
+            "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE",
+            false,
         )
-        .expect_err("Oracle raw transaction mode changes must block dirty retained sessions");
+        .expect("Oracle raw transaction mode changes must block dirty retained sessions");
 
         assert!(err.contains("transaction mode"));
         assert!(err.contains(prior.label()));
@@ -30944,16 +31402,11 @@ mod query_execution_cleanup_tests {
 
     #[test]
     fn oracle_set_transaction_option_change_blocks_dirty_retained_state() {
-        let effects =
-            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
-                .effects_for_sql("SET TRANSACTION READ ONLY");
         let prior =
             RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
 
-        let err = SqlEditorWidget::ensure_oracle_statement_transaction_option_change_allowed(
-            prior, effects, false,
-        )
-        .expect_err("Oracle SET TRANSACTION must block dirty retained sessions");
+        let err = oracle_statement_option_change_refusal(prior, "SET TRANSACTION READ ONLY", false)
+            .expect("Oracle SET TRANSACTION must block dirty retained sessions");
 
         assert!(err.contains("transaction mode"));
         assert!(err.contains(prior.label()));
@@ -30983,12 +31436,16 @@ mod query_execution_cleanup_tests {
             TransactionSessionState::MaybeDirty
         );
 
-        let err = cleanup
-            .ensure_oracle_statement_transaction_option_change_allowed(
-                post_processor.effects_for_sql("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE"),
-                false,
-            )
-            .expect_err("current transaction state must block later mode changes");
+        // Through the closure the OCI loop hands the preflight: the state the
+        // BATCH has tracked so far, merged with the live probe answer.
+        let mode_change = "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE";
+        let err = SqlEditorWidget::oracle_statement_preflight_refusal(
+            crate::db::TransactionMode::default(),
+            mode_change,
+            post_processor.effects_for_sql(mode_change),
+            || cleanup.oracle_current_retained_state(false),
+        )
+        .expect("current transaction state must block later mode changes");
         assert!(err.contains("transaction mode"));
         assert!(err.contains(TransactionSessionState::MaybeDirty.label()));
     }
@@ -31117,57 +31574,108 @@ mod query_execution_cleanup_tests {
 
     #[test]
     fn oracle_statement_transaction_option_change_allows_clean_retained_residue() {
-        let effects =
-            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
-                .effects_for_sql("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE");
         let prior = RetainedSessionState::from_parts(
             TransactionSessionState::Clean,
             SessionResidueState::user_variable_for_test(),
             SessionLockState::default(),
         );
 
-        assert!(
-            SqlEditorWidget::ensure_oracle_statement_transaction_option_change_allowed(
-                prior, effects, false,
-            )
-            .is_ok(),
+        assert_eq!(
+            oracle_statement_option_change_refusal(
+                prior,
+                "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE",
+                false,
+            ),
+            None,
             "clean session residue should not block Oracle transaction mode changes"
         );
     }
 
+    /// UNKNOWN residue blocks an option change on Oracle too — the same answer
+    /// the MySQL family gives for the same state.
+    ///
+    /// This test asserted the opposite, and the behaviour it pinned was the
+    /// Oracle statement road answering the app's option-change rule MINUS its
+    /// residue term. The distinction it was really about is kept by its sibling
+    /// above: TYPED residue (a user variable, a temp table, a session setting)
+    /// is not transaction-option state and never blocked. UNKNOWN residue is
+    /// the other thing — a body the app could not read, which is exactly when
+    /// it cannot know whether the session's transaction semantics were changed
+    /// under it, and when an Oracle write probe cannot see a transaction the
+    /// block may have opened. `SET AUTOCOMMIT ON` over that commits work the
+    /// user never asked to commit, which is the reason residue keeps blocking
+    /// option CHANGES long after it stopped blocking the next EXECUTION.
+    ///
+    /// Pinned as "the same answer on every backend" rather than as Oracle's
+    /// own, because one rule asked by two backends with two answers is what
+    /// this was.
     #[test]
-    fn oracle_statement_transaction_option_change_allows_clean_unknown_session_residue() {
-        let effects =
-            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
-                .effects_for_sql("SET TRANSACTION READ WRITE NAME 'sq-oracle-final'");
+    fn unknown_session_residue_blocks_an_option_change_on_every_backend() {
         let prior = RetainedSessionState::from_parts(
             TransactionSessionState::Clean,
             SessionResidueState::new(true),
             SessionLockState::default(),
         );
 
-        assert!(
-            SqlEditorWidget::ensure_oracle_statement_transaction_option_change_allowed(
-                prior, effects, false,
+        for (db_type, sql) in [
+            (
+                crate::db::DatabaseType::Oracle,
+                "SET TRANSACTION READ WRITE NAME 'sq-oracle-final'",
+            ),
+            (
+                crate::db::DatabaseType::Oracle,
+                "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE",
+            ),
+            (
+                crate::db::DatabaseType::MySQL,
+                "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            ),
+            (
+                crate::db::DatabaseType::MariaDB,
+                "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            ),
+        ] {
+            let effects =
+                crate::db::statement_session_post_processor_for(db_type).effects_for_sql(sql);
+            let option = effects
+                .transaction_option_change_kind()
+                .expect("this statement changes a transaction option");
+            let err = SqlEditorWidget::ensure_retained_session_option_change_allowed(
+                db_type, prior, option,
             )
-            .is_ok(),
-            "clean Oracle session residue must not block SET TRANSACTION"
+            .expect_err("unknown residue must block an option change on every backend");
+            assert!(
+                err.contains(prior.label()),
+                "{db_type}: the refusal must name what is blocking it: {err}"
+            );
+            assert!(
+                err.contains("discard"),
+                "{db_type}: and the remedy that actually clears it: {err}"
+            );
+        }
+
+        // The Oracle statement road reaches that rule through the preflight
+        // BOTH drivers ask, which adds only the LIVE probe answer -- so it must
+        // agree with it.
+        assert!(
+            oracle_statement_option_change_refusal(
+                prior,
+                "SET TRANSACTION READ WRITE NAME 'sq-oracle-final'",
+                false,
+            )
+            .is_some(),
+            "the Oracle statement road must ask the same rule as every other road"
         );
     }
 
     #[test]
     fn oracle_non_option_statement_does_not_run_transaction_option_guard() {
-        let effects =
-            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
-                .effects_for_sql("SELECT * FROM dual");
         let prior =
             RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
 
-        assert!(
-            SqlEditorWidget::ensure_oracle_statement_transaction_option_change_allowed(
-                prior, effects, false,
-            )
-            .is_ok()
+        assert_eq!(
+            oracle_statement_option_change_refusal(prior, "SELECT * FROM dual", false),
+            None
         );
     }
 
@@ -34044,24 +34552,72 @@ mod query_execution_cleanup_tests {
             );
         }
 
-        // The MySQL family's OTHER half is still refused, and now from the same
-        // answer: the server honours an explicit per-transaction READ WRITE
-        // over a READ ONLY session characteristic, so the escape statement
-        // itself has to be refused.
-        for db_type in [
-            crate::db::DatabaseType::MySQL,
-            crate::db::DatabaseType::MariaDB,
+        // The per-transaction READ WRITE escape is refused on EVERY backend,
+        // from the same answer: the server honours it over the READ ONLY that
+        // opened the transaction — the session characteristic on the MySQL
+        // family, the app's own `SET TRANSACTION READ ONLY` on Oracle.
+        //
+        // Oracle was the one that did not refuse it, because its allowlist
+        // refuses everything that WRITES afterwards. A locking READ is what
+        // that argument misses: `SELECT … FOR UPDATE` is a query, so the
+        // allowlist admits it, and the read-only transaction this statement
+        // ends was the only thing refusing it — so
+        // `COMMIT; SET TRANSACTION READ WRITE; SELECT … FOR UPDATE` took locks
+        // other sessions wait for on a tab pinned Read only.
+        for (db_type, sql) in [
+            (crate::db::DatabaseType::MySQL, "SET TRANSACTION READ WRITE"),
+            (
+                crate::db::DatabaseType::MySQL,
+                "START TRANSACTION READ WRITE",
+            ),
+            (
+                crate::db::DatabaseType::MariaDB,
+                "SET TRANSACTION READ WRITE",
+            ),
+            (
+                crate::db::DatabaseType::MariaDB,
+                "START TRANSACTION READ WRITE",
+            ),
+            (
+                crate::db::DatabaseType::Oracle,
+                "SET TRANSACTION READ WRITE",
+            ),
+            (
+                crate::db::DatabaseType::Oracle,
+                "SET TRANSACTION READ WRITE NAME 'x'",
+            ),
         ] {
-            for sql in ["SET TRANSACTION READ WRITE", "START TRANSACTION READ WRITE"] {
-                assert!(
-                    refusal(db_type, read_only, sql).is_some(),
-                    "{db_type} must refuse the escape {sql}"
-                );
-                assert!(
-                    refusal(db_type, read_write, sql).is_none(),
-                    "{db_type} a Read write tab refuses nothing"
-                );
-            }
+            assert!(
+                refusal(db_type, read_only, sql).is_some(),
+                "{db_type} must refuse the escape {sql}"
+            );
+            assert!(
+                refusal(db_type, read_write, sql).is_none(),
+                "{db_type} a Read write tab refuses nothing"
+            );
+        }
+        // And the statements a pinned tab still needs stay allowed: stating an
+        // isolation level, or asking for the mode the pin already has.
+        for (db_type, sql) in [
+            (
+                crate::db::DatabaseType::Oracle,
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            ),
+            (crate::db::DatabaseType::Oracle, "SET TRANSACTION READ ONLY"),
+            (
+                crate::db::DatabaseType::Oracle,
+                "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE",
+            ),
+            (
+                crate::db::DatabaseType::MySQL,
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            ),
+            (crate::db::DatabaseType::MySQL, "SET TRANSACTION READ ONLY"),
+        ] {
+            assert!(
+                refusal(db_type, read_only, sql).is_none(),
+                "{db_type} must still allow {sql} on a Read only tab"
+            );
         }
 
         // And the MySQL family still delegates the rest to the server, which is
@@ -34393,6 +34949,53 @@ mod query_execution_cleanup_tests {
                 false,
             ),
             crate::db::RetainedSessionDisposition::DiscardPhysical(_)
+        ));
+    }
+
+    /// A refusal the APP made is not a failure a cancel could have caused, so
+    /// it must not put the tab's session through the interrupt policy.
+    ///
+    /// The inputs are the ones
+    /// `oracle_thin_general_cancel_with_error_discards_physical_session` uses —
+    /// which DISCARDS the session — with one bit changed: the failure was the
+    /// batch refusing a statement (a Read only tab refusing a write, the
+    /// transaction-option gate refusing a `SET TRANSACTION`), so it never
+    /// reached the server and the session is exactly as the batch found it.
+    /// The thin loop used to answer `had_error = true` for those, so a user who
+    /// pressed Cancel while such a batch ran could lose the session and the
+    /// transaction in it. The OCI twin never counted them
+    /// (`oracle_cancel_affects_session_policy` asks whether the session was
+    /// INVALIDATED or a decision is REQUIRED).
+    #[test]
+    fn a_refusal_the_app_made_is_not_a_failure_a_cancel_could_have_caused() {
+        assert!(matches!(
+            SqlEditorWidget::oracle_thin_execution_disposition(
+                true,
+                false,
+                false,
+                RetainedSessionState::default(),
+                crate::db::session_policy::SqlKind::SelectLike,
+                crate::db::TransactionStatementStateHint::default(),
+                true,
+                false,
+            ),
+            crate::db::RetainedSessionDisposition::Retain(_)
+        ));
+        // And a session carrying the user's work is kept for the same reason:
+        // the refusal did not touch it.
+        assert!(matches!(
+            SqlEditorWidget::oracle_thin_execution_disposition(
+                true,
+                false,
+                false,
+                RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty),
+                crate::db::session_policy::SqlKind::Dml,
+                crate::db::TransactionStatementStateHint::default(),
+                false,
+                false,
+            ),
+            crate::db::RetainedSessionDisposition::Retain(state)
+                if state.may_have_uncommitted_work()
         ));
     }
 
@@ -46031,7 +46634,7 @@ mod mysql_transaction_feedback_tests {
         let progress = receiver.iter().collect::<Vec<_>>();
         let _ = cancel_thread.join().expect("cancel thread");
         assert!(
-            outcome.had_error,
+            outcome.server_side_failure,
             "cancelled long select should report an error"
         );
         let expected_cancel_message = format!("Error: {}", SqlEditorWidget::cancel_message());
@@ -46046,7 +46649,7 @@ mod mysql_transaction_feedback_tests {
 
         let disposition = SqlEditorWidget::oracle_thin_execution_disposition(
             load_mutex_bool(&cancel_flag),
-            outcome.had_error,
+            outcome.server_side_failure,
             conn.is_broken(),
             outcome.retained_state,
             crate::db::session_policy::SqlKind::SelectLike,

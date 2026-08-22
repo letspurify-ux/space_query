@@ -517,6 +517,154 @@ fn oracle_states_the_tabs_transaction_mode_over_a_reused_session() {
     );
 }
 
+/// Both Oracle batch loops ask ONE preflight before a statement reaches the
+/// server, and neither spells either half of it itself.
+///
+/// The two refusals a statement must pass — the tab's Read only pin, and the
+/// app's one transaction-option-change rule — used to be two blocks written
+/// into each loop, and the OCI loop had BOTH while the thin loop had only the
+/// first. A script `SET TRANSACTION READ ONLY` or `ALTER SESSION SET
+/// ISOLATION_LEVEL` after a PL/SQL block, a `CALL` or a `SET ROLE` was
+/// therefore refused on OCI and ran on thin: one script, two clients.
+///
+/// Nothing could notice, because the unit tests pin the shared FUNCTION and
+/// the road that had stopped asking it is not a function. So the guard is
+/// about the ROADS: each loop must contain the one call, and must contain
+/// neither half's own spelling.
+#[test]
+fn both_oracle_batch_loops_ask_one_statement_preflight() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    for (driver, marker) in [
+        // The OCI batch loop lives inside the tab's execution entry point.
+        (
+            "OCI",
+            "    fn execute_sql_with_mysql_delimiter_after_lazy_cancel(",
+        ),
+        (
+            "thin",
+            "    fn execute_oracle_thin_batch_with_connection<C: OracleThinBatchConnection>(",
+        ),
+    ] {
+        let start = execution
+            .find(marker)
+            .unwrap_or_else(|| panic!("the {driver} batch loop should exist"));
+        let body = slice_to_end_of_fn(&execution, start);
+        assert!(
+            body.contains("oracle_statement_preflight_refusal("),
+            "the {driver} batch loop must ask the one Oracle statement preflight"
+        );
+        assert!(
+            !body.contains("transaction_mode_refusal_for_statement("),
+            "the {driver} batch loop must not spell the Read only half itself: both halves \
+             come from `oracle_statement_preflight_refusal`, or one driver loses one of them"
+        );
+        assert!(
+            !body.contains("transaction_option_change_kind("),
+            "the {driver} batch loop must not spell the option-change half itself: that is \
+             exactly the half the thin loop never had"
+        );
+    }
+
+    // And the preflight really asks both, so the two assertions above cannot be
+    // satisfied by a loop that asks a preflight which asks nothing.
+    let preflight_start = execution
+        .find("    fn oracle_statement_preflight_refusal(")
+        .expect("the Oracle statement preflight should exist");
+    let preflight = slice_to_end_of_fn(&execution, preflight_start);
+    assert!(
+        preflight.contains("transaction_mode_refusal_for_statement(")
+            && preflight.contains("transaction_option_change_kind()")
+            && preflight.contains("ensure_oracle_retained_state_option_change_allowed("),
+        "the preflight must be where both refusals are asked"
+    );
+}
+
+/// Every UI-thread push on the tab's retained session answers what it COST,
+/// and none of them writes that sentence itself.
+///
+/// A push — the object browser's scope pick, the auto-commit toggle, the
+/// transaction-mode pick — has no operation and therefore no progress channel,
+/// so the only place the user can hear "the session you were holding is gone,
+/// with your transaction" is the value it returns. Three roads wrote the
+/// sentence out at each of their `return`s and the two MySQL-family ones did
+/// not write it at all: the same action reported the same event on Oracle and
+/// stayed silent on MySQL and MariaDB, because a `None` progress sender made
+/// "nobody to tell" look like "nothing to tell".
+///
+/// The sentence now exists once, in `RetainedSessionMutationOutcome::
+/// with_session_loss`, and the fold that applies it is the only way into these
+/// bodies — so this guard is about the ENTRY: each public push must go through
+/// `ui_action_on_retained_session`, and none may name the message.
+#[test]
+fn every_retained_session_push_answers_what_it_cost() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    for (source, marker, road) in [
+        (
+            &execution,
+            "    pub(super) fn apply_oracle_transaction_mode_to_reusable_pooled_session(",
+            "Oracle transaction mode",
+        ),
+        (
+            &execution,
+            "    pub(super) fn apply_mysql_transaction_mode_to_reusable_pooled_session(",
+            "MySQL-family transaction mode",
+        ),
+        (
+            &execution,
+            "    pub(super) fn apply_mysql_autocommit_to_reusable_pooled_session(",
+            "MySQL-family auto-commit",
+        ),
+        (
+            &editor,
+            "    pub fn apply_current_scope_to_retained_session(",
+            "scope",
+        ),
+    ] {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("the {road} push should exist"));
+        let body = slice_to_end_of_fn(source, start);
+        assert!(
+            body.contains("ui_action_on_retained_session("),
+            "the {road} push must enter through `ui_action_on_retained_session`, which is \
+             what folds a lost work-carrying session into its answer"
+        );
+    }
+
+    // No road writes the sentence: it belongs to the fold.
+    for (source, file) in [
+        (&execution, "src/ui/sql_editor/execution.rs"),
+        (&editor, "src/ui/sql_editor/mod.rs"),
+    ] {
+        for marker in [
+            "fn apply_oracle_transaction_mode_to_taken_session(",
+            "fn apply_mysql_transaction_mode_to_taken_session(",
+            "fn apply_mysql_autocommit_to_taken_session(",
+            "fn apply_current_scope_to_taken_session(",
+        ] {
+            let Some(start) = source.find(marker) else {
+                continue;
+            };
+            let body = slice_to_end_of_fn(source, start);
+            assert!(
+                !body.contains("RETAINED_SESSION_LOST_WITH_WORK"),
+                "{file}: {marker} must record the loss (`record_lost_work`, or its \
+                 hand-back's UI-action audience) instead of wording it — one spelling, \
+                 or a road grows a second one and a twin grows none"
+            );
+        }
+    }
+
+    // The sender-less hand-back is not representable any more: a road with no
+    // operation asks for the audience that records, not for `None`.
+    assert!(
+        !execution.contains("BatchSessionHandBack::new(&hand_back_owner, None)"),
+        "a UI-thread push must build its hand-back with `for_ui_action`, so the loss it \
+         cannot send reaches its answer"
+    );
+}
+
 #[test]
 fn oracle_reused_tab_session_applies_tab_scope_before_execution() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs");
@@ -951,10 +1099,13 @@ fn immediate_retained_scope_apply_failures_preserve_sessions_for_next_retry() {
         .expect("restore helper should follow immediate scope apply helper");
     let helper = &editor_content[start..end];
 
+    // Asked WITHOUT its indentation: the push moved inside the fold that makes
+    // a lost session part of its answer, which shifted every line of it by four
+    // columns and said nothing about the delegation this pins.
     assert!(
-        helper.contains(
-            "lease.apply_scope(\n                    db_type,\n                    target_scope,\n                    advanced,"
-        ),
+        compact_for_pattern(helper).contains(&compact_for_pattern(
+            "lease.apply_scope(db_type, target_scope, advanced,"
+        )),
         "Retained sessions should delegate immediate scope apply through the DB backend abstraction"
     );
     assert!(
@@ -1932,25 +2083,33 @@ fn regression_07_oracle_transaction_mode_change_does_not_silently_clear_preserve
     // through the shared gate — the two agreed only because Oracle's statement
     // classifier happens to produce a narrower kind of residue. Both branches
     // now ask what step 1 asked before the tab was pinned.
-    let preservation_check = oracle_backend
-        .find("SqlEditorWidget::ensure_retained_session_option_change_allowed(")
-        .expect("Oracle retained transaction-mode apply should ask the shared option-change gate");
-    // The clear is generation-checked: the toolbar reads the generation
-    // lock-free and applies later, so an unvalidated clear could close the
-    // fresh session the tab was already handed on a NEW generation.
-    let clear_call = oracle_backend
-        .find("pooled_db_session.clear_if_generation_matches(connection_generation)")
-        .expect("Oracle retained transaction-mode apply may clear only after the guard");
-
+    let execution = read_source("src/ui/sql_editor/execution.rs");
     assert!(
-        preservation_check < clear_call,
-        "Oracle transaction mode changes must block preserved retained sessions before clear()"
+        oracle_backend.contains("apply_oracle_transaction_mode_to_reusable_pooled_session("),
+        "the Oracle backend delegates its retained transaction-mode apply"
+    );
+    let oracle_apply = execution
+        .find("fn apply_oracle_transaction_mode_to_reusable_pooled_session(")
+        .expect("the Oracle retained transaction-mode mutation should exist");
+    let oracle_apply_body = slice_to_end_of_fn(&execution, oracle_apply);
+    let gate_call = oracle_apply_body
+        .find("Self::ensure_retained_session_option_change_allowed(")
+        .expect("Oracle retained transaction-mode apply should ask the shared option-change gate");
+    // Nothing may reach the session before the gate has answered: this apply
+    // ENDS the transaction the session is in, and the gate is what establishes
+    // there is no work in it.
+    let session_touch = oracle_apply_body
+        .find("end_transaction_for_mode_change(")
+        .expect("the Oracle apply returns the session to a transaction boundary");
+    assert!(
+        gate_call < session_touch,
+        "Oracle transaction mode changes must pass the option-change gate before \
+         they touch the tab's session"
     );
     // ...and it is the SAME gate the MySQL family passes, so a step 1 that
     // allows can never meet a step 3 that refuses.
-    let execution = read_source("src/ui/sql_editor/execution.rs");
     let gate = execution
-        .find("pub(super) fn ensure_retained_session_option_change_allowed(")
+        .find("pub(crate) fn ensure_retained_session_option_change_allowed(")
         .expect("the shared option-change gate should exist");
     let gate_body = &execution[gate..gate + 700];
     assert!(
@@ -1980,7 +2139,7 @@ fn regression_07_oracle_transaction_mode_change_does_not_silently_clear_preserve
     );
     assert!(
         !oracle_backend.contains("pooled_db_session.clear();"),
-        "the retained clear must validate the connection generation"
+        "a transaction-mode change may not end the tab's session"
     );
     // The control gating routes through the DB-specific retained-session
     // policy. It lives on the tab that owns the state; the toolbar delegates.
@@ -4705,13 +4864,15 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
             && execution.contains("&& !explicit_transaction_first_statement;"),
         "the OCI path must skip only the batch-start injection for a transaction-first opener"
     );
-    // The MySQL family's server honours per-transaction READ WRITE escapes
-    // (one-shot SET TRANSACTION, START TRANSACTION READ WRITE) over the READ
-    // ONLY session characteristic, so the batch loop must refuse them
-    // client-side while the tab is pinned Read only.
+    // Every backend's server honours a per-transaction READ WRITE escape
+    // (one-shot `SET TRANSACTION`, `START TRANSACTION READ WRITE`) over the
+    // READ ONLY that opened the transaction — the session characteristic on the
+    // MySQL family, the app's own statement on Oracle — so the tab's gate
+    // refuses the escape client-side while the tab is pinned Read only, on all
+    // four.
     assert!(
-        execution.contains("mysql_statement_escapes_read_only_transaction_for_db_type("),
-        "the MySQL batch loop must refuse the per-transaction READ WRITE escapes on a Read only tab"
+        execution.contains("statement_forces_read_write_transaction("),
+        "the tab's read-only gate must refuse the per-transaction READ WRITE escapes"
     );
 
     // (9) A Read only tab must refuse writes on BOTH Oracle drivers. The
@@ -4725,8 +4886,15 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         .count();
     assert!(
         read_only_gates >= 3,
-        "both Oracle batch loops must refuse non-queries on a read-only tab through the shared \
-         answer (found {read_only_gates} references, including its own definition)"
+        "the read-only refusal must be asked through the shared answer (found \
+         {read_only_gates} references, including its own definition)"
+    );
+    assert!(
+        execution
+            .matches("oracle_statement_preflight_refusal(")
+            .count()
+            >= 3,
+        "and both Oracle batch loops must ask the preflight that carries it"
     );
     assert!(
         thin_backend_region_has_read_only_gate(&execution),
@@ -4940,11 +5108,13 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     // cannot read — which is why recording a refused one was the bug.
     assert_eq!(
         execution.matches("boundary_step.refused();").count(),
-        8,
+        7,
         "each refusal path between the boundary decision and the statement must say the \
-         statement never ran: the mode could not be stated, the tab's mode refuses the \
-         statement, and the tab's scope could not be asserted, on both loops — plus the \
-         OCI-only statement option-change gate, and the thin loop's second mode-application \
+         statement never ran: the mode could not be stated, the PREFLIGHT refused the \
+         statement (the tab's mode or its transaction-option rule — one path now, on both \
+         loops, where the option half used to be an OCI-only second one), and the tab's \
+         scope could not be asserted, on both loops — plus the thin loop's second \
+         mode-application \
          exit (a mode this database cannot express), which used to DROP the token instead of \
          spending it. A path that stops saying so is a statement recorded as having run when \
          it never reached the server, which is the shape this whole clause exists for"
@@ -5222,11 +5392,29 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     let end_residual_start = execution
         .find("fn end_mysql_residual_transaction_after_session_mode_change(")
         .expect("the residual-transaction helper should exist");
-    let end_residual_body = &execution[end_residual_start..end_residual_start + 900];
+    let end_residual_body = &execution[end_residual_start..end_residual_start + 1200];
     assert!(
-        end_residual_body.contains("may_have_uncommitted_work()")
+        end_residual_body.contains("transaction_mode_change_returns_session_to_boundary(")
             && end_residual_body.contains("\"ROLLBACK\""),
         "the residual transaction may only be ended when the session carries no user work"
+    );
+    // And that condition is ONE rule, because Oracle needs the same act for the
+    // same reason (`SET TRANSACTION` must be first in its transaction) and
+    // answered it by destroying the session instead.
+    let oracle_apply_start = execution
+        .find("fn apply_oracle_transaction_mode_to_reusable_pooled_session(")
+        .expect("the Oracle retained transaction-mode mutation should exist");
+    assert!(
+        slice_to_end_of_fn(&execution, oracle_apply_start)
+            .contains("transaction_mode_change_returns_session_to_boundary("),
+        "both families must ask the one rule about ending a residual transaction"
+    );
+    assert_eq!(
+        read_source("src/db/transaction.rs")
+            .matches("pub(crate) fn transaction_mode_change_returns_session_to_boundary(")
+            .count(),
+        1,
+        "and that rule keeps a single definition"
     );
 
     // (15) The same claim for the TOOLBAR's half of the write path: it applies
@@ -5385,6 +5573,13 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
 
 /// The Oracle thin batch loop's own read-only gate, located without pinning
 /// formatting: the gate must appear inside `execute_oracle_thin_batch_with_connection`.
+/// CHANGED, with its reason: the thin loop used to spell the read-only refusal
+/// itself, which is how it came to have that half of the preflight and not the
+/// other (the transaction-option-change rule). Both loops now ask
+/// `oracle_statement_preflight_refusal`, which asks BOTH — so the question here
+/// is whether the loop asks it, and
+/// `both_oracle_batch_loops_ask_one_statement_preflight` holds that the
+/// preflight really is where the read-only refusal lives.
 fn thin_backend_region_has_read_only_gate(execution: &str) -> bool {
     let Some(start) = execution.find("fn execute_oracle_thin_batch_with_connection<") else {
         return false;
@@ -5394,7 +5589,7 @@ fn thin_backend_region_has_read_only_gate(execution: &str) -> bool {
         .map(|offset| start + offset)
         .unwrap_or(execution.len());
     let body = &execution[start..end];
-    body.contains("transaction_mode_refusal_for_statement(")
+    body.contains("oracle_statement_preflight_refusal(")
 }
 
 #[test]
@@ -6174,6 +6369,353 @@ fn tab_metadata_lookups_acquire_their_session_for_the_requesting_tabs_scope() {
 /// thread can release, behind a dialog the user cannot dismiss. A poisoned
 /// guard must not be treated as "busy" either, or the retry never ends.
 /// `MainWindow::schedule_with_app_state` decides all of that in one place.
+/// Brace depth for every byte of `source`, ignoring braces inside strings and
+/// comments, so a guard's SCOPE can be asked about rather than its last use.
+///
+/// A `MutexGuard` has a `Drop`, so it lives to the end of its block whatever
+/// the borrow checker does with the last read of it: "is this lock still held
+/// here?" is a question about braces, not about lines.
+fn brace_depth_per_byte(source: &str) -> Vec<i32> {
+    let bytes = source.as_bytes();
+    let mut depth = vec![0i32; bytes.len()];
+    let (mut level, mut index) = (0i32, 0usize);
+    let (mut in_string, mut in_line_comment, mut in_block_comment) = (false, false, false);
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        if in_line_comment {
+            if byte == b'\n' {
+                in_line_comment = false;
+            }
+        } else if in_block_comment {
+            if byte == b'*' && next == Some(b'/') {
+                in_block_comment = false;
+                depth[index] = level;
+                index += 1;
+            }
+        } else if in_string {
+            if byte == b'\\' {
+                depth[index] = level;
+                index += 1;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'/' && next == Some(b'/') {
+            in_line_comment = true;
+        } else if byte == b'/' && next == Some(b'*') {
+            in_block_comment = true;
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b'{' {
+            level += 1;
+        } else if byte == b'}' {
+            level -= 1;
+        }
+        if index < depth.len() {
+            depth[index] = level;
+        }
+        index += 1;
+    }
+    depth
+}
+
+/// A modal dialog is never opened while a mutex guard is still in scope.
+///
+/// `alert_on_main` and its siblings run a NESTED FLTK event loop
+/// (`finish_modal_dialog`: `while dialog.shown() { app::wait() }`), which
+/// dispatches timeouts, awake callbacks and redraws on this very thread. A
+/// `std::sync` mutex is not reentrant, so anything reached from that loop which
+/// takes the same lock blocks forever, and everything that politely uses
+/// `try_lock` silently does nothing for as long as the dialog is up.
+///
+/// The transaction-mode toolbar states the rule in its own words — "the alert
+/// runs a nested modal event loop, and callbacks firing inside it must never
+/// find the state mutex still held" — and drops its guard first. Its two
+/// sibling per-tab settings did the same. The auto-commit toggle did not, nor
+/// did File > Reconnect (which held the app state AND the config), File >
+/// Disconnect All, the export refusal, or the file-action poll (which held the
+/// channel it was draining). A rule stated in a comment on one road is a rule
+/// the next road does not have, which is why it is stated here instead.
+///
+/// `KNOWN_DEBT` is the part of the UI this round did not touch, counted rather
+/// than excused: those roads belong to the grid editor and the connection
+/// dialog, they are the same hazard, and the numbers may only go DOWN. A new
+/// site anywhere — including in those two files — fails this test.
+#[test]
+fn modal_dialogs_are_never_opened_while_a_lock_guard_is_live() {
+    /// Sites that predate this guard, by file. Fix them and lower the number;
+    /// never raise one.
+    const KNOWN_DEBT: &[(&str, usize)] = &[
+        ("src/ui/result_table.rs", 20),
+        ("src/ui/connection_dialog.rs", 8),
+    ];
+
+    let mut offenders: Vec<(String, usize)> = Vec::new();
+    let mut files: Vec<PathBuf> =
+        collect_rust_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui"));
+    files.sort();
+    for file in files {
+        let source = fs::read_to_string(&file)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()));
+        let relative = file
+            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let depth = brace_depth_per_byte(&source);
+
+        // Bindings that OWN a guard. `let flag = *m.lock()...;` reads THROUGH
+        // it — the guard is a temporary, dropped at the end of the statement.
+        let mut guards: Vec<(usize, &str)> = Vec::new();
+        let mut search = 0usize;
+        const UNWRAP: &str = ".unwrap_or_else(|poisoned| poisoned.into_inner())";
+        while let Some(offset) = source[search..].find(UNWRAP) {
+            let end = search + offset + UNWRAP.len();
+            search = end;
+            if !source[end..].starts_with(';') {
+                continue; // a further method call consumed the guard
+            }
+            let Some(statement_start) = source[..end].rfind("let ") else {
+                continue;
+            };
+            let binding = &source[statement_start..end];
+            if binding.contains('{') || !binding.contains(".lock()") {
+                continue;
+            }
+            if binding
+                .split_once('=')
+                .is_some_and(|(_, value)| value.trim_start().starts_with(['*', '&']))
+            {
+                continue;
+            }
+            let Some(name) = binding
+                .trim_start_matches("let ")
+                .trim_start_matches("mut ")
+                .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                .next()
+            else {
+                continue;
+            };
+            guards.push((end, name));
+        }
+
+        let mut count = 0usize;
+        for modal in [
+            "crate::ui::alert_on_main(",
+            "crate::ui::message_on_main(",
+            "crate::ui::choice2_on_main(",
+            "crate::ui::choice2_on_main_defaulting_to_cancel(",
+            "crate::ui::input_on_main(",
+        ] {
+            let mut from = 0usize;
+            while let Some(offset) = source[from..].find(modal) {
+                let at = from + offset;
+                from = at + modal.len();
+                for (guard_end, name) in &guards {
+                    if *guard_end >= at {
+                        break;
+                    }
+                    let scope_depth = depth[*guard_end];
+                    if depth[*guard_end..at].iter().any(|d| *d < scope_depth) {
+                        continue; // the guard's block closed before the dialog
+                    }
+                    if source[*guard_end..at].contains(&format!("drop({name})")) {
+                        continue;
+                    }
+                    count += 1;
+                    break;
+                }
+            }
+        }
+        if count > 0 {
+            offenders.push((relative, count));
+        }
+    }
+
+    let allowed: std::collections::HashMap<&str, usize> = KNOWN_DEBT.iter().copied().collect();
+    for (file, count) in &offenders {
+        let allowance = allowed.get(file.as_str()).copied().unwrap_or(0);
+        assert!(
+            *count <= allowance,
+            "{file} opens {count} modal dialog(s) while a lock guard is still in scope \
+             (allowed here: {allowance}). A modal runs a nested FLTK event loop on this \
+             thread: decide under the lock, release it, and say it afterwards."
+        );
+    }
+    for (file, allowance) in KNOWN_DEBT {
+        let actual = offenders
+            .iter()
+            .find(|(name, _)| name == file)
+            .map_or(0, |(_, count)| *count);
+        assert!(
+            actual <= *allowance,
+            "{file}: {actual} sites against an allowance of {allowance}"
+        );
+        assert!(
+            actual == *allowance,
+            "{file} is down to {actual} sites: lower its KNOWN_DEBT entry to {actual} so the \
+             ones that are fixed cannot come back"
+        );
+    }
+}
+
+/// All three per-tab settings refuse on the tab's work in the SAME words.
+///
+/// Auto-commit and transaction mode have always answered
+/// `TabDbWork::block_message`, which words each kind of work separately. The
+/// scope gate wrote one sentence for all four kinds: true for a running query
+/// and an open fetch, already fixed once for the statement the app cannot
+/// stop, and wrong for an execution the tab has ACCEPTED and not started —
+/// "a query or lazy fetch is active" names two things that are not there and
+/// leaves the user waiting for the end of something that never began.
+#[test]
+fn the_three_per_tab_settings_refuse_on_work_in_the_same_words() {
+    let main_window = read_source("src/ui/main_window.rs");
+    for (setting, marker, action) in [
+        (
+            "scope",
+            "    fn retained_scope_change_blocker_for_connection(",
+            "\"changing scope\"",
+        ),
+        (
+            "transaction mode",
+            "fn update_transaction_mode_from_controls(",
+            "\"changing transaction mode\"",
+        ),
+    ] {
+        let start = main_window
+            .find(marker)
+            .unwrap_or_else(|| panic!("the {setting} gate should exist"));
+        let body = slice_to_end_of_fn(&main_window, start);
+        assert!(
+            body.contains(&format!("block_message({action})")),
+            "the {setting} gate must word its refusal from `TabDbWork::block_message`"
+        );
+    }
+    // The auto-commit toggle lives in the menu dispatch, so it is asked of the
+    // file rather than of a function body.
+    assert!(
+        main_window.contains("block_message(\"changing auto-commit\")"),
+        "the auto-commit toggle must word its refusal from `TabDbWork::block_message`"
+    );
+    assert!(
+        !main_window.contains("Cannot change scope while"),
+        "the scope gate must not keep a sentence of its own: one kind of work it does not \
+         describe is one user told to wait for something that is not coming"
+    );
+}
+
+/// The retained-session option-change rule has ONE spelling.
+///
+/// The rule is two steps — the backend's own "this pending one-shot can simply
+/// be replaced" escape, then the shared gate — and every road that wrote both
+/// out itself was a road that could drift a term away from them. One did: the
+/// Oracle statement branch answered the gate MINUS its session-residue term
+/// while its comment claimed the same contract. The UI preflight (step 1) and
+/// the MySQL auto-commit push spelled the two steps out beside it.
+///
+/// So `can_replace_retained_transaction_mode` may be asked in exactly one
+/// place, and that place is the one function every road calls.
+#[test]
+fn the_retained_option_change_rule_has_one_spelling() {
+    let mut sites = Vec::new();
+    for file in [
+        "src/ui/main_window.rs",
+        "src/ui/sql_editor/mod.rs",
+        "src/ui/sql_editor/execution.rs",
+    ] {
+        let source = read_source(file);
+        let mut from = 0usize;
+        while let Some(offset) = source[from..].find("can_replace_retained_transaction_mode(") {
+            let at = from + offset;
+            from = at + 1;
+            sites.push(format!("{file}:{}", source[..at].matches('\n').count() + 1));
+        }
+    }
+    assert_eq!(
+        sites.len(),
+        1,
+        "the backend escape belongs to `SqlEditorWidget::\
+         ensure_retained_session_option_change_allowed` alone; found it at {sites:?}"
+    );
+
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let start = execution
+        .find("    pub(crate) fn ensure_retained_session_option_change_allowed(")
+        .expect("the one option-change gate should exist");
+    let body = slice_to_end_of_fn(&execution, start);
+    assert!(
+        body.contains("can_replace_retained_transaction_mode(")
+            && body.contains(
+                "crate::db::DatabaseConnection::ensure_retained_session_option_change_allowed("
+            ),
+        "the one gate must hold both steps of the rule"
+    );
+}
+
+/// The thin batch tells a pending cancel about SERVER failures only.
+///
+/// Both consumers of that flag ask it beside `cancel_requested` — "the user
+/// cancelled AND something failed, so ask the session policy whether the
+/// session survived" — and one of the answers that policy gives is
+/// `DiscardPhysical`. A refusal the APP made cannot be what a cancel hit: it
+/// never reached the server, and the loop says so one line later with
+/// `boundary_step.refused()`. Counting them meant a Read only tab refusing a
+/// write, or the transaction-option gate refusing a `SET TRANSACTION`, could
+/// cost the tab its session (and the transaction in it) if the user pressed
+/// Cancel while the batch ran. The OCI twin has always asked the narrower
+/// question — was the session INVALIDATED, is a decision REQUIRED — so this is
+/// the two drivers agreeing again, not a new rule.
+#[test]
+fn the_thin_batch_counts_only_server_failures_for_a_pending_cancel() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    // The NAME is part of the fix — `had_error` invited every failure,
+    // including the ones the app made itself — so only the doc comments that
+    // explain the rename may still say it.
+    let code_only: String = execution
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code_only.contains("had_error"),
+        "the flag must be named for the question it answers; only the comments that explain \
+         the rename may still say `had_error`"
+    );
+
+    let loop_start = execution
+        .find("    fn execute_oracle_thin_batch_with_connection<C: OracleThinBatchConnection>(")
+        .expect("the thin batch loop should exist");
+    let body = slice_to_end_of_fn(&execution, loop_start);
+
+    // The statement preflight's refusal block, from the call to the `continue`
+    // that ends it.
+    let refusal = body
+        .find("Self::oracle_statement_preflight_refusal(")
+        .expect("the thin loop asks the one preflight");
+    let refusal_end = body[refusal..]
+        .find("boundary_step.refused();")
+        .map(|offset| refusal + offset)
+        .expect("a refusal spends the boundary token");
+    assert!(
+        !body[refusal..refusal_end].contains("server_side_failure = true"),
+        "a statement the app refused never reached the server, so it must not be reported \
+         to a pending cancel as something that failed on it"
+    );
+
+    // CENSUS, with what each one is: a tool command that ran, SET SERVEROUTPUT,
+    // the mode application the server REFUSED, the scope assertion, the
+    // streaming select, the auto-commit call, a non-query statement, the two
+    // ref-cursor fetches, the statement-error road, the DBMS_OUTPUT drain and
+    // the cursor-close flush. Every one of them is a call the server answered.
+    assert_eq!(
+        body.matches("server_side_failure = true").count(),
+        12,
+        "a new site here is a new claim that a cancel may have cost the session: it must be \
+         a SERVER failure, never a refusal the app made"
+    );
+}
+
 #[test]
 fn ui_timer_closures_never_block_on_the_app_state() {
     let main_window = read_source("src/ui/main_window.rs");
@@ -6408,12 +6950,32 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
             && !execution.contains("&& !Self::oracle_read_only_allows_statement("),
         "the Oracle read-only gates must go through transaction_mode_refusal_for_statement"
     );
+    // CHANGED, with its reason: the escape is no longer a MySQL-family
+    // question. The server honours an explicit per-transaction READ WRITE over
+    // the READ ONLY the SESSION asked for (MySQL) and over the one the APP's
+    // own opening statement asked for (Oracle), so all four backends refuse the
+    // statement itself, from one question. Oracle looked safe because its
+    // allowlist refuses everything that writes — but a locking READ is a query,
+    // so the allowlist admits it and the read-only transaction this statement
+    // ends was the only thing refusing it.
     assert_eq!(
         execution
-            .matches("mysql_statement_escapes_read_only_transaction_for_db_type(")
+            .matches("statement_forces_read_write_transaction(")
             .count(),
         1,
-        "and the MySQL escape must be asked from inside the shared answer only"
+        "and the escape must be asked from inside the shared answer only"
+    );
+    let transaction = read_source("src/db/transaction.rs");
+    let transaction_production = transaction
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .map_or_else(|| transaction.clone(), |(before, _)| before.to_string());
+    assert_eq!(
+        transaction_production
+            .matches("mysql_statement_escapes_read_only_transaction_for_db_type(")
+            .count(),
+        // its definition, and the one dispatch inside the shared question
+        2,
+        "the MySQL-family half belongs to the shared question, not to a second caller"
     );
     // Production code only: the unit tests below call it too. The test modules
     // of this file all sit after the last production item, so the prefix before
@@ -6422,15 +6984,40 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
         .split_once("\nmod session_transaction_mode_adoption_tests {")
         .map(|(before, _)| before.to_string())
         .unwrap_or_else(|| execution.clone());
+    // CHANGED, with its reason: the two Oracle batch loops used to ask this
+    // directly and one of them then had to remember the SECOND refusal a
+    // statement must pass (the option-change rule) — which the thin loop never
+    // did. Both now ask `oracle_statement_preflight_refusal`, which asks this
+    // one, so the count moved from 5 to 4 and the two loops are pinned by
+    // `both_oracle_batch_loops_ask_one_statement_preflight` instead. What this
+    // still holds is the same fact: every path that runs a statement asks.
     assert_eq!(
         execution_production
             .matches("transaction_mode_refusal_for_statement(")
             .count(),
-        5,
-        "the entry point itself, and every path that runs a statement: both Oracle batch \
-         loops, the Oracle thin LAZY select (the one Oracle path that runs a statement \
-         without the batch loop), and the MySQL family's session acquisition"
+        4,
+        "the entry point itself, the Oracle preflight both batch loops ask, the Oracle thin \
+         LAZY select (the one Oracle path that runs a statement without the batch loop), \
+         and the MySQL family's session acquisition"
     );
+    for (asker, marker) in [
+        (
+            "the Oracle preflight",
+            "    fn oracle_statement_preflight_refusal(",
+        ),
+        (
+            "the Oracle thin lazy select",
+            "    fn oracle_thin_lazy_select_refusal(",
+        ),
+    ] {
+        if let Some(start) = execution_production.find(marker) {
+            assert!(
+                slice_to_end_of_fn(&execution_production, start)
+                    .contains("transaction_mode_refusal_for_statement("),
+                "{asker} must ask the shared answer"
+            );
+        }
+    }
     // WHERE the MySQL family asks is the point, and it is not inside one of its
     // executors. That family runs a statement down three paths — the streaming
     // SELECT, the lazy fetch and the plain executor — and the dispatch between
@@ -7054,11 +7641,21 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
     // `SqlEditorWidget::transaction_mode_change_blocked_now`, which listed the
     // same two of three and so left the combos offering a change the callback
     // beside them would refuse.
+    //
+    // The derivation itself takes one more fact than the editor holds — a lazy
+    // fetch the tab's PROGRESS CONTEXT still owns — so the flags are read in
+    // `for_editor_with_progress_lazy_fetch` and `for_editor` is that with the
+    // extra fact false. The list of flags is what this pins, so it is asked of
+    // the function that reads them.
     let editor_source = read_source("src/ui/sql_editor/mod.rs");
     let derivation = editor_source
-        .find("    pub(crate) fn for_editor(editor: &SqlEditorWidget) -> Self {")
+        .find("    pub(crate) fn for_editor_with_progress_lazy_fetch(")
         .expect("the one per-tab work derivation should exist");
     let derivation_body = slice_to_end_of_fn(&editor_source, derivation);
+    assert!(
+        editor_source.contains("Self::for_editor_with_progress_lazy_fetch(editor, false)"),
+        "and `for_editor` must be that same derivation, not a second listing of the flags"
+    );
     for expected in [
         "editor.is_query_running()",
         "editor.has_open_lazy_fetch()",
@@ -7286,6 +7883,12 @@ fn every_retained_session_mutation_validates_the_connection_generation() {
     // every mutation actually checks. The Oracle transaction-mode apply used a
     // bare clear(), which closed whatever session the slot held — including a
     // fresh one from the NEW generation.
+    // The Oracle apply no longer has a clear to validate: it applies the change
+    // to the session IN PLACE, like the MySQL twin, and the generation it was
+    // handed is what the TAKE checks — the same door every other retained
+    // mutation goes through. A mutation that ends a session on a lock-free
+    // generation is the shape this guard exists to keep out, whichever way it
+    // is spelled.
     let content = read_source("src/ui/sql_editor/mod.rs");
     let oracle_mode = content
         .find("impl TransactionActionBackend for OracleTransactionActionBackend")
@@ -7294,26 +7897,35 @@ fn every_retained_session_mutation_validates_the_connection_generation() {
     let apply = oracle_body
         .find("fn apply_transaction_mode_to_retained_session(")
         .expect("the Oracle transaction-mode apply should exist");
-    let apply_body = &oracle_body[apply..apply + 1800];
+    let apply_body = &oracle_body[apply..apply + 1200];
     assert!(
-        apply_body.contains("clear_if_generation_matches(connection_generation)"),
-        "the Oracle transaction-mode apply must validate the generation before \
-         discarding the tab's retained session"
-    );
-    assert!(
-        !apply_body.contains("pooled_db_session.clear();"),
-        "no retained mutation may clear the lease without a generation check"
+        apply_body.contains("apply_oracle_transaction_mode_to_reusable_pooled_session(")
+            && apply_body.contains("connection_generation"),
+        "the Oracle transaction-mode apply must hand the generation to the one \
+         that acts on the session"
     );
 
-    // And the generation-checked clear keeps a single implementation.
-    let connection = read_source("src/db/connection.rs");
-    assert_eq!(
-        connection
-            .matches("pub fn clear_if_generation_matches(")
-            .count(),
-        1,
-        "the generation-checked clear must have a single definition"
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let oracle_apply = execution
+        .find("fn apply_oracle_transaction_mode_to_reusable_pooled_session(")
+        .expect("the Oracle retained transaction-mode mutation should exist");
+    let oracle_apply_body = slice_to_end_of_fn(&execution, oracle_apply);
+    assert!(
+        oracle_apply_body.contains("can_reuse_pool_session(connection_generation, db_type)")
+            && oracle_apply_body.contains("take_reusable_lease_for_context_update("),
+        "it must validate the generation and take the session through the door, \
+         not act on the slot behind it"
     );
+    for forbidden in [
+        "pooled_db_session.clear()",
+        "clear_if_generation_matches",
+        "discard_physical(",
+    ] {
+        assert!(
+            !oracle_apply_body.contains(forbidden),
+            "a transaction-mode change may not end the tab's session ({forbidden})"
+        );
+    }
 }
 
 #[test]
@@ -7891,7 +8503,8 @@ fn every_backend_hands_a_batch_session_back_through_the_door_that_names_its_oper
     // Every caller turns the answer into something the user can see.
     for (source, callers) in [
         ("src/ui/sql_editor/mod.rs", 3usize),
-        ("src/ui/sql_editor/execution.rs", 2usize),
+        // The scope push, the MySQL transaction-mode push, and the Oracle one.
+        ("src/ui/sql_editor/execution.rs", 3usize),
     ] {
         assert_eq!(
             read_source(source)
@@ -8209,7 +8822,11 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         let branch = &branch[..end];
         assert!(
             branch.contains("for_unreachable_take(")
-                || branch.contains("report_retained_session_lost_with_work("),
+                || branch.contains("report_retained_session_lost_with_work(")
+                // Through the hand-back's AUDIENCE, which is the same answer
+                // for a road that has one — and the only one that reaches a
+                // UI-thread push's caller.
+                || branch.contains("hand_back.report_loss("),
             "a take that could not use the session it got must answer the loss, not describe an \
              empty slot: {branch}"
         );
@@ -8242,23 +8859,57 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         // — the one door a worker CLEARS the tab's slot through on the way out
         // of a connection, and `stale_take_reported`, the choke point every
         // EXECUTION take passes through.
-        10,
+        //
+        // CHANGED 10 -> 7, with its reason: every road that HAS a hand-back now
+        // reports through `report_loss`, which asks the hand-back WHO is
+        // listening. "No progress sender" used to mean "nobody to tell", and a
+        // UI-thread push has none — so the MySQL-family toolbar pushes
+        // destroyed a work-carrying session and answered only "the option
+        // cannot change", and the two takes that unwrap a lease plus the
+        // stale-take reporter had the same hole waiting behind
+        // `hand_back.sender()`. Five direct calls became one, inside the
+        // audience; what is left is the definition, the lazy-fetch twin, the
+        // free `stale_take_reported` for the roads with no hand-back, and the
+        // batch `clear` helper.
+        7,
         "every road that can lose a work-carrying session either reports it itself or \
          goes through a door that does; a road that does neither is how a transaction \
          disappeared in silence"
     );
+    // And the audience is what makes the sender-less half of that true: the
+    // hand-back does not expose a sender at all any more, so no road can report
+    // through it without one.
+    assert!(
+        !content.contains("fn sender(&self) -> Option<&'a QueryProgressSender>"),
+        "a hand-back that can hand out an `Option<&sender>` is a hand-back a road can report \
+         the loss through and reach nobody"
+    );
+    let report_loss = content
+        .find("    fn report_loss(&self, carried: RetainedSessionState, log_context: &str) {")
+        .expect("the hand-back must have ONE way to say what it lost");
+    let report_loss_body = slice_to_end_of_fn(&content, report_loss);
+    assert!(
+        report_loss_body.contains("SessionLossAudience::Operation(sender)")
+            && report_loss_body.contains("SessionLossAudience::UiAction(loss)"),
+        "a hand-back with no operation must RECORD the loss for its road's answer, not \
+         discover that there is nobody to send it to"
+    );
     // The two doors are what make that true, and neither can be given half of
     // its job: ending the reach and answering the loss are ONE call.
-    for (door, ends_the_reach) in [
+    for (door, ends_the_reach, answers_the_loss) in [
         (
             "fn release_without_door(&self, carried: RetainedSessionState, log_context: &str) {",
             "end_before_release()",
+            // Through the audience, so the road's own answer carries it when
+            // there is no operation to send it on.
+            "self.report_loss(carried, log_context)",
         ),
         (
             // The lazy fetch's twin delegates the reach half to the door it
             // already had, and adds the half that was missing.
             "fn discard_lazy_fetch_session<T>(",
             "Self::release_lazy_fetch_session(cancel_reach",
+            "report_retained_session_lost_with_work(",
         ),
     ] {
         let start = content
@@ -8266,8 +8917,7 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
             .unwrap_or_else(|| panic!("{door} should exist"));
         let body = slice_from(&content, start, 700);
         assert!(
-            body.contains(ends_the_reach)
-                && body.contains("report_retained_session_lost_with_work("),
+            body.contains(ends_the_reach) && body.contains(answers_the_loss),
             "a release that reaches no hand-back door owes BOTH answers: {door}"
         );
     }
@@ -8328,10 +8978,12 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
     );
     assert_eq!(
         content.matches("take_reusable_lease(").count(),
-        content.matches("stale_take_reported(").count() - 1,
+        content.matches("stale_take_reported(").count() - 2,
         "every `take_reusable_lease` in execution must be wrapped in `stale_take_reported` \
-         (the extra match is the reporter's own definition), so no execution road can read a \
-         closed work-carrying session as an empty slot again"
+         (the two extra matches are its two DEFINITIONS: the free one for the roads that hold \
+         no hand-back, and the hand-back's own, which reports through the audience so a \
+         UI-thread push hears it too), so no execution road can read a closed work-carrying \
+         session as an empty slot again"
     );
     // The hand-back answer covers BOTH ways a session with work can be closed:
     // the tab moved on (abandoned) and the slot refused to keep it (the tab is
@@ -8798,8 +9450,11 @@ fn the_transaction_option_gate_selects_its_rule_by_type_not_by_message() {
         "and the classifier must answer with that type, not with the noun it prints"
     );
     let execution = read_source("src/ui/sql_editor/execution.rs");
+    // `pub(crate)`, and that is the fix rather than a detail: the toolbar
+    // PREFLIGHT lives in `main_window` and used to re-spell the gate's two
+    // steps because it could not call it.
     let deepest_gate = execution
-        .find("pub(super) fn ensure_retained_session_option_change_allowed(")
+        .find("pub(crate) fn ensure_retained_session_option_change_allowed(")
         .expect("the shared option-change gate should exist");
     let deepest_gate_body = slice_from(&execution, deepest_gate, 700);
     assert!(
@@ -8824,15 +9479,23 @@ fn the_transaction_option_gate_selects_its_rule_by_type_not_by_message() {
         !gate.contains(r#"action == ""#),
         "the gate must not select its rule by comparing the noun it prints to the user"
     );
+    // CHANGED, with its reason: this preflight used to re-spell the rule's two
+    // steps — the backend escape keyed on `option == TransactionOptionKind::
+    // TransactionMode`, then the shared gate — which is the "one rule, two
+    // spellings" shape that let the Oracle statement branch drift a term away
+    // from it. It now PASSES the option to the one gate, where the type match
+    // is asserted above (`deepest_gate_body`). What this still holds is the
+    // same fact: the rule is selected by the type, never by the printed noun.
     assert!(
-        gate.contains(
-            "let is_transaction_mode = option == TransactionOptionKind::TransactionMode;"
-        ),
-        "the mode-only rules must be gated on the option type"
+        gate.contains("SqlEditorWidget::ensure_retained_session_option_change_allowed(")
+            && gate.contains("option,"),
+        "the preflight must hand the option TYPE to the one gate rather than re-deriving \
+         which rule applies"
     );
     assert!(
-        gate.contains("option.label()"),
-        "the message keeps the noun; the rule no longer does"
+        !gate.contains("option.label()"),
+        "and it must not word the refusal itself either: the gate that knows the rule is \
+         the gate that names what is blocking it"
     );
 }
 

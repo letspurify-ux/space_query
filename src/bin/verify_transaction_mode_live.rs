@@ -53,9 +53,11 @@
 //       picks its execution path from the leading keyword, and the tab's gate
 //       used to live on only one of those paths - so S60 passed while this did
 //       not. Skipped on Oracle, where no unit can hold two statements.
-//   S30 (MySQL family) the two per-transaction READ WRITE escape forms
-//       (one-shot SET TRANSACTION, START TRANSACTION READ WRITE) are refused
-//       on a READ ONLY tab; Oracle keeps the same promise via its client gate.
+//   S30 the per-transaction READ WRITE escape forms (one-shot SET
+//       TRANSACTION everywhere, START TRANSACTION READ WRITE on the MySQL
+//       family) are refused on a READ ONLY tab, on every backend. Oracle used
+//       to allow the escape and refuse the WRITE after it, which S67 shows was
+//       not the same promise.
 //   S26 the toolbar's OTHER half: picking a mode pins the tab AND applies the
 //       change to the tab's retained session. Driven on the state the toolbar
 //       meets in practice - a session the tab has already read on, which under
@@ -2202,10 +2204,30 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     h.editor.clear_tab_transaction_mode_override();
     h.run("ROLLBACK")?;
     let before_rows = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T")?;
+    // The tab's session must SURVIVE the toolbar's write path, on every
+    // backend. Oracle used to express "apply the mode" by discarding it — the
+    // only other way back to a transaction boundary — which silently took
+    // everything else the session carried (global temporary table rows,
+    // DBMS_OUTPUT state, session settings) with it and reported `Applied`.
+    let session_before_pin = h.editor.pooled_session_activity_snapshot().is_some();
     let pin_outcome = h.toolbar_transaction_mode(TransactionMode::new(
         TransactionIsolation::Default,
         TransactionAccessMode::ReadOnly,
     ));
+    let session_after_pin = h.editor.pooled_session_activity_snapshot().is_some();
+    // Printed, not asserted: a tab with no session to keep would make the check
+    // below vacuous, and the run says so instead of quietly passing.
+    println!(
+        "    ..  S26 retained session before the pin: {session_before_pin}, after: {session_after_pin}"
+    );
+    h.check(
+        "S26 the toolbar pin keeps the tab's session",
+        !session_before_pin || session_after_pin,
+        format!(
+            "session before: {session_before_pin}, after: {session_after_pin} \
+             (retained-session mutation: {pin_outcome})"
+        ),
+    );
     let capture = h.run("INSERT INTO SQ_TM_T VALUES (26)")?;
     let refused = capture.results.first().is_some_and(|r| {
         !r.success
@@ -2239,7 +2261,20 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     // the transaction the app's own SET TRANSACTION opened - so end it first,
     // exactly as the app tells the user to.
     h.run("ROLLBACK")?;
+    let session_before_release = h.editor.pooled_session_activity_snapshot().is_some();
     let release_outcome = h.toolbar_transaction_mode(TransactionMode::default());
+    let session_after_release = h.editor.pooled_session_activity_snapshot().is_some();
+    println!(
+        "    ..  S26 retained session before the release: {session_before_release}, after: {session_after_release}"
+    );
+    h.check(
+        "S26 the toolbar release keeps the tab's session",
+        !session_before_release || session_after_release,
+        format!(
+            "session before: {session_before_release}, after: {session_after_release} \
+             (retained-session mutation: {release_outcome})"
+        ),
+    );
     let capture = h.run("INSERT INTO SQ_TM_T VALUES (27)")?;
     h.check(
         "S26 the toolbar releases the pin on the same session",
@@ -2438,73 +2473,61 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     h.run("ROLLBACK")?;
 
     // ---- S30: explicit READ WRITE escapes cannot write on a READ ONLY tab --
-    // The MySQL family expresses the pin as a SESSION characteristic, and the
-    // server itself lets two per-transaction forms override it: a one-shot
-    // `SET TRANSACTION READ WRITE` (consumed by the next transaction) and
-    // `START TRANSACTION READ WRITE`. Without a client-side gate an INSERT
-    // rides them through while the toolbar reads READ ONLY. Oracle's client
-    // gate already keeps this promise: the escape statement runs, but the
-    // write after it is refused.
+    // Every backend's server lets a per-transaction form override the READ ONLY
+    // that opened the transaction: a one-shot `SET TRANSACTION READ WRITE`
+    // (consumed by the next transaction) and, on the MySQL family, `START
+    // TRANSACTION READ WRITE`. Without a client-side gate a write rides them
+    // through while the toolbar reads READ ONLY.
+    //
+    // The Oracle branch this scenario used to have is GONE, and that is the
+    // point: it asserted "the escape statement runs, but the write after it is
+    // refused", which was true and not enough — a locking READ is a query, so
+    // Oracle's allowlist admits it, and the escape had just ended the only
+    // thing refusing it (S67). All four now refuse the escape itself, so the
+    // steps below are the same steps on every target.
     println!("  --- S30 explicit READ WRITE escapes cannot write on a READ ONLY tab ---");
     h.toolbar_transaction_mode(TransactionMode::new(
         TransactionIsolation::Default,
         TransactionAccessMode::ReadOnly,
     ));
-    if target.is_oracle() {
-        let capture = h.run("SET TRANSACTION READ WRITE;\nINSERT INTO SQ_TM_T VALUES (30);")?;
-        let insert_result = capture
+    let capture = h.run("SET TRANSACTION READ WRITE")?;
+    h.check(
+        "S30 the one-shot READ WRITE escape is refused on a READ ONLY tab",
+        capture
             .results
-            .iter()
-            .find(|result| result.sql.contains("INSERT"))
-            .cloned();
-        h.check(
-            "S30 the write after a one-shot READ WRITE is still refused",
-            insert_result.as_ref().is_some_and(|result| {
-                !result.success
-                    && read_only_errors.iter().any(|needle| {
-                        result
-                            .message
-                            .to_ascii_lowercase()
-                            .contains(&needle.to_ascii_lowercase())
-                    })
-            }),
-            format!(
-                "insert result: {:?}",
-                insert_result.map(|r| (r.success, r.message.clone()))
-            ),
-        );
-        h.run("ROLLBACK")?;
-    } else {
-        let capture = h.run("SET TRANSACTION READ WRITE")?;
-        h.check(
-            "S30 the one-shot READ WRITE escape is refused on a READ ONLY tab",
+            .first()
+            .is_some_and(|result| !result.success),
+        format!(
+            "one-shot escape: {:?}",
             capture
                 .results
                 .first()
-                .is_some_and(|result| !result.success),
-            format!(
-                "one-shot escape: {:?}",
-                capture
-                    .results
-                    .first()
-                    .map(|r| (r.success, r.message.clone()))
-            ),
-        );
-        let capture = h.run("INSERT INTO SQ_TM_T VALUES (30)")?;
-        h.check(
-            "S30 the write after the one-shot attempt is refused",
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    let capture = h.run("INSERT INTO SQ_TM_T VALUES (30)")?;
+    h.check(
+        "S30 the write after the one-shot attempt is refused",
+        capture.results.first().is_some_and(|result| {
+            !result.success
+                && read_only_errors.iter().any(|needle| {
+                    result
+                        .message
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                })
+        }),
+        format!(
+            "insert after one-shot: {:?}",
             capture
                 .results
                 .first()
-                .is_some_and(|result| !result.success),
-            format!(
-                "insert after one-shot: {:?}",
-                capture
-                    .results
-                    .first()
-                    .map(|r| (r.success, r.message.clone()))
-            ),
-        );
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    if !target.is_oracle() {
+        // Oracle has no `START TRANSACTION`; the MySQL family's second escape
+        // form is refused by the same answer.
         let capture =
             h.run("START TRANSACTION READ WRITE;\nINSERT INTO SQ_TM_T VALUES (30);\nCOMMIT;")?;
         h.check(
@@ -2521,8 +2544,8 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
                     .map(|r| (r.success, r.message.clone()))
             ),
         );
-        let _ = h.run("ROLLBACK");
     }
+    let _ = h.run("ROLLBACK");
     h.editor.clear_tab_transaction_mode_override();
     let _ = h.editor.discard_pooled_session_for_close();
     let leaked = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V = 30")?;
@@ -4978,6 +5001,139 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         );
         h.run("ROLLBACK")?;
         h.editor.clear_tab_transaction_mode_override();
+    }
+
+    // ---- S66 (Oracle, both drivers): a transaction-option change STATEMENT is
+    // refused after a statement whose body the app could not read.
+    //
+    // The rule is the app's one option-change rule, and the road that asks it
+    // is the batch loop's statement preflight. The OCI loop had that preflight
+    // and the thin loop had only its read-only half, so this very script was
+    // refused on one driver and ran on the other. Both loops now ask one
+    // preflight.
+    //
+    // FAILS BEFORE on thin: the `ALTER SESSION` succeeded.
+    if target.is_oracle() {
+        println!(
+            "  --- S66 both Oracle drivers refuse an option change after an opaque statement ---"
+        );
+        let _ = h.editor.discard_pooled_session_for_close();
+        let capture =
+            h.run("BEGIN NULL; END;\n/\nALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE;")?;
+        let block_ran = capture
+            .results
+            .iter()
+            .any(|result| result.sql.to_uppercase().contains("BEGIN") && result.success);
+        let option_change = capture
+            .results
+            .iter()
+            .find(|result| result.sql.to_uppercase().contains("ISOLATION_LEVEL"))
+            .cloned();
+        h.check(
+            "S66 the opaque statement itself runs",
+            block_ran,
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        let refusal = option_change
+            .as_ref()
+            .filter(|result| !result.success)
+            .map(|result| result.message.clone());
+        h.check(
+            "S66 the option change after it is refused",
+            refusal.is_some(),
+            format!(
+                "option change: {:?}",
+                option_change
+                    .as_ref()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        // The STATE the app names is the driver's honest answer and legitimately
+        // differs: the block opens a transaction the thin wire reports, while a
+        // driver that can only ask a write probe files residue. What must be
+        // the same on both is that the option change is refused, that the
+        // refusal names what is blocking it, and that it names a remedy which
+        // can clear that state.
+        h.check(
+            "S66 the refusal names what blocks it and a remedy that works",
+            refusal.as_deref().is_some_and(|message| {
+                message.contains("transaction mode")
+                    && message.contains("DB session is")
+                    && message.contains("discard")
+            }),
+            format!("refusal: {refusal:?}"),
+        );
+        let _ = h.editor.discard_pooled_session_for_close();
+    }
+
+    // ---- S67 (Oracle): a Read only tab refuses the per-transaction READ WRITE
+    // escape, like the MySQL family.
+    //
+    // Oracle's own allowlist refuses everything that WRITES, so the escape
+    // looked harmless there. A locking READ is what that argument misses:
+    // `SELECT … FOR UPDATE` is a query, so the allowlist admits it, and the
+    // only thing refusing it was the read-only transaction the escape ends.
+    //
+    // FAILS BEFORE: `SET TRANSACTION READ WRITE` succeeded and the locking read
+    // after it ran, taking row locks on a tab pinned Read only.
+    if target.is_oracle() {
+        println!("  --- S67 a Read only tab refuses the READ WRITE escape ---");
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        ));
+        let capture = h.run(
+            "COMMIT;\nSET TRANSACTION READ WRITE;\nSELECT COUNT(*) AS C FROM SQ_TM_T FOR UPDATE;",
+        )?;
+        let escape = capture
+            .results
+            .iter()
+            .find(|result| {
+                let upper = result.sql.to_uppercase();
+                upper.contains("SET TRANSACTION") && upper.contains("READ WRITE")
+            })
+            .cloned();
+        let locking_read_ran = capture
+            .results
+            .iter()
+            .any(|result| result.success && result.sql.to_uppercase().contains("FOR UPDATE"));
+        h.check(
+            "S67 the escape statement is refused",
+            escape.as_ref().is_some_and(|result| {
+                !result.success && result.message.contains("READ WRITE transaction")
+            }),
+            format!(
+                "escape: {:?}; all: {:?}",
+                escape.as_ref().map(|r| (r.success, r.message.clone())),
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.check(
+            "S67 and the locking read behind it never runs",
+            !locking_read_ran,
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
     }
 
     Ok(())

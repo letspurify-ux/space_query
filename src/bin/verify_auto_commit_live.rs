@@ -62,6 +62,11 @@
 //       tab already has changes nothing, so it must NOT be refused over
 //       uncommitted work and must not stop the script that contains it.
 //
+//   S30 (all) a parenthesised set query is a READ: it leaves the tab nothing
+//       to resolve and does not block the next option change.
+//   S29 (Oracle) a script SET AUTOCOMMIT over UNKNOWN session residue is
+//       refused — the same answer the MySQL family gives — and the refusal
+//       names the remedy that actually clears it.
 //   S28 (Oracle) a labelled anonymous block (`<<outer>> BEGIN … END;`) is the
 //       block it labels: it is executed as one, so under manual commit its
 //       write is uncommitted work the tab still owns and can roll back.
@@ -1709,6 +1714,156 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
 
         let _ = h.run("DROP PROCEDURE IF EXISTS sq_ac_open_txn");
         let _ = h.menu_auto_commit(false);
+    }
+
+    // ---- S30 (all): a parenthesised set query is a read -------------------
+    // MySQL needs those parentheses whenever a branch carries its own ORDER BY
+    // or LIMIT, and Oracle set chains are written the same way. The word
+    // scanner is top-level by design, so such a statement had no leading
+    // keyword — or the set operator as one — and classified as a statement the
+    // app could not read. Under manual commit the transaction the read itself
+    // opens was then BELIEVED to be the user's work: the tab asked for a commit
+    // on close and refused the next auto-commit change, after a pure read.
+    //
+    // FAILS before the fix on the MySQL family (the tab reads as dirty and the
+    // SET AUTOCOMMIT is refused); Oracle's write probe never saw the read, so
+    // this pins the behaviour there rather than repairing it.
+    println!("  --- S30 a parenthesised set query is a read ---");
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.run("ROLLBACK")?;
+    let _ = h.editor.discard_pooled_session_for_close();
+    let capture = h.run("(SELECT V FROM SQ_AC_T) UNION (SELECT V FROM SQ_AC_T)")?;
+    h.check(
+        "S30 the parenthesised set query runs",
+        capture.results.iter().all(|r| r.success) && !capture.results.is_empty(),
+        format!(
+            "results={:?}",
+            capture
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    let after_read = h
+        .editor
+        .pooled_session_activity_snapshot()
+        .map(|snap| snap.retained_state());
+    h.check(
+        "S30 a read leaves the tab nothing to resolve",
+        !h.close_would_prompt()
+            && after_read.is_none_or(|state| !state.may_have_uncommitted_work()),
+        format!("retained state after the read: {after_read:?}"),
+    );
+    let capture = h.run("SET AUTOCOMMIT ON")?;
+    h.check(
+        "S30 the option change after a read is not refused",
+        capture.results.iter().all(|r| r.success),
+        format!(
+            "results={:?} messages={:?}",
+            capture
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>(),
+            capture.messages
+        ),
+    );
+    h.run("SET AUTOCOMMIT OFF")?;
+    let _ = h.editor.discard_pooled_session_for_close();
+
+    // ---- S29 (Oracle): unknown residue refuses an option change -----------
+    // A body the app could not read may have changed the session's transaction
+    // semantics under it — and on Oracle a write probe cannot see a transaction
+    // such a block opened without writing. Turning auto-commit ON over that
+    // commits work the user never asked to commit, which is why residue keeps
+    // blocking option CHANGES long after it stopped blocking the next
+    // EXECUTION.
+    //
+    // The Oracle statement road used to answer this question with the app's one
+    // rule MINUS its residue term, so the identical MySQL-family script was
+    // refused while this one ran. FAILS before the fix: the SET AUTOCOMMIT
+    // succeeds.
+    if target.is_oracle() {
+        println!("  --- S29 a script SET AUTOCOMMIT over unknown session residue ---");
+        h.set_connection_auto_commit(false)
+            .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+        h.editor.sync_tab_auto_commit_with_global_setting(false);
+        h.run("ROLLBACK")?;
+        let _ = h.editor.discard_pooled_session_for_close();
+        // A block that writes nothing: the residue is the whole point, so the
+        // refusal below can only be about it.
+        h.run("BEGIN NULL; END;\n/")?;
+        let after_block = h
+            .editor
+            .pooled_session_activity_snapshot()
+            .map(|snap| snap.retained_state());
+        h.check(
+            "S29 the block left session residue the pool cannot restate",
+            after_block.is_some_and(|state| state.may_have_untracked_session_state()),
+            format!("retained state: {after_block:?}"),
+        );
+        // The transaction half of that state is the drivers' own answer and is
+        // deliberately not asserted: OCI's probe reports the transaction id
+        // Oracle assigns on the first WRITE, so it cannot PROVE that a block
+        // which wrote nothing left no transaction and the app stays
+        // conservative; thin reads the wire's own in-transaction flag and can.
+        // What this scenario is about is the residue, and the refusal below
+        // names it.
+        println!("    ..  S29 state after the block: {after_block:?}");
+        let capture = h.run("SET AUTOCOMMIT ON")?;
+        let refusal = capture
+            .results
+            .iter()
+            .find(|r| !r.success)
+            .map(|r| r.message.clone())
+            .or_else(|| {
+                capture
+                    .messages
+                    .iter()
+                    .find(|m| m.contains("Cannot change auto-commit"))
+                    .cloned()
+            });
+        h.check(
+            "S29 the option change is refused over unknown residue",
+            refusal.is_some(),
+            format!(
+                "results={:?} messages={:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>(),
+                capture.messages
+            ),
+        );
+        h.check(
+            "S29 the refusal names a remedy that can clear it",
+            refusal.as_deref().is_some_and(|message| {
+                message.contains("discard") && !message.contains("Commit, rollback")
+            }),
+            format!("refusal: {refusal:?}"),
+        );
+        // And the remedy really works: discarding the session lets the very
+        // same command through.
+        let _ = h.editor.discard_pooled_session_for_close();
+        let capture = h.run("SET AUTOCOMMIT ON")?;
+        h.check(
+            "S29 the named remedy really unblocks it",
+            capture.results.iter().all(|r| r.success),
+            format!(
+                "results={:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.run("SET AUTOCOMMIT OFF")?;
+        let _ = h.editor.discard_pooled_session_for_close();
     }
 
     // ---- S28 (Oracle): a LABELLED block is the block it labels ------------

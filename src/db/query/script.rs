@@ -7802,7 +7802,11 @@ impl QueryExecutor {
         false
     }
 
-    fn with_clause_starts_with_select(sql: &str) -> bool {
+    /// Whether this `WITH` statement's MAIN query is a `SELECT`.
+    ///
+    /// `pub(crate)` because the classifier asks it rather than walking the same
+    /// clause a second time — see `classify_with_sql_for_db_type`.
+    pub(crate) fn with_clause_starts_with_select(sql: &str) -> bool {
         let stripped = Self::strip_leading_comments(sql);
         let bytes = stripped.as_bytes();
         let len = bytes.len();

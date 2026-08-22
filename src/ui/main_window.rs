@@ -423,6 +423,15 @@ impl RetainedSessionOptionChangePlan {
         })
     }
 
+    /// There used to be an Oracle-only refusal in front of this loop, asking
+    /// `requires_physical_session_preservation`. That was the right question
+    /// for the road it guarded — Oracle's mode change DESTROYED the tab's
+    /// session — and the wrong one to ask about a CHANGE: it is what an action
+    /// that ends a session asks. Now that both families apply the change in
+    /// place, every backend asks the one option-change rule below, which on
+    /// Oracle refuses a superset of what that block refused (`MaybeDirty` too,
+    /// and Oracle's classifier can leave no residue the narrower question would
+    /// have caught on its own).
     fn validate_transaction_option_change(
         &self,
         option: TransactionOptionKind,
@@ -432,33 +441,19 @@ impl RetainedSessionOptionChangePlan {
         // Per-editor apply failures after that point discard failed MySQL
         // sessions instead of leaving old option state retained beside updated
         // sessions.
-        let is_transaction_mode = option == TransactionOptionKind::TransactionMode;
         for editor in &self.retained_editors {
             let Some(snapshot) = editor.pooled_session_activity_snapshot() else {
                 continue;
             };
-            if is_transaction_mode
-                && self
-                    .db_type
-                    .retained_session_blocks_transaction_mode_change(snapshot.retained_state())
-            {
-                return Err(format!(
-                    "Cannot change {} while a retained {} DB session is {}. Resolve or discard it first.",
-                    option.label(),
-                    self.db_type.display_name(),
-                    snapshot.retained_state().label()
-                ));
-            }
-            if is_transaction_mode
-                && self
-                    .db_type
-                    .can_replace_retained_transaction_mode(snapshot.retained_state())
-            {
-                continue;
-            }
-            crate::db::DatabaseConnection::ensure_retained_session_option_change_allowed(
+            // The rule ITSELF, not a second copy of its two steps. Step 1 and
+            // step 3 ask the same question about the same session, and this
+            // used to re-spell the backend escape and the shared gate side by
+            // side — the exact shape ("one rule, two spellings") that let the
+            // Oracle branch drift a term away from it.
+            SqlEditorWidget::ensure_retained_session_option_change_allowed(
+                self.db_type,
                 snapshot.retained_state(),
-                option.label(),
+                option,
             )?;
         }
         Ok(())
@@ -3304,19 +3299,37 @@ impl AppState {
         }
     }
 
-    fn has_running_query_or_lazy_fetch_for_tab(&self, tab_id: QueryTabId) -> bool {
-        let editor_has_work = self
-            .editor_tabs
-            .iter()
-            .find(|tab| tab.tab_id == tab_id)
-            .map(|tab| Self::tab_has_unfinished_db_work(&tab.sql_editor))
-            .unwrap_or(false);
-        let progress_has_lazy_fetch = self
+    /// The work THIS TAB owns, as ONE value.
+    ///
+    /// Every gate that refuses on a tab's work words its refusal from this,
+    /// which is why it folds in the lazy fetches the tab's PROGRESS CONTEXT
+    /// holds beside the editor's own: the scope gate used to ask a `bool` that
+    /// counted them and then word its own sentence, so a tab whose only work
+    /// was an execution it had ACCEPTED and not started was told "a query or
+    /// lazy fetch is active" — waiting for something that had not begun. Its
+    /// two sibling per-tab settings have always answered
+    /// [`TabDbWork::block_message`].
+    fn tab_db_work(&self, tab_id: QueryTabId) -> TabDbWork {
+        let progress_lazy_fetch = self
             .progress_contexts
             .get(&tab_id)
-            .map(|context| !context.lazy_fetch_sessions.is_empty())
-            .unwrap_or(false);
-        editor_has_work || progress_has_lazy_fetch
+            .is_some_and(|context| !context.lazy_fetch_sessions.is_empty());
+        self.editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .map_or_else(
+                || TabDbWork::from_flags(false, progress_lazy_fetch, false, false),
+                |tab| {
+                    TabDbWork::for_editor_with_progress_lazy_fetch(
+                        &tab.sql_editor,
+                        progress_lazy_fetch,
+                    )
+                },
+            )
+    }
+
+    fn has_running_query_or_lazy_fetch_for_tab(&self, tab_id: QueryTabId) -> bool {
+        self.tab_db_work(tab_id).blocks()
     }
 
     fn should_show_progress_status_for_tab(&self, tab_id: QueryTabId) -> bool {
@@ -5001,23 +5014,17 @@ impl AppState {
         &self,
         connection_id: ConnectionId,
     ) -> Option<String> {
-        if self.active_connection_id() != Some(connection_id)
-            || !self.has_running_query_or_lazy_fetch_for_tab(self.active_editor_tab_id)
-        {
+        if self.active_connection_id() != Some(connection_id) {
             return None;
         }
-        // The third per-tab setting says the same thing the other two do when
-        // the work cannot be stopped: waiting will not help, and the action
-        // that CAN end it is named. Stating only the fact ("a query is active")
-        // is true here and still leaves the user waiting for something that is
-        // not coming.
-        let work = self
-            .find_tab_index(self.active_editor_tab_id)
-            .map(|index| TabDbWork::for_editor(&self.editor_tabs[index].sql_editor));
-        if work == Some(TabDbWork::UnstoppableStatement) {
-            return TabDbWork::UnstoppableStatement.block_message("changing scope");
-        }
-        Some("Cannot change scope while a query or lazy fetch is active on this tab.".to_string())
+        // The third per-tab setting words its refusal from the same value the
+        // other two do. It used to word its own — one sentence for all four
+        // kinds of work — which was true of two of them, said "waiting will
+        // help" about a statement the app had already failed to stop (fixed
+        // once, for that kind only), and named a query and a lazy fetch for an
+        // execution the tab had merely ACCEPTED and not started.
+        self.tab_db_work(self.active_editor_tab_id)
+            .block_message("changing scope")
     }
 
     /// The tab whose scope a browser pick on `connection_id` governs: the
@@ -7379,19 +7386,24 @@ impl MainWindow {
         state: &Arc<Mutex<AppState>>,
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
     ) {
-        let (db_type, has_selection) = {
+        // The refusal is decided under the guard and SAID after it: an alert
+        // runs a nested FLTK event loop, and callbacks firing inside it must
+        // never find the app state mutex still held.
+        let Some((db_type, has_selection)) = ({
             let guard = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !guard.result_tabs.has_data() {
-                crate::ui::alert_on_main("No results to export");
-                return;
-            }
-            let has_selection = guard.result_tabs.has_grid_selection();
-            let db_type = guard
-                .active_connection_runtime()
-                .map(|runtime| runtime.sanitized_info().db_type);
-            (db_type, has_selection)
+            guard.result_tabs.has_data().then(|| {
+                (
+                    guard
+                        .active_connection_runtime()
+                        .map(|runtime| runtime.sanitized_info().db_type),
+                    guard.result_tabs.has_grid_selection(),
+                )
+            })
+        }) else {
+            crate::ui::alert_on_main("No results to export");
+            return;
         };
 
         // `SQL Inserts` writes dialect-specific literals, so it is only on offer
@@ -14114,45 +14126,57 @@ impl MainWindow {
                 true
             }
             "File/Reconnect Active Connection" => {
-                let (runtime, mut info, pool_size, policy) = {
+                // Every refusal below is DECIDED under the two guards and SAID
+                // after both are released: an alert runs a nested FLTK event
+                // loop, and a callback firing inside it must never find the app
+                // state — or the config — still locked.
+                let resolved = {
                     let s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let Some(runtime) = s.active_connection_runtime() else {
-                        crate::ui::alert_on_main(
-                            "The active query tab has no database connection.",
-                        );
+                    s.active_connection_runtime()
+                        .ok_or_else(|| {
+                            "The active query tab has no database connection.".to_string()
+                        })
+                        .and_then(|runtime| {
+                            let profile_name = s
+                                .connection_registry
+                                .profile_name_for(runtime.id())
+                                .ok_or_else(|| {
+                                    "Transient script connections must be re-authenticated with \
+                                     CONNECT."
+                                        .to_string()
+                                })?;
+                            let config = s
+                                .config
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let info = config
+                                .recent_connections
+                                .iter()
+                                .find(|info| info.name == profile_name)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    format!(
+                                        "'{profile_name}' is not among the saved connections, so \
+                                         there are no details to reconnect with. Use Connect to \
+                                         enter them."
+                                    )
+                                })?;
+                            Ok((
+                                runtime,
+                                info,
+                                config.normalized_connection_pool_size(),
+                                ConnectionAttemptPolicy::from_config(&config),
+                            ))
+                        })
+                };
+                let (runtime, mut info, pool_size, policy) = match resolved {
+                    Ok(resolved) => resolved,
+                    Err(message) => {
+                        crate::ui::alert_on_main(&message);
                         return true;
-                    };
-                    let Some(profile_name) = s.connection_registry.profile_name_for(runtime.id())
-                    else {
-                        crate::ui::alert_on_main(
-                            "Transient script connections must be re-authenticated with CONNECT.",
-                        );
-                        return true;
-                    };
-                    let config = s
-                        .config
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let Some(info) = config
-                        .recent_connections
-                        .iter()
-                        .find(|info| info.name == profile_name)
-                        .cloned()
-                    else {
-                        crate::ui::alert_on_main(&format!(
-                            "'{profile_name}' is not among the saved connections, so there \
-                             are no details to reconnect with. Use Connect to enter them."
-                        ));
-                        return true;
-                    };
-                    (
-                        runtime,
-                        info,
-                        config.normalized_connection_pool_size(),
-                        ConnectionAttemptPolicy::from_config(&config),
-                    )
+                    }
                 };
                 // The stored password is a reason to refuse the reconnect, so
                 // it is read BEFORE the preflight — not merely before the
@@ -14416,30 +14440,39 @@ impl MainWindow {
                 true
             }
             "File/Disconnect All" => {
+                // Decided under the guard, said after it: an alert runs a
+                // nested FLTK event loop and must never be raised with the app
+                // state mutex still held.
                 let runtimes = {
                     let s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let runtimes = s.connection_registry.runtimes();
-                    if let Some(runtime) = runtimes.iter().find(|runtime| {
+                    match runtimes.iter().find(|runtime| {
                         matches!(
                             runtime.state(),
                             ConnectionRuntimeState::Connecting
                                 | ConnectionRuntimeState::Transitioning
                         )
                     }) {
-                        crate::ui::alert_on_main(&format!(
+                        Some(runtime) => Err(format!(
                             "Connection '{}' is changing state. Wait for it to finish before disconnecting all connections.",
                             runtime.display_name()
-                        ));
+                        )),
+                        None => Ok(runtimes
+                            .into_iter()
+                            .filter(|runtime| {
+                                matches!(runtime.state(), ConnectionRuntimeState::Connected)
+                            })
+                            .collect::<Vec<_>>()),
+                    }
+                };
+                let runtimes = match runtimes {
+                    Ok(runtimes) => runtimes,
+                    Err(message) => {
+                        crate::ui::alert_on_main(&message);
                         return true;
                     }
-                    runtimes
-                        .into_iter()
-                        .filter(|runtime| {
-                            matches!(runtime.state(), ConnectionRuntimeState::Connected)
-                        })
-                        .collect::<Vec<_>>()
                 };
 
                 if runtimes.is_empty() {
@@ -15102,18 +15135,31 @@ impl MainWindow {
                         }
                     }
                 };
-                let (editor, runtime) = {
+                // The refusal is decided under the guard and SAID after it,
+                // exactly like the transaction-mode twin: the alert runs a
+                // nested FLTK event loop, and callbacks firing inside it must
+                // never find the state mutex still held. This road was the one
+                // of the three per-tab settings that raised it under the lock.
+                let blocked = {
                     let mut s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Some(message) =
-                        TabDbWork::for_editor(&s.sql_editor).block_message("changing auto-commit")
-                    {
-                        crate::ui::alert_on_main(&message);
-                        s.set_status_message(&message);
-                        revert_item(&mut item);
-                        return true;
+                    let blocked =
+                        TabDbWork::for_editor(&s.sql_editor).block_message("changing auto-commit");
+                    if let Some(message) = blocked.as_deref() {
+                        s.set_status_message(message);
                     }
+                    blocked
+                };
+                if let Some(message) = blocked {
+                    revert_item(&mut item);
+                    crate::ui::alert_on_main(&message);
+                    return true;
+                }
+                let (editor, runtime) = {
+                    let s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     (s.sql_editor.clone(), s.active_connection_runtime())
                 };
                 // Asking for the value the tab already has changes nothing, so
@@ -16842,6 +16888,12 @@ impl MainWindow {
             }
 
             // Check for file operations
+            //
+            // The alerts are collected here and raised AFTER the receiver guard
+            // is released: an alert runs a nested FLTK event loop, and this
+            // poll is what re-enters through it — raising one while still
+            // holding the channel this loop drains is the shape that hangs.
+            let mut deferred_alerts: Vec<String> = Vec::new();
             {
                 let r = file_receiver
                     .lock()
@@ -16935,9 +16987,7 @@ impl MainWindow {
 
                             drop(s);
 
-                            if let Some(alert_msg) = deferred_alert.take() {
-                                crate::ui::alert_on_main(&alert_msg);
-                            }
+                            deferred_alerts.extend(deferred_alert.take());
 
                             if let Some(tab_id) = created_tab_for_open {
                                 MainWindow::attach_editor_callbacks(
@@ -16966,6 +17016,10 @@ impl MainWindow {
                         }
                     }
                 }
+            }
+
+            for alert_msg in deferred_alerts {
+                crate::ui::alert_on_main(&alert_msg);
             }
 
             if deferred_by_borrow_conflict {

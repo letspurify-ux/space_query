@@ -1508,13 +1508,6 @@ impl DatabaseType {
         backend_for(self).can_apply_empty_scope_to_retained_session()
     }
 
-    pub(crate) fn retained_session_blocks_transaction_mode_change(
-        self,
-        retained_state: RetainedSessionState,
-    ) -> bool {
-        backend_for(self).retained_session_blocks_transaction_mode_change(retained_state)
-    }
-
     pub(crate) fn can_replace_retained_transaction_mode(
         self,
         retained_state: RetainedSessionState,
@@ -2002,12 +1995,33 @@ impl RetainedSessionMutationOutcome {
     /// which does not alert, about a session the take had just destroyed with
     /// the user's work in it.
     pub fn for_unreachable_take(retained_state: RetainedSessionState) -> Self {
-        if retained_state.may_have_uncommitted_work() {
-            Self::FailedDiscarded(
-                crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK.to_string(),
-            )
-        } else {
-            Self::DiscardedBecauseStale
+        Self::DiscardedBecauseStale.with_session_loss(retained_state.may_have_uncommitted_work())
+    }
+
+    /// The answer this push must give once it knows whether handing the tab's
+    /// session back DESTROYED it with the user's work inside.
+    ///
+    /// A push on a retained session runs on the UI thread with no operation of
+    /// its own, so it has no progress channel to tell the tab on: the loss can
+    /// only reach the user as the push's own answer. Every road therefore ends
+    /// through here instead of writing the sentence itself — three of them
+    /// did, one of them was polished into doing it while its two MySQL-family
+    /// twins were not, and a twin that stays silent is a transaction that goes
+    /// with no word said.
+    ///
+    /// The loss OUTRANKS whatever the road was going to say, including a
+    /// refusal: "the option cannot change" and "the session it was about is
+    /// gone, with your transaction" are not alternatives, and the second is the
+    /// bigger fact. It is carried on the same string so the user reads both.
+    #[must_use]
+    pub fn with_session_loss(self, lost_work: bool) -> Self {
+        if !lost_work {
+            return self;
+        }
+        let lost = crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK;
+        match self.message() {
+            Some(message) => Self::FailedDiscarded(format!("{message}\n{lost}")),
+            None => Self::FailedDiscarded(lost.to_string()),
         }
     }
 
@@ -4069,6 +4083,42 @@ impl DbSessionLease {
         }
     }
 
+    /// End the transaction this session is in, so the tab's next statement
+    /// starts a fresh one.
+    ///
+    /// What a transaction-mode change needs on every backend — see
+    /// [`crate::db::transaction_mode_change_returns_session_to_boundary`] for
+    /// the rule and for the condition under which a caller may ask for it. It
+    /// is a `ROLLBACK` on all three lease kinds because the caller has already
+    /// established there is no work: what it ends is the empty transaction a
+    /// read (or the app's own bookkeeping) left open, and ending it is the only
+    /// way the mode the toolbar now shows can govern the very next statement.
+    ///
+    /// Bounded by the tab's call timeout for the same reason
+    /// [`Self::apply_scope`] is: this runs on the FLTK thread.
+    pub fn end_transaction_for_mode_change(
+        &mut self,
+        query_timeout: Option<Duration>,
+    ) -> Result<(), String> {
+        self.with_call_timeout(query_timeout, |lease| match lease {
+            DbSessionLease::Oracle(conn) => conn
+                .rollback()
+                .map_err(|err| format!("Failed to end the Oracle transaction: {err}")),
+            DbSessionLease::OracleThin(conn) => conn
+                .rollback()
+                .map_err(|err| format!("Failed to end the Oracle thin transaction: {err}")),
+            DbSessionLease::MySQL { conn, db_type } => {
+                use mysql::prelude::Queryable;
+                conn.as_mut().query_drop("ROLLBACK").map_err(|err| {
+                    format!(
+                        "Failed to end the {} transaction: {err}",
+                        db_type.display_name()
+                    )
+                })
+            }
+        })
+    }
+
     pub fn apply_scope(
         &mut self,
         db_type: DatabaseType,
@@ -4966,35 +5016,6 @@ impl SharedDbSessionLease {
         }
     }
 
-    /// `clear`, but only when the slot still holds the generation the caller
-    /// resolved. A retained mutation reads the generation lock-free and applies
-    /// later, so a connect/reconnect/pool resize can land in between; without
-    /// this check the pending mutation closes the session the tab has ALREADY
-    /// been handed on the new generation.
-    ///
-    /// Returns `false` when the slot is empty or belongs to another
-    /// generation — the caller distinguishes the two.
-    pub fn clear_if_generation_matches(&self, connection_generation: u64) -> bool {
-        let lease_to_drop = {
-            let mut lease = self.lock_inner();
-            let matches = lease
-                .entry
-                .as_ref()
-                .is_some_and(|entry| entry.connection_generation == connection_generation);
-            if matches {
-                lease.entry.take()
-            } else {
-                None
-            }
-        };
-        if let Some(entry) = lease_to_drop {
-            entry.discard_physical("db::session_lease");
-            true
-        } else {
-            false
-        }
-    }
-
     /// Close this slot for good: its owner is going away.
     ///
     /// Beyond `clear`, this refuses every store from now on. A cancelled
@@ -5610,10 +5631,6 @@ pub(crate) trait DbBackend: Sync {
     ) -> Result<(), String>;
     fn has_connection_scope(&self) -> bool;
     fn can_apply_empty_scope_to_retained_session(&self) -> bool;
-    fn retained_session_blocks_transaction_mode_change(
-        &self,
-        retained_state: RetainedSessionState,
-    ) -> bool;
     fn can_replace_retained_transaction_mode(&self, retained_state: RetainedSessionState) -> bool;
     fn scope_values_match(&self, left: Option<&str>, right: Option<&str>) -> bool;
     fn metadata_scope_noun(&self) -> &'static str;
@@ -6389,13 +6406,6 @@ impl DbBackend for OracleBackend {
         false
     }
 
-    fn retained_session_blocks_transaction_mode_change(
-        &self,
-        retained_state: RetainedSessionState,
-    ) -> bool {
-        retained_state.requires_physical_session_preservation()
-    }
-
     fn can_replace_retained_transaction_mode(&self, _retained_state: RetainedSessionState) -> bool {
         false
     }
@@ -6912,13 +6922,6 @@ impl DbBackend for MysqlBackend {
 
     fn can_apply_empty_scope_to_retained_session(&self) -> bool {
         true
-    }
-
-    fn retained_session_blocks_transaction_mode_change(
-        &self,
-        _retained_state: RetainedSessionState,
-    ) -> bool {
-        false
     }
 
     fn can_replace_retained_transaction_mode(&self, retained_state: RetainedSessionState) -> bool {
@@ -8230,18 +8233,45 @@ impl DatabaseConnection {
         "SELECT @@in_transaction"
     }
 
-    /// The HAVING guard makes the probe fail closed: with the Performance
-    /// Schema disabled `PS_CURRENT_THREAD_ID()` is NULL and an unguarded
-    /// COUNT(*) would "answer" 0 — a false clean that would stop the probe
-    /// chain before the fallbacks run. With the guard the query returns no
-    /// row instead, which the caller treats as unanswered.
+    /// The HAVING guard makes the probe fail closed: a probe that cannot SEE
+    /// transactions must answer nothing, so the chain falls through to the next
+    /// one, instead of answering 0 — a false clean, which is the one direction
+    /// that loses the user's work.
+    ///
+    /// It has to cover every way the instrumentation can be off, not just the
+    /// first one that was thought of. `PS_CURRENT_THREAD_ID() IS NOT NULL`
+    /// covers only a server started with `performance_schema = OFF`. The
+    /// transaction events are ALSO switched off — at runtime, by a plain
+    /// UPDATE, with no restart and no error — by
+    /// `setup_instruments.transaction`, by `setup_consumers
+    /// .events_transactions_current`, or by either of that consumer's parents
+    /// (`global_instrumentation`, `thread_instrumentation`). All of them are
+    /// supported settings a DBA turns off to cut instrumentation overhead, and
+    /// in each of those states the unguarded query returns a row saying 0 while
+    /// the session holds an uncommitted `INSERT` (measured on MySQL 8.0.46;
+    /// `information_schema.innodb_trx`, the next probe in the chain, answers 1
+    /// correctly and was never reached).
+    ///
+    /// So the probe proves its own instrumentation before it answers. The
+    /// `setup_*` tables are PERFORMANCE_SCHEMA-engine tables, not InnoDB ones,
+    /// so asking them opens no transaction on the session being asked about —
+    /// the rule
+    /// [`Self::mysql_current_database_collation_for_db_type`] states.
     const fn mysql_performance_schema_transaction_probe_sql() -> &'static str {
         "\
             SELECT COUNT(*) \
             FROM performance_schema.events_transactions_current \
             WHERE THREAD_ID = PS_CURRENT_THREAD_ID() \
               AND STATE = 'ACTIVE' \
-            HAVING PS_CURRENT_THREAD_ID() IS NOT NULL"
+            HAVING PS_CURRENT_THREAD_ID() IS NOT NULL \
+               AND (SELECT COUNT(*) FROM performance_schema.setup_consumers \
+                     WHERE NAME IN ('global_instrumentation', \
+                                    'thread_instrumentation', \
+                                    'events_transactions_current') \
+                       AND ENABLED = 'YES') = 3 \
+               AND (SELECT COUNT(*) FROM performance_schema.setup_instruments \
+                     WHERE NAME = 'transaction' \
+                       AND ENABLED = 'YES') = 1"
     }
 
     /// Counts only transactions with something to lose (modified rows or held
@@ -8291,8 +8321,9 @@ impl DatabaseConnection {
             Ok(())
         } else {
             Err(format!(
-                "Cannot change {action} while the current DB session is {}. Commit, rollback, or discard it first.",
-                retained_state.label()
+                "Cannot change {action} while the current DB session is {}. {}",
+                retained_state.label(),
+                retained_state.blocked_option_change_remedy()
             ))
         }
     }
@@ -18535,19 +18566,44 @@ mod tests {
 
         assert!(!DatabaseType::Oracle.can_apply_empty_scope_to_retained_session());
         assert!(!DatabaseType::Oracle.supports_mysql_delimiter_commands());
-        assert!(
-            DatabaseType::Oracle.retained_session_blocks_transaction_mode_change(dirty_transaction)
-        );
+        // Oracle has no replacement of its own to offer, so a dirty session and
+        // a pending override both leave it with the shared rule below.
         assert!(
             !DatabaseType::Oracle.can_replace_retained_transaction_mode(transaction_mode_override)
         );
+        assert!(!DatabaseType::Oracle.can_replace_retained_transaction_mode(dirty_transaction));
 
         for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
             assert!(db_type.can_apply_empty_scope_to_retained_session());
             assert!(db_type.supports_mysql_delimiter_commands());
-            assert!(!db_type.retained_session_blocks_transaction_mode_change(dirty_transaction));
             assert!(db_type.can_replace_retained_transaction_mode(transaction_mode_override));
             assert!(!db_type.can_replace_retained_transaction_mode(dirty_transaction));
+        }
+
+        // The half that is NOT per-backend, and the reason the Oracle-only
+        // pre-block that used to stand here is gone: a session that owes a
+        // decision refuses the change on every backend, through the one rule.
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+        ] {
+            assert!(
+                DatabaseConnection::ensure_retained_session_option_change_allowed(
+                    dirty_transaction,
+                    "transaction mode",
+                )
+                .is_err(),
+                "{db_type} must refuse a transaction-mode change while a decision is owed"
+            );
+            assert!(
+                DatabaseConnection::ensure_retained_session_option_change_allowed(
+                    clean,
+                    "transaction mode",
+                )
+                .is_ok(),
+                "{db_type} must allow a transaction-mode change on a clean session"
+            );
         }
     }
 
@@ -20142,6 +20198,146 @@ mod tests {
             information_schema,
             "the transaction-free spelling must give the same answer it replaced"
         );
+    }
+
+    /// The MySQL dirty probe must answer NOTHING when it cannot see
+    /// transactions, so the chain falls through to `innodb_trx`.
+    ///
+    /// `events_transactions_current` is enabled by default on MySQL 8, but it
+    /// and its instrument and its two parent consumers can all be switched off
+    /// at runtime with a plain UPDATE — supported settings a DBA uses to cut
+    /// instrumentation overhead. Before the guard the probe returned a row
+    /// saying 0 in each of those states while the session held an uncommitted
+    /// INSERT, and 0 is an ANSWER: the chain stopped there, the tab was filed
+    /// Clean, and the close prompt that protects the user's work never armed.
+    ///
+    /// FAILS before the fix: with the consumer or the instrument off, the probe
+    /// answers `Some(0)` instead of `None`.
+    #[test]
+    #[ignore = "requires local MySQL test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_transaction_probe_answers_nothing_when_its_instrumentation_is_off() {
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(mysql_test_connection_info_from_env())
+            .expect("MySQL connection should succeed");
+        let transaction_mode = connection.transaction_mode();
+        let Some(DbPoolSession::MySQL { mut conn, .. }) = connection
+            .acquire_pool_session(PooledSessionPurpose::tab_statements(
+                false,
+                transaction_mode,
+            ))
+            .expect("MySQL pool session should be acquired")
+        else {
+            panic!("expected MySQL pool session");
+        };
+
+        let instrumented: Option<u64> = conn
+            .query_first(
+                "SELECT COUNT(*) FROM performance_schema.setup_consumers \
+                 WHERE NAME = 'events_transactions_current'",
+            )
+            .expect("the consumer catalogue should be readable");
+        if instrumented.unwrap_or(0) == 0 {
+            eprintln!(
+                "skipping: this server has no events_transactions_current consumer (MariaDB), \
+                 so the performance_schema probe never answers here anyway"
+            );
+            return;
+        }
+
+        conn.query_drop("DROP TABLE IF EXISTS sq_probe_guard_fixture")
+            .expect("fixture cleanup");
+        conn.query_drop("CREATE TABLE sq_probe_guard_fixture (id INT PRIMARY KEY) ENGINE=InnoDB")
+            .expect("fixture creation");
+        conn.query_drop("SET autocommit=0").expect("manual commit");
+        conn.query_drop("ROLLBACK").expect("start from a boundary");
+        conn.query_drop("INSERT INTO sq_probe_guard_fixture VALUES (1)")
+            .expect("real uncommitted work");
+
+        let probe_sql = DatabaseConnection::mysql_performance_schema_transaction_probe_sql();
+        let with_instrumentation: Option<u64> = conn
+            .query_first(probe_sql)
+            .expect("probe with instrumentation");
+        conn.query_drop("ROLLBACK").expect("end the work");
+
+        // Each switch off, and the work started AFTER it: an instrument is
+        // consulted when the transaction event BEGINS, so disabling it over an
+        // already-running transaction leaves the row it had already created.
+        // The dangerous state is the one a session meets on a server that was
+        // configured this way before the user's statement ran — where the
+        // unguarded probe answers 0 about a session holding an uncommitted
+        // INSERT, and 0 is an ANSWER: the chain stops and the accurate
+        // `innodb_trx` probe below is never reached.
+        //
+        // These are GLOBAL settings, so each is restored immediately and
+        // nothing is left to a later assertion's panic.
+        let mut answers: Vec<(&str, Option<u64>)> = Vec::new();
+        for (table, name) in [
+            ("setup_consumers", "events_transactions_current"),
+            ("setup_instruments", "transaction"),
+        ] {
+            conn.query_drop(format!(
+                "UPDATE performance_schema.{table} SET ENABLED = 'NO' WHERE NAME = '{name}'"
+            ))
+            .expect("disable the instrumentation");
+            let work = conn.query_drop("INSERT INTO sq_probe_guard_fixture VALUES (2)");
+            let answer: Result<Option<u64>, _> = conn.query_first(probe_sql);
+            let ended = conn.query_drop("ROLLBACK");
+            conn.query_drop(format!(
+                "UPDATE performance_schema.{table} SET ENABLED = 'YES' WHERE NAME = '{name}'"
+            ))
+            .expect("restore the instrumentation");
+            work.expect("real uncommitted work with the switch off");
+            ended.expect("end the work");
+            answers.push((name, answer.expect("probe with the switch off")));
+        }
+
+        conn.query_drop("DROP TABLE IF EXISTS sq_probe_guard_fixture")
+            .expect("fixture cleanup");
+
+        assert_eq!(
+            with_instrumentation,
+            Some(1),
+            "with its instrumentation on, the probe must see the uncommitted INSERT"
+        );
+        for (name, answer) in answers {
+            assert_eq!(
+                answer, None,
+                "with {name} disabled the probe must not answer at all (it answered {answer:?})"
+            );
+        }
+        // What the chain then does with the question is the NEXT probe's
+        // business, and this test deliberately does not assert it:
+        // `information_schema.innodb_trx` is a periodically refreshed snapshot,
+        // so it answers 1 or 0 for the same state depending on timing — which
+        // is exactly why the app made it the last resort. What must hold here,
+        // and what alone was broken, is that a probe which cannot see
+        // transactions does not get to ANSWER.
+    }
+
+    /// The guard above, in the form a future edit trips: the first probe MySQL
+    /// asks has to prove its own instrumentation before it answers.
+    #[test]
+    fn the_performance_schema_transaction_probe_proves_its_own_instrumentation() {
+        let probe = DatabaseConnection::mysql_performance_schema_transaction_probe_sql();
+        assert_eq!(
+            DatabaseConnection::mysql_transaction_probe_sql_order(DatabaseType::MySQL).first(),
+            Some(&probe),
+            "MySQL asks the performance_schema probe first, so its guard is what decides"
+        );
+        for needle in [
+            "PS_CURRENT_THREAD_ID() IS NOT NULL",
+            "setup_consumers",
+            "global_instrumentation",
+            "thread_instrumentation",
+            "events_transactions_current",
+            "setup_instruments",
+        ] {
+            assert!(
+                probe.contains(needle),
+                "the probe must fail closed on {needle} being off, not answer 0"
+            );
+        }
     }
 
     #[test]
