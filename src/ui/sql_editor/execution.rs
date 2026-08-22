@@ -29844,6 +29844,76 @@ mod session_transaction_mode_adoption_tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
+    /// The control that OFFERS a transaction-mode change and the callback that
+    /// PERFORMS it ask ONE session rule, and this is what lets them be spelled
+    /// once.
+    ///
+    /// They were two spellings of the same thing —
+    /// `retained_session_state_transaction_mode_change_preflight_decision` at
+    /// the control and `ensure_retained_session_option_change_allowed` at the
+    /// callback — and two spellings of one rule is how a term drifts out of one
+    /// of them. Merging them is only safe while they answer identically, so
+    /// this asks BOTH of every state on every backend. If a future change makes
+    /// them differ, the merge has to be undone deliberately rather than
+    /// discovered by a user whose greyed-out control disagrees with the alert
+    /// they get.
+    #[test]
+    fn the_transaction_mode_gate_and_the_option_gate_are_one_rule() {
+        use crate::db::{
+            RetainedSessionPreflightDecision, RetainedSessionState, TransactionOptionKind,
+            TransactionSessionState,
+        };
+
+        let states = [
+            RetainedSessionState::default(),
+            RetainedSessionState::from_transaction_flags(true, false),
+            RetainedSessionState::from_transaction_flags(true, true),
+            RetainedSessionState::default()
+                .with_transaction_state(TransactionSessionState::BlockedDirty),
+            RetainedSessionState::default()
+                .with_transaction_state(TransactionSessionState::InvalidSession),
+        ];
+        // The state the backend escape is ABOUT: a pending one-shot
+        // `SET TRANSACTION`, which the MySQL family may replace on a session it
+        // would otherwise refuse. Built the way the app really produces it —
+        // from the statement — so the escape is exercised rather than asserted.
+        let pending_one_shot = |db_type| {
+            let post_processor = crate::db::statement_session_post_processor_for(db_type);
+            crate::db::retained_session_state_after_statement(
+                post_processor,
+                RetainedSessionState::default(),
+                post_processor.effects_for_sql("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+                false,
+                false,
+                false,
+                false,
+            )
+        };
+        for db_type in DatabaseType::ALL {
+            let states = states
+                .iter()
+                .copied()
+                .chain(std::iter::once(pending_one_shot(db_type)))
+                .collect::<Vec<_>>();
+            for state in states {
+                let control =
+                    crate::db::retained_session_state_transaction_mode_change_preflight_decision(
+                        db_type, state,
+                    ) == RetainedSessionPreflightDecision::RequireResolution;
+                let callback = SqlEditorWidget::ensure_retained_session_option_change_allowed(
+                    db_type,
+                    state,
+                    TransactionOptionKind::TransactionMode,
+                )
+                .is_err();
+                assert_eq!(
+                    control, callback,
+                    "the control and the callback must refuse the same states: {db_type:?} {state:?}"
+                );
+            }
+        }
+    }
+
     /// The tab's three counters as a running execution sees them.
     ///
     /// `current` is the operation the tab is on (0 once it has ended),

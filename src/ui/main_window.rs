@@ -2573,6 +2573,17 @@ impl AppState {
         self.synchronize_scope_for_connection(connection_id, None)
     }
 
+    /// The connection-wide twin of [`Self::synchronize_scope_for_tab`], and it
+    /// deliberately does NOT ask the cards whether they were behind.
+    ///
+    /// Its tab twin has to, because a worker can move a tab's binding while the
+    /// matching `ScopeChangedNotice` is dropped as superseded. This one has a
+    /// single caller — `keep_tab_scopes_across_connect`, on the one event where
+    /// a connection comes back as a DIFFERENT DATABASE TYPE — and that caller
+    /// clears the connection's metadata and marks every tab for a refresh
+    /// unconditionally straight afterwards, because no catalog survives a
+    /// change of database family. Adding the card question here would be a
+    /// second repair for one that has already happened.
     fn synchronize_scope_for_connection(
         &mut self,
         connection_id: ConnectionId,
@@ -4905,7 +4916,43 @@ impl AppState {
     /// lazy fetch is running on the tab, or its retained DB session is in a
     /// state that requires resolution first.
     fn transaction_mode_change_blocked_for_active_tab(&self, db_type: DatabaseType) -> bool {
-        self.sql_editor.transaction_mode_change_blocked_now(db_type)
+        self.per_tab_option_change_blocked(
+            self.active_editor_tab_id,
+            db_type,
+            TransactionOptionKind::TransactionMode,
+        )
+    }
+
+    /// Whether the ACTIVE tab can accept a change to one of its per-tab
+    /// transaction options right now.
+    ///
+    /// The one answer the control that OFFERS the change and the callback that
+    /// PERFORMS it both ask. It lives here because only the window can name a
+    /// tab and reach both halves: the work (`Self::tab_db_work`, which counts
+    /// the lazy fetches the window holds beside the editor's own) and the tab's
+    /// own session, which the editor owns.
+    ///
+    /// Asking two derivations of the work is exactly what let the
+    /// transaction-mode combos stay live while the callback beside them
+    /// refused — the state `SqlEditorWidget::per_tab_option_change_blocked_by`
+    /// exists to prevent — and it is why the auto-commit item, which had no
+    /// enablement gate at all, asks this too.
+    fn per_tab_option_change_blocked(
+        &self,
+        tab_id: QueryTabId,
+        db_type: DatabaseType,
+        option: TransactionOptionKind,
+    ) -> bool {
+        self.editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .is_some_and(|tab| {
+                tab.sql_editor.per_tab_option_change_blocked_by(
+                    self.tab_db_work(tab_id),
+                    db_type,
+                    option,
+                )
+            })
     }
 
     /// What a transaction-mode PICK needs to know, built WITHOUT the connection
@@ -5680,14 +5727,45 @@ impl AppState {
         // read — THE SAME reader the status-bar indicator uses, because the two
         // are one value. They used to be two computations with two filters.
         let effective = self.displayable_auto_commit_for_active_tab();
+        // Whether the toggle may be USED is a separate question from what it
+        // SHOWS, and it is the one the item never asked: it stayed live while
+        // its own callback refused, so a user clicking it got an alert and a
+        // reverted checkmark. Its two sibling per-tab settings gate their
+        // controls; this is that gate, asked from the one place both the
+        // control and the callback ask.
+        //
+        // The db_type is the ACTIVE TAB's, from the view
+        // `refresh_active_connection_view` has just re-learned above.
+        let blocked = self
+            .connection_info
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|info| info.db_type)
+            .is_some_and(|db_type| {
+                self.per_tab_option_change_blocked(
+                    self.active_editor_tab_id,
+                    db_type,
+                    TransactionOptionKind::AutoCommit,
+                )
+            });
+        // The mark is stated whatever the gate says: a control the user may not
+        // touch must still tell them what is in force.
+        let set_enablement = |item: &mut fltk::menu::MenuItem| {
+            if blocked {
+                item.deactivate();
+            } else {
+                item.activate();
+            }
+        };
         match effective {
             Some(true) => {
                 item.set();
-                item.activate();
+                set_enablement(&mut item);
             }
             Some(false) => {
                 item.clear();
-                item.activate();
+                set_enablement(&mut item);
             }
             // No live connection: there is no session for the toggle to act on
             // and no auto-commit in effect to show, so the item says neither —

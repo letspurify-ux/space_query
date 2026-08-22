@@ -4785,21 +4785,57 @@ impl SqlEditorWidget {
     /// lives here — where the state does — instead of being re-derived by each
     /// caller.
     pub fn transaction_mode_change_blocked_now(&self, db_type: crate::db::DatabaseType) -> bool {
-        // THE SAME ANSWER the callback beside these combos refuses on
-        // ([`TabDbWork`]), because a control that says "you may change this"
-        // and a callback that then says "no" are one question. This listed two
-        // of the three kinds, so during the window a DEFERRED execution waits
-        // -- up to 0.2s on both roads, longer while a lazy-fetch cancel is
-        // retried -- the combos stayed live and the pick was alerted away.
-        if TabDbWork::for_editor(self).blocks() {
+        // The same answer for a caller that has only an EDITOR: there, the
+        // editor's own work IS the tab's whole work. The live harness is that
+        // caller (it drives a real editor with no window), which is what live
+        // TM S23 — an open lazy fetch closes these controls — is asked of.
+        self.per_tab_option_change_blocked_by(
+            TabDbWork::for_editor(self),
+            db_type,
+            crate::db::TransactionOptionKind::TransactionMode,
+        )
+    }
+
+    /// Whether this tab can accept a change to one of its per-tab transaction
+    /// OPTIONS right now — the answer the control that offers the change and
+    /// the callback that performs it must both ask.
+    ///
+    /// The work is a PARAMETER, and that is the fix rather than a detail. It
+    /// used to be derived here as `TabDbWork::for_editor(self)`, and when the
+    /// callbacks moved to `AppState::tab_db_work` — which also counts the lazy
+    /// fetches the WINDOW holds beside the editor's own — the control and the
+    /// callback became two questions again. This function's own doc had said
+    /// what that costs since the day it was written: *a control that says "you
+    /// may change this" and a callback that then says "no" are one question.*
+    /// A caller that can name a TAB supplies the work; a caller that has only
+    /// an editor supplies what it can see.
+    ///
+    /// Both options ask ONE session rule, the one the callbacks' own step 1 and
+    /// step 3 ask (`ensure_retained_session_option_change_allowed`). For the
+    /// transaction mode that is exactly
+    /// `retained_session_state_transaction_mode_change_preflight_decision` —
+    /// both are the backend's replace-a-pending-one-shot escape over the
+    /// `TransactionOptionChange` preflight — and
+    /// `the_transaction_mode_gate_and_the_option_gate_are_one_rule` holds them
+    /// to it, so the control cannot drift from the callback on the session half
+    /// either.
+    pub(crate) fn per_tab_option_change_blocked_by(
+        &self,
+        work: TabDbWork,
+        db_type: crate::db::DatabaseType,
+        option: crate::db::TransactionOptionKind,
+    ) -> bool {
+        if work.blocks() {
             return true;
         }
         self.pooled_session_activity_snapshot()
             .is_some_and(|snapshot| {
-                crate::db::retained_session_state_transaction_mode_change_preflight_decision(
+                Self::ensure_retained_session_option_change_allowed(
                     db_type,
                     snapshot.retained_state(),
-                ) == crate::db::RetainedSessionPreflightDecision::RequireResolution
+                    option,
+                )
+                .is_err()
             })
     }
 

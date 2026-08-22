@@ -2187,15 +2187,21 @@ fn regression_07_oracle_transaction_mode_change_does_not_silently_clear_preserve
     // The control gating routes through the DB-specific retained-session
     // policy. It lives on the tab that owns the state; the toolbar delegates.
     let editor_mod = read_source("src/ui/sql_editor/mod.rs");
+    // CHANGED, with its reason: the window no longer calls
+    // `transaction_mode_change_blocked_now` — that one is for a caller with
+    // only an EDITOR (the live harness). The window can name a TAB, so it
+    // supplies the work IT can see to the one gate; deriving the work twice is
+    // what let the combos stay live while the callback beside them refused.
+    // The fact this clause is about is unchanged: the gating asks the tab that
+    // owns the session state, through the DB-specific retained-session policy.
     assert!(
         main_window.contains("fn transaction_mode_change_blocked_for_active_tab(")
-            && main_window.contains("transaction_mode_change_blocked_now("),
+            && main_window.contains("per_tab_option_change_blocked("),
         "the main window's transaction-mode control gating must ask the tab that owns the state"
     );
     assert!(
-        editor_mod.contains("fn transaction_mode_change_blocked_now(")
-            && editor_mod
-                .contains("retained_session_state_transaction_mode_change_preflight_decision(")
+        editor_mod.contains("fn per_tab_option_change_blocked_by(")
+            && editor_mod.contains("ensure_retained_session_option_change_allowed(")
             && editor_mod.contains("snapshot.retained_state()"),
         "transaction-mode control gating must route through the DB-specific retained-session policy"
     );
@@ -4690,21 +4696,94 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     // window a DEFERRED execution waits, the combos stayed live while the
     // callback beside them refused. The retained-state half is unchanged and is
     // what the rest of this guard is about.
+    // CHANGED, with its reason — and this clause is why the drift it was
+    // written about happened AGAIN. It pinned the gate to
+    // `TabDbWork::for_editor(self)`, one SIDE's spelling; when the callbacks
+    // moved to `AppState::tab_db_work` (which also counts the lazy fetches the
+    // WINDOW holds) the control kept the editor-only derivation, the combos
+    // stayed live while the callback refused, and this guard passed.
+    //
+    // A guard that pins one side of a "these two must agree" rule cannot see
+    // the other side move. So what is pinned now is the RELATIONSHIP: the work
+    // is a PARAMETER of the gate, the caller that can name a tab supplies
+    // `tab_db_work`, and the caller that has only an editor supplies what it
+    // can see.
     let blocked_body = slice_to_end_of_fn(&editor_mod, blocked_start);
     assert!(
-        blocked_body.contains("TabDbWork::for_editor(self).blocks()")
-            && blocked_body
-                .contains("retained_session_state_transaction_mode_change_preflight_decision("),
-        "the gate must cover every kind of the tab's work and a session that needs resolution: \
-         {blocked_body}"
+        blocked_body.contains("TabDbWork::for_editor(self)"),
+        "the editor-only caller supplies the work it can see (the live harness is that \
+         caller, and TM S23 is asked of it): {blocked_body}"
     );
+    let one_gate = slice_to_end_of_fn(
+        &editor_mod,
+        editor_mod
+            .find("    pub(crate) fn per_tab_option_change_blocked_by(")
+            .expect("the one per-tab option gate should exist"),
+    );
+    assert!(
+        one_gate.contains("work: TabDbWork,") && one_gate.contains("if work.blocks() {"),
+        "the work is a PARAMETER, so a control and a callback cannot derive it differently: \
+         {one_gate}"
+    );
+    assert!(
+        one_gate.contains("ensure_retained_session_option_change_allowed("),
+        "and the session half is the rule the callbacks' own steps ask, held equal to the \
+         control's older spelling by \
+         `the_transaction_mode_gate_and_the_option_gate_are_one_rule`: {one_gate}"
+    );
+    assert!(
+        !one_gate.contains("TabDbWork::for_editor("),
+        "the gate itself may never derive the work again: {one_gate}"
+    );
+    // And BOTH per-tab options that have a control ask it through the window,
+    // which is the only thing that can name a tab.
+    let window_gate = slice_to_end_of_fn(
+        &main_window,
+        main_window
+            .find("    fn per_tab_option_change_blocked(")
+            .expect("the window's one answer should exist"),
+    );
+    assert!(
+        window_gate.contains("self.tab_db_work(tab_id)")
+            && window_gate.contains("per_tab_option_change_blocked_by("),
+        "the window supplies the work it can see: {window_gate}"
+    );
+    for (control, option) in [
+        (
+            "fn transaction_mode_change_blocked_for_active_tab(",
+            "TransactionOptionKind::TransactionMode",
+        ),
+        (
+            "fn sync_auto_commit_indicators(",
+            "TransactionOptionKind::AutoCommit",
+        ),
+    ] {
+        let at = main_window
+            .find(control)
+            .unwrap_or_else(|| panic!("{control} should exist"));
+        let body = slice_to_end_of_fn(&main_window, at);
+        assert!(
+            body.contains("self.per_tab_option_change_blocked(") && body.contains(option),
+            "{control} must gate its control on the one answer — the auto-commit item had no \
+             enablement gate at all and stayed live while its own callback refused"
+        );
+    }
+    // CHANGED, with its reason: the toolbar delegates to the one gate through
+    // the window's own answer now (`per_tab_option_change_blocked`), because
+    // only the window can supply the work half the callback also uses. The fact
+    // is the same — it must not re-derive the gate.
     let blocked_delegate_start = main_window
         .find("fn transaction_mode_change_blocked_for_active_tab(")
         .expect("the toolbar's gate accessor should exist");
+    let blocked_delegate = slice_to_end_of_fn(&main_window, blocked_delegate_start);
     assert!(
-        main_window[blocked_delegate_start..blocked_delegate_start + 400]
-            .contains("transaction_mode_change_blocked_now("),
-        "the toolbar must delegate the gate to the tab instead of re-deriving it"
+        blocked_delegate.contains("self.per_tab_option_change_blocked("),
+        "the toolbar must delegate the gate instead of re-deriving it: {blocked_delegate}"
+    );
+    assert!(
+        !blocked_delegate.contains("TabDbWork::")
+            && !blocked_delegate.contains("pooled_session_activity_snapshot("),
+        "and it may not assemble either half itself: {blocked_delegate}"
     );
 
     // (3) The worker startup resolves the mode only through the resolver
@@ -7719,6 +7798,14 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
             "a gate must count {expected} as unfinished work: {derivation_body}"
         );
     }
+    // CHANGED, with its reason: this is the SECOND clause that pinned one
+    // side's spelling of "these two must agree", and the drift it names went
+    // straight past both. The gate's work is a parameter now; what this holds
+    // is that the editor-only caller states what it can see and that no gate
+    // goes back to listing the kinds of work it happens to remember. The
+    // control-equals-callback half is pinned in
+    // `pool_resize_gates_on_running_work_before_prompting_session_resolution`,
+    // where the window's own answer can be reached.
     let enablement = slice_to_end_of_fn(
         &editor_source,
         editor_source
@@ -7726,9 +7813,9 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
             .expect("the toolbar's enablement gate should exist"),
     );
     assert!(
-        enablement.contains("TabDbWork::for_editor(self).blocks()"),
-        "the control that says a change is allowed and the callback that refuses it must ask \
-         ONE question: {enablement}"
+        enablement.contains("TabDbWork::for_editor(self)")
+            && enablement.contains("per_tab_option_change_blocked_by("),
+        "the editor-only caller supplies its own work to the ONE gate: {enablement}"
     );
     assert!(
         !enablement.contains("self.is_query_running() || self.has_open_lazy_fetch()"),

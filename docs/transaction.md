@@ -643,6 +643,25 @@ cannot name a tab; it was what the auto-commit and transaction-mode gates asked
 while the scope gate asked the other, so one tab could answer "there is work" to
 one setting and "there is none" to the other two.
 
+**A control that offers a change and the callback that performs it are one
+question**, and the work is a PARAMETER of that question so they cannot derive
+it apart. `SqlEditorWidget::per_tab_option_change_blocked_by(work, db_type,
+option)` is the gate; `AppState::per_tab_option_change_blocked(tab_id, …)`
+supplies the work the window can see and is what both the transaction-mode
+combos and the `Tools > Auto-Commit` item ask, while
+`transaction_mode_change_blocked_now` supplies the editor's own work for a
+caller that has no window (the live harness, which is what TM S23 drives).
+
+Fixing only the callbacks is what re-opened this: the callbacks moved to
+`AppState::tab_db_work` and the combos kept deriving their own, so they stayed
+live during the window the window holds a fetch the editor does not — the exact
+state the gate's own doc says it exists to prevent. The auto-commit item had no
+enablement gate at all and simply alerted; it has one now. Both options ask ONE
+session rule (`ensure_retained_session_option_change_allowed`), which
+`the_transaction_mode_gate_and_the_option_gate_are_one_rule` holds equal to the
+control's older spelling on every backend and every state, so the merge cannot
+drift either.
+
 The same family rule applies to the SCREEN: `render_status_bar` settles all
 three on every status tick. Auto-commit and transaction mode have had that
 healer for some time; scope was left to a tab switch, so a worker that moved the
