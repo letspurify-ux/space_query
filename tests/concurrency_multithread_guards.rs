@@ -2444,16 +2444,9 @@ fn every_per_tab_setting_builds_its_retained_plan_without_the_connection_mutex()
     );
     assert!(
         scope_plan.contains("connection_binding.snapshot().runtime?")
-            && scope_plan.contains("runtime.connection_generation()")
-            && scope_plan.contains("runtime.pool_context_epoch()")
-            && scope_plan.contains("runtime.sanitized_info()"),
+            && scope_plan.contains("runtime.retained_session_target()?"),
         "...it is built from the runtime's lock-free identity, exactly as the two sibling \
          settings are"
-    );
-    assert!(
-        scope_plan.contains("ConnectionRuntimeState::Connected"),
-        "and the refusals it keeps — not connected, connecting, failed, transitioning — are \
-         asked of the published state rather than of whoever holds the mutex"
     );
 
     let sibling_plan_start = main_window
@@ -2462,10 +2455,31 @@ fn every_per_tab_setting_builds_its_retained_plan_without_the_connection_mutex()
     let sibling_plan = slice_to_end_of_fn(&main_window, sibling_plan_start);
     assert!(
         !sibling_plan.contains("lock_connection")
-            && sibling_plan.contains("runtime.connection_generation()")
-            && sibling_plan.contains("runtime.sanitized_info()"),
+            && sibling_plan.contains("runtime.retained_session_target()"),
         "the sibling settings stay off the mutex too — this is the shape the scope pick was \
          brought in line with"
+    );
+
+    // And the identity itself is built in ONE place now, so the rule is pinned
+    // where it lives instead of once per caller's spelling: three plans that
+    // each re-derived it are three chances to reach for the connection.
+    let runtime = read_source("src/db/runtime.rs");
+    let target_start = runtime
+        .find("    pub fn retained_session_target(")
+        .expect("the one lock-free identity builder must exist");
+    let target = slice_to_end_of_fn(&runtime, target_start);
+    assert!(
+        !target.contains("lock_connection"),
+        "the identity every per-tab setting carries is answered by the RUNTIME, never by \
+         taking the connection: {target}"
+    );
+    assert!(
+        target.contains("ConnectionRuntimeState::Connected")
+            && target.contains("self.connection_generation()")
+            && target.contains("self.pool_context_epoch()")
+            && target.contains("self.sanitized_info().db_type"),
+        "and the refusals it keeps — not connected, connecting, failed, transitioning — are \
+         asked of the published state rather than of whoever holds the mutex: {target}"
     );
 }
 
@@ -8086,22 +8100,40 @@ fn every_retained_session_mutation_validates_the_connection_generation() {
     let apply_body = &oracle_body[apply..apply + 1200];
     assert!(
         apply_body.contains("apply_oracle_transaction_mode_to_reusable_pooled_session(")
-            && apply_body.contains("connection_generation"),
-        "the Oracle transaction-mode apply must hand the generation to the one \
+            && apply_body.contains("target"),
+        "the Oracle transaction-mode apply must hand the identity to the one \
          that acts on the session"
     );
 
+    // Every retained mutation, not the Oracle one alone: they now take the same
+    // carried identity, so the rule can be asked of all three. The generation is
+    // validated where it always was — at the TAKE — and it is the one the plan
+    // resolved, which is what makes carrying it safe. `can_reuse_pool_session`
+    // used to be asked here as a second check, and its only unique term ("the
+    // connection is up") is now asked of the runtime where the plan is built,
+    // without the BLOCKING lock that check needed.
     let execution = read_source("src/ui/sql_editor/execution.rs");
+    for road in [
+        "fn apply_oracle_transaction_mode_to_reusable_pooled_session(",
+        "fn apply_mysql_transaction_mode_to_reusable_pooled_session(",
+        "fn apply_mysql_autocommit_to_reusable_pooled_session(",
+    ] {
+        let start = execution
+            .find(road)
+            .unwrap_or_else(|| panic!("{road} should exist"));
+        let body = slice_to_end_of_fn(&execution, start);
+        assert!(
+            body.contains("target.connection_generation()")
+                && body.contains("take_reusable_lease_for_context_update("),
+            "{road} must validate the identity it was handed by taking the session through \
+             the door, not act on the slot behind it"
+        );
+    }
+
     let oracle_apply = execution
         .find("fn apply_oracle_transaction_mode_to_reusable_pooled_session(")
         .expect("the Oracle retained transaction-mode mutation should exist");
     let oracle_apply_body = slice_to_end_of_fn(&execution, oracle_apply);
-    assert!(
-        oracle_apply_body.contains("can_reuse_pool_session(connection_generation, db_type)")
-            && oracle_apply_body.contains("take_reusable_lease_for_context_update("),
-        "it must validate the generation and take the session through the door, \
-         not act on the slot behind it"
-    );
     for forbidden in [
         "pooled_db_session.clear()",
         "clear_if_generation_matches",
@@ -14087,34 +14119,44 @@ fn every_action_on_a_retained_session_says_which_connection_it_is_on() {
         "the row and the connection info come from ONE resolution of the pool context, \
          because they are one fact: {begin}"
     );
-    for road in [
-        "pub(super) fn apply_mysql_autocommit_to_reusable_pooled_session(",
-        "pub(super) fn apply_mysql_transaction_mode_to_reusable_pooled_session(",
+    // All FOUR roads, because the door is now shared: the scope apply used to
+    // spell the two lines itself and the Oracle mode apply was not pinned at
+    // all. A row that names no connection is not a cosmetic loss — the canceler
+    // the take publishes is built from that `ConnectionInfo`, and on the MySQL
+    // family it opens a control connection with it to send `KILL QUERY`.
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    for (source, road) in [
+        (
+            &execution,
+            "pub(super) fn apply_mysql_autocommit_to_reusable_pooled_session(",
+        ),
+        (
+            &execution,
+            "pub(super) fn apply_mysql_transaction_mode_to_reusable_pooled_session(",
+        ),
+        (
+            &execution,
+            "pub(super) fn apply_oracle_transaction_mode_to_reusable_pooled_session(",
+        ),
+        (&editor, "pub fn apply_current_scope_to_retained_session("),
     ] {
-        let body = execution
+        let body = source
             .find(road)
-            .map(|offset| slice_to_end_of_fn(&execution, offset))
+            .map(|offset| slice_to_end_of_fn(source, offset))
             .unwrap_or_else(|| panic!("{road} should exist"));
         assert!(
-            compact_for_pattern(body).contains("Self::begin_retained_session_action("),
+            compact_for_pattern(body).contains("begin_retained_session_action("),
             "{road} must publish its row through the door that names its connection"
         );
         assert!(
             !compact_for_pattern(body).contains("crate::db::track_db_activity(db_activity,"),
             "{road} must not build a row that names no connection and carries no lifetime"
         );
+        assert!(
+            !compact_for_pattern(body).contains("ConnectionInfo::default()"),
+            "{road} must not fall back to a connection info that can reach no server"
+        );
     }
-
-    let editor = read_source("src/ui/sql_editor/mod.rs");
-    let scope = editor
-        .find("pub fn apply_current_scope_to_retained_session(")
-        .map(|offset| slice_to_end_of_fn(&editor, offset))
-        .expect("the retained-session scope apply should exist");
-    assert!(
-        compact_for_pattern(scope).contains("context.track_operation_activity("),
-        "the scope apply publishes a session canceler too, so its row states its \
-         connection: {scope}"
-    );
 
     // And the bind-parameter probe, which HAS a context and reached for the raw
     // helper beside it — the same shape round 4's F8 fixed for the schema

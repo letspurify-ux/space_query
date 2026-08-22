@@ -392,9 +392,9 @@ struct OracleThinConnectedCandidate {
 /// A UI-thread action on the tab's retained session, published.
 ///
 /// See [`SqlEditorWidget::begin_retained_session_action`].
-struct RetainedSessionAction {
-    activity: crate::db::DbActivityGuard,
-    connection_info: crate::db::ConnectionInfo,
+pub(super) struct RetainedSessionAction {
+    pub(super) activity: crate::db::DbActivityGuard,
+    pub(super) connection_info: crate::db::ConnectionInfo,
 }
 
 struct OracleThinConnectionTransitionContext<'a> {
@@ -4631,38 +4631,54 @@ impl SqlEditorWidget {
             && !Self::mysql_error_allows_session_reuse(message)
     }
 
-    /// The connection info a retained-session canceler needs. MySQL cancels over
-    /// a separate control connection, so it needs the credential-bearing copy
-    /// from the pool context rather than the sanitized one.
-    /// What a UI-thread action on the tab's RETAINED session publishes itself
-    /// as: the registry row, and the connection info that row's session
-    /// canceler needs.
+    /// Begin a UI-thread push onto the tab's RETAINED session: the registry row
+    /// it runs under, and the connection info that row's session canceler needs.
     ///
     /// ONE resolution of the connection's pool context answers both, because
-    /// they are one fact. Resolved apart, the info came from the context and
-    /// the row was built with the raw `track_db_activity` -- so the row these
-    /// actions publish a real session canceler under named NO connection and
-    /// carried NO lifetime. See
+    /// they are one fact. Resolved apart, the info came from the context and the
+    /// row was built with the raw `track_db_activity` -- so the row these actions
+    /// publish a real session canceler under named NO connection and carried NO
+    /// lifetime. See
     /// [`crate::db::DbPoolSessionContext::track_operation_activity`] for what
-    /// each of those costs.
-    fn begin_retained_session_action(
+    /// each of those costs. MySQL cancels over a separate control connection, so
+    /// it needs the credential-bearing copy from the pool context rather than
+    /// the sanitized one.
+    ///
+    /// The ONE door for all three per-tab settings. The scope push used to spell
+    /// the same two lines itself, which is how the two spellings came to answer
+    /// a failed read differently.
+    ///
+    /// Never takes the connection MUTEX:
+    /// `pool_session_context_for_shared_connection` try-locks and falls back to
+    /// the cached context, because this runs on the FLTK thread and a blocking
+    /// wait here is the whole GUI stopping. Which connection the push is aimed
+    /// at is not asked of the connection either — it was resolved lock-free
+    /// where the plan was built ([`crate::db::RetainedSessionTarget`]).
+    ///
+    /// `Err` when the connection cannot be resolved at all, and it REFUSES
+    /// rather than proceeding under a nameless row. The row is not decoration:
+    /// the take publishes a session canceler built from this `ConnectionInfo`,
+    /// and on the MySQL family that canceler opens a control connection with it
+    /// to send `KILL QUERY` — from a blank one it can reach no server at all.
+    /// Proceeding therefore meant running a server round trip on the tab's
+    /// session, on the UI thread, with no cancel that works and (on the MySQL
+    /// family) no per-call timeout either. The comment that used to justify it —
+    /// "the action below fails on the same fact" — was not true: the take
+    /// matches on the generation and the db type, which the caller supplies, so
+    /// it succeeded.
+    pub(super) fn begin_retained_session_action(
         shared_connection: &crate::db::SharedConnection,
         db_activity: &str,
         db_type: DatabaseType,
-    ) -> RetainedSessionAction {
-        match crate::db::pool_session_context_for_shared_connection(shared_connection, None) {
-            Ok(context) => RetainedSessionAction {
+    ) -> Result<RetainedSessionAction, String> {
+        crate::db::pool_session_context_for_shared_connection(shared_connection, None)
+            .map(|context| RetainedSessionAction {
                 activity: context.track_operation_activity(db_activity.to_string()),
                 connection_info: context.connection_info,
-            },
-            // The connection could not be resolved at all, so there is no
-            // connection to name and no lifetime to bind: the row says exactly
-            // what is known, and the action below fails on the same fact.
-            Err(_) => RetainedSessionAction {
-                activity: crate::db::track_db_activity(db_activity.to_string(), Some(db_type)),
-                connection_info: crate::db::ConnectionInfo::default(),
-            },
-        }
+            })
+            .map_err(|err| {
+                format!("Could not reach the {db_type} connection to update its session: {err}")
+            })
     }
 
     /// A fresh MySQL-family pooled session, held together with the cancel
@@ -10010,21 +10026,24 @@ impl SqlEditorWidget {
                                     statement_effects,
                                 ) {
                                     Ok(()) => {
-                                        let (connection_generation, pool_context_epoch) = {
+                                        // A WORKER road, not the UI thread: this
+                                        // is a script `SET AUTOCOMMIT` inside the
+                                        // batch, so taking the connection lock
+                                        // for the identity is what every other
+                                        // statement here does. The three facts
+                                        // still come from the one constructor the
+                                        // toolbar roads answer with.
+                                        let target = {
                                             let conn_guard = lock_connection_with_activity(
                                                 shared_connection,
                                                 db_activity.to_string(),
                                             );
-                                            (
-                                                conn_guard.connection_generation(),
-                                                conn_guard.pool_context_epoch(),
-                                            )
+                                            conn_guard.retained_session_target()
                                         };
                                         match SqlEditorWidget::apply_mysql_autocommit_to_reusable_pooled_session(
                                             shared_connection,
                                             pooled_db_session,
-                                            connection_generation,
-                                            pool_context_epoch,
+                                            target,
                                             enabled,
                                             db_activity,
                                         ) {
@@ -27235,18 +27254,6 @@ impl SqlEditorWidget {
         );
     }
 
-    fn mysql_pooled_session_db_type_for_generation(
-        shared_connection: &crate::db::SharedConnection,
-        connection_generation: u64,
-        db_activity: &str,
-    ) -> Option<crate::db::DatabaseType> {
-        let conn_guard = lock_connection_with_activity(shared_connection, db_activity.to_string());
-        let db_type = conn_guard.db_type();
-        conn_guard
-            .can_reuse_pool_session(connection_generation, db_type)
-            .then_some(db_type)
-    }
-
     fn pool_context_epoch_for_generation(
         shared_connection: &crate::db::SharedConnection,
         connection_generation: u64,
@@ -27369,11 +27376,15 @@ impl SqlEditorWidget {
     pub(super) fn apply_mysql_autocommit_to_reusable_pooled_session(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-        pool_context_epoch: u64,
+        target: crate::db::RetainedSessionTarget,
         enabled: bool,
         db_activity: &str,
     ) -> crate::db::RetainedSessionMutationOutcome {
+        let (db_type, connection_generation, pool_context_epoch) = (
+            target.db_type(),
+            target.connection_generation(),
+            target.pool_context_epoch(),
+        );
         Self::ui_action_on_retained_session(|loss| {
             // A toolbar/menu option change runs on the UI thread with no batch of
             // its own: the option gate has already refused it while the tab is
@@ -27389,17 +27400,26 @@ impl SqlEditorWidget {
                 ),
             );
             let hand_back = BatchSessionHandBack::for_ui_action(&hand_back_owner, loss);
-            let Some(db_type) = Self::mysql_pooled_session_db_type_for_generation(
+            // WHICH connection this is aimed at was answered where the plan was
+            // built, without the connection mutex, and it is carried here rather
+            // than re-derived: this used to open with a BLOCKING
+            // `lock_connection` for the db type alone, on the FLTK thread. The
+            // take below validates the identity against the lease, which is what
+            // makes carrying it safe.
+            let action = match Self::begin_retained_session_action(
                 shared_connection,
-                connection_generation,
                 db_activity,
-            ) else {
-                return crate::db::RetainedSessionMutationOutcome::NoSession;
+                db_type,
+            ) {
+                Ok(action) => action,
+                Err(message) => {
+                    return crate::db::RetainedSessionMutationOutcome::FailedRestored(message);
+                }
             };
             let RetainedSessionAction {
                 activity: mutation_activity,
                 connection_info: mutation_connection_info,
-            } = Self::begin_retained_session_action(shared_connection, db_activity, db_type);
+            } = action;
             // The option change runs on the session inside this function, so its
             // cancel reach begins and ends here.
 
@@ -27582,11 +27602,15 @@ impl SqlEditorWidget {
     pub(super) fn apply_oracle_transaction_mode_to_reusable_pooled_session(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-        pool_context_epoch: u64,
+        target: crate::db::RetainedSessionTarget,
         query_timeout: Option<Duration>,
         db_activity: &str,
     ) -> crate::db::RetainedSessionMutationOutcome {
+        let (db_type, connection_generation, pool_context_epoch) = (
+            target.db_type(),
+            target.connection_generation(),
+            target.pool_context_epoch(),
+        );
         Self::ui_action_on_retained_session(|loss| {
             // Same reach as the MySQL twin: a UI-thread action on the tab's own
             // session, published so a cancel or a disconnect can reach it.
@@ -27597,20 +27621,23 @@ impl SqlEditorWidget {
                     mutation_registration.clone(),
                 ),
             );
-            let Some(db_type) = ({
-                let conn_guard =
-                    lock_connection_with_activity(shared_connection, db_activity.to_string());
-                let db_type = conn_guard.db_type();
-                conn_guard
-                    .can_reuse_pool_session(connection_generation, db_type)
-                    .then_some(db_type)
-            }) else {
-                return crate::db::RetainedSessionMutationOutcome::NoSession;
+            // Carried, not re-read: see the auto-commit twin. This used to take
+            // the connection mutex with a BLOCKING lock — which also waits out
+            // any announced transition on that connection — for the db type.
+            let action = match Self::begin_retained_session_action(
+                shared_connection,
+                db_activity,
+                db_type,
+            ) {
+                Ok(action) => action,
+                Err(message) => {
+                    return crate::db::RetainedSessionMutationOutcome::FailedRestored(message);
+                }
             };
             let RetainedSessionAction {
                 activity: mutation_activity,
                 connection_info: mutation_connection_info,
-            } = Self::begin_retained_session_action(shared_connection, db_activity, db_type);
+            } = action;
 
             let mut retained_session = match pooled_db_session
                 .take_reusable_lease_for_context_update(
@@ -27727,11 +27754,16 @@ impl SqlEditorWidget {
     pub(super) fn apply_mysql_transaction_mode_to_reusable_pooled_session(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-        pool_context_epoch: u64,
+        target: crate::db::RetainedSessionTarget,
         mode: crate::db::TransactionMode,
+        default_transaction_isolation: crate::db::TransactionIsolation,
         db_activity: &str,
     ) -> crate::db::RetainedSessionMutationOutcome {
+        let (db_type, connection_generation, pool_context_epoch) = (
+            target.db_type(),
+            target.connection_generation(),
+            target.pool_context_epoch(),
+        );
         Self::ui_action_on_retained_session(|loss| {
             // A toolbar/menu option change runs on the UI thread with no batch of
             // its own: the option gate has already refused it while the tab is
@@ -27745,20 +27777,25 @@ impl SqlEditorWidget {
                 ),
             );
             let hand_back = BatchSessionHandBack::for_ui_action(&hand_back_owner, loss);
-            let Some((db_type, default_transaction_isolation)) = ({
-                let conn_guard =
-                    lock_connection_with_activity(shared_connection, db_activity.to_string());
-                let db_type = conn_guard.db_type();
-                conn_guard
-                    .can_reuse_pool_session(connection_generation, db_type)
-                    .then_some((db_type, conn_guard.default_transaction_isolation()))
-            }) else {
-                return crate::db::RetainedSessionMutationOutcome::NoSession;
+            // Carried, not re-read: see the auto-commit twin. This used to take
+            // the connection mutex with a BLOCKING lock for the db type and the
+            // connection's resolved default isolation; both now come from the
+            // pick, which read them from the window's own cached connection
+            // defaults.
+            let action = match Self::begin_retained_session_action(
+                shared_connection,
+                db_activity,
+                db_type,
+            ) {
+                Ok(action) => action,
+                Err(message) => {
+                    return crate::db::RetainedSessionMutationOutcome::FailedRestored(message);
+                }
             };
             let RetainedSessionAction {
                 activity: mutation_activity,
                 connection_info: mutation_connection_info,
-            } = Self::begin_retained_session_action(shared_connection, db_activity, db_type);
+            } = action;
             // The option change runs on the session inside this function, so its
             // cancel reach begins and ends here.
 
@@ -37118,6 +37155,112 @@ mod query_execution_cleanup_tests {
             shared_body.contains("ORACLE_THIN_LAZY_FETCH_DB_CANCEL_FORCE_TIMEOUT"),
             "the capped arm still uses the thin force grace: {shared_body}"
         );
+    }
+
+    /// A per-tab option change touches nothing but ONE tab, and it runs on the
+    /// FLTK thread. So no road it takes may WAIT for the connection mutex — not
+    /// for a neighbour tab's execution startup, an Oracle explain plan or a
+    /// metadata load, and not for an announced transition, which `lock_connection`
+    /// also waits out (`wait_for_connection_transition`). Waiting there is the
+    /// whole GUI stopping, and the row such a wait publishes names a cancel only
+    /// the stopped thread could have pressed.
+    ///
+    /// The plan for these pushes has been built lock-free from the connection
+    /// RUNTIME for several rounds, and three of the four applies re-derived the
+    /// same facts under a blocking lock anyway — a promise kept at one end of
+    /// the road and broken at the other. `RetainedSessionTarget` is what closes
+    /// it, and this is what keeps it closed: the identity is CARRIED, so no road
+    /// here has a reason to ask the connection for it again.
+    ///
+    /// `try_lock_connection` is fine and is not what this refuses: it answers
+    /// immediately, and `pool_session_context_for_shared_connection` — the one
+    /// callee that decides whether the shared door blocks — is pinned below for
+    /// exactly that reason.
+    #[test]
+    fn no_retained_session_push_takes_the_connection_lock() {
+        let execution = include_str!("execution.rs");
+        let editor = include_str!("mod.rs");
+        let db = include_str!("../../db/connection.rs");
+        // The terminator is per item, because a free function closes at column
+        // zero and a method four spaces in; using one for both stopped the
+        // free-function scan at the first inner block, which the vacuity check
+        // below is what caught.
+        let body_of = |source: &str, signature: &str, closes_with: &str| -> String {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} must exist"));
+            let end = source[start..]
+                .find(closes_with)
+                .map(|end| start + end)
+                .unwrap_or(source.len());
+            source[start..end].to_string()
+        };
+        const METHOD: &str = "\n    }\n";
+        const FREE_FN: &str = "\n}\n";
+
+        for (source, signature, closes_with, must_contain) in [
+            (
+                execution,
+                "pub(super) fn apply_mysql_autocommit_to_reusable_pooled_session(",
+                METHOD,
+                "take_reusable_lease_for_context_update",
+            ),
+            (
+                execution,
+                "pub(super) fn apply_oracle_transaction_mode_to_reusable_pooled_session(",
+                METHOD,
+                "take_reusable_lease_for_context_update",
+            ),
+            (
+                execution,
+                "pub(super) fn apply_mysql_transaction_mode_to_reusable_pooled_session(",
+                METHOD,
+                "take_reusable_lease_for_context_update",
+            ),
+            (
+                editor,
+                "pub fn apply_current_scope_to_retained_session(",
+                METHOD,
+                "take_reusable_lease_for_context_update",
+            ),
+            (
+                execution,
+                "pub(super) fn begin_retained_session_action(",
+                METHOD,
+                "pool_session_context_for_shared_connection",
+            ),
+            (
+                db,
+                "pub fn pool_session_context_for_shared_connection(",
+                FREE_FN,
+                "cached_pool_session_context",
+            ),
+        ] {
+            let body = body_of(source, signature, closes_with);
+            // Vacuity guard: if the extraction ever stopped short, the pin below
+            // would pass about nothing.
+            assert!(
+                body.contains(must_contain),
+                "{signature} body was not extracted whole (missing `{must_contain}`): {body}"
+            );
+            // Comments are dropped first: these bodies EXPLAIN what they must
+            // not do, and a rule that its own explanation trips is a rule
+            // nobody can write down.
+            let code = body
+                .lines()
+                .map(|line| match line.find("//") {
+                    Some(comment) => &line[..comment],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let blocking = code.replace("try_lock_connection", "");
+            assert!(
+                !blocking.contains("lock_connection"),
+                "{signature} must not wait for the connection mutex: it runs on the FLTK thread \
+                 and the identity it needs is carried in `RetainedSessionTarget`"
+            );
+        }
     }
 
     #[test]

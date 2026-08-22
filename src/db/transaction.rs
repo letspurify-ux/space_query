@@ -2993,6 +2993,30 @@ fn mysql_set_assignment_target_and_value(assignment: &str) -> Option<(&str, &str
     None
 }
 
+/// A `SET` target with its whitespace collapsed, so
+/// [`mysql_session_scoped_target`] can strip the scope qualifier by comparing
+/// text.
+///
+/// The `@` sigil and the `.` scope separator BIND to what follows them, so the
+/// whitespace the MySQL family's grammar allows around them is dropped rather
+/// than collapsed to one space. Both are punctuation the parser produces as
+/// tokens of their own — `'@' '@' SESSION '.' ident` — while every prefix this
+/// module strips (`@@SESSION.`, `@@GLOBAL.`, `@@`) is written as ONE piece of
+/// text.
+///
+/// Leaving them in made `SET @@session . autocommit = 1` normalize to
+/// `@@SESSION . AUTOCOMMIT`, which matches no qualifier prefix at all: the
+/// statement stopped being a recognised auto-commit change, so the tab's pin,
+/// the Tools menu and the status bar kept the old value while the server had
+/// the new one — and the execution checkpoint could not catch it either,
+/// because it compares the screen against the app's own (equally stale)
+/// resolution. The same normalizer feeds the transaction-mode targets
+/// ([`mysql_transaction_mode_assignment_scope`]), which had the gap for the
+/// same reason.
+///
+/// It matters in BOTH directions, which is why the drop happens here rather
+/// than in one caller: `SET @@global . autocommit = 0` has to keep being
+/// recognised as the GLOBAL scope this SESSION must not adopt.
 fn mysql_normalized_set_assignment_target(target: &str) -> String {
     let mut normalized = String::with_capacity(target.len());
     let mut pending_space = false;
@@ -3000,10 +3024,12 @@ fn mysql_normalized_set_assignment_target(target: &str) -> String {
         if ch.is_whitespace() {
             pending_space = !normalized.is_empty();
         } else {
-            if pending_space {
+            let binds_to_neighbour =
+                ch == '.' || normalized.ends_with('.') || normalized.ends_with('@');
+            if pending_space && !binds_to_neighbour {
                 normalized.push(' ');
-                pending_space = false;
             }
+            pending_space = false;
             normalized.extend(ch.to_uppercase());
         }
     }
@@ -7368,6 +7394,47 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    /// The `@` sigil and the `.` scope separator are TOKENS in the MySQL
+    /// family's grammar, so whitespace may sit around them. Both scopes have to
+    /// survive that: the session one so the tab adopts the change, the global
+    /// one so the tab does NOT.
+    #[test]
+    fn mysql_set_assignment_target_ignores_whitespace_around_the_scope_separator() {
+        for sql in [
+            "SET @@session . autocommit = 0",
+            "SET @@session. autocommit = 0",
+            "SET @@session .autocommit = 0",
+            "SET @@ session . autocommit = 0",
+            "SET @@local . autocommit = 0",
+            "SET sql_notes = 0, @@session . autocommit = 0",
+        ] {
+            assert_eq!(mysql_set_autocommit_value(sql), Some(false), "{sql}");
+            assert!(
+                mysql_session_state_hint_for_sql(sql).changes_auto_commit,
+                "{sql}"
+            );
+        }
+
+        for sql in [
+            "SET @@global . autocommit = 0",
+            "SET @@persist . autocommit = 0",
+            "SET @@persist_only . autocommit = 0",
+        ] {
+            assert_eq!(mysql_set_autocommit_value(sql), None, "{sql}");
+        }
+
+        // The transaction-mode targets go through the same normalizer, and
+        // the same two directions have to hold for them.
+        assert!(mysql_set_transaction_mode_assignment_sets_session_override(
+            "SET @@session . transaction_isolation = 'SERIALIZABLE'"
+        ));
+        assert!(
+            !mysql_set_transaction_mode_assignment_sets_session_override(
+                "SET @@global . transaction_isolation = 'SERIALIZABLE'"
+            )
+        );
     }
 
     #[test]

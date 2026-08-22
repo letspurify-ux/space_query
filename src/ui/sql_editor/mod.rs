@@ -2729,12 +2729,16 @@ trait TransactionActionBackend: Sync {
         restore: RetainedSessionRestore<'_>,
     ) -> Result<(), String>;
 
+    /// `target` says WHICH connection this push is aimed at, and it is a
+    /// parameter on every backend for the reason it exists: it was resolved
+    /// lock-free where the plan was built, and a backend that re-derives it from
+    /// `connection` is a backend that takes the connection mutex on the FLTK
+    /// thread. See [`crate::db::RetainedSessionTarget`].
     fn apply_auto_commit_to_retained_session(
         &self,
         connection: &SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-        pool_context_epoch: u64,
+        target: crate::db::RetainedSessionTarget,
         enabled: bool,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome;
@@ -2745,13 +2749,18 @@ trait TransactionActionBackend: Sync {
     /// retained session is a call to the server. The MySQL family has no
     /// per-call timeout to apply it to (see `DbSessionLease::with_call_timeout`)
     /// and ignores it, which is a documented limitation rather than a claim.
+    ///
+    /// `default_transaction_isolation` is the connection's RESOLVED level, which
+    /// the MySQL family states for a tab that selected "Default"; Oracle states
+    /// its mode from the batch and ignores it here. It is CARRIED for the same
+    /// reason `target` is — the only other source is the connection itself.
     fn apply_transaction_mode_to_retained_session(
         &self,
         connection: &SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-        pool_context_epoch: u64,
+        target: crate::db::RetainedSessionTarget,
         mode: TransactionMode,
+        default_transaction_isolation: TransactionIsolation,
         query_timeout: Option<Duration>,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome;
@@ -3372,8 +3381,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         &self,
         _connection: &SharedConnection,
         _pooled_db_session: &SharedDbSessionLease,
-        _connection_generation: u64,
-        _pool_context_epoch: u64,
+        _target: crate::db::RetainedSessionTarget,
         _enabled: bool,
         _db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
@@ -3390,17 +3398,19 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         &self,
         connection: &SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-        pool_context_epoch: u64,
+        target: crate::db::RetainedSessionTarget,
         _mode: TransactionMode,
+        // Oracle states its mode from the batch, before the first statement of
+        // each transaction, so a level to fall back to is not this road's to
+        // know: what it does here is return the session to a boundary.
+        _default_transaction_isolation: TransactionIsolation,
         query_timeout: Option<Duration>,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
         SqlEditorWidget::apply_oracle_transaction_mode_to_reusable_pooled_session(
             connection,
             pooled_db_session,
-            connection_generation,
-            pool_context_epoch,
+            target,
             query_timeout,
             db_activity,
         )
@@ -3597,16 +3607,14 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
         &self,
         connection: &SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-        pool_context_epoch: u64,
+        target: crate::db::RetainedSessionTarget,
         enabled: bool,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
         SqlEditorWidget::apply_mysql_autocommit_to_reusable_pooled_session(
             connection,
             pooled_db_session,
-            connection_generation,
-            pool_context_epoch,
+            target,
             enabled,
             db_activity,
         )
@@ -3616,9 +3624,9 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
         &self,
         connection: &SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-        pool_context_epoch: u64,
+        target: crate::db::RetainedSessionTarget,
         mode: TransactionMode,
+        default_transaction_isolation: TransactionIsolation,
         // The MySQL family has no per-call timeout to bound this with; see the
         // trait method.
         _query_timeout: Option<Duration>,
@@ -3627,9 +3635,9 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
         SqlEditorWidget::apply_mysql_transaction_mode_to_reusable_pooled_session(
             connection,
             pooled_db_session,
-            connection_generation,
-            pool_context_epoch,
+            target,
             mode,
+            default_transaction_isolation,
             db_activity,
         )
     }
@@ -5601,12 +5609,13 @@ impl SqlEditorWidget {
 
     pub fn apply_current_scope_to_retained_session(
         &self,
-        connection_generation: u64,
-        pool_context_epoch: u64,
-        db_type: DatabaseType,
+        target: crate::db::RetainedSessionTarget,
         target_scope: &str,
         advanced: &ConnectionAdvancedSettings,
     ) -> RetainedSessionMutationOutcome {
+        let db_type = target.db_type();
+        let connection_generation = target.connection_generation();
+        let pool_context_epoch = target.pool_context_epoch();
         SqlEditorWidget::ui_action_on_retained_session(|loss| {
             // This runs on the FLTK thread, so the tab's timeout has to bound it
             // like it bounds the close-path commit/rollback.
@@ -5619,31 +5628,25 @@ impl SqlEditorWidget {
                 return RetainedSessionMutationOutcome::NotApplicable;
             }
 
-            // Row and connection info from ONE resolution of the pool context: this
-            // action publishes a real session canceler over the tab's session, and
-            // the row it publishes under has to say which connection that is (a
-            // disconnect matches on it) and when the connection's sessions are gone
-            // (`is_stale` cannot answer without it). Both used to be left out here.
-            let (scope_activity, scope_connection_info) = match self
+            // Row and connection info through the door its two sibling pushes
+            // come through, so a failed read is answered once and the same way.
+            // This used to be a second spelling of it, and the two disagreed:
+            // where this one carried on under a blank connection info, the
+            // session canceler it then published could reach no server on the
+            // MySQL family.
+            let db_activity = format!("Applying scope to retained {db_type} session");
+            let action = match self
                 .bound_connection()
                 .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
                 .and_then(|connection| {
-                    crate::db::pool_session_context_for_shared_connection(&connection, None)
+                    Self::begin_retained_session_action(&connection, &db_activity, db_type)
                 }) {
-                Ok(context) => (
-                    context.track_operation_activity(format!(
-                        "Applying scope to retained {db_type} session"
-                    )),
-                    context.connection_info,
-                ),
-                Err(_) => (
-                    crate::db::track_db_activity(
-                        format!("Applying scope to retained {db_type} session"),
-                        Some(db_type),
-                    ),
-                    crate::db::ConnectionInfo::default(),
-                ),
+                Ok(action) => action,
+                Err(message) => {
+                    return RetainedSessionMutationOutcome::FailedRestored(message);
+                }
             };
+            let (scope_activity, scope_connection_info) = (action.activity, action.connection_info);
             // Same rule as the auto-commit and transaction-mode pushes: a take that
             // could not reach the tab's session closed it, and saying `NoSession`
             // about that loses the user's work in silence.
@@ -6258,20 +6261,17 @@ impl SqlEditorWidget {
 
     pub fn apply_auto_commit_to_retained_session(
         &self,
-        connection_generation: u64,
-        pool_context_epoch: u64,
-        db_type: DatabaseType,
+        target: crate::db::RetainedSessionTarget,
         enabled: bool,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
         let Some(connection) = self.bound_connection() else {
             return RetainedSessionMutationOutcome::NoSession;
         };
-        transaction_action_backend_for(db_type).apply_auto_commit_to_retained_session(
+        transaction_action_backend_for(target.db_type()).apply_auto_commit_to_retained_session(
             &connection,
             &self.pooled_db_session,
-            connection_generation,
-            pool_context_epoch,
+            target,
             enabled,
             db_activity,
         )
@@ -6279,10 +6279,9 @@ impl SqlEditorWidget {
 
     pub fn apply_transaction_mode_to_retained_session(
         &self,
-        connection_generation: u64,
-        pool_context_epoch: u64,
-        db_type: DatabaseType,
+        target: crate::db::RetainedSessionTarget,
         mode: TransactionMode,
+        default_transaction_isolation: TransactionIsolation,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
         let Some(connection) = self.bound_connection() else {
@@ -6292,12 +6291,12 @@ impl SqlEditorWidget {
         // is: the same value the close-path commit/rollback and the scope push
         // are bounded by.
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
-        transaction_action_backend_for(db_type).apply_transaction_mode_to_retained_session(
+        transaction_action_backend_for(target.db_type()).apply_transaction_mode_to_retained_session(
             &connection,
             &self.pooled_db_session,
-            connection_generation,
-            pool_context_epoch,
+            target,
             mode,
+            default_transaction_isolation,
             query_timeout,
             db_activity,
         )

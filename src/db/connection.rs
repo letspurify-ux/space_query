@@ -2384,6 +2384,66 @@ impl PooledSessionLeaseSnapshot {
     }
 }
 
+/// WHICH connection a UI-thread push onto a tab's retained session is aimed at.
+///
+/// One value for all three per-tab settings — auto-commit, transaction mode and
+/// scope — because they ask one question, and answering it three ways is what
+/// let two of them answer it under the CONNECTION MUTEX.
+///
+/// The plan for such a push is built lock-free from the connection RUNTIME
+/// ([`crate::db::ConnectionRuntime::retained_session_target`]) precisely so a
+/// change that touches nothing but one tab does not wait on a neighbour tab's
+/// work. The apply step then re-derived the same facts from the connection
+/// itself, through a BLOCKING `lock_connection` — which waits for the mutex an
+/// execution's startup, an Oracle explain plan or a metadata load holds, and
+/// waits out any announced transition on that connection as well. On the FLTK
+/// thread that is the whole GUI stopping, and it published a cancel row for a
+/// wait only the stopped thread could have cancelled. Carrying the answer
+/// instead of re-deriving it is what removes the road rather than shortening
+/// it, and the pushes cannot regress into taking the lock again:
+/// `no_retained_session_push_takes_the_connection_lock` refuses it in the
+/// source.
+///
+/// Stale identity is safe, and that is why nothing has to be re-read: the take
+/// (`SharedDbSessionLease::take_reusable_lease_for_context_update`) validates
+/// the generation and the db type against the lease and answers `Empty` /
+/// `Unreachable` when they have moved, and `restore_with_context_epoch` checks
+/// the epoch on the way back.
+///
+/// It carries only the facts ALL THREE settings need. A value that also held,
+/// say, the resolved default isolation would be one two of its three users had
+/// to supply without reading — and a field supplied without being read is a
+/// field that gets supplied wrongly. The mode-specific default travels with the
+/// mode instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedSessionTarget {
+    db_type: DatabaseType,
+    connection_generation: u64,
+    pool_context_epoch: u64,
+}
+
+impl RetainedSessionTarget {
+    pub fn new(db_type: DatabaseType, connection_generation: u64, pool_context_epoch: u64) -> Self {
+        Self {
+            db_type,
+            connection_generation,
+            pool_context_epoch,
+        }
+    }
+
+    pub fn db_type(self) -> DatabaseType {
+        self.db_type
+    }
+
+    pub fn connection_generation(self) -> u64 {
+        self.connection_generation
+    }
+
+    pub fn pool_context_epoch(self) -> u64 {
+        self.pool_context_epoch
+    }
+}
+
 #[derive(Clone)]
 pub struct DbPoolSessionContext {
     pub connection_generation: u64,
@@ -8881,6 +8941,23 @@ impl DatabaseConnection {
 
     pub fn default_transaction_isolation(&self) -> TransactionIsolation {
         self.default_transaction_isolation
+    }
+
+    /// Which connection a push onto a tab's retained session is aimed at, read
+    /// from the connection itself.
+    ///
+    /// The GUI does NOT come through here — it answers from the runtime, which
+    /// costs no lock ([`crate::db::ConnectionRuntime::retained_session_target`]).
+    /// This is for a caller that is already holding the connection (the live
+    /// verification harnesses, which have no window and no runtime), so the
+    /// three facts are still stated in ONE place rather than assembled per
+    /// harness.
+    pub fn retained_session_target(&self) -> RetainedSessionTarget {
+        RetainedSessionTarget::new(
+            self.info.db_type,
+            self.connection_generation,
+            self.pool_context_epoch(),
+        )
     }
 
     pub fn transaction_mode_statements_for(

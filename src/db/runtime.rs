@@ -445,6 +445,31 @@ impl ConnectionRuntime {
         self.pool_context_epoch.load(Ordering::Acquire)
     }
 
+    /// Which connection a per-tab option push is aimed at, answered WITHOUT the
+    /// connection mutex.
+    ///
+    /// This is the whole point of the value: the three per-tab settings —
+    /// auto-commit, transaction mode and scope — touch nothing but one tab, so
+    /// none of them may wait on a neighbour tab's statement, an Oracle explain
+    /// plan, a metadata load or an announced transition. See
+    /// [`crate::db::RetainedSessionTarget`] for why carrying the answer is safe.
+    ///
+    /// `None` when this runtime says there is nothing to push onto —
+    /// `Connecting`, `Failed`, `Disconnected` and `Transitioning` all mean that,
+    /// and it is the same question `retained_scope_update_for_tab` already asks
+    /// of the runtime and the connection's own `can_reuse_pool_session` asked
+    /// under the lock.
+    pub fn retained_session_target(&self) -> Option<crate::db::RetainedSessionTarget> {
+        if !matches!(self.state(), ConnectionRuntimeState::Connected) {
+            return None;
+        }
+        Some(crate::db::RetainedSessionTarget::new(
+            self.sanitized_info().db_type,
+            self.connection_generation(),
+            self.pool_context_epoch(),
+        ))
+    }
+
     /// Record which incarnation of its connection this runtime is describing.
     ///
     /// The ONE writer of the two counters, and it only ever moves them

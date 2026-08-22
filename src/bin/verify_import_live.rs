@@ -355,19 +355,17 @@ impl Harness {
         mode: TransactionMode,
     ) -> Result<(), String> {
         self.editor.set_tab_transaction_mode(mode);
-        let (generation, epoch, db_type) = {
+        let (target, default_transaction_isolation) = {
             let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             (
-                guard.connection_generation(),
-                guard.pool_context_epoch(),
-                guard.db_type(),
+                guard.retained_session_target(),
+                guard.default_transaction_isolation(),
             )
         };
         let outcome = self.editor.apply_transaction_mode_to_retained_session(
-            generation,
-            epoch,
-            db_type,
+            target,
             mode,
+            default_transaction_isolation,
             "verify import",
         );
         match outcome {

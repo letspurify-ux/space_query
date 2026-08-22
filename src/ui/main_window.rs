@@ -367,57 +367,86 @@ struct ActiveSchemaUpdateTarget {
 }
 
 struct RetainedSessionOptionChangePlan {
-    connection_generation: u64,
+    /// The family this plan's gate speaks for. Read from the runtime
+    /// UNCONDITIONALLY, and separate from `target` on purpose: the gate is a
+    /// question about the TAB's session, which exists whatever the connection is
+    /// doing, and folding the two would have let a connection mid-transition
+    /// skip the refusal a dirty session owes the user.
     db_type: DatabaseType,
+    /// Which connection to push onto, or `None` when the runtime says there is
+    /// nothing to push onto — the answer `can_reuse_pool_session` used to give
+    /// under the connection mutex.
+    target: Option<crate::db::RetainedSessionTarget>,
     retained_editors: Vec<SqlEditorWidget>,
 }
 
 impl RetainedSessionOptionChangePlan {
-    /// Built from the runtime's lock-free identity snapshot, so an option
-    /// change that only touches retained tab sessions does not have to wait
-    /// for the connection mutex another tab's execution may be holding. Stale
-    /// identity is safe: retained-session mutation validates the generation
-    /// against the lease and no-ops or discards on mismatch.
+    /// Built from the runtime's lock-free identity, so an option change that
+    /// only touches retained tab sessions does not have to wait for the
+    /// connection mutex another tab's execution may be holding — nor for an
+    /// announced transition on that connection, which a BLOCKING lock waits out
+    /// as well.
+    ///
+    /// The identity is CARRIED from here to the session rather than re-derived
+    /// at the apply, which is what makes that promise hold end to end: the
+    /// applies used to re-read the same facts from the connection under
+    /// `lock_connection`, on the FLTK thread. Stale identity is safe —
+    /// retained-session mutation validates the generation against the lease and
+    /// no-ops or discards on mismatch. See [`crate::db::RetainedSessionTarget`].
     fn from_runtime(
         runtime: &crate::db::ConnectionRuntime,
         retained_editors: Vec<SqlEditorWidget>,
     ) -> Self {
         Self {
-            connection_generation: runtime.connection_generation(),
             db_type: runtime.sanitized_info().db_type,
+            target: runtime.retained_session_target(),
             retained_editors,
         }
     }
 
     fn apply_auto_commit(
         &self,
-        pool_context_epoch: u64,
         enabled: bool,
         db_activity: &str,
     ) -> Vec<RetainedSessionMutationOutcome> {
+        let Some(target) = self.target else {
+            return self.nothing_to_push_onto();
+        };
         self.apply(|editor| {
-            editor.apply_auto_commit_to_retained_session(
-                self.connection_generation,
-                pool_context_epoch,
-                self.db_type,
-                enabled,
-                db_activity,
-            )
+            editor.apply_auto_commit_to_retained_session(target, enabled, db_activity)
         })
     }
 
+    /// What every editor's push answers when there is no connection to push
+    /// onto. `NoSession` does not alert, which is what the blocking identity
+    /// read this replaces answered in the same situation.
+    fn nothing_to_push_onto(&self) -> Vec<RetainedSessionMutationOutcome> {
+        self.retained_editors
+            .iter()
+            .map(|_| RetainedSessionMutationOutcome::NoSession)
+            .collect()
+    }
+
+    /// `default_transaction_isolation` is the connection's RESOLVED level — the
+    /// one a tab selecting "Default" is put back to, which the MySQL family has
+    /// to STATE. It is an argument rather than a field of the target because
+    /// only this one of the three settings reads it, and it comes from the same
+    /// lock-free place the pick's other answers do
+    /// (`TransactionModePickContext::Ready`).
     fn apply_transaction_mode(
         &self,
-        pool_context_epoch: u64,
         mode: TransactionMode,
+        default_transaction_isolation: TransactionIsolation,
         db_activity: &str,
     ) -> Vec<RetainedSessionMutationOutcome> {
+        let Some(target) = self.target else {
+            return self.nothing_to_push_onto();
+        };
         self.apply(|editor| {
             editor.apply_transaction_mode_to_retained_session(
-                self.connection_generation,
-                pool_context_epoch,
-                self.db_type,
+                target,
                 mode,
+                default_transaction_isolation,
                 db_activity,
             )
         })
@@ -1365,10 +1394,11 @@ impl StatusBarWidget {
     fn set_label(&mut self, _label: &str) {}
 }
 
+/// The scope pick's half of the same shape its two sibling per-tab settings
+/// use: the connection identity resolved ONCE and lock-free
+/// ([`crate::db::RetainedSessionTarget`]), then what to push and onto whom.
 type RetainedScopeUpdate = (
-    DatabaseType,
-    u64,
-    u64,
+    crate::db::RetainedSessionTarget,
     crate::db::ConnectionAdvancedSettings,
     String,
     Vec<SqlEditorWidget>,
@@ -1399,17 +1429,11 @@ fn apply_retained_scope_update(update: RetainedScopeUpdate) -> Vec<RetainedSessi
     // fails, the editor helper restores a preserved session whose error allows
     // reuse and otherwise discards the stale physical session, so a retained
     // tab is never silently left on the old scope.
-    let (db_type, connection_generation, pool_context_epoch, advanced, selected_scope, editors) =
-        update;
+    let (target, advanced, selected_scope, editors) = update;
     let mut retained_outcomes = Vec::new();
     for editor in editors {
-        let outcome = editor.apply_current_scope_to_retained_session(
-            connection_generation,
-            pool_context_epoch,
-            db_type,
-            &selected_scope,
-            &advanced,
-        );
+        let outcome =
+            editor.apply_current_scope_to_retained_session(target, &selected_scope, &advanced);
         if outcome.should_alert_user() {
             retained_outcomes.push(outcome);
         }
@@ -1464,6 +1488,17 @@ enum QueryCancelPhase {
 struct CachedConnectionDefaults {
     auto_commit: Option<bool>,
     transaction_mode: Option<TransactionMode>,
+    /// The connection's RESOLVED default isolation, which a tab selecting
+    /// "Default" is put back to.
+    ///
+    /// Here for the reason the other two are: it is a CONNECTION default the
+    /// per-tab settings need, and the only other way to it is the connection
+    /// mutex. The MySQL-family transaction-mode push used to go there — and
+    /// with a BLOCKING lock, so the pick that "touches nothing but this tab"
+    /// stopped the whole GUI for as long as a neighbour tab's work or an
+    /// announced transition held it. Read from the same tick as its two
+    /// siblings so all three describe one moment.
+    default_transaction_isolation: Option<TransactionIsolation>,
 }
 
 /// Why a session teardown was refused, in the form the CALLER has to act on.
@@ -1573,6 +1608,12 @@ enum TransactionModePickContext {
         /// The mode this tab is effectively on right now, which is what decides
         /// whether the SESSION has to be told anything.
         previous_mode: TransactionMode,
+        /// The connection's RESOLVED default isolation, which the MySQL family
+        /// has to STATE for a tab that selects "Default". It comes out of this
+        /// context rather than being fetched at the apply, because the apply is
+        /// on the FLTK thread and the only other source is the connection
+        /// mutex.
+        default_transaction_isolation: TransactionIsolation,
     },
     /// The active tab has no live connection. There is nothing to pin a mode
     /// on and nothing to say about it.
@@ -2792,6 +2833,7 @@ impl AppState {
             self.cached_connection_defaults = CachedConnectionDefaults {
                 auto_commit: Some(false),
                 transaction_mode: Some(TransactionMode::default()),
+                default_transaction_isolation: Some(TransactionIsolation::ReadCommitted),
             };
             *self
                 .connection_info
@@ -2832,13 +2874,14 @@ impl AppState {
                     info.clear_password();
                     info
                 });
-                // Both defaults come out of the SAME read, which is what
+                // All three defaults come out of the SAME read, which is what
                 // makes them one value: a second reader would have its own
-                // window in which the connection is busy, and the two answers
+                // window in which the connection is busy, and the answers
                 // would then describe different moments.
                 let defaults = CachedConnectionDefaults {
                     auto_commit: Some(guard.auto_commit()),
                     transaction_mode: Some(guard.transaction_mode()),
+                    default_transaction_isolation: Some(guard.default_transaction_isolation()),
                 };
                 drop(guard);
                 self.has_live_connection = is_live;
@@ -5017,11 +5060,16 @@ impl AppState {
             return TransactionModePickContext::NotConnected;
         }
         let db_type = runtime.sanitized_info().db_type;
-        let Some(connection_default) = self.cached_connection_defaults.transaction_mode else {
+        let (Some(connection_default), Some(default_transaction_isolation)) = (
+            self.cached_connection_defaults.transaction_mode,
+            self.cached_connection_defaults
+                .default_transaction_isolation,
+        ) else {
             return TransactionModePickContext::DefaultsNotLearnedYet;
         };
         TransactionModePickContext::Ready {
             db_type,
+            default_transaction_isolation,
             // Tab-scoped: the toolbar shows and pins the ACTIVE tab's effective
             // transaction mode (tab override over connection default).
             previous_mode: crate::ui::sql_editor::SqlEditorWidget::effective_transaction_mode(
@@ -5277,10 +5325,10 @@ impl AppState {
         // The published state, not the connection: `Connecting`, `Failed`,
         // `Disconnected` and `Transitioning` all mean there is nothing to push
         // onto a retained session, which is exactly what the old
-        // `is_connected()` and transition checks answered.
-        if !matches!(runtime.state(), ConnectionRuntimeState::Connected) {
-            return None;
-        }
+        // `is_connected()` and transition checks answered. Asked inside
+        // `retained_session_target`, so the three per-tab settings ask it once
+        // and in one place.
+        let target = runtime.retained_session_target()?;
         let info = runtime.sanitized_info();
         if !info.db_type.has_connection_scope() {
             return None;
@@ -5290,14 +5338,7 @@ impl AppState {
         } else {
             Vec::new()
         };
-        Some((
-            info.db_type,
-            runtime.connection_generation(),
-            runtime.pool_context_epoch(),
-            info.advanced,
-            scope,
-            editors,
-        ))
+        Some((target, info.advanced, scope, editors))
     }
 
     fn append_result_tab_request(&mut self, request: ResultTabRequest) {
@@ -7187,7 +7228,7 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
     // Blocked/busy alerts are raised only after the AppState lock is
     // released: the alert runs a nested modal event loop, and callbacks
     // firing inside it must never find the state mutex still held.
-    let (editor, runtime, previous_mode, mode, db_type) = {
+    let (editor, runtime, previous_mode, mode, db_type, default_transaction_isolation) = {
         let mut s = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -7204,28 +7245,31 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
         // Built WITHOUT the connection mutex, like the auto-commit toggle and
         // the scope pick: a pick that touches nothing but this tab must not be
         // refused because a NEIGHBOUR tab's work is holding the connection.
-        let (db_type, current_mode) = match s.transaction_mode_pick_context() {
-            TransactionModePickContext::Ready {
-                db_type,
-                previous_mode,
-            } => (db_type, previous_mode),
-            TransactionModePickContext::NotConnected => {
-                s.revert_transaction_mode_controls_to_displayed();
-                return;
-            }
-            TransactionModePickContext::DefaultsNotLearnedYet => {
-                s.revert_transaction_mode_controls_to_displayed();
-                drop(s);
-                crate::ui::alert_on_main(&format_connection_busy_message());
-                return;
-            }
-        };
+        let (db_type, current_mode, default_transaction_isolation) =
+            match s.transaction_mode_pick_context() {
+                TransactionModePickContext::Ready {
+                    db_type,
+                    previous_mode,
+                    default_transaction_isolation,
+                } => (db_type, previous_mode, default_transaction_isolation),
+                TransactionModePickContext::NotConnected => {
+                    s.revert_transaction_mode_controls_to_displayed();
+                    return;
+                }
+                TransactionModePickContext::DefaultsNotLearnedYet => {
+                    s.revert_transaction_mode_controls_to_displayed();
+                    drop(s);
+                    crate::ui::alert_on_main(&format_connection_busy_message());
+                    return;
+                }
+            };
         (
             s.sql_editor.clone(),
             s.active_connection_runtime(),
             current_mode,
             s.selected_transaction_mode_from_controls(db_type),
             db_type,
+            default_transaction_isolation,
         )
     };
 
@@ -7292,10 +7336,10 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
         }
     }
     editor.set_tab_transaction_mode(mode);
-    if let (Some(retained_plan), Some(runtime)) = (retained_plan.as_ref(), runtime.as_ref()) {
+    if let Some(retained_plan) = retained_plan.as_ref() {
         let retained_outcomes = retained_plan.apply_transaction_mode(
-            runtime.pool_context_epoch(),
             mode,
+            default_transaction_isolation,
             "Updating transaction mode",
         );
         if let Some(message) = first_retained_outcome_message(&retained_outcomes) {
@@ -15571,7 +15615,9 @@ impl MainWindow {
                 // Guard and apply only for THIS tab's retained session; other
                 // tabs — even dirty or executing ones — are not involved, and
                 // the runtime's lock-free identity keeps the toggle from
-                // waiting on a connection mutex another tab's query holds.
+                // waiting on a connection mutex another tab's query holds — all
+                // the way to the session, because the plan CARRIES that identity
+                // instead of letting the apply re-read it.
                 let retained_plan = (!auto_commit_unchanged)
                     .then(|| {
                         runtime.as_ref().map(|runtime| {
@@ -15602,14 +15648,9 @@ impl MainWindow {
                     }
                 }
                 editor.set_tab_auto_commit(enabled);
-                if let (Some(retained_plan), Some(runtime)) =
-                    (retained_plan.as_ref(), runtime.as_ref())
-                {
-                    let retained_outcomes = retained_plan.apply_auto_commit(
-                        runtime.pool_context_epoch(),
-                        enabled,
-                        "Updating auto-commit setting",
-                    );
+                if let Some(retained_plan) = retained_plan.as_ref() {
+                    let retained_outcomes =
+                        retained_plan.apply_auto_commit(enabled, "Updating auto-commit setting");
                     if let Some(message) = first_retained_outcome_message(&retained_outcomes) {
                         crate::ui::alert_on_main(&format!(
                             "Auto-commit was changed, but the retained session could not be updated. It was restored or discarded according to session safety: {}",

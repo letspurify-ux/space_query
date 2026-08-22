@@ -352,19 +352,16 @@ impl Harness {
     /// the tab, then apply the change to the tab's retained DB session.
     /// `set_tab_auto_commit` on its own is only the first half.
     fn menu_auto_commit(&mut self, enabled: bool) -> String {
-        let (db_type, connection_generation, pool_context_epoch) = {
+        // The same three facts the GUI's plan carries, from the one
+        // constructor that states them (`RetainedSessionTarget`); a harness has
+        // no runtime, so it reads them off the connection it already holds.
+        let target = {
             let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
-            (
-                guard.db_type(),
-                guard.connection_generation(),
-                guard.pool_context_epoch(),
-            )
+            guard.retained_session_target()
         };
         self.editor.set_tab_auto_commit(enabled);
         let outcome = self.editor.apply_auto_commit_to_retained_session(
-            connection_generation,
-            pool_context_epoch,
-            db_type,
+            target,
             enabled,
             "Updating auto-commit setting",
         );
@@ -378,19 +375,15 @@ impl Harness {
     /// holding on the old database/schema.
     fn change_tab_scope(&mut self, scope: Option<&str>) -> String {
         self.editor.set_tab_scope(scope.map(str::to_string));
-        let (db_type, connection_generation, pool_context_epoch, advanced) = {
+        let (target, advanced) = {
             let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             (
-                guard.db_type(),
-                guard.connection_generation(),
-                guard.pool_context_epoch(),
+                guard.retained_session_target(),
                 guard.get_info().advanced.clone(),
             )
         };
         let outcome = self.editor.apply_current_scope_to_retained_session(
-            connection_generation,
-            pool_context_epoch,
-            db_type,
+            target,
             scope.unwrap_or(""),
             &advanced,
         );

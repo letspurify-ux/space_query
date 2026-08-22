@@ -430,20 +430,21 @@ impl Harness {
     /// second half is what makes the live session agree with the toolbar
     /// before the next statement runs.
     fn toolbar_transaction_mode(&mut self, mode: TransactionMode) -> String {
-        let (db_type, connection_generation, pool_context_epoch) = {
+        // The identity AND the connection's resolved default isolation, which
+        // the toolbar takes from the window's cached connection defaults and a
+        // harness reads off the connection it is holding.
+        let (target, default_transaction_isolation) = {
             let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             (
-                guard.db_type(),
-                guard.connection_generation(),
-                guard.pool_context_epoch(),
+                guard.retained_session_target(),
+                guard.default_transaction_isolation(),
             )
         };
         self.editor.set_tab_transaction_mode(mode);
         let outcome = self.editor.apply_transaction_mode_to_retained_session(
-            connection_generation,
-            pool_context_epoch,
-            db_type,
+            target,
             mode,
+            default_transaction_isolation,
             "Updating transaction mode",
         );
         format!("{outcome:?}")
@@ -456,19 +457,15 @@ impl Harness {
     /// holding on the old database/schema.
     fn change_tab_scope(&mut self, scope: Option<&str>) -> String {
         self.editor.set_tab_scope(scope.map(str::to_string));
-        let (db_type, connection_generation, pool_context_epoch, advanced) = {
+        let (target, advanced) = {
             let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             (
-                guard.db_type(),
-                guard.connection_generation(),
-                guard.pool_context_epoch(),
+                guard.retained_session_target(),
                 guard.get_info().advanced.clone(),
             )
         };
         let outcome = self.editor.apply_current_scope_to_retained_session(
-            connection_generation,
-            pool_context_epoch,
-            db_type,
+            target,
             scope.unwrap_or(""),
             &advanced,
         );
@@ -822,19 +819,17 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
             TransactionAccessMode::ReadWrite,
         );
         h.editor.set_tab_transaction_mode(replacement);
-        let (generation, epoch, db_type) = {
+        let (target, default_transaction_isolation) = {
             let guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
             (
-                guard.connection_generation(),
-                guard.pool_context_epoch(),
-                guard.db_type(),
+                guard.retained_session_target(),
+                guard.default_transaction_isolation(),
             )
         };
         let outcome = h.editor.apply_transaction_mode_to_retained_session(
-            generation,
-            epoch,
-            db_type,
+            target,
             replacement,
+            default_transaction_isolation,
             "verify transaction mode",
         );
         h.check(
