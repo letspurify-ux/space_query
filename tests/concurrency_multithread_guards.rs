@@ -14216,10 +14216,14 @@ fn a_lazy_fetch_cancel_resolves_its_session_policy_at_one_door() {
     );
 
     // The eviction is the road that ends ANOTHER tab's session, so it asks for
-    // a victim it may actually have.
+    // a victim it may actually have — and what to do about a full pool is ONE
+    // answer (`PoolSlotEvictionPick`) for every road that asks, because three
+    // roads reading three different facts is how the worker's retry road came
+    // to evict a SECOND grid while the first eviction's slot was still on its
+    // way back (round 26).
     let window = read_source("src/ui/main_window.rs");
     for road in [
-        "fn oldest_evictable_lazy_fetch_session_on_connection(",
+        "fn pool_slot_eviction_pick_on_connection(",
         "fn cancel_oldest_lazy_fetch_if_session_pool_full(",
     ] {
         let body = window
@@ -14241,6 +14245,83 @@ fn a_lazy_fetch_cancel_resolves_its_session_policy_at_one_door() {
         victim_rule.contains(".filter(|session_id|!cancel_already_pending(*session_id))")
             && victim_rule.contains(".filter(|session_id|!session_carries_tab_work(*session_id))"),
         "both exclusions belong to the rule, not to its callers: {victim_rule}"
+    );
+    // All three eviction roads ask the one pick: the pre-execution check on
+    // the connection, and the worker's request/notify handlers on the tab.
+    let pre_execution = window
+        .find("fn cancel_oldest_lazy_fetch_if_session_pool_full(")
+        .map(|at| slice_to_end_of_item(&window, at))
+        .expect("the pre-execution eviction road should exist");
+    assert!(
+        pre_execution.contains("pool_slot_eviction_pick_on_connection(connection_id)"),
+        "the pre-execution road asks the one pick"
+    );
+    assert_eq!(
+        window
+            .matches("s.pool_slot_eviction_pick_for_tab(tab_id)")
+            .count(),
+        2,
+        "and so do BOTH worker roads — the synchronous request and the Oracle notify"
+    );
+    // The pick's wait half is a pure rule beside the victim rule, and it waits
+    // only for a slot that is actually coming: a Retain-cancel never produces
+    // an item (the handle's stamp exists only for a resolved discard), and a
+    // pending discard older than the worker's whole wait is a wedge (R25-2),
+    // not a slot.
+    let on_its_way = window
+        .find("fn a_pool_slot_is_already_on_its_way(")
+        .map(|at| slice_to_end_of_item(&window, at))
+        .expect("the slot-on-its-way rule should exist");
+    assert!(
+        compact_for_pattern(on_its_way).contains("any(|age|age<wait_budget)"),
+        "the wait rule weighs freshness; the slot-freeing half lives in the door's stamp"
+    );
+    let pick = window
+        .find("fn pool_slot_eviction_pick_on_connection(")
+        .map(|at| slice_to_end_of_fn(&window, at))
+        .expect("the pick should exist");
+    let compact_pick = compact_for_pattern(pick);
+    assert!(
+        compact_pick.contains("a_pool_slot_is_already_on_its_way(")
+            && compact_pick.contains("lazy_fetch_cancel_slot_freeing_since(*session_id)")
+            && compact_pick.contains("crate::ui::sql_editor::SESSION_POOL_CANCEL_WAIT_TIMEOUT"),
+        "the pick reads the editor's own since-when-slot-freeing fact and shares the WORKER's \
+         wait as its freshness budget — one value, so the wait the road grants and the wait \
+         the worker performs cannot drift: {pick}"
+    );
+    // The since-when fact is the HANDLE's, stamped by the one door above at
+    // the moment the policy resolves to a discard — NOT at the first cancel
+    // request. Stamped there, a Retain-cancel later downgraded to a discard
+    // (the user closes the grid) read as already-wedged and a second grid was
+    // evicted for nothing (round 28); and the stamp is written once, so a
+    // wedged victim re-requested by the eviction cannot keep itself fresh.
+    let since_reader = editor
+        .find("fn lazy_fetch_cancel_slot_freeing_since(")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the editor must answer since when a cancel has been slot-freeing");
+    assert!(
+        compact_for_pattern(since_reader).contains("handle.slot_freeing_cancel_since.lock()"),
+        "the answer is read from the handle's own stamp: {since_reader}"
+    );
+    let door_body = editor
+        .find("fn cancel_lazy_fetch_handle_for_session(")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the cancel door should exist");
+    let compact_door = compact_for_pattern(door_body);
+    assert!(
+        compact_door.contains(
+            "if!handle.retain_session_on_cancel.load(Ordering::Relaxed){letmutsince=handle.slot_freeing_cancel_since"
+        ) && compact_door.contains("ifsince.is_none(){*since=Some(Instant::now());}"),
+        "the door stamps the moment the cancel becomes slot-freeing, once, from the resolved \
+         retain flag: {door_body}"
+    );
+    assert_eq!(
+        compact_for_pattern(&editor)
+            .matches(".slot_freeing_cancel_since.lock()")
+            .count(),
+        2,
+        "one writer (the cancel door) and one reader (the editor's answer to the pick); a \
+         second writer would let a road re-stamp a wedge fresh"
     );
 
     // And a cancel that did not land may not put the grid back into a state it
@@ -14516,10 +14597,19 @@ fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
     // the tab's is the only kind that carries the user's transaction. Every
     // road that makes the first call on one asks the rule, on all four
     // backends.
-    // The Oracle OCI cleanup asks it through the two named helpers, because
-    // both of its questions have a residue-less spelling that every OTHER
-    // caller in the app still wants; the helpers are where the rule is asked so
-    // there is no spelling of either question that skips it.
+    // The Oracle OCI cleanup asks it through the two named helpers. CHANGED,
+    // with its reason: their residue-less spellings
+    // (`oracle_pooled_session_health_check`, and the MySQL family's bool
+    // ping/health twins) lost their last callers in round 26 and were REMOVED
+    // — a residue-less spelling is exactly how a road with a cancel in flight
+    // reaches the question without saying so, which is how the thin lazy
+    // cleanup's health check ran raw for a round. The residue is a required
+    // parameter now; a road with none states `NothingLeftToLand`. And since
+    // round 28 it is asked through the WHEN form — the residue is evaluated
+    // when the answer came, because on the flag-fed roads (the batch cleanup,
+    // the mid-batch schema sync) the user can press Cancel WHILE the
+    // protected call runs, and a value frozen before it read that break as
+    // the session's verdict.
     for (question, helper) in [
         (
             "the health check",
@@ -14534,26 +14624,35 @@ fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
             .find(helper)
             .unwrap_or_else(|| panic!("{question} should have a residue-aware entry point"));
         assert!(
-            slice_to_end_of_fn(&execution, at).contains("answer_not_taken_from_our_own_cancel("),
-            "{question} must ask the app's one rule"
+            slice_to_end_of_fn(&execution, at)
+                .contains("answer_not_taken_from_our_own_cancel_when("),
+            "{question} must ask the app's one rule, evaluated when the answer came"
         );
     }
     let cleanup_at = execution
         .find("let cleanup_cancel_residue =")
         .expect("the Oracle OCI cleanup must state what its own cancel may still do");
-    let cleanup_body = slice_from(&execution, cleanup_at, 3000);
+    // Bounded by the function, not by a byte count: the block grows a comment
+    // and a byte window stops reaching what it asserts (round 9's lesson).
+    let cleanup_body = slice_to_end_of_fn(&execution, cleanup_at);
     assert_eq!(
         cleanup_body.matches("cleanup_cancel_residue,").count(),
-        2,
-        "and the cleanup must hand it to BOTH — the health check and the probe are the two \
-         calls a break it sent can land on: {cleanup_body}"
+        3,
+        "and the cleanup must hand it to ALL THREE — the health check, the scope re-apply and \
+         the probe are the calls a break it sent can land on. Round 26 found the middle one \
+         running raw: a break landing on the `ALTER SESSION` failed the keep chain and \
+         discarded the tab's transaction for a cancel the app itself sent"
     );
     assert!(
         compact_for_pattern(cleanup_body).contains(&compact_for_pattern(
-            "SessionCancelResidue::after_a_cancel_this_app_sent(
- cancel_requested,"
+            "move || {
+                crate::db::SessionCancelResidue::after_a_cancel_this_app_sent(
+                    load_mutex_bool(&cancel_flag),"
         )),
-        "worded from what this road KNOWS — whether a cancel was sent at all: {cleanup_body}"
+        "worded from what this road KNOWS — whether a cancel has been sent by the time each \
+         answer comes, read from the flag INSIDE the closure: the tab's cancel handle is still \
+         published while the cleanup's wire calls run, so a snapshot taken at drop start said \
+         'no cancel here' about a Cancel pressed during them (round 28): {cleanup_body}"
     );
     // The two roads that take a session back out of a TAB's slot cannot know
     // whether a cancel was sent (it belonged to a previous execution), so they
@@ -14748,6 +14847,132 @@ fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
         compact_for_pattern(mysql_probe)
             .contains("should_retain_session=Self::session_health_after_a_break("),
         "the cheap question goes first, so the sync is not what the KILL lands on: {mysql_probe}"
+    );
+
+    // ROUND 26: THE KEEP CHAIN IS PROTECTED AT EVERY WIRE CALL, NOT ONLY AT
+    // THE HEALTH CHECK. A break that had not landed by the health check lands
+    // on whichever call comes next — the scope re-apply, the cursor close, the
+    // timeout restore, the session-info sync — and each of those roads' answer
+    // to an error is to discard the session with the tab's transaction on it.
+    // The census of the lazy roads' own residue, one per protected call:
+    // Oracle OCI's scope re-apply and probe, Oracle thin's cursor close and
+    // health check, the MySQL family's timeout restore and sync, and the
+    // shared `session_health_after_a_break` body.
+    assert_eq!(
+        production
+            .matches("break_recovery.cancel_residue()")
+            .count(),
+        7,
+        "every wire call in the three lazy keep chains states the recovery's own residue; a \
+         call that stops asking re-opens the loss round 26 closed, and a new call must say so \
+         here"
+    );
+    // The scope re-apply and the MySQL session-info sync REQUIRE the residue —
+    // stated by every caller, so no road can reach either without answering
+    // what its own cancel may still do. That requirement is what covers the
+    // STATEMENT cleanups too (they pass `cleanup_cancel_residue` /
+    // `SessionCancelResidue::MYSQL_FAMILY`), which is where round 26 found the
+    // OCI scope re-apply running raw.
+    for (question, marker, asks) in [
+        (
+            "the cleanup scope re-apply",
+            "fn apply_oracle_schema_to_pooled_session_if_current(",
+            1,
+        ),
+        (
+            "the MySQL session-info sync",
+            "fn sync_mysql_pooled_session_info(",
+            // The first contact's two spellings (ping-only for preserved
+            // state, the full check for a clean session) and the
+            // session-database read: three asks, each a wire call a KILL can
+            // land on. The clean-only calls further down stay outside the
+            // rule and the sync's own comment says why.
+            3,
+        ),
+        (
+            "the Oracle OCI schema sync after ALTER SESSION",
+            "fn sync_oracle_pooled_session_current_schema(",
+            1,
+        ),
+        (
+            "the Oracle thin schema sync after ALTER SESSION",
+            "fn sync_oracle_thin_pooled_session_current_schema(",
+            1,
+        ),
+    ] {
+        let body = execution
+            .find(marker)
+            .map(|at| slice_to_end_of_fn(&execution, at))
+            .unwrap_or_else(|| panic!("{question} should exist"));
+        let compact_body = compact_for_pattern(body);
+        assert!(
+            compact_body.contains("residue:implFn()->crate::db::SessionCancelResidue,"),
+            "{question} must REQUIRE the residue as a QUESTION — a caller cannot reach it \
+             without stating what its own cancel may still do, and the answer is evaluated \
+             when each wire call's answer comes, because the flag-fed callers (the batch \
+             cleanup, the mid-batch schema sync) run with the cancel handle still published \
+             and a value frozen early missed a Cancel pressed during the call (round 28)"
+        );
+        assert_eq!(
+            body.matches("answer_not_taken_from_our_own_cancel_when(")
+                .count(),
+            asks,
+            "{question} asks the app's one rule for each wire call it makes"
+        );
+    }
+    // The flag-fed residue is READ INSIDE the closure, never frozen before
+    // the call: every production spelling of `after_a_cancel_this_app_sent(
+    // load_mutex_bool(..))` must be a closure body (`|| ...`), so the flag is
+    // read when the answer comes. A value computed before the call is the
+    // round-28 defect: the user pressed Cancel while the protected call ran,
+    // the frozen residue said NothingLeftToLand, and the break that landed on
+    // the call was taken for the session's verdict — invalidating the pooled
+    // session and destroying the tab's transaction for the user's own cancel.
+    {
+        let compact_production = compact_for_pattern(production);
+        let flag_fed =
+            "crate::db::SessionCancelResidue::after_a_cancel_this_app_sent(load_mutex_bool(";
+        let mut occurrences = 0;
+        let mut search_from = 0;
+        while let Some(found) = compact_production[search_from..].find(flag_fed) {
+            let at = search_from + found;
+            assert!(
+                compact_production[..at].ends_with("||")
+                    || compact_production[..at].ends_with("||{"),
+                "a flag-fed residue must be read inside the closure the rule evaluates when \
+                 the answer comes, not frozen into a value before the call (round 28): \
+                 ...{}...",
+                &compact_production
+                    [at.saturating_sub(80)..(at + flag_fed.len()).min(compact_production.len())]
+            );
+            occurrences += 1;
+            search_from = at + flag_fed.len();
+        }
+        assert_eq!(
+            occurrences, 3,
+            "the three flag-fed roads — the OCI batch cleanup and the two mid-batch schema \
+             syncs; a new one must join this census and the closure discipline"
+        );
+    }
+    // Oracle thin's cursor close re-registers the cursor INSIDE the ask: a
+    // flush whose write went out drains the driver's pending list even when
+    // the answer was an error, so a bare retry would flush nothing and claim
+    // the cursor closed.
+    assert!(
+        compact_for_pattern(production).contains(
+            "||{conn.close_cursor_on_next_call(Some(cursor_id));conn.flush_pending_cursor_closes()"
+        ),
+        "the thin cursor close's re-ask must re-register the cursor id, or the second ask is a \
+         no-op that reports an open cursor closed"
+    );
+    // And the thin lazy health check names the recovery's residue rather than
+    // the residue-less wrapper: on this road a break of the app's may still be
+    // travelling (the in-band marker `is_broken()` cannot see).
+    assert!(
+        compact_for_pattern(production).contains(
+            "Self::oracle_thin_pooled_session_health_check_after_a_cancel(conn,||break_recovery.cancel_residue(),"
+        ),
+        "the thin lazy cleanup's health check must state the recovery's own residue"
     );
 }
 

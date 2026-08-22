@@ -1006,7 +1006,17 @@ impl SessionCancelResidue {
 /// THE COMMIT THEY CANCELLED. Everything else in the app reads that flag after
 /// its call for the same reason; a value read early cannot describe what
 /// happened during it.
-fn answer_not_taken_from_our_own_cancel_when<T, E: std::fmt::Display>(
+///
+/// Pub since round 28, because the aimed-at door was not the only road whose
+/// residue changes mid-call: any road that derives its residue from a LIVE
+/// cancel flag — the mid-batch Oracle schema syncs, the batch cleanup's keep
+/// chain — has a cancel handle still published while its wire calls run, so
+/// the user can press Cancel DURING the protected call and a value frozen
+/// before it said `NothingLeftToLand` about the break that then landed on it.
+/// Those roads pass `|| SessionCancelResidue::after_a_cancel_this_app_sent(
+/// load_flag(), DRIVER)`; the value form below stays only for a residue that
+/// really cannot change while the call runs.
+pub fn answer_not_taken_from_our_own_cancel_when<T, E: std::fmt::Display>(
     residue_when_the_answer_came: impl Fn() -> SessionCancelResidue,
     log_context: &str,
     mut ask: impl FnMut() -> Result<T, E>,
@@ -1030,9 +1040,15 @@ fn answer_not_taken_from_our_own_cancel_when<T, E: std::fmt::Display>(
     ask()
 }
 
-/// The rule for a road whose residue cannot change while its call runs: a take,
-/// a batch cleanup, a lazy-fetch close, a per-tab push. Nothing can aim a
-/// cancel at the app's own bookkeeping call, so the answer is a value.
+/// The rule for a road whose residue genuinely cannot change while its call
+/// runs: a take, a lazy-fetch close, a per-tab push. "Cannot change" is a
+/// claim about ORDERING, not about bookkeeping: the lazy roads' snapshot
+/// qualifies because the cancel door's flag writes and the cleanup's reads
+/// share one lock, so a break born of a first cancel cannot land on a cleanup
+/// whose snapshot missed it. A residue derived from a live cancel FLAG never
+/// qualifies — the user can press Cancel while the call runs — and such a
+/// road asks [`answer_not_taken_from_our_own_cancel_when`] with a closure
+/// that reads the flag when the answer came.
 pub fn answer_not_taken_from_our_own_cancel<T, E: std::fmt::Display>(
     residue: SessionCancelResidue,
     log_context: &str,
@@ -1132,6 +1148,50 @@ mod tests {
         );
         assert_eq!(answer, Ok(7));
         assert_eq!(asked.get(), 2, "the second ask is what consumes the cancel");
+    }
+
+    /// A cancel pressed WHILE the protected call ran is still our own cancel.
+    ///
+    /// The residue closure reads the flag when the answer came, so a Cancel
+    /// pressed during the call — the flag was still false when the road
+    /// started — is recognised and consumed. A value computed before the call
+    /// would have said `NothingLeftToLand` about it, and the road then took
+    /// ORA-01013 as the session's verdict and destroyed the tab's transaction
+    /// for the user's own cancel (round 28, the mid-batch schema syncs and the
+    /// batch cleanup's keep chain).
+    #[test]
+    fn a_cancel_pressed_while_the_call_ran_is_still_our_own_cancel() {
+        let cancel_flag = std::cell::Cell::new(false);
+        let asked = std::cell::Cell::new(0);
+        let answer = answer_not_taken_from_our_own_cancel_when(
+            || {
+                SessionCancelResidue::after_a_cancel_this_app_sent(
+                    cancel_flag.get(),
+                    SessionCancelResidue::ORACLE_OCI,
+                )
+            },
+            "test",
+            || {
+                asked.set(asked.get() + 1);
+                if asked.get() == 1 {
+                    // The user presses Cancel while this call is on the wire,
+                    // and the break lands on it instead of on the statement.
+                    cancel_flag.set(true);
+                    Err(our_own_cancel())
+                } else {
+                    Ok(7)
+                }
+            },
+        );
+        assert_eq!(answer, Ok(7));
+        assert_eq!(asked.get(), 2);
+        // The early-value spelling is exactly what could not see it: frozen
+        // before the call, the flag said no cancel was in flight.
+        assert!(!SessionCancelResidue::after_a_cancel_this_app_sent(
+            false,
+            SessionCancelResidue::ORACLE_OCI
+        )
+        .may_land_on_the_next_call());
     }
 
     /// ONCE, not in a loop. A session that answers every ask with a cancel is

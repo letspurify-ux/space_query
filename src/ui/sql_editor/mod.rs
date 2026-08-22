@@ -55,7 +55,9 @@ mod formatter;
 /// Re-exported so the main window can hold one: the pool-slot execution road
 /// lives there and must count — and give up — its wait exactly as the editor's
 /// own lazy-cancel retry does.
-pub(crate) use execution::{DeferredExecutionGuard, DeferredExecutions};
+pub(crate) use execution::{
+    DeferredExecutionGuard, DeferredExecutions, SESSION_POOL_CANCEL_WAIT_TIMEOUT,
+};
 
 pub mod hangul_repair;
 mod intellisense;
@@ -1142,19 +1144,26 @@ impl LazyFetchBreakRecovery {
     }
 
     /// Whether a break the app sent may still be on its way to this session —
-    /// so the FIRST thing asked of it can be answered by that break instead of
+    /// so the NEXT thing asked of it can be answered by that break instead of
     /// by the session.
     ///
-    /// True on exactly the roads whose driver cannot clear the break itself,
-    /// which is the same set that answers
-    /// [`Self::after_a_break_the_driver_does_not_judge`] and for the same
-    /// reason. A break interrupts the call that is RUNNING; when the call has
-    /// already finished, OCI remembers it and aborts the next one, and a MySQL
-    /// `KILL QUERY` lands on whatever that thread runs next. Oracle thin drains
-    /// its own break/reset handshake, so nothing is left travelling and it
-    /// never answers `BreakLeftTheSessionUsable` while one is.
+    /// True whenever a break was sent and did not take the session away, on
+    /// ALL THREE drivers. OCI remembers a break that found no call running and
+    /// aborts the next one; a MySQL `KILL QUERY` lands on whatever that thread
+    /// runs next; and Oracle thin — which drains its own break/reset handshake
+    /// when the break interrupts a RUNNING read — still leaves an in-band
+    /// INTERRUPT marker on the socket when the break was sent while no call
+    /// was running, which `is_broken()` cannot see and the SERVER answers the
+    /// next request with a user-requested-cancel error (live-measured; the
+    /// same fact `crate::db::SessionCancelResidue::ORACLE_THIN` records, with
+    /// the driver's own marker named there). This value
+    /// used to claim thin never answers `BreakLeftTheSessionUsable` while a
+    /// break travels, and the thin cleanup's cursor close and health check ran
+    /// outside the rule on the strength of that claim.
     ///
-    /// See `SqlEditorWidget::session_health_after_a_break`, which is what asks.
+    /// So EVERY wire call a cleanup makes while this answers true is asked
+    /// through [`crate::db::session_policy::answer_not_taken_from_our_own_cancel`]
+    /// with [`Self::cancel_residue`] — not only the health check.
     pub(crate) fn a_break_may_still_be_landing(self) -> bool {
         matches!(self, Self::BreakLeftTheSessionUsable)
     }
@@ -1811,6 +1820,20 @@ pub(crate) struct LazyFetchHandle {
     pub db_cancel_requested: Arc<AtomicBool>,
     pub fetch_in_progress: Arc<AtomicBool>,
     pub cancel_watchdog_started: Arc<AtomicBool>,
+    /// When the cancel under way on this fetch BECAME slot-freeing — resolved
+    /// to a discard — and `None` until then. Monotonic: a discard can never
+    /// go back to a retain (the upgrade is refused once a cancel is under
+    /// way), so the one write is the first moment the pool could start
+    /// waiting on this slot.
+    ///
+    /// On the HANDLE, beside the flags it derives from, because the moment is
+    /// created where the policy is resolved (`cancel_lazy_fetch_handle_for_
+    /// session`) and nothing else can know it: stamping at the first CANCEL
+    /// request instead made a Retain-cancel later downgraded to a discard
+    /// (the user closes the grid) look older than the eviction's freshness
+    /// budget, so the pool read a genuinely fresh discard as a wedge and
+    /// evicted a second grid for nothing (round 28).
+    pub slot_freeing_cancel_since: Arc<Mutex<Option<Instant>>>,
     pub status_activity: Option<crate::db::DbActivityFinishHandle>,
 }
 
@@ -6163,6 +6186,35 @@ impl SqlEditorWidget {
             .map(|handle| handle.session_carries_tab_work)
     }
 
+    /// When the cancel under way on this tab's live lazy fetch `session_id`
+    /// became SLOT-FREEING — resolved to a discard that will give the POOL
+    /// its slot back. `None` when this tab does not hold that fetch, or when
+    /// no slot is coming: a `Retain`-cancel (the cancel button, the
+    /// pre-execution cancel) moves the session to the tab's lease and frees
+    /// nothing, so it never gets a stamp and a road waiting for capacity
+    /// never waits on one.
+    ///
+    /// The pool-slot eviction is the caller: a fresh stamp means a slot is
+    /// already on its way, and taking a SECOND grid while it travels is the
+    /// over-eviction this answer exists to prevent. The stamp is the moment
+    /// the cancel BECAME a discard (see `LazyFetchHandle::
+    /// slot_freeing_cancel_since`), not the first cancel request — measured
+    /// from the request, a retain later downgraded by a grid close read as
+    /// already-wedged and cost a second grid.
+    pub(crate) fn lazy_fetch_cancel_slot_freeing_since(&self, session_id: u64) -> Option<Instant> {
+        self.active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|handle| handle.session_id == session_id)
+            .and_then(|handle| {
+                *handle
+                    .slot_freeing_cancel_since
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+    }
+
     pub fn lazy_fetch_progress_event_is_current(
         &self,
         session_id: u64,
@@ -6323,6 +6375,21 @@ impl SqlEditorWidget {
                 let fetch_in_progress = handle.fetch_in_progress.load(Ordering::Relaxed);
                 if fetch_in_progress && first_cancel_request {
                     handle.db_cancel_requested.store(true, Ordering::Relaxed);
+                }
+                // The moment this cancel became slot-freeing, stamped once:
+                // read AFTER the resolution above so a first discard, a
+                // retain later downgraded by a grid close, and a repeated
+                // discard all answer from the same fact — and the repeat
+                // keeps the original stamp, so a wedged eviction victim
+                // cannot keep itself fresh by being re-requested.
+                if !handle.retain_session_on_cancel.load(Ordering::Relaxed) {
+                    let mut since = handle
+                        .slot_freeing_cancel_since
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if since.is_none() {
+                        *since = Some(Instant::now());
+                    }
                 }
                 Some((handle.clone(), first_cancel_request, fetch_in_progress))
             });

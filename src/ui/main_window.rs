@@ -2152,6 +2152,13 @@ pub struct AppState {
     progress_contexts: HashMap<QueryTabId, QueryProgressContext>,
     abandoned_query_operations: HashSet<QueryOperationToken>,
     pending_query_cancellations: HashMap<QueryOperationToken, QueryCancelPhase>,
+    /// The lazy fetches a cancel is under way on, by session id — the UI's
+    /// bookkeeping set (result-tab labels, the victim rule's "already being
+    /// cancelled" exclusion). WHEN a pending cancel became slot-freeing is
+    /// NOT here: that moment is the handle's own fact
+    /// (`LazyFetchHandle::slot_freeing_cancel_since`), stamped by the cancel
+    /// door where the policy resolves, and the pool-slot pick reads it from
+    /// the editors.
     pending_lazy_fetch_canceling_sessions: HashSet<u64>,
     orphaned_lazy_fetch_missing_since: HashMap<u64, Instant>,
     pub object_browser: MultiObjectBrowserWidget,
@@ -4165,26 +4172,49 @@ impl AppState {
     ///
     /// See [`oldest_evictable_lazy_fetch_session`] for what "may take" excludes
     /// and why.
-    fn oldest_evictable_lazy_fetch_session_for_tab(&self, tab_id: QueryTabId) -> Option<u64> {
-        let connection_id = self
+    fn pool_slot_eviction_pick_for_tab(&self, tab_id: QueryTabId) -> PoolSlotEvictionPick {
+        let Some(connection_id) = self
             .editor_tabs
             .iter()
             .find(|tab| tab.tab_id == tab_id)
-            .and_then(|tab| tab.connection_binding.snapshot().connection_id())?;
-        self.oldest_evictable_lazy_fetch_session_on_connection(connection_id)
+            .and_then(|tab| tab.connection_binding.snapshot().connection_id())
+        else {
+            return PoolSlotEvictionPick::NothingEvictable {
+                fetches_exist: false,
+            };
+        };
+        self.pool_slot_eviction_pick_on_connection(connection_id)
     }
 
-    /// [`oldest_evictable_lazy_fetch_session`] asked of this window's state:
-    /// the fetches holding a slot on `connection_id`
+    /// [`PoolSlotEvictionPick`] asked of this window's state: the fetches
+    /// holding a slot on `connection_id`
     /// ([`Self::lazy_fetch_sessions_for_connection`], which counts them all
-    /// because they all hold one), which of them is already being cancelled,
-    /// and which of them is holding the tab's work.
-    fn oldest_evictable_lazy_fetch_session_on_connection(
+    /// because they all hold one), which of them has a slot-freeing cancel
+    /// already under way and how long ago it BECAME one — the handle's own
+    /// stamp (`SqlEditorWidget::lazy_fetch_cancel_slot_freeing_since`), so a
+    /// user's grid close counts exactly like an eviction and a retain-cancel
+    /// never counts ([`a_pool_slot_is_already_on_its_way`]) — which is
+    /// already being cancelled, and which is holding the tab's work
+    /// ([`oldest_evictable_lazy_fetch_session`]).
+    fn pool_slot_eviction_pick_on_connection(
         &self,
         connection_id: ConnectionId,
-    ) -> Option<u64> {
-        oldest_evictable_lazy_fetch_session(
-            &self.lazy_fetch_sessions_for_connection(connection_id),
+    ) -> PoolSlotEvictionPick {
+        let sessions = self.lazy_fetch_sessions_for_connection(connection_id);
+        let now = Instant::now();
+        if a_pool_slot_is_already_on_its_way(
+            sessions.iter().filter_map(|session_id| {
+                let since = self
+                    .editors_that_can_own_db_work()
+                    .find_map(|editor| editor.lazy_fetch_cancel_slot_freeing_since(*session_id))?;
+                Some(now.saturating_duration_since(since))
+            }),
+            crate::ui::sql_editor::SESSION_POOL_CANCEL_WAIT_TIMEOUT,
+        ) {
+            return PoolSlotEvictionPick::AlreadyOnItsWay;
+        }
+        match oldest_evictable_lazy_fetch_session(
+            &sessions,
             |session_id| {
                 self.pending_lazy_fetch_canceling_sessions
                     .contains(&session_id)
@@ -4194,7 +4224,12 @@ impl AppState {
                     editor.lazy_fetch_session_carries_tab_work(session_id) == Some(true)
                 })
             },
-        )
+        ) {
+            Some(session_id) => PoolSlotEvictionPick::Victim(session_id),
+            None => PoolSlotEvictionPick::NothingEvictable {
+                fetches_exist: !sessions.is_empty(),
+            },
+        }
     }
 
     fn mark_lazy_fetch_cancelled_without_status(&mut self, session_id: u64) {
@@ -6828,6 +6863,50 @@ fn oldest_evictable_lazy_fetch_session(
         .min()
 }
 
+/// What the pool-slot road should do about a full pool, as ONE answer for
+/// every road that asks it — the pre-execution check, the worker's synchronous
+/// request and the Oracle fire-and-forget notify. Three roads reading three
+/// different facts is how the worker's retry road came to evict a SECOND grid
+/// while the first eviction's slot was still on its way back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoolSlotEvictionPick {
+    /// A slot is already on its way back — a pending DISCARD-cancel younger
+    /// than the wait the worker's retry loop grants. Wait for it; taking a
+    /// second grid now would cancel it for nothing.
+    AlreadyOnItsWay,
+    /// This fetch is the oldest one the road may actually take.
+    Victim(u64),
+    /// Nothing here may be taken. `fetches_exist` distinguishes "every fetch
+    /// is holding work or already being cancelled" (the user's to clear, so
+    /// the road says so) from "there are no fetches at all" (the pool is full
+    /// of something this road cannot evict, and the driver's error is the
+    /// honest one).
+    NothingEvictable { fetches_exist: bool },
+}
+
+/// Whether one of the fetches holding a slot has a cancel under way that will
+/// give the slot back, recently enough to still be worth waiting for.
+///
+/// Each item is the AGE of one pending slot-freeing cancel, measured from the
+/// moment it BECAME slot-freeing — the handle's own stamp
+/// (`SqlEditorWidget::lazy_fetch_cancel_slot_freeing_since`), written by the
+/// one cancel door when the policy resolves to a discard. A `Retain`-cancel
+/// moves the session to the tab's lease and frees nothing, so it never gets a
+/// stamp and never produces an item here; a retain later DOWNGRADED to a
+/// discard (the user closes the grid) is stamped at the downgrade, so its
+/// freshness is the discard's, not the older cancel's. The age bound is what
+/// keeps R25-2's wedged-victim rule: a pending discard older than
+/// [`crate::ui::sql_editor::SESSION_POOL_CANCEL_WAIT_TIMEOUT`] has already
+/// been given the whole wait the worker performs, so the road stops waiting
+/// on it and picks the next victim instead.
+fn a_pool_slot_is_already_on_its_way(
+    pending_discards: impl Iterator<Item = Duration>,
+    wait_budget: Duration,
+) -> bool {
+    let mut pending_discards = pending_discards;
+    pending_discards.any(|age| age < wait_budget)
+}
+
 fn session_pool_slot_action(
     active_lazy_fetches: usize,
     connection_pool_size: u32,
@@ -6954,24 +7033,37 @@ fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Counted over EVERY fetch on the connection, because every one of them
-        // holds a slot; the victim is picked from the ones this road may
-        // actually take. See `evictable_lazy_fetch_sessions_for_connection`.
+        // holds a slot; what to do about a full pool is then ONE answer for
+        // every road that asks. See `pool_slot_eviction_pick_on_connection`.
         let active_sessions = guard.lazy_fetch_sessions_for_connection(connection_id);
         match session_pool_slot_action(active_sessions.len(), connection_pool_size) {
             SessionPoolSlotAction::None => return false,
             SessionPoolSlotAction::CancelLazyFetch => {}
         }
-        let Some(session_id) =
-            guard.oldest_evictable_lazy_fetch_session_on_connection(connection_id)
-        else {
-            // The pool is full and nothing here may be taken. Said, rather than
-            // left to the driver's pool-exhausted error: the remedy is the
-            // user's (commit, roll back, or close a grid) and nothing else in
-            // the app is going to name it.
-            guard.set_status_message(SESSION_POOL_FULL_OF_WORK_STATUS);
-            return false;
-        };
-        session_id
+        match guard.pool_slot_eviction_pick_on_connection(connection_id) {
+            PoolSlotEvictionPick::AlreadyOnItsWay => {
+                // A discard-cancel is already freeing a slot. Answering "a
+                // cancel is under way" defers the accepted execution exactly
+                // like a fresh eviction, and its own acquire then waits the
+                // slot out — cancelling a SECOND grid here is the
+                // over-eviction this arm exists to prevent.
+                guard.set_status_message(SESSION_POOL_SLOT_ON_ITS_WAY_STATUS);
+                return true;
+            }
+            PoolSlotEvictionPick::Victim(session_id) => session_id,
+            PoolSlotEvictionPick::NothingEvictable { fetches_exist } => {
+                // The pool is full and nothing here may be taken. Said, rather
+                // than left to the driver's pool-exhausted error: the remedy is
+                // the user's (commit, roll back, or close a grid) and nothing
+                // else in the app is going to name it. With no fetches at all
+                // there is nothing this road could have evicted, and the
+                // driver's error is the honest one.
+                if fetches_exist {
+                    guard.set_status_message(SESSION_POOL_FULL_OF_WORK_STATUS);
+                }
+                return false;
+            }
+        }
     };
 
     request_lazy_fetch_cancel_for_session_pool(state, session_id)
@@ -6999,10 +7091,19 @@ fn run_sql_execution_request_on(editor: &SqlEditorWidget, request: SqlExecutionR
 /// the connection is one it may not take.
 ///
 /// The two reasons a fetch is not evictable are both the user's to clear, and
-/// only one of them is visible in the grid, so the sentence names both.
+/// only one of them is visible in the grid, so the sentence names both. Said
+/// by EVERY road that reaches that answer — the pre-execution check AND the
+/// worker's request/notify roads — because on the worker roads nothing else in
+/// the app names the remedy either; the grid still shows the driver's own
+/// pool-exhausted error, exactly as it does on the pre-execution road.
 const SESSION_POOL_FULL_OF_WORK_STATUS: &str =
     "Session pool is full; the open result grids are holding uncommitted work or are already \
      being cancelled. Commit or roll back, or close a grid, and try again.";
+
+/// What the pool-slot road says when it is WAITING instead of evicting: a
+/// discard-cancel is already freeing a slot, so no second grid is taken.
+const SESSION_POOL_SLOT_ON_ITS_WAY_STATUS: &str =
+    "Session pool is full; waiting for a lazy fetch that is already being canceled...";
 
 /// How long the pool-slot road waits for the lazy fetch it cancelled to give
 /// its session back before starting the execution it accepted.
@@ -13363,25 +13464,51 @@ impl MainWindow {
                 }
                 QueryProgress::PromptInput { .. } => {}
                 QueryProgress::RequestCancelOldestLazyFetchForSessionPool { response } => {
-                    if let Some(session_id) = s.oldest_evictable_lazy_fetch_session_for_tab(tab_id) {
-                        drop(s);
-                        let requested = request_lazy_fetch_cancel_for_session_pool(
-                            &state_for_progress,
-                            session_id,
-                        );
-                        let _ = response.send(requested);
-                    } else {
-                        drop(s);
-                        let _ = response.send(false);
+                    match s.pool_slot_eviction_pick_for_tab(tab_id) {
+                        PoolSlotEvictionPick::AlreadyOnItsWay => {
+                            drop(s);
+                            // A slot is already coming back. "Requested"
+                            // sends the worker into the same bounded retry a
+                            // fresh eviction gets, instead of this road taking
+                            // a SECOND grid while the first one frees.
+                            let _ = response.send(true);
+                        }
+                        PoolSlotEvictionPick::Victim(session_id) => {
+                            drop(s);
+                            let requested = request_lazy_fetch_cancel_for_session_pool(
+                                &state_for_progress,
+                                session_id,
+                            );
+                            let _ = response.send(requested);
+                        }
+                        PoolSlotEvictionPick::NothingEvictable { fetches_exist } => {
+                            // Same answer the pre-execution road gives: the
+                            // remedy is the user's, and nothing else names it.
+                            if fetches_exist {
+                                s.set_status_message(SESSION_POOL_FULL_OF_WORK_STATUS);
+                            }
+                            drop(s);
+                            let _ = response.send(false);
+                        }
                     }
                 }
                 QueryProgress::NotifyCancelOldestLazyFetchForSessionPool => {
-                    if let Some(session_id) = s.oldest_evictable_lazy_fetch_session_for_tab(tab_id) {
-                        drop(s);
-                        let _ = request_lazy_fetch_cancel_for_session_pool(
-                            &state_for_progress,
-                            session_id,
-                        );
+                    match s.pool_slot_eviction_pick_for_tab(tab_id) {
+                        // A slot is already coming back; the notifying
+                        // worker's retry loop waits for it on its own.
+                        PoolSlotEvictionPick::AlreadyOnItsWay => {}
+                        PoolSlotEvictionPick::Victim(session_id) => {
+                            drop(s);
+                            let _ = request_lazy_fetch_cancel_for_session_pool(
+                                &state_for_progress,
+                                session_id,
+                            );
+                        }
+                        PoolSlotEvictionPick::NothingEvictable { fetches_exist } => {
+                            if fetches_exist {
+                                s.set_status_message(SESSION_POOL_FULL_OF_WORK_STATUS);
+                            }
+                        }
                     }
                 }
                 QueryProgress::AutoCommitChanged { enabled } => {
@@ -20309,6 +20436,43 @@ mod tests {
             oldest_evictable_lazy_fetch_session(&holding_a_slot, |_| false, |_| true),
             None,
             "and when nothing may be taken the road declines instead of inventing a victim"
+        );
+    }
+
+    /// A slot already on its way defers a SECOND eviction — and only a slot
+    /// that is actually coming. Before this rule the worker's retry road,
+    /// finding the pending victim excluded, picked the NEXT evictable fetch:
+    /// one Ctrl+Enter cancelled two grids whenever the first eviction's
+    /// cleanup outlived the 0.2s execution delay, which is the common case.
+    ///
+    /// An item is the age of one pending SLOT-FREEING cancel, measured from
+    /// the moment it became one: a Retain-cancel never produces an item at
+    /// all (the handle's stamp exists only for a resolved discard — see
+    /// `a_lazy_fetch_cancel_stamps_the_moment_it_becomes_slot_freeing`), so
+    /// this rule only weighs freshness.
+    #[test]
+    fn a_pool_slot_already_on_its_way_defers_a_second_eviction() {
+        let budget = Duration::from_secs(2);
+
+        assert!(
+            a_pool_slot_is_already_on_its_way([Duration::from_millis(300)].into_iter(), budget,),
+            "a fresh discard-cancel is a slot on its way: wait for it"
+        );
+        assert!(
+            !a_pool_slot_is_already_on_its_way([Duration::from_secs(3)].into_iter(), budget),
+            "a pending discard older than the worker's whole wait is a wedge (R25-2), and the \
+             next victim may be taken"
+        );
+        assert!(
+            !a_pool_slot_is_already_on_its_way(std::iter::empty(), budget),
+            "with nothing pending there is nothing to wait for"
+        );
+        assert!(
+            a_pool_slot_is_already_on_its_way(
+                [Duration::from_secs(3), Duration::from_millis(100)].into_iter(),
+                budget,
+            ),
+            "one fresh discard beside a wedged one is still a slot on its way"
         );
     }
 

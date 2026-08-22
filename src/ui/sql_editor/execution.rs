@@ -222,7 +222,12 @@ const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 const PROGRESS_ROWS_MAX_BATCH: usize = 10_000;
 const ORACLE_THIN_LAZY_CLEANUP_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SCRIPT_INCLUDE_DEPTH: usize = 64;
-const SESSION_POOL_CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a worker's pool acquire waits for a lazy-fetch cancel to free a
+/// slot before giving up — and, exported, how long a pending DISCARD-cancel
+/// counts as "a slot is already on its way" to the eviction roads
+/// (`MainWindow`'s pool-slot pick): one value, because the wait the road
+/// grants and the wait the worker performs must be the same wait.
+pub(crate) const SESSION_POOL_CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the bind prompt waits for the metadata that names its parameter
 /// types — the columns they are compared with, the routines they are passed to.
 /// The user is watching an unopened dialog, so this is short: past it every
@@ -3423,17 +3428,24 @@ impl Drop for QueryExecutionCleanupGuard {
                 // check, or the probe below. Reading that as the session's
                 // verdict discarded a perfectly good session and the tab's
                 // transaction with it. The app's one rule is asked with what
-                // this road knows: whether a cancel was sent at all, and which
-                // driver is holding the session.
-                let cleanup_cancel_residue =
+                // this road knows: whether a cancel has been sent BY THE TIME
+                // each answer comes — a QUESTION, not the `cancel_requested`
+                // snapshot above, because the tab's cancel handle is still
+                // published while these calls run, and a Cancel pressed during
+                // one of them flips the flag after the snapshot was taken
+                // (round 28). The snapshot keeps deciding the session POLICY;
+                // only what a stray cancel answer means is read late.
+                let cancel_flag = Arc::clone(&self.cancel_flag);
+                let cleanup_cancel_residue = move || {
                     crate::db::SessionCancelResidue::after_a_cancel_this_app_sent(
-                        cancel_requested,
+                        load_mutex_bool(&cancel_flag),
                         crate::db::SessionCancelResidue::ORACLE_OCI,
-                    );
+                    )
+                };
                 let health_check_ok = !health_check_required
                     || SqlEditorWidget::oracle_pooled_session_health_check_after_a_cancel(
                         conn.as_ref(),
-                        cleanup_cancel_residue,
+                        &cleanup_cancel_residue,
                         "sql_editor::cleanup",
                     );
                 let scope_reapply_failed = health_check_ok
@@ -3447,6 +3459,7 @@ impl Drop for QueryExecutionCleanupGuard {
                                 "sql_editor::cleanup",
                                 *connection_generation,
                                 self.oracle_pooled_session_scope.as_deref(),
+                                &cleanup_cancel_residue,
                             )
                         });
                 let policy_health_check_ok = health_check_ok && !scope_reapply_failed;
@@ -3478,7 +3491,7 @@ impl Drop for QueryExecutionCleanupGuard {
                             interrupt_decision,
                         ) && SqlEditorWidget::oracle_session_may_have_uncommitted_work_after_a_cancel(
                             conn.as_ref(),
-                            cleanup_cancel_residue,
+                            &cleanup_cancel_residue,
                             "sql_editor::cleanup",
                         ))
                     {
@@ -4525,22 +4538,52 @@ impl SqlEditorWidget {
     /// acquire door refuse a session on one whose pool a decided teardown is
     /// holding shut. Reaching the pool directly is no longer expressible --
     /// `DbConnectionPool::acquire_session` is private to the DB layer.
+    /// One acquire, with the pool-slot eviction road behind it — asked in at
+    /// most TWO rounds, not one.
+    ///
+    /// The first request can be answered by the UI with "a cancel is already
+    /// on its way" (a slot-freeing discard younger than the wait below), and
+    /// when that cancel turns out to be WEDGED the wait expires with the pool
+    /// still exhausted. By then the pending cancel is older than the freshness
+    /// budget — the road's budget and this wait are the same
+    /// `SESSION_POOL_CANCEL_WAIT_TIMEOUT` — so the second request picks the
+    /// next victim instead of waiting on the wedge again (round 25's R25-2
+    /// rule, kept without the over-eviction). Bounded at two: a second wedge
+    /// inside one acquire means the pool really is stuck, and the driver's
+    /// error is the answer.
     fn acquire_fresh_pool_session_once(
         context: &crate::db::DbPoolSessionContext,
         expected_db_type: crate::db::DatabaseType,
         cancel_strategy: SessionPoolCancelStrategy<'_>,
         activity: &crate::db::DbActivityGuard,
     ) -> Result<crate::db::AcquiredPoolSession, String> {
-        match context.acquire_session_applying_scope_itself(activity) {
-            Ok(session) => Self::expected_pool_session(session, expected_db_type),
-            Err(message)
-                if Self::session_pool_error_is_exhausted(&message)
-                    && Self::request_lazy_fetch_cancel_for_session_pool(cancel_strategy) =>
-            {
-                let session = Self::retry_pool_session_after_lazy_cancel(context, activity)?;
-                Self::expected_pool_session(session, expected_db_type)
+        const EVICTION_ROUNDS: u32 = 2;
+        let mut rounds = 0;
+        loop {
+            match context.acquire_session_applying_scope_itself(activity) {
+                Ok(session) => return Self::expected_pool_session(session, expected_db_type),
+                Err(message)
+                    if rounds < EVICTION_ROUNDS
+                        && Self::session_pool_error_is_exhausted(&message)
+                        && Self::request_lazy_fetch_cancel_for_session_pool(cancel_strategy) =>
+                {
+                    rounds += 1;
+                    match Self::retry_pool_session_after_lazy_cancel(context, activity) {
+                        Ok(session) => {
+                            return Self::expected_pool_session(session, expected_db_type)
+                        }
+                        // Still exhausted after the wait: go round once more —
+                        // the loop's next acquire decides whether a request is
+                        // even needed, and the UI's freshness budget has aged
+                        // past the pending cancel by now.
+                        Err(retry_message)
+                            if rounds < EVICTION_ROUNDS
+                                && Self::session_pool_error_is_exhausted(&retry_message) => {}
+                        Err(retry_message) => return Err(retry_message),
+                    }
+                }
+                Err(message) => return Err(message),
             }
-            Err(message) => Err(message),
         }
     }
 
@@ -5288,6 +5331,7 @@ impl SqlEditorWidget {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity,
         });
     }
@@ -6357,10 +6401,10 @@ impl SqlEditorWidget {
 
     fn oracle_thin_pooled_session_health_check_after_a_cancel(
         conn: &mut OracleThinSession,
-        residue: crate::db::SessionCancelResidue,
+        residue: impl Fn() -> crate::db::SessionCancelResidue,
         log_context: &str,
     ) -> bool {
-        match crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+        match crate::db::session_policy::answer_not_taken_from_our_own_cancel_when(
             residue,
             log_context,
             || Self::oracle_thin_session_health_reporting(conn),
@@ -6382,7 +6426,7 @@ impl SqlEditorWidget {
             // No cancel of this app's is in flight on this road; stated rather
             // than defaulted, so a road that DOES have one cannot reach the
             // check without saying so.
-            crate::db::SessionCancelResidue::NothingLeftToLand,
+            || crate::db::SessionCancelResidue::NothingLeftToLand,
             log_context,
         )
     }
@@ -6854,12 +6898,23 @@ impl SqlEditorWidget {
                             "oracle lazy fetch cleanup",
                             connection_generation,
                             execution_scope.as_deref(),
+                            // The same residue the health check above consumed
+                            // FROM: a break that had not landed by then lands
+                            // on this re-apply instead. The SNAPSHOT is sound
+                            // here — the cancel door's flag writes and this
+                            // cleanup's reads share the handle lock, so no
+                            // break can be born mid-cleanup unseen.
+                            || break_recovery.cancel_residue(),
                         )
                         && Self::lazy_fetch_can_keep_session(&active_lazy_fetch, session_id);
                     if should_keep_session {
+                        // Through the residue-aware probe: this one fails OPEN,
+                        // so a break of the app's own landing here made a clean
+                        // tab report uncommitted work it never had.
                         let may_have_uncommitted_work =
-                            Self::oracle_session_may_have_uncommitted_work(
+                            Self::oracle_session_may_have_uncommitted_work_after_a_cancel(
                                 conn.as_ref(),
+                                || break_recovery.cancel_residue(),
                                 "oracle lazy fetch cleanup",
                             );
                         let retained_state = Self::oracle_lazy_fetch_retained_state_after_cleanup(
@@ -7678,14 +7733,32 @@ impl SqlEditorWidget {
                                 InterruptKind::None | InterruptKind::Cancelled
                             );
                         if can_flush_cursor_close {
-                            conn.close_cursor_on_next_call(Some(cursor_id));
-                            match conn.flush_pending_cursor_closes() {
+                            // Through the app's one late-cancel rule: a break
+                            // sent while no call was running leaves an in-band
+                            // INTERRUPT marker the driver cannot see
+                            // (`is_broken()` stays false), and the SERVER
+                            // answers this close with ORA-01013. The cursor id
+                            // is RE-REGISTERED on every ask — a flush whose
+                            // write went out drains the pending list even when
+                            // the answer was an error, so a bare retry would
+                            // flush nothing and claim the cursor closed.
+                            let close_result =
+                                crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+                                    break_recovery.cancel_residue(),
+                                    "oracle thin lazy fetch cleanup",
+                                    || {
+                                        conn.close_cursor_on_next_call(Some(cursor_id));
+                                        conn.flush_pending_cursor_closes()
+                                            .map_err(|err| err.to_string())
+                                    },
+                                );
+                            match close_result {
                                 Ok(()) => cursor_closed = true,
                                 Err(err) => {
                                     cleanup_failed = true;
                                     close_cancelled = true;
                                     close_error_kind =
-                                        Self::oracle_thin_interrupt_kind_for_message(&err.to_string());
+                                        Self::oracle_thin_interrupt_kind_for_message(&err);
                                     crate::utils::logging::log_error(
                                         "oracle thin lazy fetch cleanup",
                                         &format!(
@@ -7704,8 +7777,13 @@ impl SqlEditorWidget {
                             && cursor_closed
                             && !conn.is_broken();
                     let health_check_ok = if can_check_session_health {
-                        Self::oracle_thin_pooled_session_health_check(
+                        // With the recovery's own residue, NOT the residue-less
+                        // wrapper: on this road a break of the app's may still
+                        // be travelling (the in-band marker the driver cannot
+                        // see), and it can be what answers this check.
+                        Self::oracle_thin_pooled_session_health_check_after_a_cancel(
                             conn,
+                            || break_recovery.cancel_residue(),
                             "oracle thin lazy fetch cleanup",
                         )
                     } else {
@@ -8521,8 +8599,20 @@ impl SqlEditorWidget {
                             // generic timeout=None reset would miss lock wait
                             // variables and leak short app timeouts into the
                             // next statement on this retained session.
+                            //
+                            // Through the app's one late-cancel rule: this is
+                            // the FIRST wire call of the cleanup, so a `KILL
+                            // QUERY` still on its way lands on one of these
+                            // `SET`s just as readily as on the probe below.
+                            // The re-ask re-runs the WHOLE restore sequence,
+                            // which is also what makes a kill-interrupted
+                            // partial restore whole again.
                             if let Err(err) =
-                                timeout_restore.restore_for_db(conn, connection_info.db_type)
+                                crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+                                    break_recovery.cancel_residue(),
+                                    "mysql lazy fetch cleanup",
+                                    || timeout_restore.restore_for_db(conn, connection_info.db_type),
+                                )
                             {
                                 crate::utils::logging::log_error(
                                     "mysql lazy fetch cleanup",
@@ -8570,6 +8660,7 @@ impl SqlEditorWidget {
                             &shared_connection,
                             conn,
                             "mysql lazy fetch cleanup",
+                            || break_recovery.cancel_residue(),
                             connection_generation,
                             false,
                             MysqlSessionDatabaseUpdate::None,
@@ -17188,6 +17279,17 @@ impl SqlEditorWidget {
                                             conn,
                                             &db_activity,
                                             connection_generation,
+                                            // The statement succeeded, so a
+                                            // cancel dispatched for it can
+                                            // only land on this sync now — and
+                                            // the flag is read when the ANSWER
+                                            // comes, so a Cancel pressed while
+                                            // the sync itself is on the wire
+                                            // is recognised too (round 28).
+                                            || crate::db::SessionCancelResidue::after_a_cancel_this_app_sent(
+                                                load_mutex_bool(&cancel_flag),
+                                                crate::db::SessionCancelResidue::ORACLE_OCI,
+                                            ),
                                         );
                                     match SqlEditorWidget::oracle_current_schema_sync_notice(
                                         synced_current_schema,
@@ -21763,6 +21865,19 @@ impl SqlEditorWidget {
                                                 conn,
                                                 db_activity,
                                                 *connection_generation,
+                                                // The statement succeeded, so
+                                                // a cancel dispatched for it
+                                                // can only land on this sync
+                                                // now — and the flag is read
+                                                // when the ANSWER comes, so a
+                                                // Cancel pressed while the
+                                                // sync itself is on the wire
+                                                // is recognised too (round
+                                                // 28).
+                                                || crate::db::SessionCancelResidue::after_a_cancel_this_app_sent(
+                                                    load_mutex_bool(cancel_flag),
+                                                    crate::db::SessionCancelResidue::ORACLE_THIN,
+                                                ),
                                             )
                                         });
                                     match Self::oracle_current_schema_sync_notice(
@@ -25555,6 +25670,11 @@ impl SqlEditorWidget {
                     shared_connection,
                     &mut conn,
                     db_activity,
+                    // This finalization took the session back out of the TAB's
+                    // slot after an interrupted batch: whether that batch's
+                    // cancel landed cannot be known here, so the driver's
+                    // constant is the honest answer.
+                    || crate::db::SessionCancelResidue::MYSQL_FAMILY,
                     connection_generation,
                     false,
                     MysqlSessionDatabaseUpdate::None,
@@ -28081,29 +28201,26 @@ impl SqlEditorWidget {
         }
     }
 
-    fn oracle_pooled_session_health_check(conn: &Connection, log_context: &str) -> bool {
-        Self::oracle_pooled_session_health_check_after_a_cancel(
-            conn,
-            // No cancel of this app's is in flight on this road; stated rather
-            // than defaulted, so a road that DOES send one cannot reach the
-            // check without saying so.
-            crate::db::SessionCancelResidue::NothingLeftToLand,
-            log_context,
-        )
-    }
-
     /// The Oracle OCI health check, asked so the app's OWN cancel is never
     /// mistaken for the session's answer.
     ///
-    /// The one entry point: `oracle_pooled_session_health_check` is this with
-    /// "nothing of ours is in flight" written out, so there is no spelling of
-    /// the check that silently skips the rule.
+    /// The one entry point, and the residue is a REQUIRED answer: the
+    /// residue-less spelling (`oracle_pooled_session_health_check`) lost its
+    /// last caller when the schema sync learned to state its own, and keeping
+    /// it around is how a road with a cancel in flight reaches the check
+    /// without saying so. A road with none states `NothingLeftToLand`.
+    ///
+    /// A QUESTION, not a value, since round 28: on the roads whose residue
+    /// comes from a live cancel flag (the batch cleanup, the mid-batch schema
+    /// sync) the user can press Cancel WHILE this check runs, and a value
+    /// frozen before it read that break as the session's verdict. The closure
+    /// is evaluated when the answer came.
     fn oracle_pooled_session_health_check_after_a_cancel(
         conn: &Connection,
-        residue: crate::db::SessionCancelResidue,
+        residue: impl Fn() -> crate::db::SessionCancelResidue,
         log_context: &str,
     ) -> bool {
-        match crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+        match crate::db::session_policy::answer_not_taken_from_our_own_cancel_when(
             residue,
             log_context,
             || crate::db::session_policy::health_check_oracle_session_reporting(conn),
@@ -28125,10 +28242,10 @@ impl SqlEditorWidget {
     /// transaction-option gate then refused the user's next change.
     fn oracle_session_may_have_uncommitted_work_after_a_cancel(
         conn: &Connection,
-        residue: crate::db::SessionCancelResidue,
+        residue: impl Fn() -> crate::db::SessionCancelResidue,
         log_context: &str,
     ) -> bool {
-        match crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+        match crate::db::session_policy::answer_not_taken_from_our_own_cancel_when(
             residue,
             log_context,
             || crate::db::DatabaseConnection::oracle_session_uncommitted_work_reporting(conn),
@@ -28141,22 +28258,16 @@ impl SqlEditorWidget {
         }
     }
 
-    fn mysql_pooled_session_health_check(conn: &mut mysql::PooledConn, log_context: &str) -> bool {
-        crate::db::session_policy::health_check_session(
-            crate::db::session_policy::PhysicalSession::MySql(conn),
-            log_context,
-        )
-    }
-
-    fn mysql_pooled_session_ping(conn: &mut mysql::PooledConn, log_context: &str) -> bool {
-        if conn.as_mut().ping().is_err() {
-            crate::utils::logging::log_error(
-                log_context,
-                "MySQL/MariaDB pooled session ping failed",
-            );
-            return false;
-        }
-        true
+    /// The MySQL/MariaDB pooled-session ping, with WHY it failed — for the
+    /// roads that ask it through the late-cancel rule, which recognises the
+    /// app's own `KILL QUERY` by the message. The bool spellings
+    /// (`mysql_pooled_session_ping` / `mysql_pooled_session_health_check`)
+    /// lost their last callers when the session-info sync learned to state its
+    /// residue, and were removed for the same reason as the OCI one above.
+    fn mysql_pooled_session_ping_reporting(conn: &mut mysql::PooledConn) -> Result<(), String> {
+        conn.as_mut()
+            .ping()
+            .map_err(|err| format!("MySQL/MariaDB pooled session ping failed: {err}"))
     }
 
     fn mysql_statement_effects_may_preserve_session_state_after_action(
@@ -28301,6 +28412,17 @@ impl SqlEditorWidget {
         shared_connection: &crate::db::SharedConnection,
         conn: &mut mysql::PooledConn,
         db_activity: &str,
+        // What a cancel this road (or the batch it is cleaning up after) sent
+        // may still do to this session. The sync's first contact and its
+        // session-database read are asked through the app's one late-cancel
+        // rule with this answer, so a `KILL QUERY` that lands on them is not
+        // taken for the session's verdict — this sync's answer to a failure is
+        // to file the session as unusable, with the tab's transaction on it.
+        // REQUIRED, so no caller can reach the sync without stating it; a
+        // QUESTION, so a road whose flag can flip while the sync runs states
+        // it when the answer comes (round 28) — the roads with a constant
+        // answer just return it.
+        residue: impl Fn() -> crate::db::SessionCancelResidue,
         connection_generation: u64,
         refresh_encoding: bool,
         session_database_update: MysqlSessionDatabaseUpdate,
@@ -28318,15 +28440,32 @@ impl SqlEditorWidget {
         // Internal protocol/SQL health commands change MySQL's statement
         // diagnostics. Skip them while ROW_COUNT()/FOUND_ROWS() is pending;
         // the user statement itself will report a dead connection. Other
-        // retained state uses ping-only, and clean sessions get the full check.
-        let session_is_alive = if preserve_statement_diagnostics {
-            true
+        // retained state uses ping-only, and clean sessions get the full
+        // check — each asked through the app's one late-cancel rule, because
+        // this first contact is the one wire call a WORK-CARRYING session
+        // makes in this sync (a preserved session takes the ping-only road),
+        // and a `KILL QUERY` still on its way lands exactly here. The
+        // clean-session calls further down (`SELECT DATABASE()`, the encoding
+        // refresh, the `USE`) stay outside the rule: they run only when
+        // `preserve_existing_session_state` is false, so a kill landing on
+        // them costs a session carrying nothing.
+        let first_contact = if preserve_statement_diagnostics {
+            Ok(())
         } else if preserve_existing_session_state {
-            Self::mysql_pooled_session_ping(conn, db_activity)
+            crate::db::session_policy::answer_not_taken_from_our_own_cancel_when(
+                &residue,
+                db_activity,
+                || Self::mysql_pooled_session_ping_reporting(conn),
+            )
         } else {
-            Self::mysql_pooled_session_health_check(conn, db_activity)
+            crate::db::session_policy::answer_not_taken_from_our_own_cancel_when(
+                &residue,
+                db_activity,
+                || crate::db::session_policy::health_check_mysql_session_reporting(conn),
+            )
         };
-        if !session_is_alive {
+        if let Err(message) = first_contact {
+            crate::utils::logging::log_error(db_activity, &message);
             return false;
         }
         let mut conn_guard =
@@ -28342,9 +28481,14 @@ impl SqlEditorWidget {
                 && Self::mysql_should_refresh_connection_encoding(preserve_existing_session_state);
             // A `USE` moved THIS TAB's session; the connection's own database
             // is untouched, so read the session back (refreshing its
-            // encoding) and let that answer stand for this tab.
-            let sync_result =
-                conn_guard.read_mysql_session_current_database(conn, refresh_encoding);
+            // encoding) and let that answer stand for this tab. Through the
+            // rule: this branch CAN run over a work-carrying session (a `USE`
+            // inside an open transaction), and the read is idempotent.
+            let sync_result = crate::db::session_policy::answer_not_taken_from_our_own_cancel_when(
+                &residue,
+                db_activity,
+                || conn_guard.read_mysql_session_current_database(conn, refresh_encoding),
+            );
 
             match sync_result {
                 Ok(session_database) => {
@@ -28495,13 +28639,31 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Read back where an `ALTER SESSION SET CURRENT_SCHEMA` statement left
+    /// the session, through the app's one late-cancel rule.
+    ///
+    /// The statement SUCCEEDED, but a cancel dispatched just as it finished
+    /// has nothing left to interrupt, so its break lands on this health check
+    /// or this read — and the caller's answer to `None` is to INVALIDATE the
+    /// pooled session and error the batch, destroying the tab's transaction
+    /// for the user's own late cancel. The residue is REQUIRED so a caller
+    /// states what its cancel may still do — and it is a QUESTION, because
+    /// this sync runs MID-BATCH with the cancel handle still published: a
+    /// Cancel pressed while the sync itself is on the wire flips the flag
+    /// DURING the protected call, and a value frozen before it said "no
+    /// cancel here" about the break that then landed on it (round 28).
     fn sync_oracle_pooled_session_current_schema(
         shared_connection: &crate::db::SharedConnection,
         conn: &Arc<Connection>,
         db_activity: &str,
         connection_generation: u64,
+        residue: impl Fn() -> crate::db::SessionCancelResidue,
     ) -> Option<String> {
-        if !Self::oracle_pooled_session_health_check(conn.as_ref(), db_activity) {
+        if !Self::oracle_pooled_session_health_check_after_a_cancel(
+            conn.as_ref(),
+            &residue,
+            db_activity,
+        ) {
             return None;
         }
         let conn_guard = lock_connection_with_activity(shared_connection, db_activity.to_string());
@@ -28512,7 +28674,11 @@ impl SqlEditorWidget {
         }
 
         // Read, never write: the tab's session moved, not the connection's.
-        let sync_result = conn_guard.read_oracle_session_current_schema(conn.as_ref());
+        let sync_result = crate::db::session_policy::answer_not_taken_from_our_own_cancel_when(
+            &residue,
+            db_activity,
+            || conn_guard.read_oracle_session_current_schema(conn.as_ref()),
+        );
 
         match sync_result {
             Ok(current_schema) => {
@@ -28570,13 +28736,23 @@ impl SqlEditorWidget {
         Some(conn_guard.pool_context_epoch())
     }
 
+    /// The thin twin of [`Self::sync_oracle_pooled_session_current_schema`],
+    /// asked through the same rule for the same reason: a cancel that missed
+    /// its statement leaves an in-band INTERRUPT marker the driver cannot see,
+    /// and the server answers this sync with `ORA-01013`. The residue is a
+    /// QUESTION for the same mid-batch reason as the OCI twin.
     fn sync_oracle_thin_pooled_session_current_schema(
         shared_connection: &crate::db::SharedConnection,
         conn: &mut OracleThinSession,
         db_activity: &str,
         connection_generation: u64,
+        residue: impl Fn() -> crate::db::SessionCancelResidue,
     ) -> Option<String> {
-        if !Self::oracle_thin_pooled_session_health_check(conn, db_activity) {
+        if !Self::oracle_thin_pooled_session_health_check_after_a_cancel(
+            conn,
+            &residue,
+            db_activity,
+        ) {
             return None;
         }
         let conn_guard = lock_connection_with_activity(shared_connection, db_activity.to_string());
@@ -28587,7 +28763,11 @@ impl SqlEditorWidget {
         }
 
         // Read, never write: the tab's session moved, not the connection's.
-        let sync_result = conn_guard.read_oracle_thin_session_current_schema(conn);
+        let sync_result = crate::db::session_policy::answer_not_taken_from_our_own_cancel_when(
+            &residue,
+            db_activity,
+            || conn_guard.read_oracle_thin_session_current_schema(conn),
+        );
 
         match sync_result {
             Ok(current_schema) => {
@@ -28605,19 +28785,41 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Put the tab's schema on a pooled session during a CLEANUP, through the
+    /// app's one late-cancel rule.
+    ///
+    /// Both callers run right after a batch or a fetch that may have SENT a
+    /// break, and a break interrupts the call that is RUNNING: when the work
+    /// finished first, the break lands on the NEXT call — which can be this
+    /// `ALTER SESSION` just as well as the health check beside it. Reading that
+    /// as the session's verdict fails the keep chain and discards the tab's
+    /// transaction for a cancel the app itself sent. So the residue is a
+    /// REQUIRED answer here: a caller cannot reach the re-apply without saying
+    /// what its own cancel may still do — asked as a QUESTION when the answer
+    /// comes, because the batch cleanup's cancel handle is still published
+    /// while this re-apply runs (round 28). The apply is idempotent (one
+    /// `ALTER SESSION SET CURRENT_SCHEMA`), so the one re-ask the rule allows
+    /// costs a round trip and nothing else.
     fn apply_oracle_schema_to_pooled_session_if_current(
         shared_connection: &crate::db::SharedConnection,
         conn: &Arc<Connection>,
         db_activity: &str,
         connection_generation: u64,
         execution_scope: Option<&str>,
+        residue: impl Fn() -> crate::db::SessionCancelResidue,
     ) -> bool {
-        match Self::apply_oracle_schema_before_pooled_action(
-            shared_connection,
-            conn,
+        match crate::db::session_policy::answer_not_taken_from_our_own_cancel_when(
+            residue,
             db_activity,
-            connection_generation,
-            execution_scope,
+            || {
+                Self::apply_oracle_schema_before_pooled_action(
+                    shared_connection,
+                    conn,
+                    db_activity,
+                    connection_generation,
+                    execution_scope,
+                )
+            },
         ) {
             // The lazy-fetch cleanup path: it runs no statement of the user's,
             // so an unavailable scope has nothing here to mis-resolve.
@@ -29316,6 +29518,11 @@ impl SqlEditorWidget {
                     shared_connection,
                     &mut conn,
                     log_context,
+                    // A cancel is definitely under way on this road (the abort
+                    // above read the flag), and whether its KILL has landed
+                    // cannot be known — the statement it was aimed at never
+                    // ran.
+                    || crate::db::SessionCancelResidue::MYSQL_FAMILY,
                     connection_generation,
                     false,
                     MysqlSessionDatabaseUpdate::None,
@@ -29553,6 +29760,12 @@ impl SqlEditorWidget {
                     shared_connection,
                     &mut conn,
                     log_context,
+                    // This statement can be a cancel TARGET, and by the time
+                    // the sync runs its outcome has already been read from
+                    // `result` — a stray KILL landing on the sync stops
+                    // nothing the user asked to stop, so re-asking past it
+                    // performs nothing they cancelled.
+                    || crate::db::SessionCancelResidue::MYSQL_FAMILY,
                     connection_generation,
                     unit_moves_session_database,
                     session_database_update,
@@ -36042,6 +36255,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(false)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         };
 
@@ -36091,6 +36305,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
 
@@ -36121,6 +36336,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
@@ -36162,6 +36378,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
@@ -36195,6 +36412,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(false)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
@@ -36236,6 +36454,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
@@ -36281,6 +36500,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: Some(status_activity.finish_handle()),
         })));
 
@@ -36365,6 +36585,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let grace = Duration::from_millis(150);
@@ -36451,6 +36672,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(false)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let grace = Duration::from_millis(150);
@@ -36599,6 +36821,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: watchdog_started.clone(),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
 
@@ -36675,6 +36898,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: watchdog_started.clone(),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
 
@@ -36731,6 +36955,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(true)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: watchdog_started.clone(),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         // The release door withdraws BEFORE the session moves; here that lands
@@ -36790,6 +37015,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: db_cancel_requested.clone(),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
 
@@ -36912,6 +37138,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
@@ -37015,6 +37242,7 @@ mod query_execution_cleanup_tests {
             // and the one every close road meets.
             fetch_in_progress: Arc::new(AtomicBool::new(false)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         (active, receiver)
@@ -37109,6 +37337,80 @@ mod query_execution_cleanup_tests {
         );
     }
 
+    /// The moment a cancel becomes SLOT-FREEING is the handle's own stamp,
+    /// written once by the door where the policy resolves.
+    ///
+    /// Three clauses, each a pool-slot eviction fact (round 28):
+    /// a Retain-cancel never gets a stamp, so the roads waiting for capacity
+    /// never wait on a slot that is not coming; a retain later DOWNGRADED to
+    /// a discard (the user closes the grid) is stamped at the downgrade, so
+    /// its freshness is the discard's — measured from the first cancel it
+    /// read as already-wedged and a second grid was evicted for nothing; and
+    /// a REPEATED discard keeps the original stamp, so a wedged eviction
+    /// victim cannot keep itself fresh by being re-requested.
+    #[test]
+    fn a_lazy_fetch_cancel_stamps_the_moment_it_becomes_slot_freeing() {
+        let stamp = |active: &Arc<Mutex<Option<LazyFetchHandle>>>| {
+            active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .and_then(|handle| {
+                    *handle
+                        .slot_freeing_cancel_since
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                })
+        };
+        let pooled_db_session = crate::db::SharedDbSessionLease::new();
+
+        let (retained, _retained_rx) = lazy_fetch_handle_carrying_tab_work(false);
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
+            &retained,
+            &pooled_db_session,
+            Some(42),
+            LazyFetchSessionPolicy::Retain,
+        ));
+        assert!(
+            stamp(&retained).is_none(),
+            "a Retain-cancel frees no slot, so it must not read as one on its way"
+        );
+
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
+            &retained,
+            &pooled_db_session,
+            Some(42),
+            LazyFetchSessionPolicy::DiscardIdleSession,
+        ));
+        let downgraded_at = stamp(&retained)
+            .expect("the retain-to-discard downgrade is the moment a slot starts coming");
+
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
+            &retained,
+            &pooled_db_session,
+            Some(42),
+            LazyFetchSessionPolicy::DiscardIdleSession,
+        ));
+        assert_eq!(
+            stamp(&retained),
+            Some(downgraded_at),
+            "a repeated discard keeps the original stamp: a wedged victim cannot keep itself \
+             fresh by being re-requested"
+        );
+
+        let (discarded, _discarded_rx) = lazy_fetch_handle_carrying_tab_work(false);
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
+            &discarded,
+            &pooled_db_session,
+            Some(42),
+            LazyFetchSessionPolicy::DiscardIdleSession,
+        ));
+        assert!(
+            stamp(&discarded).is_some(),
+            "a first-request discard is slot-freeing from the start"
+        );
+    }
+
     /// The rule itself, stated once so both roads answer the same way.
     #[test]
     fn the_session_policy_answers_what_a_cancel_may_do_to_the_session() {
@@ -37137,6 +37439,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
@@ -37172,6 +37475,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
 
@@ -37200,6 +37504,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(false)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
@@ -37237,6 +37542,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(false)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
@@ -37275,6 +37581,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(false)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
@@ -37312,6 +37619,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
@@ -37349,6 +37657,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
 
@@ -37379,6 +37688,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
 
@@ -40202,6 +40512,7 @@ mod query_execution_cleanup_tests {
             db_cancel_requested: Arc::new(AtomicBool::new(false)),
             fetch_in_progress: Arc::new(AtomicBool::new(true)),
             cancel_watchdog_started: Arc::new(AtomicBool::new(false)),
+            slot_freeing_cancel_since: Arc::new(Mutex::new(None)),
             status_activity: None,
         })));
         let panic_payload = "simulated lazy fetch panic";
