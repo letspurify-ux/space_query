@@ -2981,14 +2981,7 @@ impl AppState {
         // matches the tab needs a load. Runs after `self.sql_editor` has been
         // switched, because seeding pushes highlight data into the editor.
         if binding_snapshot.connection_id().is_some() {
-            let tab_scope = Self::normalize_scope_name(binding_snapshot.scope.clone());
-            let scope_out_of_sync = !self
-                .object_browser
-                .tab_scope_matches(tab_id, tab_scope.as_deref());
-            if scope_out_of_sync {
-                self.object_browser
-                    .set_selected_scope_for_tab(tab_id, tab_scope);
-            }
+            let scope_out_of_sync = self.sync_active_tab_scope_selection();
             // A card that exists but never got a catalog (its load failed, or
             // it was created while one was running and nothing filled it)
             // needs one too, or the tab would stay blank until the user hit
@@ -3299,6 +3292,55 @@ impl AppState {
         }
     }
 
+    /// Make the ACTIVE tab's browser card report the scope its BINDING holds,
+    /// and answer whether they disagreed.
+    ///
+    /// The binding is the source of truth — every batch asserts it on the
+    /// session it runs — and the card's selector is what the user reads. The
+    /// two are moved together by every ordinary road (a pick, a tab switch, a
+    /// `ScopeChangedNotice` that lands), and this is what settles the one road
+    /// where they can part: a worker writes the tab's binding from its own
+    /// `ALTER SESSION SET CURRENT_SCHEMA` while the matching notice is dropped
+    /// as superseded, and the selector then names a schema the tab has left.
+    ///
+    /// Scope's two SIBLING per-tab settings have had a tick that heals them
+    /// whatever happened since `render_status_bar` learned to re-state them;
+    /// the third was left to a tab switch, so a tab the user stayed on kept
+    /// showing the wrong scope for as long as they stayed. The three are one
+    /// family and the app promises the same thing about each: what the screen
+    /// shows is what the next statement will do.
+    ///
+    /// It only re-states the SELECTOR. Whether the catalog behind it has to be
+    /// reloaded is the caller's question — a tab switch marks a refresh
+    /// pending, and the status tick deliberately does not, because a load
+    /// clears the tree, the expansion and the filter the user arranged, and the
+    /// scope that moved was already applied to the session by the statement
+    /// that moved it.
+    fn sync_active_tab_scope_selection(&mut self) -> bool {
+        let tab_id = self.active_editor_tab_id;
+        let Some(binding) = self
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .map(|tab| tab.connection_binding.snapshot())
+        else {
+            return false;
+        };
+        if binding.connection_id().is_none() {
+            return false;
+        }
+        let tab_scope = Self::normalize_scope_name(binding.scope.clone());
+        if self
+            .object_browser
+            .tab_scope_matches(tab_id, tab_scope.as_deref())
+        {
+            return false;
+        }
+        self.object_browser
+            .set_selected_scope_for_tab(tab_id, tab_scope);
+        true
+    }
+
     /// The work THIS TAB owns, as ONE value.
     ///
     /// Every gate that refuses on a tab's work words its refusal from this,
@@ -3309,6 +3351,13 @@ impl AppState {
     /// lazy fetch is active" — waiting for something that had not begun. Its
     /// two sibling per-tab settings have always answered
     /// [`TabDbWork::block_message`].
+    ///
+    /// And they ask THIS, not [`TabDbWork::for_editor`]. The words were made
+    /// one and the SOURCE was left as two: the scope gate counted the fetches
+    /// the window holds and the auto-commit and transaction-mode gates could
+    /// not see them, so one tab answered "there is work" to one setting and
+    /// "there is none" to the other two. A gate that refuses on a tab's work
+    /// asks the tab, and a caller that only has an editor is one that cannot.
     fn tab_db_work(&self, tab_id: QueryTabId) -> TabDbWork {
         let progress_lazy_fetch = self
             .progress_contexts
@@ -4678,6 +4727,11 @@ impl AppState {
         // change, and the sync defers itself while a pulldown holds the FLTK
         // grab.
         self.sync_transaction_mode_controls();
+        // And the THIRD member of that family. It was the one left to a tab
+        // switch, so a tab the user stayed on could go on showing a scope its
+        // binding had left — the selector is what the user reads, and every
+        // batch runs in the binding's scope.
+        self.sync_active_tab_scope_selection();
         let conn_info = self
             .connection_info
             .lock()
@@ -6919,8 +6973,9 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
         let mut s = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(message) =
-            TabDbWork::for_editor(&s.sql_editor).block_message("changing transaction mode")
+        if let Some(message) = s
+            .tab_db_work(s.active_editor_tab_id)
+            .block_message("changing transaction mode")
         {
             s.revert_transaction_mode_controls_to_displayed();
             s.set_status_message(&message);
@@ -15233,8 +15288,9 @@ impl MainWindow {
                     let mut s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let blocked =
-                        TabDbWork::for_editor(&s.sql_editor).block_message("changing auto-commit");
+                    let blocked = s
+                        .tab_db_work(s.active_editor_tab_id)
+                        .block_message("changing auto-commit");
                     if let Some(message) = blocked.as_deref() {
                         s.set_status_message(message);
                     }

@@ -887,6 +887,143 @@ pub fn message_indicates_query_cancel(message: &str) -> bool {
         || lower_matches_any_db_marker(&lower, query_cancel_markers_for_db_type)
 }
 
+/// Whether a cancel THIS APP sent can still be sitting on a session when the
+/// next call is made on it.
+///
+/// A break/`KILL QUERY` interrupts the call that is RUNNING. When the work
+/// finished first there is nothing to interrupt, so Oracle OCI remembers the
+/// break and aborts the NEXT call, and a MySQL `KILL QUERY` lands on whatever
+/// that connection runs next. `SessionCancelClaim::deliver` cannot close that
+/// window: it asks whether the session is still this cancel's to act on, which
+/// is true right up to the hand-back — the statement being over is not the same
+/// fact.
+///
+/// It is a value, and the drivers are NAMED here rather than at each road,
+/// because there is exactly one reason a road may skip the medicine: its driver
+/// clears the residue itself. Oracle thin does (`reset_pending_cancel`, called
+/// by `reset_before_reuse` and by the pool canceler). ODPI-C exposes no reset
+/// the app can call, and a `KILL QUERY` is the server's — so those two roads
+/// recognise the residue instead, which is what
+/// `DbConnectionPool::acquire_session_untracked` already does for every session
+/// that comes out of the POOL. A session taken back out of a TAB's slot does
+/// not come through that door, and it is the only kind that carries the user's
+/// transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionCancelResidue {
+    /// Nothing of this app's is left to land: either no cancel was sent, or the
+    /// driver cleared the one that was.
+    NothingLeftToLand,
+    /// A cancel this app sent may still be on its way, so the next call this
+    /// session makes can be answered by it instead of by the session.
+    MayLandOnTheNextCall,
+}
+
+impl SessionCancelResidue {
+    /// Oracle OCI: ODPI-C has no reset the app can call.
+    pub const ORACLE_OCI: Self = Self::MayLandOnTheNextCall;
+    /// Oracle Thin: the SAME answer, and it was written as the opposite one
+    /// until a live probe said otherwise.
+    ///
+    /// The thin driver clears a cancel that was QUEUED and never sent
+    /// (`reset_pending_cancel`, called by `reset_before_reuse` and by the two
+    /// cancelers), and it drains its own break/reset handshake INSIDE the call
+    /// the break interrupted. Neither fact covers a break sent while no call
+    /// was running: with OOB unavailable `break_execution` writes one in-band
+    /// INTERRUPT marker onto the socket, nobody is reading, and the SERVER
+    /// answers the next request with `ORA-01013`. Measured on Oracle Free 23
+    /// (`verify_commit_close_live`, the stray-cancel scenario): the tab's next
+    /// statement failed as cancelled and its transaction was discarded.
+    ///
+    /// So all three drivers answer the same here, and what differs is only what
+    /// each road KNOWS — which is why the lazy fetch answers from its own
+    /// evidence (`LazyFetchBreakRecovery::cancel_residue`) rather than from
+    /// this constant.
+    pub const ORACLE_THIN: Self = Self::MayLandOnTheNextCall;
+    /// MySQL / MariaDB: `KILL QUERY` is the server's, and it lands on whatever
+    /// the connection runs next.
+    ///
+    /// Narrower than the two Oracle drivers in practice, and stated as the same
+    /// answer on purpose: the server discards a `KILL QUERY` whose thread has
+    /// gone idle (measured — the stray-cancel scenario does not reproduce on
+    /// MySQL 8.0 or MariaDB 12.2), so what is left is the window where the KILL
+    /// arrives while the app's OWN next call is already running. That window is
+    /// real and it is the one round 25 measured on the lazy road.
+    pub const MYSQL_FAMILY: Self = Self::MayLandOnTheNextCall;
+
+    /// The residue for a road that KNOWS whether this app sent a cancel at all
+    /// — a batch cleanup, a lazy-fetch close. A road that took a session back
+    /// out of a tab's slot does NOT know (the cancel belonged to a previous
+    /// execution), so it names its driver's constant instead and pays the
+    /// re-ask only when the first answer really is our own cancel.
+    pub fn after_a_cancel_this_app_sent(cancel_sent: bool, driver: Self) -> Self {
+        if cancel_sent {
+            driver
+        } else {
+            Self::NothingLeftToLand
+        }
+    }
+
+    /// The residue for a call that is ITSELF a cancel target — a toolbar
+    /// COMMIT/ROLLBACK, which the app breaks on the spot when the user cancels
+    /// it.
+    ///
+    /// The opposite question to [`Self::after_a_cancel_this_app_sent`], and
+    /// both are needed because they are two different roads: there, a cancel of
+    /// ours means one may still be travelling; here, a cancel of ours is the
+    /// answer the road is WAITING for, and only one left from BEFORE may be
+    /// asked past.
+    pub fn unless_a_cancel_is_aimed_at_this_call(aimed_at_this_call: bool, driver: Self) -> Self {
+        if aimed_at_this_call {
+            Self::NothingLeftToLand
+        } else {
+            driver
+        }
+    }
+
+    pub fn may_land_on_the_next_call(self) -> bool {
+        matches!(self, Self::MayLandOnTheNextCall)
+    }
+}
+
+/// Ask a session something, and do not take the app's OWN cancel for its
+/// answer.
+///
+/// THE rule, in one place, for every road that speaks to a session this app may
+/// have just broken — the cleanup that files the session, the take that gets it
+/// back, and every UI-thread push that runs a statement on it. Each of those
+/// used to read a stray `ORA-01013` / killed statement as the session's verdict
+/// and DISCARD it, taking the tab's open transaction with it.
+///
+/// Once, not in a loop: a second cancel answer is not residue, it is the
+/// session refusing to work. And only when the first answer is recognisably our
+/// own cancel, so a real failure is never asked twice.
+/// Generic over the ERROR TYPE, not only over the answer: the roads that ask it
+/// include the ones holding a driver's own error (`mysql::Error`), and making
+/// each of them stringify first is how a rule ends up with a second copy for
+/// "the road that could not convert". The only thing asked of the error is what
+/// it SAYS.
+pub fn answer_not_taken_from_our_own_cancel<T, E: std::fmt::Display>(
+    residue: SessionCancelResidue,
+    log_context: &str,
+    mut ask: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let first = match ask() {
+        Ok(answer) => return Ok(answer),
+        Err(first) => first,
+    };
+    if !residue.may_land_on_the_next_call() || !message_indicates_query_cancel(&first.to_string()) {
+        return Err(first);
+    }
+    crate::utils::logging::log_warning(
+        log_context,
+        &format!(
+            "A cancel this app sent landed on the next call this session made rather than on the \
+             work it was aimed at ({first}); asking the session again"
+        ),
+    );
+    ask()
+}
+
 /// DB-agnostic classifier for generic UI: cancel or timeout — the statement
 /// was aborted before producing a normal result.
 pub fn message_indicates_execution_abort(message: &str) -> bool {
@@ -920,6 +1057,176 @@ pub fn classify_sql_for_db_type(db_type: DatabaseType, sql: &str) -> SqlKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cancel THIS APP sent, answered by the session it was aimed at after
+    /// the work it was aimed at had already finished.
+    fn our_own_cancel() -> String {
+        "ORA-01013: user requested cancel of current operation".to_string()
+    }
+
+    /// The whole point: a break the app sent lands on the NEXT call, and the
+    /// answer to it is not the session's answer. Asking again is what consumes
+    /// it — which is why a road that skips this discarded a healthy session and
+    /// the tab's transaction with it.
+    #[test]
+    fn a_cancel_this_app_sent_is_not_the_sessions_answer() {
+        let asked = std::cell::Cell::new(0);
+        let answer = answer_not_taken_from_our_own_cancel(
+            SessionCancelResidue::MayLandOnTheNextCall,
+            "test",
+            || {
+                asked.set(asked.get() + 1);
+                if asked.get() == 1 {
+                    Err(our_own_cancel())
+                } else {
+                    Ok(7)
+                }
+            },
+        );
+        assert_eq!(answer, Ok(7));
+        assert_eq!(asked.get(), 2, "the second ask is what consumes the cancel");
+    }
+
+    /// ONCE, not in a loop. A session that answers every ask with a cancel is
+    /// refusing to work, and holding a cleanup for ever is worse than losing
+    /// the session.
+    #[test]
+    fn a_session_that_answers_twice_with_a_cancel_is_not_asked_a_third_time() {
+        let asked = std::cell::Cell::new(0);
+        let answer: Result<(), String> = answer_not_taken_from_our_own_cancel(
+            SessionCancelResidue::MayLandOnTheNextCall,
+            "test",
+            || {
+                asked.set(asked.get() + 1);
+                Err(our_own_cancel())
+            },
+        );
+        assert_eq!(answer, Err(our_own_cancel()));
+        assert_eq!(asked.get(), 2);
+    }
+
+    /// Only about the CANCEL: a real failure is never asked twice, or every
+    /// broken session would cost two round trips to find out.
+    #[test]
+    fn a_real_failure_is_asked_once() {
+        let asked = std::cell::Cell::new(0);
+        let answer: Result<(), String> = answer_not_taken_from_our_own_cancel(
+            SessionCancelResidue::MayLandOnTheNextCall,
+            "test",
+            || {
+                asked.set(asked.get() + 1);
+                Err("ORA-03113: end-of-file on communication channel".to_string())
+            },
+        );
+        assert!(answer.is_err());
+        assert_eq!(asked.get(), 1);
+    }
+
+    /// And only on a road where something of ours may still be landing.
+    ///
+    /// CHANGED, with its reason. This asserted that `ORACLE_THIN` never
+    /// re-asks, because the app had recorded that the thin driver "clears its
+    /// own residue" — true of a cancel that was QUEUED and never sent
+    /// (`reset_pending_cancel`) and of a break/reset handshake DRAINED inside
+    /// the call it interrupted, and false of the case this rule is about. With
+    /// OOB unavailable the graceful break writes one in-band INTERRUPT marker
+    /// onto the socket; sent while no call is running, nobody reads it and the
+    /// SERVER answers the next request with `ORA-01013`. Live-measured on
+    /// Oracle Free 23 (`verify_commit_close_live`, the stray-cancel scenario):
+    /// the tab's next statement failed as cancelled and its transaction was
+    /// discarded, and the tab's own toolbar ROLLBACK was answered by it too.
+    ///
+    /// So all three drivers answer the same, and what is pinned now is the
+    /// RULE — a road with nothing left to land is never asked twice — plus the
+    /// census of the three constants, which is what a new backend has to join.
+    #[test]
+    fn a_road_with_nothing_left_to_land_is_never_asked_again() {
+        let asked = std::cell::Cell::new(0);
+        let answer: Result<(), String> = answer_not_taken_from_our_own_cancel(
+            SessionCancelResidue::NothingLeftToLand,
+            "test",
+            || {
+                asked.set(asked.get() + 1);
+                Err(our_own_cancel())
+            },
+        );
+        assert!(answer.is_err());
+        assert_eq!(asked.get(), 1);
+        for driver in [
+            SessionCancelResidue::ORACLE_OCI,
+            SessionCancelResidue::ORACLE_THIN,
+            SessionCancelResidue::MYSQL_FAMILY,
+        ] {
+            assert!(
+                driver.may_land_on_the_next_call(),
+                "no driver in this app can un-send a cancel it has already delivered"
+            );
+        }
+    }
+
+    /// The two constructors are two QUESTIONS, and they have opposite answers
+    /// for the same input. A road that SENT a cancel may still be waiting for
+    /// it to land; a road whose own call is the cancel's TARGET wants that
+    /// answer and must not ask past it.
+    #[test]
+    fn the_two_residue_questions_are_not_one_question() {
+        let driver = SessionCancelResidue::ORACLE_OCI;
+        assert_eq!(
+            SessionCancelResidue::after_a_cancel_this_app_sent(true, driver),
+            SessionCancelResidue::MayLandOnTheNextCall
+        );
+        assert_eq!(
+            SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(true, driver),
+            SessionCancelResidue::NothingLeftToLand
+        );
+        assert_eq!(
+            SessionCancelResidue::after_a_cancel_this_app_sent(false, driver),
+            SessionCancelResidue::NothingLeftToLand
+        );
+        assert_eq!(
+            SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(false, driver),
+            SessionCancelResidue::MayLandOnTheNextCall
+        );
+    }
+
+    /// A first answer that is fine costs exactly one call, on every road.
+    #[test]
+    fn a_session_that_answers_costs_one_call() {
+        for residue in [
+            SessionCancelResidue::MayLandOnTheNextCall,
+            SessionCancelResidue::NothingLeftToLand,
+        ] {
+            let asked = std::cell::Cell::new(0);
+            let answer: Result<(), String> =
+                answer_not_taken_from_our_own_cancel(residue, "test", || {
+                    asked.set(asked.get() + 1);
+                    Ok(())
+                });
+            assert_eq!(answer, Ok(()));
+            assert_eq!(asked.get(), 1);
+        }
+    }
+
+    /// A road that KNOWS no cancel was sent has nothing to recognise, whatever
+    /// its driver is — otherwise every failure on a quiet session would be
+    /// asked twice.
+    #[test]
+    fn a_road_that_sent_no_cancel_has_nothing_left_to_land() {
+        for driver in [
+            SessionCancelResidue::ORACLE_OCI,
+            SessionCancelResidue::ORACLE_THIN,
+            SessionCancelResidue::MYSQL_FAMILY,
+        ] {
+            assert_eq!(
+                SessionCancelResidue::after_a_cancel_this_app_sent(false, driver),
+                SessionCancelResidue::NothingLeftToLand
+            );
+            assert_eq!(
+                SessionCancelResidue::after_a_cancel_this_app_sent(true, driver),
+                driver
+            );
+        }
+    }
 
     fn base_ctx() -> InterruptDecisionContext {
         InterruptDecisionContext {

@@ -735,6 +735,107 @@ fn verify(target: Target) -> Result<bool, String> {
     }
     let _ = h.run("COMMIT");
 
+    // A CANCEL OF THIS APP'S THAT OUTLIVED ITS WORK MUST NOT COST THE TAB ITS
+    // TRANSACTION AT THE NEXT STATEMENT.
+    //
+    // The STATEMENT road's twin of the scenario above, and the reason it is
+    // driven rather than raced: a break interrupts the call that is RUNNING, so
+    // the state this is about is the one where there was none — the statement
+    // finished first, Oracle OCI remembers the break and aborts the NEXT call,
+    // and a MySQL `KILL QUERY` lands on whatever the connection runs next. The
+    // next call is the ping the tab's own retained take makes, and reading it
+    // as the session's verdict discarded the session with the user's open
+    // transaction on it. A session taken back out of a TAB's slot never comes
+    // through `DbConnectionPool::acquire_session_untracked`, where the app has
+    // always recognised this for POOLED sessions.
+    //
+    // Oracle Thin is expected to pass at any baseline: its driver clears its
+    // own residue (`reset_pending_cancel`), which is exactly why the residue is
+    // a per-driver fact and not a blanket rule.
+    println!("  --- a cancel left on the tab's own session, then the next statement ---");
+    h.run(target.dml())?;
+    if !h
+        .retained_transaction_state()
+        .is_some_and(|state| state.may_have_uncommitted_work())
+    {
+        return Err("expected the tab to hold an open transaction before the stray cancel".into());
+    }
+    match h.editor.leave_a_cancel_on_the_retained_session_for_probe() {
+        Some(Ok(delivery)) => println!("    left one cancel on the tab's session: {delivery:?}"),
+        Some(Err(err)) => println!("    (the cancel could not be delivered: {err})"),
+        None => return Err("the tab held no retained session to leave a cancel on".into()),
+    }
+    messages.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    h.run("SELECT COUNT(*) AS C FROM SQ_TXCLOSE_T")?;
+    if let Some(sid) = h.editor.active_lazy_fetch_session() {
+        h.editor
+            .request_lazy_fetch(sid, space_query::ui::sql_editor::LazyFetchRequest::All);
+        h.pump_until("verification fetch to drain", || {
+            h.editor.active_lazy_fetch_session().is_none()
+        })?;
+    }
+    let said = messages
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join(" | ");
+    let kept = h
+        .retained_transaction_state()
+        .is_some_and(|state| state.may_have_uncommitted_work());
+    if !kept || said.contains(space_query::db::result_messages::RETAINED_SESSION_LOST_WITH_WORK) {
+        println!(
+            ">>> BUG REPRODUCED: a cancel that outlived its work took the tab's transaction at \
+             the next statement (retained={:?}, said: {said})",
+            h.retained_transaction_state()
+        );
+        reproduced = true;
+    } else {
+        println!("    OK: the stray cancel was consumed and the tab kept its transaction");
+    }
+    h.toolbar_action("rollback")?;
+    let _ = h.run("COMMIT");
+
+    // AND THE THREE PER-TAB PUSHES ARE THE SAME ROAD.
+    //
+    // A toolbar/menu push takes the tab's session back and runs a statement on
+    // it straight away, and its answer to an error is to DISCARD the session —
+    // so the same stray cancel cost the user their transaction through a
+    // Commit/Rollback button instead of through the next statement.
+    println!("  --- a cancel left on the tab's own session, then the toolbar ROLLBACK ---");
+    h.run(target.dml())?;
+    match h.editor.leave_a_cancel_on_the_retained_session_for_probe() {
+        Some(Ok(delivery)) => println!("    left one cancel on the tab's session: {delivery:?}"),
+        Some(Err(err)) => println!("    (the cancel could not be delivered: {err})"),
+        None => return Err("the tab held no retained session to leave a cancel on".into()),
+    }
+    messages.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    h.toolbar_action("rollback")?;
+    let said = messages
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join(" | ");
+    if said.contains(space_query::db::result_messages::RETAINED_SESSION_LOST_WITH_WORK)
+        || said.to_ascii_lowercase().contains("rollback failed")
+    {
+        println!(
+            ">>> BUG REPRODUCED: a cancel that outlived its work answered the user's own \
+             toolbar ROLLBACK (said: {said})"
+        );
+        reproduced = true;
+    } else {
+        println!("    OK: the toolbar action ran on the session it was given");
+    }
+    // And the rollback really happened on that session: the row it took back
+    // must be gone.
+    h.run("SELECT COUNT(*) AS C FROM SQ_TXCLOSE_T")?;
+    if let Some(sid) = h.editor.active_lazy_fetch_session() {
+        h.editor
+            .request_lazy_fetch(sid, space_query::ui::sql_editor::LazyFetchRequest::All);
+        h.pump_until("verification fetch to drain", || {
+            h.editor.active_lazy_fetch_session().is_none()
+        })?;
+    }
+    let _ = h.run("COMMIT");
+
     if !target.is_oracle() {
         // A toolbar COMMIT pressed on a tab whose work-carrying session the
         // server has closed must answer the LOSS

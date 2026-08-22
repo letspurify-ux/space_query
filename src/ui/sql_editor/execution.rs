@@ -1601,6 +1601,11 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
         }
 
         let pool_size = conn_guard.connection_pool_size();
+        // Whether the session below came out of the TAB's slot rather than out
+        // of the pool. Only that one can be carrying a cancel of this app's
+        // that outlived the work it was aimed at: a pool session comes through
+        // `DbConnectionPool::acquire_session_untracked`, which recognises one.
+        let took_retained_session = std::cell::Cell::new(false);
         let (
             thin_conn,
             prior_retained_state,
@@ -1661,9 +1666,23 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
 
             let (thin_conn, prior_retained_state) = match retained {
                 crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => {
+                    // Out of the slot and not an Oracle thin session after all:
+                    // it is GONE, and a bare error would leave the tab believing
+                    // it still has one. The MySQL twin has answered this since
+                    // the take gained its third answer; both Oracle roads only
+                    // said what they expected.
+                    let taken_retained_state = retained_session.retained_state();
                     match retained_session.into_oracle_thin_connection_with_retained_state() {
-                        Some((conn, state)) => (conn, state),
+                        Some((conn, state)) => {
+                            took_retained_session.set(true);
+                            (conn, state)
+                        }
                         None => {
+                            SqlEditorWidget::report_retained_session_lost_with_work(
+                                Some(sender),
+                                taken_retained_state,
+                                "oracle thin execution startup",
+                            );
                             SqlEditorWidget::emit_execution_startup_error(
                                 sender,
                                 script_mode,
@@ -1908,6 +1927,38 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             return ExecutionWorkerOutcome::Handled;
         };
         thin_conn.reset_pending_cancel();
+        // ...and that clears the CLIENT flags only. A cancel that was really
+        // SENT is not a flag: with OOB unavailable the graceful break writes
+        // one in-band INTERRUPT marker onto the socket, and one sent while no
+        // call was running sits there for the SERVER to answer the next request
+        // with `ORA-01013`. The next request used to be the USER'S statement,
+        // which failed with "Query cancelled" and took the tab's transaction
+        // with it — measured on Oracle Free 23, and the reason this driver's
+        // `SessionCancelResidue` is the same as the other two.
+        //
+        // So the app makes the first call itself, exactly as the OCI take's
+        // ping and the MySQL family's readiness ping do, and asks it through
+        // the app's one rule. Only for a session taken back out of the TAB's
+        // slot: a fresh one comes through `acquire_session_untracked`, which
+        // has recognised this for every POOLED session all along.
+        //
+        // A PING and not the health check, and that is not a shortcut: on
+        // Oracle a transaction begins with the first executable SQL statement,
+        // so the health check's `SELECT 1 FROM DUAL` would open one — and the
+        // tab's `SET TRANSACTION` has to be the first statement of its own
+        // (ORA-01453), which is the whole reason both Oracle loops re-apply the
+        // mode at every boundary. Running SQL here silently disarmed a pinned
+        // tab (live `verify_transaction_mode_live` S4). A ping is a TTC call,
+        // not a statement: it consumes the marker and starts nothing. The two
+        // sibling roads use a ping first for their own reasons, and this is the
+        // third.
+        if took_retained_session.get() {
+            SqlEditorWidget::consume_oracle_thin_cancel_residue(
+                thin_conn,
+                crate::db::SessionCancelResidue::ORACLE_THIN,
+                "oracle thin execution startup",
+            );
+        }
         let cancel_handle = thin_conn.cancel_handle();
         SqlEditorWidget::set_current_oracle_thin_cancel_context(
             current_oracle_thin_cancel_context,
@@ -3364,9 +3415,24 @@ impl Drop for QueryExecutionCleanupGuard {
                     self.oracle_pooled_session_requires_health_check,
                     transaction_decision_required,
                 );
+                // The batch this guard is closing may have SENT a break, and a
+                // break interrupts the call that is RUNNING: when the statement
+                // finished first there was nothing to interrupt, so OCI
+                // remembers it and aborts the NEXT call -- which is this health
+                // check, or the probe below. Reading that as the session's
+                // verdict discarded a perfectly good session and the tab's
+                // transaction with it. The app's one rule is asked with what
+                // this road knows: whether a cancel was sent at all, and which
+                // driver is holding the session.
+                let cleanup_cancel_residue =
+                    crate::db::SessionCancelResidue::after_a_cancel_this_app_sent(
+                        cancel_requested,
+                        crate::db::SessionCancelResidue::ORACLE_OCI,
+                    );
                 let health_check_ok = !health_check_required
-                    || SqlEditorWidget::oracle_pooled_session_health_check(
+                    || SqlEditorWidget::oracle_pooled_session_health_check_after_a_cancel(
                         conn.as_ref(),
+                        cleanup_cancel_residue,
                         "sql_editor::cleanup",
                     );
                 let scope_reapply_failed = health_check_ok
@@ -3409,8 +3475,9 @@ impl Drop for QueryExecutionCleanupGuard {
                         || (self.oracle_cleanup_should_probe_uncommitted_work_after_interrupt(
                             interrupted,
                             interrupt_decision,
-                        ) && SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+                        ) && SqlEditorWidget::oracle_session_may_have_uncommitted_work_after_a_cancel(
                             conn.as_ref(),
+                            cleanup_cancel_residue,
                             "sql_editor::cleanup",
                         ))
                     {
@@ -4821,12 +4888,45 @@ impl SqlEditorWidget {
         );
         match retained {
             crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => {
+                // Out of the slot and not an Oracle OCI session after all: it is
+                // GONE, and an error naming what was expected says nothing about
+                // what the tab just lost. Same answer as the thin twin and as
+                // the MySQL family's.
+                let taken_retained_state = retained_session.retained_state();
                 let Some((conn, prior_retained_state)) =
                     retained_session.into_oracle_connection_with_retained_state()
                 else {
+                    Self::report_retained_session_lost_with_work(
+                        Some(sender),
+                        taken_retained_state,
+                        "oracle execution startup",
+                    );
                     return (conn_guard, Err("Expected Oracle pool session".to_string()));
                 };
-                if conn.ping().is_ok() {
+                // THE session that carries the user's transaction, and the one
+                // road it comes back down. A cancel of a PREVIOUS execution's
+                // can still be travelling: OCI remembers a break sent with no
+                // call running and aborts the next one, which is this ping --
+                // and a ping read as the session's verdict discarded the tab's
+                // session with its transaction on it. This road cannot know
+                // whether a cancel was sent (it belonged to another execution),
+                // so it names its DRIVER and pays the re-ask only when the
+                // first answer really is our own cancel. The pool road has had
+                // this medicine since `acquire_session_untracked`; a session
+                // taken back out of a tab's slot never comes through that door.
+                let take_cancel_residue = crate::db::SessionCancelResidue::ORACLE_OCI;
+                let ping_answer = crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+                    take_cancel_residue,
+                    "oracle execution startup",
+                    || {
+                        conn.ping()
+                            .map_err(|err| format!("Oracle retained session ping failed: {err}"))
+                    },
+                );
+                if let Err(message) = ping_answer.as_ref() {
+                    crate::utils::logging::log_error("oracle execution startup", message);
+                }
+                if ping_answer.is_ok() {
                     let preserve_existing_session_state =
                         prior_retained_state.requires_physical_session_preservation();
                     // The connection's own rule, not the raw scope: it resolves
@@ -4839,21 +4939,36 @@ impl SqlEditorWidget {
                     // including the statement that would fix it — while the
                     // thin driver, which has always gone through this rule,
                     // carried on. Same function the per-statement apply uses.
-                    let setup_result = if preserve_existing_session_state {
-                        conn_guard
-                            .apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope)
-                    } else {
-                        crate::db::DatabaseConnection::apply_oracle_session_settings(
-                            conn.as_ref(),
-                            &conn_guard.get_info().advanced,
-                        )
-                        .and_then(|_| {
-                            conn_guard.apply_oracle_current_schema_for_scope(
-                                conn.as_ref(),
-                                execution_scope,
-                            )
-                        })
-                    };
+                    // Asked through the same rule as the ping above: these are
+                    // the session's first statements after it came back, and
+                    // `oracle_error_message_allows_session_reuse` reads
+                    // `ORA-01013` as "this session may NOT be reused", so a
+                    // stray break landing here discarded the tab's transaction
+                    // just as surely.
+                    let setup_result =
+                        crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+                            take_cancel_residue,
+                            "oracle execution startup",
+                            || {
+                                if preserve_existing_session_state {
+                                    conn_guard.apply_oracle_current_schema_for_scope(
+                                        conn.as_ref(),
+                                        execution_scope,
+                                    )
+                                } else {
+                                    crate::db::DatabaseConnection::apply_oracle_session_settings(
+                                        conn.as_ref(),
+                                        &conn_guard.get_info().advanced,
+                                    )
+                                    .and_then(|_| {
+                                        conn_guard.apply_oracle_current_schema_for_scope(
+                                            conn.as_ref(),
+                                            execution_scope,
+                                        )
+                                    })
+                                }
+                            },
+                        );
                     match setup_result {
                         // A scope the server no longer has is reported by the
                         // per-statement assertion, which runs for every
@@ -6168,43 +6283,94 @@ impl SqlEditorWidget {
         }
     }
 
+    /// The Oracle Thin health check, asked so the app's OWN cancel is never
+    /// mistaken for the session's answer — the twin of
+    /// [`Self::oracle_pooled_session_health_check_after_a_cancel`].
+    ///
+    /// Thin needed one for the same reason the other two did, which a live
+    /// probe had to say: with OOB unavailable its graceful break writes one
+    /// in-band INTERRUPT marker onto the socket, and a break sent while no call
+    /// is running leaves it there for the SERVER to answer the next request
+    /// with `ORA-01013`. `reset_pending_cancel` clears the CLIENT flags; it
+    /// cannot un-send a marker.
+    /// Make the app's OWN cancel land HERE rather than on the user's statement.
+    ///
+    /// A ping, because on Oracle a transaction begins with the first executable
+    /// SQL statement and the tab's `SET TRANSACTION` has to be the first of its
+    /// own; the answer is deliberately not acted on beyond a log, because this
+    /// is not a health check — a session that cannot answer will say so through
+    /// the statement that follows, exactly as it did before.
+    fn consume_oracle_thin_cancel_residue(
+        conn: &mut OracleThinSession,
+        residue: crate::db::SessionCancelResidue,
+        log_context: &str,
+    ) {
+        if let Err(message) = crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+            residue,
+            log_context,
+            || {
+                conn.ping()
+                    .map_err(|err| format!("Oracle thin retained session ping failed: {err}"))
+            },
+        ) {
+            crate::utils::logging::log_warning(log_context, &message);
+        }
+    }
+
+    fn oracle_thin_pooled_session_health_check_after_a_cancel(
+        conn: &mut OracleThinSession,
+        residue: crate::db::SessionCancelResidue,
+        log_context: &str,
+    ) -> bool {
+        match crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+            residue,
+            log_context,
+            || Self::oracle_thin_session_health_reporting(conn),
+        ) {
+            Ok(()) => true,
+            Err(message) => {
+                crate::utils::logging::log_error(log_context, &message);
+                false
+            }
+        }
+    }
+
     fn oracle_thin_pooled_session_health_check(
         conn: &mut OracleThinSession,
         log_context: &str,
     ) -> bool {
+        Self::oracle_thin_pooled_session_health_check_after_a_cancel(
+            conn,
+            // No cancel of this app's is in flight on this road; stated rather
+            // than defaulted, so a road that DOES have one cannot reach the
+            // check without saying so.
+            crate::db::SessionCancelResidue::NothingLeftToLand,
+            log_context,
+        )
+    }
+
+    /// The Oracle Thin health check, with WHY it failed.
+    ///
+    /// The third of the three (`health_check_oracle_session_reporting`,
+    /// `health_check_mysql_session_reporting`), and it exists for the same
+    /// reason: a caller that may have BROKEN this session needs the reason, not
+    /// only the verdict, because a break the app sent can be what answered.
+    fn oracle_thin_session_health_reporting(conn: &mut OracleThinSession) -> Result<(), String> {
         if let Err(err) = conn.ping() {
-            crate::utils::logging::log_error(
-                log_context,
-                &format!("Oracle thin pooled session ping failed: {err}"),
-            );
-            return false;
+            return Err(format!("Oracle thin pooled session ping failed: {err}"));
         }
         match crate::db::DatabaseConnection::oracle_thin_select_one_text(
             conn,
             ORACLE_THIN_HEALTH_CHECK_SQL,
         ) {
-            Ok(Some(value)) if value == "1" => true,
-            Ok(Some(value)) => {
-                crate::utils::logging::log_error(
-                    log_context,
-                    &format!("Oracle thin pooled session health check returned {value}"),
-                );
-                false
-            }
-            Ok(None) => {
-                crate::utils::logging::log_error(
-                    log_context,
-                    "Oracle thin pooled session health check returned no rows",
-                );
-                false
-            }
-            Err(err) => {
-                crate::utils::logging::log_error(
-                    log_context,
-                    &format!("Oracle thin pooled session health check failed: {err}"),
-                );
-                false
-            }
+            Ok(Some(value)) if value == "1" => Ok(()),
+            Ok(Some(value)) => Err(format!(
+                "Oracle thin pooled session health check returned {value}"
+            )),
+            Ok(None) => Err("Oracle thin pooled session health check returned no rows".to_string()),
+            Err(err) => Err(format!(
+                "Oracle thin pooled session health check failed: {err}"
+            )),
         }
     }
 
@@ -25784,17 +25950,38 @@ impl SqlEditorWidget {
         true
     }
 
+    /// Whether the session this tab just took back can be used as it is.
+    ///
+    /// `residue` is not bookkeeping: this is the FIRST thing said to a session
+    /// that has been sitting in a tab's slot, and a `KILL QUERY` a previous
+    /// execution sent lands on whatever that connection runs next. Read as this
+    /// session's own answer, it discarded the tab's session -- with its open
+    /// transaction -- and handed the statement a fresh one. Both questions
+    /// below therefore go through the app's one rule; see
+    /// [`crate::db::session_policy::answer_not_taken_from_our_own_cancel`].
     fn reusable_mysql_pooled_session_is_ready(
         conn: &mut mysql::PooledConn,
         advanced: &crate::db::ConnectionAdvancedSettings,
         db_type: crate::db::DatabaseType,
         preserve_existing_session_state: bool,
         preserve_statement_diagnostics: bool,
+        residue: crate::db::SessionCancelResidue,
+        log_context: &str,
     ) -> Result<bool, String> {
         if preserve_statement_diagnostics {
             return Ok(true);
         }
-        if conn.as_mut().ping().is_err() {
+        if crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+            residue,
+            log_context,
+            || {
+                conn.as_mut()
+                    .ping()
+                    .map_err(|err| format!("MySQL/MariaDB retained session ping failed: {err}"))
+            },
+        )
+        .is_err()
+        {
             return Ok(false);
         }
         if preserve_existing_session_state {
@@ -25806,8 +25993,19 @@ impl SqlEditorWidget {
         // the transaction this session may already be in (the setup statements
         // start with ROLLBACK, because MySQL fixes a transaction's isolation at
         // its start). A session that is already correct must be left alone.
-        crate::db::DatabaseConnection::apply_mysql_session_settings_without_default_isolation_for_db_type(
-            conn, advanced, db_type,
+        //
+        // Through the rule for the same reason the ping is: these are the
+        // session's first statements after it came back, they are idempotent
+        // `SET SESSION`s, and a late `KILL QUERY` landing on one of them is not
+        // this session refusing to work.
+        crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+            residue,
+            log_context,
+            || {
+                crate::db::DatabaseConnection::apply_mysql_session_settings_without_default_isolation_for_db_type(
+                conn, advanced, db_type,
+            )
+            },
         )?;
         Ok(true)
     }
@@ -26196,6 +26394,11 @@ impl SqlEditorWidget {
                         prior_retained_state
                             .session_residue_state()
                             .may_have_statement_diagnostics(),
+                        // This road cannot know whether a cancel was sent -- it
+                        // belonged to a previous execution -- so it names its
+                        // DRIVER, exactly as the Oracle OCI take does.
+                        crate::db::SessionCancelResidue::MYSQL_FAMILY,
+                        db_activity,
                     ) {
                         Ok(true) => (conn, prior_retained_state, retained_scope, false),
                         Ok(false) => {
@@ -26264,7 +26467,38 @@ impl SqlEditorWidget {
                                 true,
                             )
                         }
-                        Err(message) => return Err(message),
+                        // The readiness check spoke to the session and the
+                        // error says the session may still be used. That is a
+                        // decision about what becomes of it, not a reason to
+                        // let it fall out of this frame: dropping the value
+                        // returns the tab's session to the POOL with the cancel
+                        // registration this take published still naming it, and
+                        // a cancel or a disconnect on this tab then reaches
+                        // whichever tab picked it up — the very defect
+                        // `prepare_mysql_pooled_session_or_retry_once` names.
+                        // It also left the tab's slot empty with nothing said.
+                        //
+                        // So it takes the road the two LATER failures of this
+                        // same function take for the same class of error: one
+                        // disposition, which ends the reach, answers what the
+                        // close destroyed, and restores the session when the
+                        // state is one the user still owes a decision on.
+                        Err(message) => {
+                            return Err(
+                                Self::restore_or_drop_dirty_mysql_retained_session_after_error(
+                                    shared_connection,
+                                    pooled_db_session,
+                                    context.connection_generation,
+                                    context.pool_context_epoch(),
+                                    conn,
+                                    prior_retained_state,
+                                    db_activity,
+                                    message,
+                                    retained_scope,
+                                    hand_back,
+                                ),
+                            );
+                        }
                     }
                 }
                 crate::db::RetainedSessionTakeOutcome::BlockedContextMismatch(retained_state) => {
@@ -27067,12 +27301,23 @@ impl SqlEditorWidget {
                 return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(err);
             }
 
-            if let Err(err) = conn.query_drop(if enabled {
-                "SET autocommit=1"
-            } else {
-                "SET autocommit=0"
-            }) {
-                let message = SqlEditorWidget::mysql_error_message(&err, None);
+            // Same reason as the Oracle twin: this push runs on a session the
+            // tab has just stopped using, so a `KILL QUERY` the last batch sent
+            // can land on the `SET` below -- and this road's answer to an error
+            // is to DISCARD the session. `SET autocommit` is idempotent, so the
+            // one re-ask the rule allows costs a round trip and nothing else.
+            if let Err(message) = crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+                crate::db::SessionCancelResidue::MYSQL_FAMILY,
+                db_activity,
+                || {
+                    conn.query_drop(if enabled {
+                        "SET autocommit=1"
+                    } else {
+                        "SET autocommit=0"
+                    })
+                    .map_err(|err| SqlEditorWidget::mysql_error_message(&err, None))
+                },
+            ) {
                 let message = Self::discard_mysql_retained_session_after_option_change_error(
                     shared_connection,
                     pooled_db_session,
@@ -27260,10 +27505,29 @@ impl SqlEditorWidget {
                 );
             }
 
-            let result = retained_session
+            // The tab has just been idle: the option gate refuses while it is
+            // executing, so this push runs right after a batch ended -- which
+            // is exactly when a cancel that batch sent may still be travelling.
+            // `oracle_error_message_allows_session_reuse` reads `ORA-01013` as
+            // "this session may NOT be reused", so a stray break landing on the
+            // rollback below discarded the tab's session and its transaction
+            // for a toolbar pick. Asked through the app's one rule; the
+            // boundary rollback is idempotent, so re-asking costs a round trip
+            // and nothing else.
+            let mode_push_residue = retained_session
                 .lease_mut()
-                .ok_or_else(|| "No retained DB session for this tab.".to_string())
-                .and_then(|lease| lease.end_transaction_for_mode_change(query_timeout));
+                .map(|lease| lease.cancel_residue())
+                .unwrap_or(crate::db::SessionCancelResidue::NothingLeftToLand);
+            let result = crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+                mode_push_residue,
+                db_activity,
+                || {
+                    retained_session
+                        .lease_mut()
+                        .ok_or_else(|| "No retained DB session for this tab.".to_string())
+                        .and_then(|lease| lease.end_transaction_for_mode_change(query_timeout))
+                },
+            );
             match result {
                 Ok(()) => {
                     // The transaction is over, so the session is Clean whatever the
@@ -27392,45 +27656,57 @@ impl SqlEditorWidget {
                 return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(err);
             }
 
-            let apply_result = (|| {
-                // Replacing the mode clears the tracked override residue below, so
-                // a pending server-side one-shot SET TRANSACTION must actually be
-                // consumed first — a session-scope SET does not cancel it, and the
-                // next transaction would otherwise silently run under the stale
-                // one-shot instead of the mode the toolbar now shows. Safe here:
-                // the replaceable state carries no user work, so an empty
-                // rolled-back transaction discards nothing.
-                if prior_retained_state.may_have_transaction_mode_override() {
-                    use mysql::prelude::Queryable;
-                    for statement in ["ROLLBACK", "START TRANSACTION", "ROLLBACK"] {
-                        conn.query_drop(statement).map_err(|err| {
-                            format!("Failed to supersede the pending transaction mode: {err}")
-                        })?;
+            // Through the app's one rule, for the reason its two sibling pushes
+            // are: this runs on a session the tab has just stopped using, a
+            // `KILL QUERY` the last batch sent can land on any of the
+            // statements below, and this road's answer to an error is to
+            // DISCARD the session with the tab's transaction on it. Every
+            // statement in the closure is idempotent -- a rollback/start/
+            // rollback boundary and `SET SESSION` -- so the one re-ask the rule
+            // allows costs a round trip and nothing else.
+            let apply_result = crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+                crate::db::SessionCancelResidue::MYSQL_FAMILY,
+                db_activity,
+                || {
+                    // Replacing the mode clears the tracked override residue below, so
+                    // a pending server-side one-shot SET TRANSACTION must actually be
+                    // consumed first — a session-scope SET does not cancel it, and the
+                    // next transaction would otherwise silently run under the stale
+                    // one-shot instead of the mode the toolbar now shows. Safe here:
+                    // the replaceable state carries no user work, so an empty
+                    // rolled-back transaction discards nothing.
+                    if prior_retained_state.may_have_transaction_mode_override() {
+                        use mysql::prelude::Queryable;
+                        for statement in ["ROLLBACK", "START TRANSACTION", "ROLLBACK"] {
+                            conn.query_drop(statement).map_err(|err| {
+                                format!("Failed to supersede the pending transaction mode: {err}")
+                            })?;
+                        }
                     }
-                }
-                crate::db::DatabaseConnection::apply_mysql_transaction_mode_for_db_with_default(
+                    crate::db::DatabaseConnection::apply_mysql_transaction_mode_for_db_with_default(
                     &mut conn,
                     mode,
                     db_type,
                     default_transaction_isolation,
                 )?;
-                // MySQL fixes a transaction's isolation and access mode at its
-                // START, and the statements this tab has already run have usually
-                // left a transaction open on this session (a plain read under
-                // manual commit is enough). The SET above changes the session, not
-                // that transaction — and the next statement's setup skips its own
-                // ROLLBACK precisely because the session now reads as correct, so
-                // the user's next statement would run under the mode the toolbar
-                // has just replaced (live-observed on MySQL 8.0: the INSERT after
-                // a Read only pin succeeded). End it here, on the same "no user
-                // work" condition the adopted-statement path uses.
-                Self::end_mysql_residual_transaction_after_session_mode_change(
-                    &mut conn,
-                    prior_retained_state,
-                    db_activity,
-                );
-                Ok(())
-            })();
+                    // MySQL fixes a transaction's isolation and access mode at its
+                    // START, and the statements this tab has already run have usually
+                    // left a transaction open on this session (a plain read under
+                    // manual commit is enough). The SET above changes the session, not
+                    // that transaction — and the next statement's setup skips its own
+                    // ROLLBACK precisely because the session now reads as correct, so
+                    // the user's next statement would run under the mode the toolbar
+                    // has just replaced (live-observed on MySQL 8.0: the INSERT after
+                    // a Read only pin succeeded). End it here, on the same "no user
+                    // work" condition the adopted-statement path uses.
+                    Self::end_mysql_residual_transaction_after_session_mode_change(
+                        &mut conn,
+                        prior_retained_state,
+                        db_activity,
+                    );
+                    Ok(())
+                },
+            );
             match apply_result {
                 Ok(()) => {
                     Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
@@ -27742,49 +28018,88 @@ impl SqlEditorWidget {
     /// transaction with it — live-observed on Oracle OCI as roughly one round
     /// in three.
     ///
-    /// Asking again is what CONSUMES the break: the same medicine
-    /// `DbConnectionPool::acquire_session_untracked` applies to a cancel that
-    /// outlived the work it was aimed at, recognised by the same predicate. And
-    /// once, not in a loop — a second cancel answer is not residue, it is the
-    /// session refusing to work.
-    ///
-    /// Only for a road that says a break may still be landing: Oracle thin
-    /// drains its own handshake before it ever gets here, so it re-asks nothing.
+    /// The RULE is [`crate::db::session_policy::answer_not_taken_from_our_own_cancel`],
+    /// which every other road that speaks to a session this app may have just
+    /// broken now asks as well; this is the LAZY FETCH's way in, which supplies
+    /// the residue from its own break recovery (Oracle thin drains its own
+    /// handshake before it ever gets here, so it re-asks nothing) and turns the
+    /// answer into the boolean its keep chain reads.
     fn session_health_after_a_break(
         break_recovery: LazyFetchBreakRecovery,
         log_context: &str,
-        mut health_check: impl FnMut() -> Result<(), String>,
+        health_check: impl FnMut() -> Result<(), String>,
     ) -> bool {
-        let Err(first) = health_check() else {
-            return true;
-        };
-        if !break_recovery.a_break_may_still_be_landing()
-            || !crate::db::session_policy::message_indicates_query_cancel(&first)
-        {
-            crate::utils::logging::log_error(log_context, &first);
-            return false;
-        }
-        crate::utils::logging::log_warning(
+        match crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+            break_recovery.cancel_residue(),
             log_context,
-            &format!(
-                "The break this cancel sent landed on the health check rather than on the \
-                 fetch ({first}); asking the session again"
-            ),
-        );
-        match health_check() {
+            health_check,
+        ) {
             Ok(()) => true,
-            Err(second) => {
-                crate::utils::logging::log_error(log_context, &second);
+            Err(message) => {
+                crate::utils::logging::log_error(log_context, &message);
                 false
             }
         }
     }
 
     fn oracle_pooled_session_health_check(conn: &Connection, log_context: &str) -> bool {
-        crate::db::session_policy::health_check_session(
-            crate::db::session_policy::PhysicalSession::Oracle(conn),
+        Self::oracle_pooled_session_health_check_after_a_cancel(
+            conn,
+            // No cancel of this app's is in flight on this road; stated rather
+            // than defaulted, so a road that DOES send one cannot reach the
+            // check without saying so.
+            crate::db::SessionCancelResidue::NothingLeftToLand,
             log_context,
         )
+    }
+
+    /// The Oracle OCI health check, asked so the app's OWN cancel is never
+    /// mistaken for the session's answer.
+    ///
+    /// The one entry point: `oracle_pooled_session_health_check` is this with
+    /// "nothing of ours is in flight" written out, so there is no spelling of
+    /// the check that silently skips the rule.
+    fn oracle_pooled_session_health_check_after_a_cancel(
+        conn: &Connection,
+        residue: crate::db::SessionCancelResidue,
+        log_context: &str,
+    ) -> bool {
+        match crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+            residue,
+            log_context,
+            || crate::db::session_policy::health_check_oracle_session_reporting(conn),
+        ) {
+            Ok(()) => true,
+            Err(message) => {
+                crate::utils::logging::log_error(log_context, &message);
+                false
+            }
+        }
+    }
+
+    /// The Oracle OCI transaction probe, asked through the same rule.
+    ///
+    /// It fails OPEN like its DB-layer twin — an answer the app could not get
+    /// is not an answer that there is nothing to resolve — but a break of the
+    /// app's OWN landing on it is not a failure to fail open about: it made a
+    /// clean tab report uncommitted work it never had, and every
+    /// transaction-option gate then refused the user's next change.
+    fn oracle_session_may_have_uncommitted_work_after_a_cancel(
+        conn: &Connection,
+        residue: crate::db::SessionCancelResidue,
+        log_context: &str,
+    ) -> bool {
+        match crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+            residue,
+            log_context,
+            || crate::db::DatabaseConnection::oracle_session_uncommitted_work_reporting(conn),
+        ) {
+            Ok(has_transaction) => has_transaction,
+            Err(message) => {
+                crate::utils::logging::log_error(log_context, &message);
+                true
+            }
+        }
     }
 
     fn mysql_pooled_session_health_check(conn: &mut mysql::PooledConn, log_context: &str) -> bool {

@@ -634,6 +634,24 @@ through and blocked the one after). `mysql_pooled_execution_session_setup_statem
 therefore issues `ROLLBACK` first — safe because setup statements only run
 when the retained state carries no user work.
 
+### The three per-tab settings answer one question about the tab's work
+
+A gate that refuses on the tab's work asks `AppState::tab_db_work`, which folds
+in the lazy fetches the WINDOW holds beside the editor's own.
+`TabDbWork::for_editor` is the derivation for a caller that has an editor and
+cannot name a tab; it was what the auto-commit and transaction-mode gates asked
+while the scope gate asked the other, so one tab could answer "there is work" to
+one setting and "there is none" to the other two.
+
+The same family rule applies to the SCREEN: `render_status_bar` settles all
+three on every status tick. Auto-commit and transaction mode have had that
+healer for some time; scope was left to a tab switch, so a worker that moved the
+tab's binding while the matching `ScopeChangedNotice` was dropped as superseded
+left the selector naming a schema the tab had left, for as long as the user
+stayed on it. `AppState::sync_active_tab_scope_selection` re-states the SELECTOR
+only — ordering a catalog load on a tick would clear the tree, the expansion and
+the filter the user arranged.
+
 ## Central preflight
 
 Every execution, setting change, and connection-lifecycle action is checked as

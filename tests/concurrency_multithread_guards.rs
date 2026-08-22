@@ -697,18 +697,26 @@ fn oracle_reused_tab_session_applies_tab_scope_before_execution() {
     // with its cancel reach still published -- but the SCOPE is not: both the
     // reusable and the fresh path must put the owning tab's explicit scope on
     // the session before a statement runs on it.
+    // CHANGED, with its reason: this asked for the two calls in ONE LINE's
+    // worth of layout, and the reusable path's setup now sits inside the
+    // closure the late-cancel rule asks (`answer_not_taken_from_our_own_cancel`),
+    // which rustfmt breaks over three lines. The FACT is the same and is what
+    // is pinned now — both the reusable and the fresh path put the owning tab's
+    // explicit scope on the session before a statement runs on it — asked of
+    // the whitespace-free text so a reflow can never be read as a missing call.
+    let compact_helper = compact_for_pattern(helper);
     assert!(
         helper.contains("execution_scope: Option<&str>")
-            && helper
+            && compact_helper
                 .matches("apply_oracle_current_schema_for_scope(")
                 .count()
                 >= 2
-            && helper
-                .matches("apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope)")
+            && compact_helper
+                .matches("apply_oracle_current_schema_for_scope(conn.as_ref(),execution_scope")
                 .count()
                 >= 1
-            && helper
-                .matches("apply_oracle_current_schema_for_scope(held.as_ref(), execution_scope)")
+            && compact_helper
+                .matches("apply_oracle_current_schema_for_scope(held.as_ref(),execution_scope")
                 .count()
                 >= 1,
         "Reusable and fresh Oracle execution sessions must apply the owning tab's explicit scope before execution"
@@ -793,6 +801,41 @@ fn mysql_reused_tab_session_reselects_global_database_before_execution() {
     assert!(
         setup_failure_branch.contains("restore_or_drop_dirty_mysql_retained_session_after_error"),
         "Dirty retained MySQL/MariaDB sessions should be restored for user resolution when scope setup fails"
+    );
+
+    // EVERY road out of this function that has the tab's session in hand says
+    // what becomes of it. The readiness check's own failure arm did not: it
+    // returned the error and let the value DROP, which puts the tab's session
+    // back in the POOL with the cancel registration this take published still
+    // naming it — a cancel or a disconnect on this tab then reaches whichever
+    // tab picked it up, the defect
+    // `prepare_mysql_pooled_session_or_retry_once` was written for — and left
+    // the tab's slot empty with nothing said. Its two SIBLING arms in the same
+    // match, and the two LATER failures in the same function, all name a road.
+    let readiness_start = helper
+        .find("match Self::reusable_mysql_pooled_session_is_ready(")
+        .expect("the reusable-session readiness check should be asked here");
+    let readiness_end = helper[readiness_start..]
+        .find("crate::db::RetainedSessionTakeOutcome::BlockedContextMismatch")
+        .map(|offset| readiness_start + offset)
+        .expect("the readiness match should be followed by the take's other outcomes");
+    let readiness_branch = &helper[readiness_start..readiness_end];
+    assert!(
+        !readiness_branch.contains("Err(message) => return Err(message),"),
+        "no arm of the readiness match may let the tab's session fall out of this frame: \
+         {readiness_branch}"
+    );
+    assert_eq!(
+        readiness_branch
+            .matches("hand_back.release_without_door(")
+            .count()
+            + readiness_branch
+                .matches("restore_or_drop_dirty_mysql_retained_session_after_error(")
+                .count(),
+        3,
+        "the three failing arms — the session is not ready, the error says take a fresh one, \
+         and the error says this one may still be used — each name a road for the session \
+         they were handed: {readiness_branch}"
     );
 }
 
@@ -5348,14 +5391,24 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     // isolation, and the setup must be skipped when the session already
     // carries the wanted settings — except for a statement that has to be the
     // first of its transaction.
+    // CHANGED, with its reason: the body grew a doc block and both of its
+    // questions now go through the app's late-cancel rule, so a window measured
+    // in BYTES no longer reaches the statement this clause is about. Bounded by
+    // the FUNCTION instead (round 9's lesson), and the fact it pins is
+    // unchanged: the settings applied here are the ones WITHOUT the
+    // connection's default isolation.
     let ready_start = execution
         .find("fn reusable_mysql_pooled_session_is_ready(")
         .expect("the reusable-session readiness check should exist");
-    let ready_body = &execution[ready_start..ready_start + 1600];
+    let ready_body = slice_to_end_of_fn(&execution, ready_start);
     assert!(
         ready_body
             .contains("apply_mysql_session_settings_without_default_isolation_for_db_type("),
         "a reusable MySQL pooled session must not have the connection's default isolation re-applied to it"
+    );
+    assert!(
+        !ready_body.contains("apply_mysql_session_settings_for_db_type("),
+        "and never the spelling that carries it"
     );
     let settings_start = execution
         .find("fn apply_mysql_pooled_execution_session_settings(")
@@ -7688,13 +7741,39 @@ fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
     // launched then started on the other side of it, because both deferred
     // roads re-read the tab's pins at startup. The display checkpoints cannot
     // catch that: the displayed value moves with the pin.
-    assert_eq!(
-        content
-            .matches("TabDbWork::for_editor(&s.sql_editor).block_message(")
-            .count(),
-        2,
-        "the auto-commit menu and the transaction-mode toolbar must both refuse on the one \
-         answer every session-ending gate uses"
+    // CHANGED, with its reason: this pinned the two gates to
+    // `TabDbWork::for_editor`, which is the derivation for a caller that has an
+    // EDITOR and nothing else. The words of the three per-tab refusals were
+    // made one and the SOURCE was left as two — the scope gate asked
+    // `AppState::tab_db_work`, which also counts the lazy fetches the WINDOW
+    // holds beside the editor, and these two could not see them. One tab
+    // answered "there is work" to one setting and "there is none" to the other
+    // two. All three ask the tab now, and `for_editor` is left to the callers
+    // that cannot name one.
+    for (setting, asked) in [
+        (
+            "the transaction-mode toolbar",
+            "block_message(\"changing transaction mode\")",
+        ),
+        (
+            "the auto-commit menu",
+            "block_message(\"changing auto-commit\")",
+        ),
+        ("the scope pick", "block_message(\"changing scope\")"),
+    ] {
+        let at = content
+            .find(asked)
+            .unwrap_or_else(|| panic!("{setting} should refuse on the tab's work"));
+        let before = &content[at.saturating_sub(200)..at];
+        assert!(
+            before.contains("tab_db_work("),
+            "{setting} must ask AppState::tab_db_work, which counts the lazy fetches the \
+             window holds beside the editor's own: ...{before}"
+        );
+    }
+    assert!(
+        !content.contains("TabDbWork::for_editor(&s.sql_editor).block_message("),
+        "and none of them may go back to the editor-only derivation"
     );
     for assembled in [
         "s.sql_editor.is_query_running(),\n            s.sql_editor.has_open_lazy_fetch(),",
@@ -8871,7 +8950,17 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         // audience; what is left is the definition, the lazy-fetch twin, the
         // free `stale_take_reported` for the roads with no hand-back, and the
         // batch `clear` helper.
-        7,
+        //
+        // CHANGED 7 -> 9, with its reason: the two ORACLE takes that unwrap a
+        // lease and find it is not their driver's session. The MySQL twin has
+        // answered the loss since the take gained its third answer; both Oracle
+        // roads said only what they had EXPECTED to get, so a take that had
+        // already emptied the tab's slot left the tab believing it still had a
+        // session. They have no `BatchSessionHandBack` at that point — the
+        // execution's is built later, from the session they did not get — so
+        // they report through the free function, exactly as the OCI acquire
+        // window's own ping failure beside them does.
+        9,
         "every road that can lose a work-carrying session either reports it itself or \
          goes through a door that does; a road that does neither is how a transaction \
          disappeared in silence"
@@ -9715,6 +9804,48 @@ fn the_transaction_option_indicators_settle_themselves() {
     assert!(
         render_body.contains("self.sync_auto_commit_indicators();"),
         "the status tick must settle the auto-commit menu item, not only the status label"
+    );
+    // (1a) ALL THREE per-tab settings settle on that tick, because the app
+    // makes the same promise about each: what the screen shows is what the next
+    // statement will do. Two of them had a healer and the SCOPE was left to a
+    // tab switch — so a worker that moved the tab's binding while the matching
+    // `ScopeChangedNotice` was dropped as superseded left the selector naming a
+    // schema the tab had left, for as long as the user stayed on it.
+    // Asked of the whole function, unlike the clause above: the auto-commit
+    // item is settled BEFORE anything is read from the connection, which is
+    // what the 2000-byte window holds; the other two only have to happen on the
+    // tick.
+    let render_fn = slice_to_end_of_fn(&main_window, render);
+    for (setting, healer) in [
+        ("auto-commit", "self.sync_auto_commit_indicators();"),
+        ("transaction mode", "self.sync_transaction_mode_controls();"),
+        ("scope", "self.sync_active_tab_scope_selection();"),
+    ] {
+        assert!(
+            render_fn.contains(healer),
+            "the status tick must settle the tab's {setting} as well: a rule kept by callers \
+             remembering is not kept"
+        );
+    }
+    // And the scope healer re-states the SELECTOR only. Ordering a catalog load
+    // on a tick would clear the tree, the expansion and the filter the user
+    // arranged, every tick the two disagreed; the scope that moved was already
+    // applied to the session by the statement that moved it.
+    let scope_sync = slice_to_end_of_fn(
+        &main_window,
+        main_window
+            .find("    fn sync_active_tab_scope_selection(&mut self) -> bool {")
+            .expect("the scope healer should exist"),
+    );
+    assert!(
+        scope_sync.contains("set_selected_scope_for_tab(")
+            && scope_sync.contains("tab_scope_matches("),
+        "it states the binding's scope on the card, and only when they disagree: {scope_sync}"
+    );
+    assert!(
+        !scope_sync.contains("mark_metadata_refresh_pending(")
+            && !scope_sync.contains("clear_metadata_for_tab("),
+        "and it orders no load of its own — the caller that wants one asks for it: {scope_sync}"
     );
     // (1b) Running on every tick makes the item's whole appearance this
     // function's answer, and it has THREE cases, not two. A value is shown only
@@ -14068,29 +14199,90 @@ fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
     // perfectly good session failed it and was discarded with the tab's
     // transaction on it (live-observed on Oracle OCI as roughly one round in
     // three). Asking again is what consumes the break.
-    let after_break = execution
-        .find("fn session_health_after_a_break(")
-        .map(|at| slice_to_end_of_fn(&execution, at))
-        .expect("the after-a-break health check should exist");
-    let after_break_body = compact_for_pattern(after_break);
+    // CHANGED, with its reason: this pinned the rule to the LAZY FETCH's own
+    // function, and a rule that lives on one road is a rule the next road does
+    // not have. The identical hazard is on every road that speaks to a session
+    // this app may have just broken — the batch cleanup that files it, the take
+    // that gets it back, and the three UI-thread pushes that run a statement on
+    // it — and on those roads the answer to an error is to DISCARD the session
+    // with the tab's transaction on it. So the rule moved to
+    // `session_policy::answer_not_taken_from_our_own_cancel` and this function
+    // is the lazy fetch's way IN. Every clause below is the same clause about
+    // the new home.
+    let rule_source = read_source("src/db/session_policy.rs");
+    let rule = rule_source
+        .find("pub fn answer_not_taken_from_our_own_cancel<T, E: std::fmt::Display>(")
+        .map(|at| slice_to_end_of_fn(&rule_source, at))
+        .expect("the app's one late-cancel rule should exist");
+    let rule_body = compact_for_pattern(rule);
     assert!(
-        after_break_body.contains("if!break_recovery.a_break_may_still_be_landing()")
-            && after_break_body
-                .contains("||!crate::db::session_policy::message_indicates_query_cancel(&first)"),
-        "only a road with a break still travelling re-asks, and only about the break: \
-         {after_break}"
+        rule_body.contains("if!residue.may_land_on_the_next_call()")
+            && rule_body.contains("||!message_indicates_query_cancel(&first.to_string())"),
+        "only a road with a cancel still travelling re-asks, and only about the cancel: {rule}"
     );
     assert_eq!(
-        after_break_body.matches("health_check()").count(),
+        rule_body.matches("ask()").count(),
         2,
         "once, not in a loop: a second cancel answer is the session refusing to work"
     );
     assert!(
-        !after_break.contains("while ")
-            && !after_break.contains("loop ")
-            && !after_break.contains("for "),
+        !rule.contains("while ") && !rule.contains("loop ") && !rule.contains("for "),
         "and it must be straight-line: a session that answers every ask with a cancel would \
-         hold this cleanup for ever: {after_break}"
+         hold its caller for ever: {rule}"
+    );
+    // WHICH driver can clear its own residue has ONE home, so no road writes
+    // out an answer of its own. Oracle thin does (`reset_pending_cancel`);
+    // ODPI-C exposes no reset and a `KILL QUERY` is the server's.
+    let residue = rule_source
+        .find("impl SessionCancelResidue {")
+        .map(|at| slice_to_end_of_item(&rule_source, at))
+        .expect("the driver fact should live on the value");
+    let residue_body = compact_for_pattern(residue);
+    // CHANGED, with its reason: `ORACLE_THIN` was `NothingLeftToLand` — the app
+    // had recorded that the thin driver clears its own residue, which is true
+    // of a cancel QUEUED and never sent and false of one already delivered. A
+    // live probe settled it: with OOB unavailable the graceful break writes an
+    // in-band INTERRUPT marker that nobody reads when no call is running, and
+    // the server answers the next request with `ORA-01013`. All three drivers
+    // answer the same now; what differs is what each ROAD knows.
+    for (driver, answer) in [
+        ("ORACLE_OCI", "Self::MayLandOnTheNextCall"),
+        ("ORACLE_THIN", "Self::MayLandOnTheNextCall"),
+        ("MYSQL_FAMILY", "Self::MayLandOnTheNextCall"),
+    ] {
+        assert!(
+            residue_body.contains(&compact_for_pattern(&format!(
+                "pub const {driver}: Self = {answer};"
+            ))),
+            "{driver} must name its answer where the drivers are compared, not at a road"
+        );
+    }
+    let lease = read_source("src/db/connection.rs");
+    let lease_answer = lease
+        .find("pub fn cancel_residue(&self) -> crate::db::SessionCancelResidue {")
+        .map(|at| slice_to_end_of_fn(&lease, at))
+        .expect("a lease must be able to say which driver is holding it");
+    for driver in ["ORACLE_OCI", "ORACLE_THIN", "MYSQL_FAMILY"] {
+        assert!(
+            lease_answer.contains(driver),
+            "the lease answers for all three drivers, so a dispatched road (the scope push) \
+             never has to guess: {lease_answer}"
+        );
+    }
+    // The lazy fetch's way in still exists and still supplies its own evidence,
+    // and it must not be a second copy of the rule.
+    let after_break = execution
+        .find("fn session_health_after_a_break(")
+        .map(|at| slice_to_end_of_fn(&execution, at))
+        .expect("the after-a-break health check should exist");
+    assert!(
+        after_break.contains("crate::db::session_policy::answer_not_taken_from_our_own_cancel(")
+            && after_break.contains("break_recovery.cancel_residue()"),
+        "the lazy fetch asks the app's one rule with its OWN residue: {after_break}"
+    );
+    assert!(
+        !after_break.contains("message_indicates_query_cancel("),
+        "and it may not keep a copy of the rule's own question: {after_break}"
     );
     // Both roads whose driver cannot clear the break ask it, and Oracle thin --
     // which drains its own handshake -- does not.
@@ -14100,6 +14292,187 @@ fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
             .count(),
         2,
         "Oracle OCI's keep chain and the MySQL family's, and nothing else"
+    );
+    // THE ROADS. A session taken back out of a TAB's slot never comes through
+    // `DbConnectionPool::acquire_session_untracked`, which is where the app
+    // recognises a cancel that outlived its work for every POOLED session — and
+    // the tab's is the only kind that carries the user's transaction. Every
+    // road that makes the first call on one asks the rule, on all four
+    // backends.
+    // The Oracle OCI cleanup asks it through the two named helpers, because
+    // both of its questions have a residue-less spelling that every OTHER
+    // caller in the app still wants; the helpers are where the rule is asked so
+    // there is no spelling of either question that skips it.
+    for (question, helper) in [
+        (
+            "the health check",
+            "fn oracle_pooled_session_health_check_after_a_cancel(",
+        ),
+        (
+            "the transaction probe",
+            "fn oracle_session_may_have_uncommitted_work_after_a_cancel(",
+        ),
+    ] {
+        let at = execution
+            .find(helper)
+            .unwrap_or_else(|| panic!("{question} should have a residue-aware entry point"));
+        assert!(
+            slice_to_end_of_fn(&execution, at).contains("answer_not_taken_from_our_own_cancel("),
+            "{question} must ask the app's one rule"
+        );
+    }
+    let cleanup_at = execution
+        .find("let cleanup_cancel_residue =")
+        .expect("the Oracle OCI cleanup must state what its own cancel may still do");
+    let cleanup_body = slice_from(&execution, cleanup_at, 3000);
+    assert_eq!(
+        cleanup_body.matches("cleanup_cancel_residue,").count(),
+        2,
+        "and the cleanup must hand it to BOTH — the health check and the probe are the two \
+         calls a break it sent can land on: {cleanup_body}"
+    );
+    assert!(
+        compact_for_pattern(cleanup_body).contains(&compact_for_pattern(
+            "SessionCancelResidue::after_a_cancel_this_app_sent(
+ cancel_requested,"
+        )),
+        "worded from what this road KNOWS — whether a cancel was sent at all: {cleanup_body}"
+    );
+    // The two roads that take a session back out of a TAB's slot cannot know
+    // whether a cancel was sent (it belonged to a previous execution), so they
+    // name their DRIVER and pay the re-ask only when the first answer really is
+    // our own cancel.
+    let take_at = execution
+        .find("let take_cancel_residue = crate::db::SessionCancelResidue::ORACLE_OCI;")
+        .expect("the Oracle OCI retained take must name its driver");
+    let take_body = slice_from(&execution, take_at, 4000);
+    assert_eq!(
+        take_body
+            .matches("answer_not_taken_from_our_own_cancel(")
+            .count(),
+        2,
+        "the ping AND the setup statements — both are first contact with the session that \
+         carries the tab's transaction: {take_body}"
+    );
+    let ready_at = execution
+        .find("fn reusable_mysql_pooled_session_is_ready(")
+        .expect("the MySQL-family readiness check should exist");
+    let ready = slice_to_end_of_fn(&execution, ready_at);
+    assert_eq!(
+        ready
+            .matches("answer_not_taken_from_our_own_cancel(")
+            .count(),
+        2,
+        "the MySQL family's twin of that road asks it for both of its questions: {ready}"
+    );
+    assert!(
+        execution.contains(
+            "crate::db::SessionCancelResidue::MYSQL_FAMILY,
+                        db_activity,"
+        ),
+        "and its caller names the driver, exactly as the Oracle OCI take does"
+    );
+    let mode_push_at = execution
+        .find("let mode_push_residue =")
+        .expect("the Oracle transaction-mode push should state its residue");
+    assert!(
+        slice_from(&execution, mode_push_at, 1400)
+            .contains("answer_not_taken_from_our_own_cancel("),
+        "the Oracle transaction-mode push runs a rollback on a session the tab has just \
+         stopped using, and reads ORA-01013 as \"not reusable\": it must ask the rule"
+    );
+    for (road, marker) in [
+        (
+            "the MySQL auto-commit push",
+            "fn apply_mysql_autocommit_to_reusable_pooled_session(",
+        ),
+        (
+            "the MySQL transaction-mode push",
+            "fn apply_mysql_transaction_mode_to_reusable_pooled_session(",
+        ),
+    ] {
+        let at = execution
+            .find(marker)
+            .unwrap_or_else(|| panic!("{road} should exist"));
+        assert!(
+            slice_to_end_of_fn(&execution, at).contains("answer_not_taken_from_our_own_cancel("),
+            "{road} runs a statement on a session the tab has just stopped using, and its \
+             answer to an error is to DISCARD it: it must ask the rule"
+        );
+    }
+    let editor_source = read_source("src/ui/sql_editor/mod.rs");
+    let scope_push = editor_source
+        .find("pub fn apply_current_scope_to_retained_session(")
+        .map(|at| slice_to_end_of_fn(&editor_source, at))
+        .expect("the scope push should exist");
+    assert!(
+        scope_push.contains("answer_not_taken_from_our_own_cancel(")
+            && scope_push.contains("lease.cancel_residue()"),
+        "the third per-tab push asks the rule too, and takes the residue from the LEASE, so a \
+         dispatched road never has to guess which driver it is on: {scope_push}"
+    );
+    // ORACLE THIN'S OWN FIRST CONTACT.
+    //
+    // Its take makes no ping of its own, so the app's cancel used to land on
+    // the USER'S statement — which cannot be asked again. A live probe is what
+    // said so: with OOB unavailable the graceful break writes one in-band
+    // INTERRUPT marker onto the socket, and one sent with no call running sits
+    // there for the server to answer the next request with `ORA-01013`.
+    //
+    // A PING, never SQL: on Oracle a transaction begins with the first
+    // executable SQL statement, and the tab's `SET TRANSACTION` has to be the
+    // first of its own (ORA-01453). A health check here silently disarmed a
+    // pinned tab — caught by live `verify_transaction_mode_live` S4.
+    let consume = execution
+        .find("fn consume_oracle_thin_cancel_residue(")
+        .map(|at| slice_to_end_of_fn(&execution, at))
+        .expect("Oracle thin must make the first call on a session it took back");
+    assert!(
+        consume.contains("answer_not_taken_from_our_own_cancel(")
+            && consume.contains("conn.ping()"),
+        "thin's first contact asks the rule, and it is a ping: {consume}"
+    );
+    assert!(
+        !consume.contains("oracle_thin_select_one_text")
+            && !consume.contains("oracle_thin_pooled_session_health_check"),
+        "and never SQL, which would open the transaction the tab's own SET TRANSACTION has to \
+         open: {consume}"
+    );
+    assert!(
+        execution.contains("SqlEditorWidget::consume_oracle_thin_cancel_residue(")
+            && execution.contains("if took_retained_session.get() {"),
+        "and it runs for a session taken back out of the TAB's slot, never for a fresh one — \
+         a pool session already comes through the acquire door that recognises this"
+    );
+    // THE TOOLBAR COMMIT/ROLLBACK, on all four backends. It runs a statement on
+    // a session the tab has just stopped using, so a cancel of a PREVIOUS
+    // execution's could answer the user's own button: live-measured on Oracle
+    // thin as "Rollback failed: ORA-01013" for an action nobody cancelled.
+    let mut action_roads = 0;
+    for (road, marker) in [
+        ("Oracle OCI", "let action_residue = crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call("),
+        ("Oracle thin", "let action_residue =
+                    crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call("),
+    ] {
+        assert!(
+            editor_source.contains(marker),
+            "{road}'s transaction action must state that only a cancel from BEFORE counts"
+        );
+        action_roads += 1;
+    }
+    assert_eq!(action_roads, 2, "both Oracle drivers");
+    assert!(
+        compact_for_pattern(&editor_source).contains(&compact_for_pattern(
+            "crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(
+                        load_mutex_bool(cancel_flag),
+                        crate::db::SessionCancelResidue::MYSQL_FAMILY,"
+        )),
+        "and the MySQL family's, from the same question"
+    );
+    assert!(
+        editor_source.contains("type OracleTransactionAction = Box<dyn Fn("),
+        "the OCI action is `Fn`, because the rule may ask it again — and both COMMIT and \
+         ROLLBACK are safe to repeat"
     );
     for (road, reporting) in [
         (

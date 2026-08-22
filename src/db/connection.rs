@@ -4036,6 +4036,24 @@ impl DbSessionLease {
         self.db_type().is_same_type_as(expected)
     }
 
+    /// Whether a cancel this app sent can still land on the next call this
+    /// session makes.
+    ///
+    /// The DRIVER answers, and this is the one place the lease says which of
+    /// the three it is holding: `db_type()` cannot, because Oracle's two
+    /// drivers share a type and only one of them clears its own residue. A road
+    /// that holds a lease asks here; a road that has already split the lease
+    /// into a bare connection names its driver's constant instead
+    /// ([`SessionCancelResidue::ORACLE_OCI`] and friends), so no road writes
+    /// out an answer of its own.
+    pub fn cancel_residue(&self) -> crate::db::SessionCancelResidue {
+        match self {
+            DbSessionLease::Oracle(_) => crate::db::SessionCancelResidue::ORACLE_OCI,
+            DbSessionLease::OracleThin(_) => crate::db::SessionCancelResidue::ORACLE_THIN,
+            DbSessionLease::MySQL { .. } => crate::db::SessionCancelResidue::MYSQL_FAMILY,
+        }
+    }
+
     pub fn into_oracle_connection(self) -> Option<Arc<Connection>> {
         match self {
             DbSessionLease::Oracle(conn) => Some(conn),
@@ -4939,6 +4957,36 @@ impl SharedDbSessionLease {
         };
         lease.register_for_connection_teardown();
         lease
+    }
+
+    /// Send ONE cancel of this app's to the session this tab is holding, with
+    /// no call running on it, and answer what the delivery did.
+    ///
+    /// `#[doc(hidden)]`, for the live verification harness, and for the same
+    /// reason `SqlEditorWidget::cancel_published_session_with_a_lapsing_claim_for_probe`
+    /// exists: **the window cannot be reached by waiting.** A break interrupts
+    /// the call that is RUNNING; the state this is about is the one where there
+    /// was none — the statement finished first, so Oracle OCI remembers the
+    /// break and aborts the NEXT call, and a MySQL `KILL QUERY` lands on
+    /// whatever that connection runs next. Racing a real statement for it is
+    /// what makes a scenario flaky; SAYING it is what makes the scenario a
+    /// discriminator.
+    ///
+    /// It is the app's own canceler, built the way `track_under` builds it, so
+    /// what lands on the session is exactly what a real cancel lands.
+    ///
+    /// `None` when this tab holds no session.
+    #[doc(hidden)]
+    pub fn leave_a_cancel_on_the_retained_session_for_probe(
+        &self,
+        connection_info: &ConnectionInfo,
+    ) -> Option<Result<SessionCancelDelivery, String>> {
+        let canceler = {
+            let slot = self.lock_inner();
+            let lease = slot.entry.as_ref()?.lease()?;
+            session_lease_canceler(lease, connection_info)
+        };
+        Some(canceler.interrupt(&SessionCancelClaim::owned_outright()))
     }
 
     fn from_inner(inner: Arc<Mutex<DbSessionLeaseSlot>>) -> Self {
@@ -8117,7 +8165,28 @@ impl DatabaseConnection {
         conn: &Connection,
         log_context: &str,
     ) -> bool {
-        let result = (|| -> Result<bool, OracleError> {
+        match Self::oracle_session_uncommitted_work_reporting(conn) {
+            Ok(has_transaction) => has_transaction,
+            Err(message) => {
+                logging::log_error(log_context, &message);
+                // Fails OPEN: an answer the app could not get is not an answer
+                // that there is nothing to resolve.
+                true
+            }
+        }
+    }
+
+    /// [`Self::oracle_session_may_have_uncommitted_work`], with WHY it failed.
+    ///
+    /// A caller that may have just BROKEN this session needs the reason, not
+    /// only the verdict: a break the app sent can be what answered, and that is
+    /// not the session's answer. Same split, and for the same reason, as
+    /// `session_policy::health_check_oracle_session_reporting`. See
+    /// [`crate::db::session_policy::answer_not_taken_from_our_own_cancel`].
+    pub(crate) fn oracle_session_uncommitted_work_reporting(
+        conn: &Connection,
+    ) -> Result<bool, String> {
+        (|| -> Result<bool, OracleError> {
             let stmt = conn.execute_named(
                 Self::oracle_session_transaction_probe_sql(),
                 &[("transaction_id", &OracleType::Varchar2(128))],
@@ -8126,18 +8195,8 @@ impl DatabaseConnection {
             Ok(transaction_id
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty()))
-        })();
-
-        match result {
-            Ok(has_transaction) => has_transaction,
-            Err(err) => {
-                logging::log_error(
-                    log_context,
-                    &format!("Failed to inspect Oracle session transaction state: {err}"),
-                );
-                true
-            }
-        }
+        })()
+        .map_err(|err| format!("Failed to inspect Oracle session transaction state: {err}"))
     }
 
     pub(crate) fn oracle_thin_session_may_have_uncommitted_work(

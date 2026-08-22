@@ -1159,6 +1159,22 @@ impl LazyFetchBreakRecovery {
         matches!(self, Self::BreakLeftTheSessionUsable)
     }
 
+    /// The same fact in the form the app's ONE rule takes
+    /// ([`crate::db::session_policy::answer_not_taken_from_our_own_cancel`]).
+    ///
+    /// A lazy fetch knows more than the driver constants do — it knows whether
+    /// a break was sent AT ALL, and whether the one that was sent already took
+    /// the session away — so it answers from that rather than from its driver.
+    /// The rule itself is the same one the statement road, the retained take
+    /// and the UI-thread pushes ask.
+    pub(crate) fn cancel_residue(self) -> crate::db::SessionCancelResidue {
+        if self.a_break_may_still_be_landing() {
+            crate::db::SessionCancelResidue::MayLandOnTheNextCall
+        } else {
+            crate::db::SessionCancelResidue::NothingLeftToLand
+        }
+    }
+
     /// The answer for a road whose driver cannot say more than "a break was
     /// sent": the evidence is the round trips that follow.
     ///
@@ -2030,9 +2046,15 @@ pub(crate) enum TabDbWork {
 }
 
 impl TabDbWork {
-    /// The one derivation. `AppState::tab_has_unfinished_db_work` is this
-    /// answer as a `bool`, so the gate that refuses and the gate that only
-    /// counts cannot disagree.
+    /// The derivation for a caller that has an EDITOR and nothing else.
+    /// `AppState::tab_has_unfinished_db_work` is this answer as a `bool`, so
+    /// the gate that refuses and the gate that only counts cannot disagree.
+    ///
+    /// A caller that can name the TAB asks `AppState::tab_db_work` instead: the
+    /// window keeps a tab's live fetch sessions beside the editor, and this
+    /// answer cannot see them. All three per-tab settings ask that one, because
+    /// two of them asked this one and the third the other, and "does this tab
+    /// have work?" is not a question the app may answer two ways.
     pub(crate) fn for_editor(editor: &SqlEditorWidget) -> Self {
         Self::for_editor_with_progress_lazy_fetch(editor, false)
     }
@@ -2619,8 +2641,14 @@ fn explain_plan_backend_for(db_type: DatabaseType) -> &'static dyn ExplainPlanBa
     }
 }
 
-type OracleTransactionAction =
-    Box<dyn FnOnce(Arc<Connection>) -> Result<(), String> + Send + 'static>;
+/// `Fn`, not `FnOnce`: the app's late-cancel rule may ask a COMMIT/ROLLBACK
+/// again when the FIRST answer was a cancel of this app's that outlived the
+/// work it was aimed at — see
+/// [`crate::db::session_policy::answer_not_taken_from_our_own_cancel`]. Both
+/// are safe to repeat: the server refused the call, and if it did run, a second
+/// COMMIT commits an empty transaction and a second ROLLBACK takes nothing
+/// back.
+type OracleTransactionAction = Box<dyn Fn(Arc<Connection>) -> Result<(), String> + Send + 'static>;
 
 struct TransactionActionRequest<'a> {
     connection: &'a SharedConnection,
@@ -2972,19 +3000,41 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 if load_mutex_bool(cancel_flag) {
                     let _ = cancel_handle.break_execution();
                 }
+                // The thin twin of the OCI road below: a cancel a PREVIOUS
+                // execution sent is still an in-band INTERRUPT marker on this
+                // socket, so it can be what answers the user's own
+                // COMMIT/ROLLBACK. Asked through the app's one rule, with a
+                // cancel aimed at THIS call excluded.
+                let action_residue =
+                    crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(
+                        load_mutex_bool(cancel_flag),
+                        crate::db::SessionCancelResidue::ORACLE_THIN,
+                    );
                 let result = match resolution_action {
                     RetainedSessionResolutionAction::Commit => {
-                        SqlEditorWidget::run_oracle_thin_action_with_timeout(
-                            &mut thin_conn,
-                            query_timeout,
-                            |session| session.commit().map_err(|err| err.to_string()),
+                        crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+                            action_residue,
+                            activity_label,
+                            || {
+                                SqlEditorWidget::run_oracle_thin_action_with_timeout(
+                                    &mut thin_conn,
+                                    query_timeout,
+                                    |session| session.commit().map_err(|err| err.to_string()),
+                                )
+                            },
                         )
                     }
                     RetainedSessionResolutionAction::Rollback => {
-                        SqlEditorWidget::run_oracle_thin_action_with_timeout(
-                            &mut thin_conn,
-                            query_timeout,
-                            |session| session.rollback().map_err(|err| err.to_string()),
+                        crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+                            action_residue,
+                            activity_label,
+                            || {
+                                SqlEditorWidget::run_oracle_thin_action_with_timeout(
+                                    &mut thin_conn,
+                                    query_timeout,
+                                    |session| session.rollback().map_err(|err| err.to_string()),
+                                )
+                            },
                         )
                     }
                     RetainedSessionResolutionAction::DiscardPhysical => {
@@ -3115,11 +3165,27 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         if load_mutex_bool(cancel_flag) {
             let _ = db_conn.break_execution();
         }
-        let result = SqlEditorWidget::run_oracle_action_with_timeout(
-            Arc::clone(&db_conn),
-            query_timeout,
+        // The user pressed COMMIT or ROLLBACK on a session the tab has just
+        // stopped using, so a cancel a PREVIOUS execution sent can be what
+        // answers it: the button then reported "ORA-01013: user requested
+        // cancel" for an action the user had not cancelled, and the work stayed
+        // where it was. A cancel aimed at THIS call is a different thing and is
+        // handled below, so only one left from before is asked past.
+        let action_residue = crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(
+            load_mutex_bool(cancel_flag),
+            crate::db::SessionCancelResidue::ORACLE_OCI,
+        );
+        let result = crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+            action_residue,
             activity_label,
-            oracle_action,
+            || {
+                SqlEditorWidget::run_oracle_action_with_timeout(
+                    Arc::clone(&db_conn),
+                    query_timeout,
+                    activity_label,
+                    &oracle_action,
+                )
+            },
         );
         if load_mutex_bool(cancel_flag) {
             // session.md §27.1 / §17: a cancel that arrived AFTER the
@@ -3391,7 +3457,21 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             Some(resolution_action),
             mysql_sql,
             crate::db::statement_session_post_processor_for(db_type).effects_for_sql(mysql_sql),
-            |mysql_conn: &mut mysql::PooledConn, _| mysql_conn.query_drop(mysql_sql),
+            |mysql_conn: &mut mysql::PooledConn, _| {
+                // The same road as the two Oracle ones: a `KILL QUERY` a
+                // previous execution sent can be what answers the user's own
+                // COMMIT/ROLLBACK. Repeating either is safe -- the server
+                // refused the call, and a second one resolves an empty
+                // transaction.
+                crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+                    crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(
+                        load_mutex_bool(cancel_flag),
+                        crate::db::SessionCancelResidue::MYSQL_FAMILY,
+                    ),
+                    activity_label,
+                    || mysql_conn.query_drop(mysql_sql),
+                )
+            },
         )
     }
 
@@ -5543,18 +5623,36 @@ impl SqlEditorWidget {
             // close. `apply_scope` receives the preservation flag and a failed
             // apply on a work-carrying session restores it unless the error says
             // the session itself is gone.
-            let result = retained_session
+            // The third per-tab push, through the same rule as the other two:
+            // it runs on a session the tab has just stopped using, so a break
+            // or a `KILL QUERY` the last batch sent can land on the `USE` /
+            // `ALTER SESSION SET CURRENT_SCHEMA` below -- and this road reads a
+            // failure as "the session is gone" unless the error text says
+            // otherwise, which `ORA-01013` does not. The residue comes from the
+            // LEASE, so the one driver that clears its own (Oracle thin) is not
+            // asked to pay for a re-ask it never needs.
+            let scope_push_residue = retained_session
                 .lease_mut()
-                .ok_or_else(|| "No retained DB session for this tab.".to_string())
-                .and_then(|lease| {
-                    lease.apply_scope(
-                        db_type,
-                        target_scope,
-                        advanced,
-                        retained_state.requires_physical_session_preservation(),
-                        query_timeout,
-                    )
-                });
+                .map(|lease| lease.cancel_residue())
+                .unwrap_or(crate::db::SessionCancelResidue::NothingLeftToLand);
+            let result = crate::db::session_policy::answer_not_taken_from_our_own_cancel(
+                scope_push_residue,
+                "retained session scope",
+                || {
+                    retained_session
+                        .lease_mut()
+                        .ok_or_else(|| "No retained DB session for this tab.".to_string())
+                        .and_then(|lease| {
+                            lease.apply_scope(
+                                db_type,
+                                target_scope,
+                                advanced,
+                                retained_state.requires_physical_session_preservation(),
+                                query_timeout,
+                            )
+                        })
+                },
+            );
             match result {
                 Ok(()) => Self::retained_session_hand_back_outcome(
                     retained_session.restore_with_context_epoch_and_scope(
@@ -6027,6 +6125,24 @@ impl SqlEditorWidget {
         &self,
     ) -> Option<crate::db::PooledSessionLeaseSnapshot> {
         self.pooled_db_session.snapshot()
+    }
+
+    /// Leave one cancel of this app's on the session this tab is holding, with
+    /// nothing running on it.
+    ///
+    /// `#[doc(hidden)]`, for the live verification harness. See
+    /// [`crate::db::SharedDbSessionLease::leave_a_cancel_on_the_retained_session_for_probe`]
+    /// for why the state has to be SAID rather than raced for.
+    #[doc(hidden)]
+    pub fn leave_a_cancel_on_the_retained_session_for_probe(
+        &self,
+    ) -> Option<Result<crate::db::SessionCancelDelivery, String>> {
+        let connection = self.bound_connection()?;
+        let info = crate::db::pool_session_context_for_shared_connection(&connection, None)
+            .ok()
+            .map(|context| context.connection_info)?;
+        self.pooled_db_session
+            .leave_a_cancel_on_the_retained_session_for_probe(&info)
     }
 
     pub fn apply_auto_commit_to_retained_session(

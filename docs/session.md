@@ -430,6 +430,67 @@ explain, object-browser Drop/Truncate, CSV import, and the grid's staged save.
 For a restriction the server enforces, use the connection's `READ ONLY`
 transaction access mode or an account without write privileges.
 
+## A cancel this app sent is not the session's answer
+
+A break / `KILL QUERY` interrupts the call that is **running**. When the work
+finished first there is nothing to interrupt, so the cancel is still travelling
+when the session stops being that work's — and the next call the session makes
+is answered by it. `SessionCancelClaim::deliver` cannot close that window: it
+asks whether the session is still this cancel's to act on, which stays true
+right up to the hand-back; the statement being over is a different fact.
+
+All three drivers can leave one behind, and the app recorded otherwise until a
+live probe said so. Oracle OCI has no reset ODPI-C exposes; a `KILL QUERY` is
+the server's; and Oracle Thin — which clears a cancel that was *queued and never
+sent* (`reset_pending_cancel`) and drains its break/reset handshake *inside the
+call the break interrupted* — writes one in-band `INTERRUPT` marker onto the
+socket when OOB is unavailable, and a marker sent with no reader sits there for
+the server to answer the next request with `ORA-01013`. So
+`SessionCancelResidue` names one answer for all three, and what differs is only
+what each ROAD knows: whether it sent a cancel at all
+(`after_a_cancel_this_app_sent`), or whether its own call is the cancel's target
+(`unless_a_cancel_is_aimed_at_this_call`, for a toolbar COMMIT/ROLLBACK the app
+breaks on the spot).
+
+The rule is `session_policy::answer_not_taken_from_our_own_cancel`: ask, and when
+the first answer is recognisably our own cancel and something of ours may still
+be landing, ask **once** more. Once, not in a loop — a second cancel answer is
+the session refusing to work — and only about the cancel, so a real failure is
+never asked twice.
+
+For a session out of the POOL the app has recognised this since
+`DbConnectionPool::acquire_session_untracked`, which throws that session away and
+takes another. **A session taken back out of a TAB's slot never comes through
+that door, and it is the only kind that carries the user's transaction**, so
+every road that speaks to one asks the rule instead:
+
+- the batch cleanup that files the session (Oracle OCI: its health check and its
+  transaction probe),
+- the take that gets it back — Oracle OCI's ping and its setup statements, the
+  MySQL family's readiness ping and session settings, and Oracle Thin's own
+  first contact, which it had none of,
+- the two lazy-fetch cleanups (`SqlEditorWidget::session_health_after_a_break`,
+  which supplies the residue from `LazyFetchBreakRecovery` rather than from the
+  driver, because a fetch knows whether a break was sent at all),
+- all three per-tab pushes (auto-commit, transaction mode, scope) and the
+  toolbar COMMIT/ROLLBACK on every backend, which run a statement on a session
+  the tab has just stopped using and whose answer to an error is to DISCARD it.
+
+Thin's first contact is a **ping and never SQL**. On Oracle a transaction begins
+with the first executable SQL statement, and the tab's own `SET TRANSACTION` has
+to be the first of its own (`ORA-01453`) — a health check there silently
+disarmed a pinned tab, which live `verify_transaction_mode_live` S4 catches. A
+ping is a TTC call: it consumes the marker and starts nothing.
+
+Live: `verify_commit_close_live`, the two stray-cancel scenarios. They are
+driven and not raced, for the reason
+`SharedDbSessionLease::leave_a_cancel_on_the_retained_session_for_probe` states —
+the window cannot be reached by waiting, so the harness SAYS it. They
+discriminate on Oracle Thin, whose marker persists on an idle socket; OCI and
+the MySQL family absorb a break sent to a fully idle session, and their half of
+the same hazard is the intra-frame race `verify_commit_close_live`'s
+fetch-on-the-wire scenario covers.
+
 ## Teardown closes every session
 
 A session the app has finished with must be gone from the *server*, not merely
