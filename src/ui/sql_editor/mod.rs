@@ -4683,9 +4683,15 @@ impl SqlEditorWidget {
     }
 
     /// The tab's scope (the object browser's selected database or schema),
-    /// which every execution applies to the session it runs on. Public so the
-    /// live verification harness can drive a scope change the way the object
-    /// browser does and check what it leaves on the tab's session.
+    /// which every execution applies to the session it runs on.
+    ///
+    /// **Public for the live verification harness**, and it writes the BINDING
+    /// only. A scope pick in the GUI goes through
+    /// `AppState::synchronize_scope_for_tab`, which also states the browser
+    /// card, the result grids and the catalog's reload — so this is not "the
+    /// way the object browser does" it, and the scenarios that use it are about
+    /// what the binding leaves on the tab's SESSION, which is the half a
+    /// binding write decides.
     pub fn set_tab_scope(&self, scope: Option<String>) -> u64 {
         self.connection_binding.set_scope(scope)
     }
@@ -4780,15 +4786,21 @@ impl SqlEditorWidget {
 
     /// Whether this tab cannot accept a transaction-mode change right now: a
     /// query or lazy fetch of its own is still running, or its retained DB
-    /// session is in a state that has to be resolved first. The toolbar
-    /// deactivates the isolation/access choices on exactly this answer, so it
-    /// lives here — where the state does — instead of being re-derived by each
-    /// caller.
+    /// session is in a state that has to be resolved first.
+    ///
+    /// **The EDITOR-ONLY view of the one gate, for the live verification
+    /// harness**, which drives a real editor with no window. The toolbar does
+    /// NOT ask this — it asks `AppState::per_tab_option_change_blocked`, which
+    /// supplies the work the WINDOW can see as well (the lazy fetches it holds
+    /// beside the editor's own). This doc said the toolbar deactivates "on
+    /// exactly this answer" for one round after that stopped being true, which
+    /// is the same thing that left live TM S9 asserting a rule production had
+    /// stopped asking.
+    ///
+    /// Live TM S23 — an open lazy fetch closes these controls — and S9 — a
+    /// dirty session closes them — are what drive it, and both are honest about
+    /// the half they reach: the gate itself is shared, only the work differs.
     pub fn transaction_mode_change_blocked_now(&self, db_type: crate::db::DatabaseType) -> bool {
-        // The same answer for a caller that has only an EDITOR: there, the
-        // editor's own work IS the tab's whole work. The live harness is that
-        // caller (it drives a real editor with no window), which is what live
-        // TM S23 — an open lazy fetch closes these controls — is asked of.
         self.per_tab_option_change_blocked_by(
             TabDbWork::for_editor(self),
             db_type,
@@ -5972,6 +5984,16 @@ impl SqlEditorWidget {
         true
     }
 
+    /// Give this tab's DB session up and stop any lazy fetch on it.
+    ///
+    /// **Public for the live verification harnesses**, which reset a tab
+    /// between scenarios — the GUI releases a session through
+    /// `release_pooled_db_session` / `release_pooled_db_session_if_resolved`
+    /// and cancels a fetch through the result-tab and Clear-results roads,
+    /// which ask the same policy this does. Saying so is not decoration: an
+    /// undocumented method that only a harness calls reads like a production
+    /// road, and a scenario driving one is a scenario that can go on passing
+    /// after production stops taking it.
     pub fn clear_pooled_db_session(&self) {
         let _ = self.release_pooled_db_session();
         // Same answer as every other road that wants the slot back: the fetch

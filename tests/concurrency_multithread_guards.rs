@@ -14398,10 +14398,17 @@ fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
             && rule_body.contains("||!message_indicates_query_cancel(&first.to_string())"),
         "only a road with a cancel still travelling re-asks, and only about the cancel: {rule}"
     );
+    // Both anchors are asserted before they are compared: a bare `unwrap()` on
+    // the second `find` turns a missing anchor into a panic with no message,
+    // which is a worse failure than the one this clause is for.
+    let ask_at = rule_body
+        .find("letfirst=matchask(){")
+        .expect("the rule must ask ONCE before it judges the answer");
+    let residue_at = rule_body
+        .find("residue_when_the_answer_came()")
+        .expect("the rule must ask the residue");
     assert!(
-        rule_body.contains("letfirst=matchask(){")
-            && rule_body.find("residue_when_the_answer_came()").unwrap()
-                > rule_body.find("letfirst=matchask(){").unwrap(),
+        residue_at > ask_at,
         "and the residue is asked AFTER the call, never before it: a fact read early cannot \
          describe what happened during the call: {rule}"
     );
@@ -14742,4 +14749,106 @@ fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
             .contains("should_retain_session=Self::session_health_after_a_break("),
         "the cheap question goes first, so the sync is not what the KILL lands on: {mysql_probe}"
     );
+}
+
+/// An editor API that only a HARNESS calls must say so.
+///
+/// This is the class that let live TM S9 go on passing about a rule the toolbar
+/// had stopped asking: once a production road is unified or renamed, the
+/// function the harness still drives becomes a road nothing takes, and nothing
+/// says so. Round 30 found three dead live tests this way and round 39 a
+/// fourth, each time by hand.
+///
+/// So it is asked of the source instead: every `pub` method on
+/// `SqlEditorWidget` that no file outside `src/bin` calls must carry a doc that
+/// names the harness (or be a `_for_probe` / `_for_harness` door). That is a
+/// cheap marker with a real effect — the author who makes a road
+/// production-unreachable has to come here and write down that it is, which is
+/// exactly the moment to ask whether the scenario driving it still means
+/// anything.
+///
+/// Deliberately lenient in one direction: "production calls it" is a textual
+/// search over every non-bin source file, test modules included. A method
+/// reached only from a unit test therefore does not need the marker. The strict
+/// version would be worth more and would also fail on things this guard is not
+/// about; what it has to catch is a method NOTHING but a harness reaches.
+#[test]
+fn every_editor_api_only_the_harness_uses_says_so() {
+    let editor_sources = [
+        read_source("src/ui/sql_editor/mod.rs"),
+        read_source("src/ui/sql_editor/execution.rs"),
+    ];
+
+    // Every `pub` method declared on the widget, with the doc block above it.
+    let mut declared: Vec<(String, String)> = Vec::new();
+    for source in &editor_sources {
+        for (offset, matched) in source.match_indices("\n    pub fn ") {
+            let name: String = source[offset + matched.len()..]
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            // The contiguous attribute/doc lines directly above the signature.
+            // Starts at the newline BEFORE the signature, so a method with no
+            // doc block yields an empty slice rather than an inverted range.
+            let mut doc_start = offset;
+            for line in source[..offset + 1].lines().rev() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("///")
+                    || trimmed.starts_with("//")
+                    || trimmed.starts_with('#')
+                {
+                    doc_start -= line.len() + 1;
+                } else {
+                    break;
+                }
+            }
+            declared.push((name, source[doc_start..offset].to_string()));
+        }
+    }
+    assert!(
+        declared.len() > 40,
+        "the widget's public surface should have been found: {}",
+        declared.len()
+    );
+
+    let harness_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
+    let harness = collect_rust_files(&harness_root)
+        .iter()
+        .map(|file| {
+            fs::read_to_string(file)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let ui_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let production = collect_rust_files(&ui_root)
+        .iter()
+        .filter(|file| !file.starts_with(&harness_root))
+        .map(|file| {
+            fs::read_to_string(file)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for (name, doc) in declared {
+        let call = format!(".{name}(");
+        if !harness.contains(&call) || production.contains(&call) {
+            continue;
+        }
+        let lower = doc.to_ascii_lowercase();
+        assert!(
+            lower.contains("harness")
+                || name.ends_with("_for_probe")
+                || name.ends_with("_for_harness"),
+            "`SqlEditorWidget::{name}` is called by a verification harness and by nothing in \
+             production. Say so in its doc (or name it `_for_probe`): an undocumented \
+             harness-only road reads like a production road, and a live scenario driving one \
+             goes on passing after production stops taking it."
+        );
+    }
 }
