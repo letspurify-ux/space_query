@@ -807,9 +807,10 @@ lifecycle: a cancelled statement leaves the pin in place and it still governs
 the session the tab uses next (S21), the pin survives a disconnect and
 reconnect and is applied to the new connection's session (S22), and an open
 lazy fetch — which holds the tab's session — closes the transaction-mode
-controls until it is fetched out or cancelled, through the same
-`SqlEditorWidget::transaction_mode_change_blocked_now()` the toolbar asks
-(S23). Finally, two settle the controls' own surface: every isolation level
+controls until it is fetched out or cancelled, through
+`SqlEditorWidget::transaction_mode_change_blocked_now()` — the editor-only view
+of the one gate the toolbar asks, since a harness has no window to supply the
+rest (S23), and the same gate is what S9 drives for the session half. Finally, two settle the controls' own surface: every isolation level
 the toolbar offers for a backend really lands on the session, read back from
 `@@transaction_isolation` on the MySQL family and behaviourally everywhere —
 a dirty read for READ UNCOMMITTED, another session's commit seen inside the

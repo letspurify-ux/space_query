@@ -4735,6 +4735,26 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         !one_gate.contains("TabDbWork::for_editor("),
         "the gate itself may never derive the work again: {one_gate}"
     );
+    // ...and never from inside a live lock guard. A temporary `MutexGuard`
+    // lives to the end of its STATEMENT, so folding the ask into the same
+    // expression that reads the connection info held that lock across a call
+    // which takes the tab's session lease — an ordering nothing can see,
+    // because the connection-info lock is not one the lock-order harness
+    // tracks. Read the value out, drop the guard, then ask.
+    for (offset, _) in main_window.match_indices("self.per_tab_option_change_blocked(") {
+        // Bounded by the statement TERMINATOR, not by a brace: the guard read
+        // `.unwrap_or_else(|poisoned| poisoned.into_inner())` closes a brace
+        // between the `.lock()` and the call, so a walk-back that stopped at
+        // one landed inside the closure and saw nothing.
+        let statement_start = main_window[..offset].rfind(';').map_or(0, |at| at + 1);
+        let statement = &main_window[statement_start..offset];
+        assert!(
+            !statement.contains(".lock()"),
+            "the per-tab option gate takes the tab's session lease, so it may not be asked \
+             while another lock guard is still live: ...{statement}"
+        );
+    }
+
     // And BOTH per-tab options that have a control ask it through the window,
     // which is the only thing that can name a tab.
     let window_gate = slice_to_end_of_fn(

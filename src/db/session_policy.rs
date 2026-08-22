@@ -178,6 +178,16 @@ pub fn retained_session_state_execute_preflight_decision_for_sql(
     }
 }
 
+/// The DB-layer rule behind the transaction-mode gate.
+///
+/// The UI no longer calls it: the control and the callback ask ONE gate
+/// (`SqlEditorWidget::per_tab_option_change_blocked_by`), which reaches
+/// `ensure_retained_session_option_change_allowed`. This stays as the
+/// INDEPENDENT second opinion that makes that merge safe — the unit
+/// `the_transaction_mode_gate_and_the_option_gate_are_one_rule` asks both of
+/// every state on every backend, so a term drifting out of either one is a test
+/// failure rather than a greyed-out control that disagrees with its own alert.
+/// It is not dead code; it is the other half of a cross-check.
 pub fn retained_session_state_transaction_mode_change_preflight_decision(
     db_type: DatabaseType,
     state: RetainedSessionState,

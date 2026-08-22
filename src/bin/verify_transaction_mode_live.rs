@@ -2164,32 +2164,28 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     // a clean transaction, so the family difference (the MySQL side can replace
     // over a pending one-shot override) only shows on a clean session, which is
     // what S5 covers.
+    //
+    // Asked of the GATE and not of the DB-layer rule behind it. This used to
+    // call `retained_session_state_transaction_mode_change_preflight_decision`
+    // directly, and when the gate was unified that spelling stopped being a
+    // road production takes at all — so the scenario went on passing about a
+    // rule the toolbar no longer asks. The two are held equal by the unit
+    // `the_transaction_mode_gate_and_the_option_gate_are_one_rule`; what a LIVE
+    // check is for is the road.
     println!("  --- S9 toolbar gate closes on uncommitted work and reopens after ROLLBACK ---");
     h.run("UPDATE SQ_TM_T SET V = V + 1")?;
-    let dirty_decision = h.editor.pooled_session_activity_snapshot().map(|snapshot| {
-        space_query::db::retained_session_state_transaction_mode_change_preflight_decision(
-            snapshot.db_type,
-            snapshot.retained_state(),
-        )
-    });
+    let dirty_blocked = h.editor.transaction_mode_change_blocked_now(db_type);
     h.check(
         "S9 uncommitted work disables the controls",
-        dirty_decision
-            == Some(space_query::db::RetainedSessionPreflightDecision::RequireResolution),
-        format!("decision while dirty = {dirty_decision:?}"),
+        dirty_blocked,
+        format!("gate while dirty = {dirty_blocked}"),
     );
     h.run("ROLLBACK")?;
-    let clean_decision = h.editor.pooled_session_activity_snapshot().map(|snapshot| {
-        space_query::db::retained_session_state_transaction_mode_change_preflight_decision(
-            snapshot.db_type,
-            snapshot.retained_state(),
-        )
-    });
+    let clean_blocked = h.editor.transaction_mode_change_blocked_now(db_type);
     h.check(
         "S9 controls are allowed again once the transaction is resolved",
-        clean_decision
-            .is_none_or(|d| d == space_query::db::RetainedSessionPreflightDecision::Allow),
-        format!("decision after ROLLBACK = {clean_decision:?}"),
+        !clean_blocked,
+        format!("gate after ROLLBACK = {clean_blocked}"),
     );
     // ---- S26: the half of the toolbar write path nothing else drives ------
     // The GUI does two things when a mode is picked: it pins the tab AND it

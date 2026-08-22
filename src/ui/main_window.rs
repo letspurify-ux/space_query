@@ -5736,19 +5736,24 @@ impl AppState {
         //
         // The db_type is the ACTIVE TAB's, from the view
         // `refresh_active_connection_view` has just re-learned above.
-        let blocked = self
+        // Read out and the guard DROPPED before the gate is asked. A temporary
+        // `MutexGuard` lives to the end of its statement, so folding the ask
+        // into the same expression held this lock across a call that takes the
+        // tab's session lease — an ordering nothing can see, because this lock
+        // is not one the lock-order harness tracks.
+        let active_db_type = self
             .connection_info
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .map(|info| info.db_type)
-            .is_some_and(|db_type| {
-                self.per_tab_option_change_blocked(
-                    self.active_editor_tab_id,
-                    db_type,
-                    TransactionOptionKind::AutoCommit,
-                )
-            });
+            .map(|info| info.db_type);
+        let blocked = active_db_type.is_some_and(|db_type| {
+            self.per_tab_option_change_blocked(
+                self.active_editor_tab_id,
+                db_type,
+                TransactionOptionKind::AutoCommit,
+            )
+        });
         // The mark is stated whatever the gate says: a control the user may not
         // touch must still tell them what is in force.
         let set_enablement = |item: &mut fltk::menu::MenuItem| {
