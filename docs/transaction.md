@@ -648,9 +648,16 @@ three on every status tick. Auto-commit and transaction mode have had that
 healer for some time; scope was left to a tab switch, so a worker that moved the
 tab's binding while the matching `ScopeChangedNotice` was dropped as superseded
 left the selector naming a schema the tab had left, for as long as the user
-stayed on it. `AppState::sync_active_tab_scope_selection` re-states the SELECTOR
-only — ordering a catalog load on a tick would clear the tree, the expansion and
-the filter the user arranged.
+stayed on it.
+
+`AppState::sync_active_tab_scope_selection` asks for the WHOLE repair, through
+`synchronize_scope_for_tab`. Re-stating the selector alone is not a smaller
+version of that: `ObjectBrowser::set_selected_scope` compares the name against
+what the held catalog was ASKED for and, when they differ, retires the catalog —
+so a healer that stopped there discarded the tab's tree and ordered nothing to
+refill it. `synchronize_scope_for_tab` therefore decides its metadata repair
+from whatever was BEHIND — the binding or the card — rather than from the
+binding alone, and retiring a catalog and ordering its reload are one step.
 
 ## Central preflight
 

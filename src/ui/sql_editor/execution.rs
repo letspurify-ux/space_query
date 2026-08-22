@@ -1956,6 +1956,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             SqlEditorWidget::consume_oracle_thin_cancel_residue(
                 thin_conn,
                 crate::db::SessionCancelResidue::ORACLE_THIN,
+                query_timeout,
                 "oracle thin execution startup",
             );
         }
@@ -4841,6 +4842,14 @@ impl SqlEditorWidget {
         pooled_db_session: &SharedDbSessionLease,
         session_owner: &crate::db::SessionHandBackOwner,
         execution_scope: Option<&str>,
+        // The TAB'S timeout, for the first calls this makes on a session taken
+        // back out of its slot. A retained session comes back carrying whatever
+        // call timeout its last batch left, and the batch does not apply the
+        // tab's until later -- so an unbounded ping or setup statement on a
+        // half-dead socket held this worker with nothing published yet for a
+        // cancel to reach. The thin twin bounds its own first call for the same
+        // reason.
+        query_timeout: Option<Duration>,
     ) -> (
         crate::db::ConnectionLockGuard<'a>,
         Result<Option<(Arc<Connection>, RetainedSessionState, u64)>, String>,
@@ -4919,8 +4928,16 @@ impl SqlEditorWidget {
                     take_cancel_residue,
                     "oracle execution startup",
                     || {
-                        conn.ping()
-                            .map_err(|err| format!("Oracle retained session ping failed: {err}"))
+                        Self::run_oracle_action_with_timeout(
+                            Arc::clone(&conn),
+                            query_timeout,
+                            "oracle execution startup",
+                            |conn| {
+                                conn.ping().map_err(|err| {
+                                    format!("Oracle retained session ping failed: {err}")
+                                })
+                            },
+                        )
                     },
                 );
                 if let Err(message) = ping_answer.as_ref() {
@@ -4950,23 +4967,34 @@ impl SqlEditorWidget {
                             take_cancel_residue,
                             "oracle execution startup",
                             || {
-                                if preserve_existing_session_state {
-                                    conn_guard.apply_oracle_current_schema_for_scope(
-                                        conn.as_ref(),
-                                        execution_scope,
-                                    )
-                                } else {
-                                    crate::db::DatabaseConnection::apply_oracle_session_settings(
-                                        conn.as_ref(),
-                                        &conn_guard.get_info().advanced,
-                                    )
-                                    .and_then(|_| {
-                                        conn_guard.apply_oracle_current_schema_for_scope(
-                                            conn.as_ref(),
-                                            execution_scope,
-                                        )
-                                    })
-                                }
+                                // Bounded by the tab's timeout for the same
+                                // reason the ping above is: these are
+                                // statements on a session whose call timeout is
+                                // whatever its last batch left on it.
+                                Self::run_oracle_action_with_timeout(
+                                    Arc::clone(&conn),
+                                    query_timeout,
+                                    "oracle execution startup",
+                                    |conn| {
+                                        if preserve_existing_session_state {
+                                            conn_guard.apply_oracle_current_schema_for_scope(
+                                                conn.as_ref(),
+                                                execution_scope,
+                                            )
+                                        } else {
+                                            crate::db::DatabaseConnection::apply_oracle_session_settings(
+                                                conn.as_ref(),
+                                                &conn_guard.get_info().advanced,
+                                            )
+                                            .and_then(|_| {
+                                                conn_guard.apply_oracle_current_schema_for_scope(
+                                                    conn.as_ref(),
+                                                    execution_scope,
+                                                )
+                                            })
+                                        }
+                                    },
+                                )
                             },
                         );
                     match setup_result {
@@ -6303,14 +6331,24 @@ impl SqlEditorWidget {
     fn consume_oracle_thin_cancel_residue(
         conn: &mut OracleThinSession,
         residue: crate::db::SessionCancelResidue,
+        query_timeout: Option<Duration>,
         log_context: &str,
     ) {
         if let Err(message) = crate::db::session_policy::answer_not_taken_from_our_own_cancel(
             residue,
             log_context,
             || {
-                conn.ping()
-                    .map_err(|err| format!("Oracle thin retained session ping failed: {err}"))
+                // Under the TAB'S timeout, like every other call the app makes
+                // on this session. A retained session comes back carrying
+                // whatever call timeout its last batch left, and the batch does
+                // not apply the tab's until after this point -- so an unbounded
+                // ping on a half-dead socket (one that never resets) would hold
+                // this worker with nothing published yet for a cancel to reach.
+                Self::run_oracle_thin_action_with_timeout(conn, query_timeout, |session| {
+                    session
+                        .ping()
+                        .map_err(|err| format!("Oracle thin retained session ping failed: {err}"))
+                })
             },
         ) {
             crate::utils::logging::log_warning(log_context, &message);
@@ -12422,6 +12460,7 @@ impl SqlEditorWidget {
                             ),
                         ),
                         acquire_scope.as_deref(),
+                        query_timeout,
                     );
                 let conn_guard = guard_after_acquire;
                 let (mut conn_opt, oracle_prior_retained_state, oracle_pool_context_epoch) =

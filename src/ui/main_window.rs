@@ -2619,7 +2619,21 @@ impl AppState {
             return false;
         };
         let binding = tab.connection_binding.snapshot();
-        let changed = binding.scope != scope;
+        let binding_moved = binding.scope != scope;
+        // ...and the CARD can be behind while the binding is not: a worker
+        // writes the tab's binding from its own `ALTER SESSION SET
+        // CURRENT_SCHEMA` and the matching `ScopeChangedNotice` can be dropped
+        // as superseded, so the card is left describing a schema the tab has
+        // left. Deciding the metadata repair on the binding alone missed
+        // exactly that case — and `ObjectBrowser::set_selected_scope` below is
+        // not a selector write: it retires a catalog that no longer answers the
+        // name being asked for. Retiring one without ordering the reload leaves
+        // the card blank with nothing coming. Asked BEFORE the write, because
+        // the write is what makes the card agree.
+        let card_was_behind = !self
+            .object_browser
+            .tab_scope_matches(tab_id, scope.as_deref());
+        let changed = binding_moved || card_was_behind;
         tab.connection_binding.set_scope(scope.clone());
         // A grid that is being edited names its table the way the user's SELECT
         // did, so it has to learn that the tab moved: saving after a scope
@@ -3310,12 +3324,22 @@ impl AppState {
     /// family and the app promises the same thing about each: what the screen
     /// shows is what the next statement will do.
     ///
-    /// It only re-states the SELECTOR. Whether the catalog behind it has to be
-    /// reloaded is the caller's question — a tab switch marks a refresh
-    /// pending, and the status tick deliberately does not, because a load
-    /// clears the tree, the expansion and the filter the user arranged, and the
-    /// scope that moved was already applied to the session by the statement
-    /// that moved it.
+    /// It runs the WHOLE repair, through the one function the scope road
+    /// already owns (`synchronize_scope_for_tab`), and that is the fix rather
+    /// than a detail. The first cut wrote only the selector — and
+    /// `ObjectBrowser::set_selected_scope` is not a selector write: it compares
+    /// the name against what the held catalog was ASKED for and, when they
+    /// differ, bumps the scope generation and marks the catalog as no longer
+    /// answering. So a healing tick that stopped there DISCARDED the tab's
+    /// tree and ordered nothing to refill it, leaving the card blank until the
+    /// user switched tabs or hit Refresh. That is worse than the stale selector
+    /// it was fixing.
+    ///
+    /// The tab-switch road has always paired the two (`set_selected_scope_for_tab`
+    /// then `mark_metadata_refresh_pending`), and the scope road states both
+    /// halves plus the result grids' own scope in one place. A repair that is
+    /// half of a repair is a second thing to keep in step; this asks for the
+    /// whole one.
     fn sync_active_tab_scope_selection(&mut self) -> bool {
         let tab_id = self.active_editor_tab_id;
         let Some(binding) = self
@@ -3336,9 +3360,12 @@ impl AppState {
         {
             return false;
         }
-        self.object_browser
-            .set_selected_scope_for_tab(tab_id, tab_scope);
-        true
+        // The binding is already where it should be — this is the card catching
+        // up with it — so writing the same scope back is a no-op for the
+        // binding and states the card, the result grids and the pending reload
+        // in the one place that owns all three. That function answers "was
+        // anything behind?", which is the same question this one asks.
+        self.synchronize_scope_for_tab(tab_id, tab_scope)
     }
 
     /// The work THIS TAB owns, as ONE value.
@@ -4731,7 +4758,14 @@ impl AppState {
         // switch, so a tab the user stayed on could go on showing a scope its
         // binding had left — the selector is what the user reads, and every
         // batch runs in the binding's scope.
-        self.sync_active_tab_scope_selection();
+        //
+        // The repair retires a catalog that described the schema the tab has
+        // left, so the reload it orders is started here too. Only when a repair
+        // really happened: the answer is false on every ordinary tick, and the
+        // starter itself refuses while the tab has work.
+        if self.sync_active_tab_scope_selection() {
+            self.start_pending_metadata_refresh_if_ready();
+        }
         let conn_info = self
             .connection_info
             .lock()

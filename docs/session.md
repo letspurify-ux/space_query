@@ -452,11 +452,28 @@ what each ROAD knows: whether it sent a cancel at all
 (`unless_a_cancel_is_aimed_at_this_call`, for a toolbar COMMIT/ROLLBACK the app
 breaks on the spot).
 
-The rule is `session_policy::answer_not_taken_from_our_own_cancel`: ask, and when
-the first answer is recognisably our own cancel and something of ours may still
-be landing, ask **once** more. Once, not in a loop — a second cancel answer is
-the session refusing to work — and only about the cancel, so a real failure is
-never asked twice.
+The rule is `session_policy::answer_not_taken_from_our_own_cancel_when`: ask,
+and when the first answer is recognisably our own cancel and something of ours
+may still be landing, ask **once** more. Once, not in a loop — a second cancel
+answer is the session refusing to work — and only about the cancel, so a real
+failure is never asked twice.
+
+**The residue is asked when the ANSWER came, never before the call**, and that
+is why it reaches the rule as a closure. It has two doors:
+
+- `answer_not_taken_from_our_own_cancel(residue, …)` for a road whose residue
+  cannot change while its call runs — a take, a batch cleanup, a lazy-fetch
+  close, a per-tab push. Nothing can aim a cancel at the app's own bookkeeping
+  call, so the answer is a value.
+- `answer_a_call_a_cancel_could_be_aimed_at(driver, is_aimed_here, …)` for a
+  call a cancel can be aimed AT — the toolbar COMMIT/ROLLBACK, which the app
+  breaks on the spot when the user cancels it. `is_aimed_here` is asked after
+  the call and only then, because that is the only moment its answer is known.
+  Folded in as a bool read beforehand, it said "no cancel here" about the very
+  cancel the user was pressing: the rule re-asked past it and **ran the COMMIT
+  they had cancelled**. There is deliberately no value form of that question —
+  computing it early is the defect — and every other road in this app reads the
+  cancel flag after its call for the same reason.
 
 For a session out of the POOL the app has recognised this since
 `DbConnectionPool::acquire_session_untracked`, which throws that session away and
@@ -481,6 +498,13 @@ with the first executable SQL statement, and the tab's own `SET TRANSACTION` has
 to be the first of its own (`ORA-01453`) — a health check there silently
 disarmed a pinned tab, which live `verify_transaction_mode_live` S4 catches. A
 ping is a TTC call: it consumes the marker and starts nothing.
+
+Every first call on a session taken back out of a tab's slot runs under the
+**tab's own query timeout**, on both Oracle drivers. A retained session comes
+back carrying whatever call timeout its last batch left on it and the batch
+applies the tab's only later, so an unbounded ping or setup statement on a
+half-dead socket — one that never resets — held the worker with nothing
+published yet for a cancel to reach.
 
 Live: `verify_commit_close_live`, the two stray-cancel scenarios. They are
 driven and not raced, for the reason

@@ -963,23 +963,6 @@ impl SessionCancelResidue {
         }
     }
 
-    /// The residue for a call that is ITSELF a cancel target — a toolbar
-    /// COMMIT/ROLLBACK, which the app breaks on the spot when the user cancels
-    /// it.
-    ///
-    /// The opposite question to [`Self::after_a_cancel_this_app_sent`], and
-    /// both are needed because they are two different roads: there, a cancel of
-    /// ours means one may still be travelling; here, a cancel of ours is the
-    /// answer the road is WAITING for, and only one left from BEFORE may be
-    /// asked past.
-    pub fn unless_a_cancel_is_aimed_at_this_call(aimed_at_this_call: bool, driver: Self) -> Self {
-        if aimed_at_this_call {
-            Self::NothingLeftToLand
-        } else {
-            driver
-        }
-    }
-
     pub fn may_land_on_the_next_call(self) -> bool {
         matches!(self, Self::MayLandOnTheNextCall)
     }
@@ -990,20 +973,31 @@ impl SessionCancelResidue {
 ///
 /// THE rule, in one place, for every road that speaks to a session this app may
 /// have just broken — the cleanup that files the session, the take that gets it
-/// back, and every UI-thread push that runs a statement on it. Each of those
-/// used to read a stray `ORA-01013` / killed statement as the session's verdict
-/// and DISCARD it, taking the tab's open transaction with it.
+/// back, and every UI-thread push or toolbar action that runs a statement on
+/// it. Each of those used to read a stray `ORA-01013` / killed statement as the
+/// session's verdict and DISCARD it, taking the tab's open transaction with it.
 ///
 /// Once, not in a loop: a second cancel answer is not residue, it is the
 /// session refusing to work. And only when the first answer is recognisably our
 /// own cancel, so a real failure is never asked twice.
+///
 /// Generic over the ERROR TYPE, not only over the answer: the roads that ask it
 /// include the ones holding a driver's own error (`mysql::Error`), and making
 /// each of them stringify first is how a rule ends up with a second copy for
 /// "the road that could not convert". The only thing asked of the error is what
 /// it SAYS.
-pub fn answer_not_taken_from_our_own_cancel<T, E: std::fmt::Display>(
-    residue: SessionCancelResidue,
+///
+/// **The residue is asked WHEN THE ANSWER CAME, never before the call.** That
+/// is the whole reason it is a closure and not a value: on a road whose own
+/// call is a cancel TARGET, the fact that decides this — is a cancel of ours
+/// aimed at this very call? — can become true WHILE the call runs, and a value
+/// computed beforehand says "no cancel here" about the one the user just asked
+/// for. Read early, the rule then re-asked past the user's own cancel and RAN
+/// THE COMMIT THEY CANCELLED. Everything else in the app reads that flag after
+/// its call for the same reason; a value read early cannot describe what
+/// happened during it.
+fn answer_not_taken_from_our_own_cancel_when<T, E: std::fmt::Display>(
+    residue_when_the_answer_came: impl Fn() -> SessionCancelResidue,
     log_context: &str,
     mut ask: impl FnMut() -> Result<T, E>,
 ) -> Result<T, E> {
@@ -1011,7 +1005,9 @@ pub fn answer_not_taken_from_our_own_cancel<T, E: std::fmt::Display>(
         Ok(answer) => return Ok(answer),
         Err(first) => first,
     };
-    if !residue.may_land_on_the_next_call() || !message_indicates_query_cancel(&first.to_string()) {
+    if !residue_when_the_answer_came().may_land_on_the_next_call()
+        || !message_indicates_query_cancel(&first.to_string())
+    {
         return Err(first);
     }
     crate::utils::logging::log_warning(
@@ -1022,6 +1018,47 @@ pub fn answer_not_taken_from_our_own_cancel<T, E: std::fmt::Display>(
         ),
     );
     ask()
+}
+
+/// The rule for a road whose residue cannot change while its call runs: a take,
+/// a batch cleanup, a lazy-fetch close, a per-tab push. Nothing can aim a
+/// cancel at the app's own bookkeeping call, so the answer is a value.
+pub fn answer_not_taken_from_our_own_cancel<T, E: std::fmt::Display>(
+    residue: SessionCancelResidue,
+    log_context: &str,
+    ask: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    answer_not_taken_from_our_own_cancel_when(|| residue, log_context, ask)
+}
+
+/// The rule for a call a cancel can be AIMED at — the toolbar COMMIT/ROLLBACK,
+/// which the app breaks on the spot when the user cancels it.
+///
+/// `a_cancel_is_aimed_at_this_call` is asked AFTER the call and only then,
+/// because that is the only moment its answer is known: a cancel of ours is
+/// exactly the answer this road is WAITING for, and re-asking past it would
+/// perform the action the user cancelled. Only a cancel left from BEFORE — one
+/// this road never asked for — may be asked past.
+///
+/// A separate door rather than a bool the caller folds in, because folding it
+/// in is what let it be computed too early.
+pub fn answer_a_call_a_cancel_could_be_aimed_at<T, E: std::fmt::Display>(
+    driver: SessionCancelResidue,
+    a_cancel_is_aimed_at_this_call: impl Fn() -> bool,
+    log_context: &str,
+    ask: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    answer_not_taken_from_our_own_cancel_when(
+        || {
+            if a_cancel_is_aimed_at_this_call() {
+                SessionCancelResidue::NothingLeftToLand
+            } else {
+                driver
+            }
+        },
+        log_context,
+        ask,
+    )
 }
 
 /// DB-agnostic classifier for generic UI: cancel or timeout — the statement
@@ -1164,10 +1201,62 @@ mod tests {
         }
     }
 
-    /// The two constructors are two QUESTIONS, and they have opposite answers
-    /// for the same input. A road that SENT a cancel may still be waiting for
-    /// it to land; a road whose own call is the cancel's TARGET wants that
-    /// answer and must not ask past it.
+    /// THE thing the second door exists for: a cancel that arrives WHILE the
+    /// call runs is the answer that call was waiting for, and re-asking past it
+    /// performs the action the user cancelled.
+    ///
+    /// This is why the residue is a closure asked after the answer came and not
+    /// a value computed before the call. Written as a value, the toolbar
+    /// COMMIT/ROLLBACK read "no cancel here" about the very cancel the user was
+    /// pressing, re-asked, and COMMITTED THE WORK THEY CANCELLED.
+    #[test]
+    fn a_cancel_that_arrives_while_the_call_runs_is_the_answer_it_wanted() {
+        let aimed_at_this_call = std::cell::Cell::new(false);
+        let asked = std::cell::Cell::new(0);
+        let answer: Result<(), String> = answer_a_call_a_cancel_could_be_aimed_at(
+            SessionCancelResidue::ORACLE_OCI,
+            || aimed_at_this_call.get(),
+            "test",
+            || {
+                asked.set(asked.get() + 1);
+                // The user presses Cancel while the COMMIT is on the wire.
+                aimed_at_this_call.set(true);
+                Err(our_own_cancel())
+            },
+        );
+        assert!(answer.is_err());
+        assert_eq!(
+            asked.get(),
+            1,
+            "a cancel aimed at this call must never be asked past"
+        );
+    }
+
+    /// And the door still does its job for the cancel it exists to absorb: one
+    /// left from BEFORE, which this road never asked for.
+    #[test]
+    fn a_cancel_left_from_before_is_still_asked_past() {
+        let asked = std::cell::Cell::new(0);
+        let answer = answer_a_call_a_cancel_could_be_aimed_at(
+            SessionCancelResidue::ORACLE_OCI,
+            || false,
+            "test",
+            || {
+                asked.set(asked.get() + 1);
+                if asked.get() == 1 {
+                    Err(our_own_cancel())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(answer, Ok(()));
+        assert_eq!(asked.get(), 2);
+    }
+
+    /// A road that SENT a cancel and a road whose own call is a cancel's TARGET
+    /// are two questions with opposite answers for the same input, which is why
+    /// they are two doors and not one bool a caller folds in.
     #[test]
     fn the_two_residue_questions_are_not_one_question() {
         let driver = SessionCancelResidue::ORACLE_OCI;
@@ -1176,16 +1265,26 @@ mod tests {
             SessionCancelResidue::MayLandOnTheNextCall
         );
         assert_eq!(
-            SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(true, driver),
-            SessionCancelResidue::NothingLeftToLand
-        );
-        assert_eq!(
             SessionCancelResidue::after_a_cancel_this_app_sent(false, driver),
             SessionCancelResidue::NothingLeftToLand
         );
+        // The other question has no value form at all: computing it before the
+        // call is exactly the defect, so it is only reachable through the door
+        // that asks it after.
+        let asked_early = std::cell::Cell::new(0);
+        let _: Result<(), String> = answer_a_call_a_cancel_could_be_aimed_at(
+            driver,
+            || {
+                asked_early.set(asked_early.get() + 1);
+                false
+            },
+            "test",
+            || Ok(()),
+        );
         assert_eq!(
-            SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(false, driver),
-            SessionCancelResidue::MayLandOnTheNextCall
+            asked_early.get(),
+            0,
+            "a call that answers is never asked whether a cancel was aimed at it"
         );
     }
 

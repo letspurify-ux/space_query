@@ -9819,7 +9819,11 @@ fn the_transaction_option_indicators_settle_themselves() {
     for (setting, healer) in [
         ("auto-commit", "self.sync_auto_commit_indicators();"),
         ("transaction mode", "self.sync_transaction_mode_controls();"),
-        ("scope", "self.sync_active_tab_scope_selection();"),
+        // CHANGED, with its reason: the scope healer's answer is now ACTED on —
+        // it retires a catalog that described the schema the tab has left, so
+        // the tick starts the reload it orders — and the call sits inside an
+        // `if`. The fact pinned is the same: the tick settles all three.
+        ("scope", "if self.sync_active_tab_scope_selection() {"),
     ] {
         assert!(
             render_fn.contains(healer),
@@ -9827,10 +9831,19 @@ fn the_transaction_option_indicators_settle_themselves() {
              remembering is not kept"
         );
     }
-    // And the scope healer re-states the SELECTOR only. Ordering a catalog load
-    // on a tick would clear the tree, the expansion and the filter the user
-    // arranged, every tick the two disagreed; the scope that moved was already
-    // applied to the session by the statement that moved it.
+    // CHANGED, with its reason. This said the healer "re-states the SELECTOR
+    // only" and BANNED it from ordering a reload — and that ban was the defect,
+    // because `ObjectBrowser::set_selected_scope` is not a selector write: it
+    // compares the name against what the held catalog was ASKED for and, when
+    // they differ, retires the catalog. A healer that stopped there discarded
+    // the tab's tree and ordered nothing to refill it, leaving the card blank
+    // until the user switched tabs or hit Refresh — worse than the stale
+    // selector it was fixing.
+    //
+    // So the healer asks for the WHOLE repair, through the one function the
+    // scope road already owns, and that function decides its metadata repair
+    // from whatever was behind — the binding OR the card — instead of from the
+    // binding alone. Half a repair is a second thing to keep in step.
     let scope_sync = slice_to_end_of_fn(
         &main_window,
         main_window
@@ -9838,14 +9851,28 @@ fn the_transaction_option_indicators_settle_themselves() {
             .expect("the scope healer should exist"),
     );
     assert!(
-        scope_sync.contains("set_selected_scope_for_tab(")
+        scope_sync.contains("self.synchronize_scope_for_tab(tab_id, tab_scope)")
             && scope_sync.contains("tab_scope_matches("),
-        "it states the binding's scope on the card, and only when they disagree: {scope_sync}"
+        "the healer asks the one repair, and only when the card is behind: {scope_sync}"
     );
     assert!(
-        !scope_sync.contains("mark_metadata_refresh_pending(")
-            && !scope_sync.contains("clear_metadata_for_tab("),
-        "and it orders no load of its own — the caller that wants one asks for it: {scope_sync}"
+        !scope_sync.contains("set_selected_scope_for_tab("),
+        "and never the card write on its own — retiring a catalog without ordering the reload \
+         is what left the card blank: {scope_sync}"
+    );
+    let scope_repair = slice_to_end_of_fn(
+        &main_window,
+        main_window
+            .find("    fn synchronize_scope_for_tab(&mut self, tab_id: QueryTabId, scope: Option<String>) -> bool {")
+            .expect("the one scope repair should exist"),
+    );
+    assert!(
+        scope_repair.contains("let card_was_behind = !self")
+            && scope_repair.contains("let changed = binding_moved || card_was_behind;")
+            && scope_repair.contains("self.clear_metadata_for_tab(tab_id);")
+            && scope_repair.contains("self.mark_metadata_refresh_pending(tab_id);"),
+        "the repair is decided by whatever was behind, and retiring the catalog and ordering \
+         its reload are one step: {scope_repair}"
     );
     // (1b) Running on every tick makes the item's whole appearance this
     // function's answer, and it has THREE cases, not two. A value is shown only
@@ -10176,6 +10203,42 @@ fn production_ui_ends_db_work_by_cancelling_it_not_by_emptying_the_registry() {
             file.display()
         );
     }
+
+    // The SAME rule for the probe door round 36 added, which is sharper still:
+    // it sends a real break / `KILL QUERY` to the session a tab is holding, so
+    // a production call would take the user's transaction away on purpose. It
+    // exists because the window it opens cannot be reached by waiting, and it
+    // belongs to the harnesses in `src/bin` and to nothing else. Two mentions
+    // in `src/ui` are allowed and no more: the widget accessor's own signature
+    // and the one line inside it that forwards to the DB layer. Its doc link to
+    // the DB-layer door is not a call, so comments are stripped first.
+    let mut probe_mentions = 0;
+    for file in collect_rust_files(&ui_root) {
+        let source = fs::read_to_string(&file)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()));
+        let mentions = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .matches("leave_a_cancel_on_the_retained_session_for_probe")
+            .count();
+        if mentions == 0 {
+            continue;
+        }
+        assert!(
+            file.ends_with("sql_editor/mod.rs"),
+            "{} reaches the probe door that breaks a tab's live session. It is for the \
+             verification harnesses in src/bin, which need a state that cannot be reached by \
+             waiting; production ends work by cancelling it.",
+            file.display()
+        );
+        probe_mentions += mentions;
+    }
+    assert_eq!(
+        probe_mentions, 2,
+        "the widget accessor and the one call inside it, and nothing else in the UI"
+    );
 
     // And the one place that used to empty it now cancels, with the app's own
     // configured cancel timeout as the force tier's deadline.
@@ -14210,15 +14273,55 @@ fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
     // is the lazy fetch's way IN. Every clause below is the same clause about
     // the new home.
     let rule_source = read_source("src/db/session_policy.rs");
+    // CHANGED, with its reason: the rule's BODY moved behind two doors, and
+    // that split is itself the fix. A road whose own call is a cancel TARGET
+    // cannot answer "is a cancel aimed at this call?" before the call — the
+    // user can press Cancel while it runs — and a value computed beforehand
+    // said "no cancel here" about the very one they pressed, so the rule
+    // re-asked past it and RAN THE COMMIT THEY CANCELLED. The residue is asked
+    // when the ANSWER came, and the value door is the special case where it
+    // cannot change.
     let rule = rule_source
-        .find("pub fn answer_not_taken_from_our_own_cancel<T, E: std::fmt::Display>(")
+        .find("fn answer_not_taken_from_our_own_cancel_when<T, E: std::fmt::Display>(")
         .map(|at| slice_to_end_of_fn(&rule_source, at))
         .expect("the app's one late-cancel rule should exist");
     let rule_body = compact_for_pattern(rule);
     assert!(
-        rule_body.contains("if!residue.may_land_on_the_next_call()")
+        rule_body.contains("if!residue_when_the_answer_came().may_land_on_the_next_call()")
             && rule_body.contains("||!message_indicates_query_cancel(&first.to_string())"),
         "only a road with a cancel still travelling re-asks, and only about the cancel: {rule}"
+    );
+    assert!(
+        rule_body.contains("letfirst=matchask(){")
+            && rule_body.find("residue_when_the_answer_came()").unwrap()
+                > rule_body.find("letfirst=matchask(){").unwrap(),
+        "and the residue is asked AFTER the call, never before it: a fact read early cannot \
+         describe what happened during the call: {rule}"
+    );
+    // Both doors delegate to it, and the one for a cancel TARGET takes its
+    // question as a closure so it cannot be answered early.
+    for (door, must_have) in [
+        (
+            "pub fn answer_not_taken_from_our_own_cancel<T, E: std::fmt::Display>(",
+            "answer_not_taken_from_our_own_cancel_when(||residue,log_context,ask)",
+        ),
+        (
+            "pub fn answer_a_call_a_cancel_could_be_aimed_at<T, E: std::fmt::Display>(",
+            "a_cancel_is_aimed_at_this_call:implFn()->bool",
+        ),
+    ] {
+        let at = rule_source
+            .find(door)
+            .unwrap_or_else(|| panic!("{door} should exist"));
+        assert!(
+            compact_for_pattern(slice_to_end_of_fn(&rule_source, at)).contains(must_have),
+            "{door} must be a door onto the one rule, not a second copy of it"
+        );
+    }
+    assert!(
+        !rule_source.contains("fn unless_a_cancel_is_aimed_at_this_call("),
+        "and there is no VALUE form of \"is a cancel aimed at this call\": computing it before \
+         the call is the defect, so it is only reachable through the door that asks it after"
     );
     assert_eq!(
         rule_body.matches("ask()").count(),
@@ -14427,10 +14530,38 @@ fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
         .find("fn consume_oracle_thin_cancel_residue(")
         .map(|at| slice_to_end_of_fn(&execution, at))
         .expect("Oracle thin must make the first call on a session it took back");
+    // Whitespace-insensitive: rustfmt reflows a method chain across lines, and
+    // a clause that pins the LAYOUT reads a reformat as a missing call.
+    let compact_consume = compact_for_pattern(consume);
     assert!(
-        consume.contains("answer_not_taken_from_our_own_cancel(")
-            && consume.contains("conn.ping()"),
+        compact_consume.contains("answer_not_taken_from_our_own_cancel(")
+            && compact_consume.contains("session.ping()"),
         "thin's first contact asks the rule, and it is a ping: {consume}"
+    );
+    // ...and under the TAB'S timeout, like every other call the app makes on
+    // that session. A retained session comes back carrying whatever call
+    // timeout its last batch left and the batch applies the tab's only later,
+    // so an unbounded first call on a half-dead socket held the worker with
+    // nothing published yet for a cancel to reach.
+    assert!(
+        compact_consume.contains("run_oracle_thin_action_with_timeout(conn,query_timeout,"),
+        "thin's first contact runs under the tab's timeout: {consume}"
+    );
+    // Bounded by the FUNCTION, not by a byte count: the window grew past 6000
+    // bytes and a slice measured in bytes stops reaching what it asserts as
+    // soon as the body does (round 9's lesson, met again here).
+    let oci_take = execution
+        .find("fn acquire_oracle_pooled_execution_connection<'a>(")
+        .map(|at| slice_to_end_of_fn(&execution, at))
+        .expect("the Oracle OCI acquire window should exist");
+    let compact_oci_take = compact_for_pattern(oci_take);
+    assert!(
+        compact_oci_take.contains("query_timeout:Option<Duration>,")
+            && compact_oci_take
+                .matches("run_oracle_action_with_timeout(")
+                .count()
+                >= 2,
+        "and so do the OCI take's own two first calls -- the ping and the setup statements"
     );
     assert!(
         !consume.contains("oracle_thin_select_one_text")
@@ -14448,27 +14579,32 @@ fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
     // a session the tab has just stopped using, so a cancel of a PREVIOUS
     // execution's could answer the user's own button: live-measured on Oracle
     // thin as "Rollback failed: ORA-01013" for an action nobody cancelled.
-    let mut action_roads = 0;
-    for (road, marker) in [
-        ("Oracle OCI", "let action_residue = crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call("),
-        ("Oracle thin", "let action_residue =
-                    crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call("),
-    ] {
-        assert!(
-            editor_source.contains(marker),
-            "{road}'s transaction action must state that only a cancel from BEFORE counts"
-        );
-        action_roads += 1;
-    }
-    assert_eq!(action_roads, 2, "both Oracle drivers");
-    assert!(
-        compact_for_pattern(&editor_source).contains(&compact_for_pattern(
-            "crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(
-                        load_mutex_bool(cancel_flag),
-                        crate::db::SessionCancelResidue::MYSQL_FAMILY,"
-        )),
-        "and the MySQL family's, from the same question"
+    // CHANGED, with its reason: these three used to fold the answer into a
+    // VALUE read before the call (`unless_a_cancel_is_aimed_at_this_call`), and
+    // a user pressing Cancel WHILE the COMMIT ran was then read as "no cancel
+    // here" -- the rule re-asked and committed the work they had just
+    // cancelled. They ask the door that puts the question after the answer, and
+    // the question is `load_mutex_bool(cancel_flag)`, which is what every other
+    // road in this app reads AFTER its call for the same reason.
+    assert_eq!(
+        editor_source
+            .matches("answer_a_call_a_cancel_could_be_aimed_at(")
+            .count(),
+        4,
+        "the toolbar COMMIT/ROLLBACK on all four backends: Oracle OCI's one call, Oracle \
+         thin's two branches (its driver spells commit and rollback separately), and the \
+         MySQL family's"
     );
+    let compact_editor = compact_for_pattern(&editor_source);
+    for driver in ["ORACLE_OCI", "ORACLE_THIN", "MYSQL_FAMILY"] {
+        assert!(
+            compact_editor.contains(&format!(
+                "answer_a_call_a_cancel_could_be_aimed_at(crate::db::SessionCancelResidue::{driver},||load_mutex_bool(cancel_flag),"
+            )),
+            "{driver}'s transaction action must ask the aimed-at door, and ask the flag as a \
+             CLOSURE so it is read when the answer came and not before the call"
+        );
+    }
     assert!(
         editor_source.contains("type OracleTransactionAction = Box<dyn Fn("),
         "the OCI action is `Fn`, because the rule may ask it again — and both COMMIT and \

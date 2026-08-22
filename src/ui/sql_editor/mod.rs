@@ -3003,17 +3003,15 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 // The thin twin of the OCI road below: a cancel a PREVIOUS
                 // execution sent is still an in-band INTERRUPT marker on this
                 // socket, so it can be what answers the user's own
-                // COMMIT/ROLLBACK. Asked through the app's one rule, with a
-                // cancel aimed at THIS call excluded.
-                let action_residue =
-                    crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(
-                        load_mutex_bool(cancel_flag),
-                        crate::db::SessionCancelResidue::ORACLE_THIN,
-                    );
+                // COMMIT/ROLLBACK. Through the door that asks "is a cancel
+                // aimed at THIS call?" AFTER the call — the user can press
+                // Cancel while it runs, and a flag read beforehand would say
+                // "no cancel here" about the one they just asked for.
                 let result = match resolution_action {
                     RetainedSessionResolutionAction::Commit => {
-                        crate::db::session_policy::answer_not_taken_from_our_own_cancel(
-                            action_residue,
+                        crate::db::session_policy::answer_a_call_a_cancel_could_be_aimed_at(
+                            crate::db::SessionCancelResidue::ORACLE_THIN,
+                            || load_mutex_bool(cancel_flag),
                             activity_label,
                             || {
                                 SqlEditorWidget::run_oracle_thin_action_with_timeout(
@@ -3025,8 +3023,9 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                         )
                     }
                     RetainedSessionResolutionAction::Rollback => {
-                        crate::db::session_policy::answer_not_taken_from_our_own_cancel(
-                            action_residue,
+                        crate::db::session_policy::answer_a_call_a_cancel_could_be_aimed_at(
+                            crate::db::SessionCancelResidue::ORACLE_THIN,
+                            || load_mutex_bool(cancel_flag),
                             activity_label,
                             || {
                                 SqlEditorWidget::run_oracle_thin_action_with_timeout(
@@ -3169,14 +3168,18 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         // stopped using, so a cancel a PREVIOUS execution sent can be what
         // answers it: the button then reported "ORA-01013: user requested
         // cancel" for an action the user had not cancelled, and the work stayed
-        // where it was. A cancel aimed at THIS call is a different thing and is
-        // handled below, so only one left from before is asked past.
-        let action_residue = crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(
-            load_mutex_bool(cancel_flag),
+        // where it was.
+        //
+        // A cancel aimed at THIS call is the opposite case, and the door below
+        // asks about it AFTER the call because that is the only moment the
+        // answer is known: the user can press Cancel while the COMMIT runs, and
+        // the flag read beforehand would say "no cancel here" about the very
+        // one they asked for — re-asking past it would COMMIT the work they
+        // cancelled. It is handled by the branch below this call, as it always
+        // was.
+        let result = crate::db::session_policy::answer_a_call_a_cancel_could_be_aimed_at(
             crate::db::SessionCancelResidue::ORACLE_OCI,
-        );
-        let result = crate::db::session_policy::answer_not_taken_from_our_own_cancel(
-            action_residue,
+            || load_mutex_bool(cancel_flag),
             activity_label,
             || {
                 SqlEditorWidget::run_oracle_action_with_timeout(
@@ -3463,11 +3466,9 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
                 // COMMIT/ROLLBACK. Repeating either is safe -- the server
                 // refused the call, and a second one resolves an empty
                 // transaction.
-                crate::db::session_policy::answer_not_taken_from_our_own_cancel(
-                    crate::db::SessionCancelResidue::unless_a_cancel_is_aimed_at_this_call(
-                        load_mutex_bool(cancel_flag),
-                        crate::db::SessionCancelResidue::MYSQL_FAMILY,
-                    ),
+                crate::db::session_policy::answer_a_call_a_cancel_could_be_aimed_at(
+                    crate::db::SessionCancelResidue::MYSQL_FAMILY,
+                    || load_mutex_bool(cancel_flag),
                     activity_label,
                     || mysql_conn.query_drop(mysql_sql),
                 )
