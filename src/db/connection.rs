@@ -2404,11 +2404,23 @@ impl PooledSessionLeaseSnapshot {
 /// `no_retained_session_push_takes_the_connection_lock` refuses it in the
 /// source.
 ///
-/// Stale identity is safe, and that is why nothing has to be re-read: the take
-/// (`SharedDbSessionLease::take_reusable_lease_for_context_update`) validates
-/// the generation and the db type against the lease and answers `Empty` /
-/// `Unreachable` when they have moved, and `restore_with_context_epoch` checks
-/// the epoch on the way back.
+/// **Stale identity is NOT safe, and this value does not make it so.** The
+/// sentence that used to stand here — "the take validates the generation
+/// against the lease and no-ops or discards on mismatch" — is what made
+/// carrying it look free, and it reads past the word *discards*:
+/// `take_reusable_lease_for_context_update` answers `Unreachable` by CLOSING the
+/// lease it found, with the user's uncommitted work in it. That is right for a
+/// caller who knows its generation is the live one, and destructive for one who
+/// does not — so `SqlEditorWidget::begin_retained_session_action` confirms the
+/// generation against the connection's live pool context before any push
+/// reaches the take, and answers `NotThisConnection` (touch nothing) when it has
+/// moved.
+///
+/// The pool-context EPOCH here is only the stamp the session is re-filed under
+/// (`file_into_slot` compares it to decide whether the slot already holds this
+/// same entry). It refuses nothing — `filing_decision` refuses, on the
+/// generation — so it is carried rather than re-read for the same reason the
+/// rest is.
 ///
 /// It carries only the facts ALL THREE settings need. A value that also held,
 /// say, the resolved default isolation would be one two of its three users had

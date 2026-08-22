@@ -5628,24 +5628,39 @@ impl SqlEditorWidget {
                 return RetainedSessionMutationOutcome::NotApplicable;
             }
 
-            // Row and connection info through the door its two sibling pushes
-            // come through, so a failed read is answered once and the same way.
-            // This used to be a second spelling of it, and the two disagreed:
-            // where this one carried on under a blank connection info, the
-            // session canceler it then published could reach no server on the
-            // MySQL family.
+            // Row, connection info AND "is this still the connection I was told
+            // to push onto" through the door its two sibling pushes come
+            // through, so a failed read is answered once and the same way. This
+            // used to be a second spelling of it, and the two disagreed twice:
+            // this one carried on under a blank connection info — publishing a
+            // session canceler that could reach no server on the MySQL family —
+            // and it never asked the currency question at all, so a tab that had
+            // reconnected and acquired a fresh session could lose that session,
+            // with the user's transaction, to a scope pick carrying the
+            // generation before it.
             let db_activity = format!("Applying scope to retained {db_type} session");
-            let action = match self
-                .bound_connection()
-                .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
-                .and_then(|connection| {
-                    Self::begin_retained_session_action(&connection, &db_activity, db_type)
-                }) {
-                Ok(action) => action,
-                Err(message) => {
-                    return RetainedSessionMutationOutcome::FailedRestored(message);
-                }
+            let Some(connection) = self.bound_connection() else {
+                return RetainedSessionMutationOutcome::FailedRestored(
+                    crate::db::NOT_CONNECTED_MESSAGE.to_string(),
+                );
             };
+            let action =
+                match Self::begin_retained_session_action(&connection, &db_activity, target) {
+                    Ok(action) => action,
+                    // The slot is untouched: the take is a discard road, and a
+                    // push that cannot speak for what is in there must not
+                    // reach it.
+                    Err(
+                        crate::ui::sql_editor::execution::RetainedSessionRefusal::NotThisConnection,
+                    ) => {
+                        return RetainedSessionMutationOutcome::NoSession;
+                    }
+                    Err(crate::ui::sql_editor::execution::RetainedSessionRefusal::Unreachable(
+                        message,
+                    )) => {
+                        return RetainedSessionMutationOutcome::FailedRestored(message);
+                    }
+                };
             let (scope_activity, scope_connection_info) = (action.activity, action.connection_info);
             // Same rule as the auto-commit and transaction-mode pushes: a take that
             // could not reach the tab's session closed it, and saying `NoSession`

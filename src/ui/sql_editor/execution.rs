@@ -397,6 +397,28 @@ pub(super) struct RetainedSessionAction {
     pub(super) connection_info: crate::db::ConnectionInfo,
 }
 
+/// Why [`SqlEditorWidget::begin_retained_session_action`] would not start this
+/// push, and why the two are separate answers.
+///
+/// They call for OPPOSITE things and neither may be folded into the other.
+/// `NotThisConnection` must leave the tab's slot ALONE — whatever is in it
+/// belongs to a connection this push cannot speak for, and the take would CLOSE
+/// it with the user's work inside. `Unreachable` is about the connection rather
+/// than the slot, so it is reported: the tab's setting has moved and its session
+/// has not.
+///
+/// The refusal is the enum and the action is not, so the door's answer is a
+/// `Result` — a two-variant enum holding a `ConnectionInfo` beside a bare unit
+/// is 320 bytes wide for every caller that only wanted to know why.
+pub(super) enum RetainedSessionRefusal {
+    /// The connection has moved on since the plan was built (or is not the
+    /// family the plan named). Touch nothing: this push does not speak for
+    /// whatever is in the tab's slot now.
+    NotThisConnection,
+    /// The connection could not be resolved at all.
+    Unreachable(String),
+}
+
 struct OracleThinConnectionTransitionContext<'a> {
     connection_binding: &'a crate::db::TabConnectionBinding,
     pooled_db_session: &'a SharedDbSessionLease,
@@ -4648,37 +4670,64 @@ impl SqlEditorWidget {
     /// the same two lines itself, which is how the two spellings came to answer
     /// a failed read differently.
     ///
+    /// It also answers the question the take CANNOT be asked without cost:
+    /// **is the connection this push names still the one that is up?**
+    /// `take_reusable_lease_for_context_update` is a DISCARD road — a lease that
+    /// does not match the generation it is handed is CLOSED, with the user's
+    /// uncommitted work in it — which is right for a caller that knows its
+    /// generation is the live one, and destructive for one that does not. The
+    /// auto-commit and transaction-mode pushes used to know, through a blocking
+    /// `can_reuse_pool_session` under the connection mutex; the scope push never
+    /// asked at all, so a tab that had just reconnected and acquired a fresh
+    /// session could lose it to a scope pick, because the identity the pick
+    /// carried named the incarnation before it.
+    ///
+    /// Asked here because the answer is FREE here: a pool context is only handed
+    /// out while its `cache_epoch` is the connection's current one, and every
+    /// `bump_connection_generation` is paired with a `bump_pool_context_epoch`,
+    /// so a live context necessarily carries the live generation. No lock, and
+    /// the read was already happening.
+    ///
     /// Never takes the connection MUTEX:
     /// `pool_session_context_for_shared_connection` try-locks and falls back to
     /// the cached context, because this runs on the FLTK thread and a blocking
-    /// wait here is the whole GUI stopping. Which connection the push is aimed
-    /// at is not asked of the connection either — it was resolved lock-free
-    /// where the plan was built ([`crate::db::RetainedSessionTarget`]).
+    /// wait here is the whole GUI stopping.
     ///
-    /// `Err` when the connection cannot be resolved at all, and it REFUSES
-    /// rather than proceeding under a nameless row. The row is not decoration:
-    /// the take publishes a session canceler built from this `ConnectionInfo`,
-    /// and on the MySQL family that canceler opens a control connection with it
-    /// to send `KILL QUERY` — from a blank one it can reach no server at all.
-    /// Proceeding therefore meant running a server round trip on the tab's
-    /// session, on the UI thread, with no cancel that works and (on the MySQL
-    /// family) no per-call timeout either. The comment that used to justify it —
-    /// "the action below fails on the same fact" — was not true: the take
-    /// matches on the generation and the db type, which the caller supplies, so
-    /// it succeeded.
+    /// [`RetainedSessionActionStart::Unreachable`] when the connection cannot be
+    /// resolved at all, and it REFUSES rather than proceeding under a nameless
+    /// row. The row is not decoration: the take publishes a session canceler
+    /// built from this `ConnectionInfo`, and on the MySQL family that canceler
+    /// opens a control connection with it to send `KILL QUERY` — from a blank
+    /// one it can reach no server at all. Proceeding therefore meant running a
+    /// server round trip on the tab's session, on the UI thread, with no cancel
+    /// that works and (on the MySQL family) no per-call timeout either. The
+    /// comment that used to justify it — "the action below fails on the same
+    /// fact" — was not true: the take matches on the generation and the db type,
+    /// which the caller supplies, so it succeeded.
     pub(super) fn begin_retained_session_action(
         shared_connection: &crate::db::SharedConnection,
         db_activity: &str,
-        db_type: DatabaseType,
-    ) -> Result<RetainedSessionAction, String> {
-        crate::db::pool_session_context_for_shared_connection(shared_connection, None)
-            .map(|context| RetainedSessionAction {
-                activity: context.track_operation_activity(db_activity.to_string()),
-                connection_info: context.connection_info,
-            })
-            .map_err(|err| {
-                format!("Could not reach the {db_type} connection to update its session: {err}")
-            })
+        target: crate::db::RetainedSessionTarget,
+    ) -> Result<RetainedSessionAction, RetainedSessionRefusal> {
+        let db_type = target.db_type();
+        let context =
+            match crate::db::pool_session_context_for_shared_connection(shared_connection, None) {
+                Ok(context) => context,
+                Err(err) => {
+                    return Err(RetainedSessionRefusal::Unreachable(format!(
+                        "Could not reach the {db_type} connection to update its session: {err}"
+                    )));
+                }
+            };
+        if context.connection_generation != target.connection_generation()
+            || !context.connection_info.db_type.is_same_type_as(db_type)
+        {
+            return Err(RetainedSessionRefusal::NotThisConnection);
+        }
+        Ok(RetainedSessionAction {
+            activity: context.track_operation_activity(db_activity.to_string()),
+            connection_info: context.connection_info,
+        })
     }
 
     /// A fresh MySQL-family pooled session, held together with the cancel
@@ -27404,18 +27453,21 @@ impl SqlEditorWidget {
             // built, without the connection mutex, and it is carried here rather
             // than re-derived: this used to open with a BLOCKING
             // `lock_connection` for the db type alone, on the FLTK thread. The
-            // take below validates the identity against the lease, which is what
-            // makes carrying it safe.
-            let action = match Self::begin_retained_session_action(
-                shared_connection,
-                db_activity,
-                db_type,
-            ) {
-                Ok(action) => action,
-                Err(message) => {
-                    return crate::db::RetainedSessionMutationOutcome::FailedRestored(message);
-                }
-            };
+            // door CONFIRMS it — the take below is a discard road, so a push
+            // that cannot speak for the connection must not reach it.
+            let action =
+                match Self::begin_retained_session_action(shared_connection, db_activity, target) {
+                    Ok(action) => action,
+                    // The slot is untouched: the take is a discard road, and a
+                    // push that cannot speak for what is in there must not
+                    // reach it.
+                    Err(RetainedSessionRefusal::NotThisConnection) => {
+                        return crate::db::RetainedSessionMutationOutcome::NoSession;
+                    }
+                    Err(RetainedSessionRefusal::Unreachable(message)) => {
+                        return crate::db::RetainedSessionMutationOutcome::FailedRestored(message);
+                    }
+                };
             let RetainedSessionAction {
                 activity: mutation_activity,
                 connection_info: mutation_connection_info,
@@ -27624,16 +27676,19 @@ impl SqlEditorWidget {
             // Carried, not re-read: see the auto-commit twin. This used to take
             // the connection mutex with a BLOCKING lock — which also waits out
             // any announced transition on that connection — for the db type.
-            let action = match Self::begin_retained_session_action(
-                shared_connection,
-                db_activity,
-                db_type,
-            ) {
-                Ok(action) => action,
-                Err(message) => {
-                    return crate::db::RetainedSessionMutationOutcome::FailedRestored(message);
-                }
-            };
+            let action =
+                match Self::begin_retained_session_action(shared_connection, db_activity, target) {
+                    Ok(action) => action,
+                    // The slot is untouched: the take is a discard road, and a
+                    // push that cannot speak for what is in there must not
+                    // reach it.
+                    Err(RetainedSessionRefusal::NotThisConnection) => {
+                        return crate::db::RetainedSessionMutationOutcome::NoSession;
+                    }
+                    Err(RetainedSessionRefusal::Unreachable(message)) => {
+                        return crate::db::RetainedSessionMutationOutcome::FailedRestored(message);
+                    }
+                };
             let RetainedSessionAction {
                 activity: mutation_activity,
                 connection_info: mutation_connection_info,
@@ -27782,16 +27837,19 @@ impl SqlEditorWidget {
             // connection's resolved default isolation; both now come from the
             // pick, which read them from the window's own cached connection
             // defaults.
-            let action = match Self::begin_retained_session_action(
-                shared_connection,
-                db_activity,
-                db_type,
-            ) {
-                Ok(action) => action,
-                Err(message) => {
-                    return crate::db::RetainedSessionMutationOutcome::FailedRestored(message);
-                }
-            };
+            let action =
+                match Self::begin_retained_session_action(shared_connection, db_activity, target) {
+                    Ok(action) => action,
+                    // The slot is untouched: the take is a discard road, and a
+                    // push that cannot speak for what is in there must not
+                    // reach it.
+                    Err(RetainedSessionRefusal::NotThisConnection) => {
+                        return crate::db::RetainedSessionMutationOutcome::NoSession;
+                    }
+                    Err(RetainedSessionRefusal::Unreachable(message)) => {
+                        return crate::db::RetainedSessionMutationOutcome::FailedRestored(message);
+                    }
+                };
             let RetainedSessionAction {
                 activity: mutation_activity,
                 connection_info: mutation_connection_info,
@@ -37259,6 +37317,76 @@ mod query_execution_cleanup_tests {
                 !blocking.contains("lock_connection"),
                 "{signature} must not wait for the connection mutex: it runs on the FLTK thread \
                  and the identity it needs is carried in `RetainedSessionTarget`"
+            );
+        }
+    }
+
+    /// `take_reusable_lease_for_context_update` CLOSES a lease whose generation
+    /// does not match the one it is handed, and reports the user's uncommitted
+    /// work as lost with it. That is right for a caller who knows its generation
+    /// is the live one, and destructive for one who does not — so a push may
+    /// only reach the take through the door that has just confirmed it.
+    ///
+    /// Two of the pushes used to know through a BLOCKING `can_reuse_pool_session`
+    /// under the connection mutex, and lost the question when that lock was
+    /// removed. The scope push never asked at all: a tab that had reconnected
+    /// and taken a fresh session could lose it, with its transaction, to a scope
+    /// pick still carrying the generation before the reconnect. The door asks it
+    /// for all three now, and `NotThisConnection` is the answer that leaves the
+    /// slot alone.
+    #[test]
+    fn no_retained_session_push_reaches_the_take_without_confirming_its_connection() {
+        let execution = include_str!("execution.rs");
+        let editor = include_str!("mod.rs");
+        let body_of = |source: &str, signature: &str| -> String {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} must exist"));
+            let end = source[start..]
+                .find("\n    }\n")
+                .map(|end| start + end)
+                .unwrap_or(source.len());
+            source[start..end].to_string()
+        };
+
+        // The door asks the question, once, for everyone.
+        let door = body_of(execution, "pub(super) fn begin_retained_session_action(");
+        assert!(
+            door.contains("context.connection_generation != target.connection_generation()")
+                && door.contains("RetainedSessionRefusal::NotThisConnection"),
+            "the door must refuse a push whose connection has moved on: {door}"
+        );
+
+        for (source, signature) in [
+            (
+                execution,
+                "pub(super) fn apply_mysql_autocommit_to_reusable_pooled_session(",
+            ),
+            (
+                execution,
+                "pub(super) fn apply_oracle_transaction_mode_to_reusable_pooled_session(",
+            ),
+            (
+                execution,
+                "pub(super) fn apply_mysql_transaction_mode_to_reusable_pooled_session(",
+            ),
+            (editor, "pub fn apply_current_scope_to_retained_session("),
+        ] {
+            let body = body_of(source, signature);
+            let door_at = body
+                .find("begin_retained_session_action(")
+                .unwrap_or_else(|| panic!("{signature} must come through the door"));
+            let take_at = body
+                .find("take_reusable_lease_for_context_update(")
+                .unwrap_or_else(|| panic!("{signature} must take the session through the door"));
+            assert!(
+                door_at < take_at,
+                "{signature} must confirm its connection BEFORE the take, which closes a lease \
+                 that does not match"
+            );
+            assert!(
+                body.contains("RetainedSessionRefusal::NotThisConnection"),
+                "{signature} must answer the moved-on case by leaving the tab's slot alone"
             );
         }
     }

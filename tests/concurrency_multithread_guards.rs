@@ -8106,12 +8106,14 @@ fn every_retained_session_mutation_validates_the_connection_generation() {
     );
 
     // Every retained mutation, not the Oracle one alone: they now take the same
-    // carried identity, so the rule can be asked of all three. The generation is
-    // validated where it always was — at the TAKE — and it is the one the plan
-    // resolved, which is what makes carrying it safe. `can_reuse_pool_session`
-    // used to be asked here as a second check, and its only unique term ("the
-    // connection is up") is now asked of the runtime where the plan is built,
-    // without the BLOCKING lock that check needed.
+    // carried identity, so the rule can be asked of all three.
+    //
+    // The take is what validates that identity against the LEASE — and it does
+    // so by CLOSING a lease that does not match, with the user's work in it. So
+    // a carried identity is not "safe" on its own: `can_reuse_pool_session` used
+    // to ask, under a BLOCKING lock, whether it was still the connection's live
+    // one, and that question now lives in `begin_retained_session_action`, which
+    // asks it of the connection's live pool context for nothing.
     let execution = read_source("src/ui/sql_editor/execution.rs");
     for road in [
         "fn apply_oracle_transaction_mode_to_reusable_pooled_session(",
@@ -8127,6 +8129,10 @@ fn every_retained_session_mutation_validates_the_connection_generation() {
                 && body.contains("take_reusable_lease_for_context_update("),
             "{road} must validate the identity it was handed by taking the session through \
              the door, not act on the slot behind it"
+        );
+        assert!(
+            body.contains("RetainedSessionRefusal::NotThisConnection"),
+            "{road} must leave the tab's slot alone when the connection it names has moved on"
         );
     }
 

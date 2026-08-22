@@ -390,9 +390,13 @@ impl RetainedSessionOptionChangePlan {
     /// The identity is CARRIED from here to the session rather than re-derived
     /// at the apply, which is what makes that promise hold end to end: the
     /// applies used to re-read the same facts from the connection under
-    /// `lock_connection`, on the FLTK thread. Stale identity is safe —
-    /// retained-session mutation validates the generation against the lease and
-    /// no-ops or discards on mismatch. See [`crate::db::RetainedSessionTarget`].
+    /// `lock_connection`, on the FLTK thread.
+    ///
+    /// What carrying it does NOT make safe is acting on a stale one. The take
+    /// CLOSES a lease whose generation does not match, so the push confirms the
+    /// generation at `SqlEditorWidget::begin_retained_session_action` — against
+    /// the connection's live pool context, which costs no lock — before it can
+    /// reach the take. See [`crate::db::RetainedSessionTarget`].
     fn from_runtime(
         runtime: &crate::db::ConnectionRuntime,
         retained_editors: Vec<SqlEditorWidget>,
@@ -5306,10 +5310,13 @@ impl AppState {
     /// Auto-commit and transaction mode were moved off the mutex for this
     /// reason already (`RetainedSessionOptionChangePlan::from_runtime`), so all
     /// three per-tab settings now build their plan from one kind of answer.
-    /// Stale identity is safe here for the same reason it is there: the
-    /// retained take validates the generation against the lease, and a
-    /// generation that has moved means the session belonged to a retired
-    /// incarnation of the connection.
+    /// The identity it carries is confirmed at the push, for the same reason it
+    /// is there: a generation that has moved means the session in the slot
+    /// belongs to another incarnation, and the take answers that by CLOSING it
+    /// — so `begin_retained_session_action` refuses first. This road is the one
+    /// that never asked, and a tab that had reconnected and taken a fresh
+    /// session could lose it, with the user's transaction, to a scope pick
+    /// carrying the generation before the reconnect.
     ///
     /// `None` still means "there is nothing to push" — no runtime, a connection
     /// that is not up, a database with no scope concept, or an empty pick — and
