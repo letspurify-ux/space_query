@@ -2240,15 +2240,15 @@ pub struct AppState {
     /// [`AppState::refresh_active_connection_view`].
     cached_connection_defaults: CachedConnectionDefaults,
     /// The answer the controls that offer a write were last given: the tab, the
-    /// write refusal, and whether the displayed result still belongs to that
-    /// tab's binding.
+    /// write refusal, whether the displayed result still belongs to that
+    /// tab's binding, and whether a value filter is narrowing the visible grid.
     ///
     /// Written only by
     /// [`AppState::refresh_result_edit_controls_if_their_answer_moved`]. It
     /// exists so those controls can be re-asked when the per-tab settings move
     /// the answer, without re-laying out the result toolbar on every status
     /// tick.
-    published_write_refusal: Option<(QueryTabId, bool, bool)>,
+    published_write_refusal: Option<(QueryTabId, bool, bool, bool)>,
     pending_connection_metadata_refresh: bool,
     pending_metadata_refresh_tabs: HashSet<QueryTabId>,
     latest_schema_request_id: u64,
@@ -3313,13 +3313,18 @@ impl AppState {
     /// per frame. The ANSWER is what the tick carries instead, and the control is
     /// re-asked only when it moves.
     ///
-    /// Exactly the two facts the three per-tab settings move, and no more: the
-    /// write refusal (auto-commit is not among its halves, and the transaction
-    /// mode and the connection's flag are) and whether the displayed result still
-    /// belongs to the tab's current binding, which is what a SCOPE change moves.
-    /// `can_current_begin_edit_mode` is deliberately not watched — it parses the
-    /// result's SQL, and every road that moves it is one of the ~40 that already
-    /// call the refresh.
+    /// Exactly the facts that move OUTSIDE the ~40 refresh sites, and no more:
+    /// the write refusal (auto-commit is not among its halves, and the
+    /// transaction mode and the connection's flag are), whether the displayed
+    /// result still belongs to the tab's current binding, which is what a SCOPE
+    /// change moves, and whether a value filter is narrowing the visible grid —
+    /// the filter's apply and clear roads refresh nothing, and the checkbox
+    /// they left stale is how an edit session could be started over a filter
+    /// (`begin_edit_mode` refuses that on its own now; this keeps the control
+    /// honest). `can_current_begin_edit_mode` as a WHOLE is deliberately not
+    /// watched — it parses the result's SQL, and its other inputs move only on
+    /// roads among the ~40 — the filter fact is watched apart because it is
+    /// the one input that does not, and it costs a bool read.
     ///
     /// Keyed by tab, so switching to a tab whose answer happens to match does not
     /// suppress anything: `activate_tab` refreshes on its own.
@@ -3333,6 +3338,7 @@ impl AppState {
             self.active_editor_tab_id,
             self.active_tab_write_would_be_refused(),
             self.active_result_origin_is_current(),
+            self.result_tabs.current_value_filter_is_active(),
         );
         if self.published_write_refusal == Some(answer) {
             return;

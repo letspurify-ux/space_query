@@ -3120,6 +3120,18 @@ impl ResultTabsWidget {
             .unwrap_or(false)
     }
 
+    /// Whether the visible grid is narrowed by a value filter right now.
+    ///
+    /// The write-control publisher watches this: it is the one input of
+    /// `can_current_begin_edit_mode` that moves OUTSIDE the ~40
+    /// query-lifecycle/tab-switch sites that refresh the edit controls (the
+    /// filter's apply and clear roads call none of them), and unlike the full
+    /// answer it costs a bool read, not a SQL parse.
+    pub(crate) fn current_value_filter_is_active(&self) -> bool {
+        self.current_table()
+            .is_some_and(|table| table.value_filter_is_active())
+    }
+
     pub fn is_current_save_pending(&self) -> bool {
         self.current_table()
             .map(|table| table.is_save_pending())

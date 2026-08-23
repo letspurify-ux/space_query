@@ -7221,6 +7221,13 @@ fn a_control_that_offers_a_write_asks_every_half_of_the_refusal() {
          re-asks the controls: {publisher}"
     );
     assert!(
+        compact_publisher.contains("self.result_tabs.current_value_filter_is_active()"),
+        "...and the THIRD fact that moves outside the ~40 refresh sites: whether a value filter \
+         is narrowing the visible grid. The filter's apply and clear roads refresh nothing, so a \
+         checkbox left stale by them is how an edit session could be offered over a filter: \
+         {publisher}"
+    );
+    assert!(
         compact_publisher.contains("self.active_editor_tab_id,"),
         "keyed by tab, so a switch cannot be mistaken for 'nothing moved': {publisher}"
     );
@@ -7251,6 +7258,69 @@ fn a_control_that_offers_a_write_asks_every_half_of_the_refusal() {
         1,
         "exactly one caller: a second is a second place that could disagree about when the \
          controls are re-asked"
+    );
+
+    // AND THE DO REFUSES WHAT THE CAN REFUSES.
+    //
+    // The value-filter check used to live only in `can_begin_edit_mode` — the
+    // checkbox's enablement — while `begin_edit_mode` itself checked
+    // save-pending and streaming and nothing else. A checkbox the filter roads
+    // had left stale then STARTED an edit session over a filtered grid, and the
+    // filter's clear replaced the rows that session's per-row state was paired
+    // with: staged cell values discarded client-side, dirty marks on the wrong
+    // rows, and Save refusing for ever with "out of sync". One refusal
+    // (`edit_mode_start_refusal`), asked by both, is what keeps the CAN and the
+    // DO from drifting again.
+    let result_table = read_source("src/ui/result_table.rs");
+    for signature in [
+        "    pub fn begin_edit_mode(",
+        "    pub fn can_begin_edit_mode(",
+    ] {
+        let body = result_table
+            .find(signature)
+            .map(|at| slice_to_end_of_fn(&result_table, at))
+            .unwrap_or_else(|| panic!("{signature} should exist"));
+        assert!(
+            body.contains("edit_mode_start_refusal()"),
+            "{signature} must ask the ONE start refusal, so the checkbox's enablement and the \
+             action it enables cannot disagree: {body}"
+        );
+        assert!(
+            !body.contains("value_filter_is_active()"),
+            "{signature} must not spell the filter half itself — the refusal owns it: {body}"
+        );
+    }
+    let refusal = result_table
+        .find("    fn edit_mode_start_refusal_for(")
+        .map(|at| slice_to_end_of_fn(&result_table, at))
+        .expect("the one statement of the start refusal should exist");
+    assert!(
+        refusal.contains("value_filter_active"),
+        "the refusal names the filter beside save-pending and streaming: {refusal}"
+    );
+
+    // The filter's CLEAR is the third writer of the rows an edit session pairs
+    // with (beside the filter's install and the browse re-query, which refuse
+    // and prompt respectively), so it refuses under a live session — before it
+    // touches the backup — and re-applies the sort the header arrow still
+    // declares to the rows it restores.
+    let clear = result_table
+        .find("    pub fn clear_value_filter(")
+        .map(|at| slice_to_end_of_fn(&result_table, at))
+        .expect("the value filter clear should exist");
+    let guard_at = clear
+        .find("self.is_edit_mode_enabled()")
+        .expect("the clear must ask about a live edit session");
+    let restore_at = clear
+        .find("unfiltered_data")
+        .expect("the clear restores the unfiltered backup");
+    assert!(
+        guard_at < restore_at,
+        "the edit-session refusal must run before the backup is taken: {clear}"
+    );
+    assert!(
+        clear.contains("apply_sort_to_table_data("),
+        "the restored rows must follow the sort the header arrow still declares: {clear}"
     );
 }
 

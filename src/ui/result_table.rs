@@ -6831,19 +6831,52 @@ impl ResultTableWidget {
             .is_some()
     }
 
-    pub fn can_begin_edit_mode(&self) -> bool {
-        if self.is_save_pending() {
-            return false;
+    /// Why an edit session cannot START on this grid right now, if it cannot.
+    ///
+    /// ONE statement of the rule, asked by the checkbox's enablement
+    /// (`can_begin_edit_mode`) and by [`Self::begin_edit_mode`] itself. The
+    /// check used to live only in the CAN, so a checkbox that had gone stale —
+    /// none of the roads that apply or clear a value filter refresh the edit
+    /// controls, and the tick publisher heals it only a beat later — could
+    /// start a session the enablement would have refused.
+    fn edit_mode_start_refusal(&self) -> Option<String> {
+        Self::edit_mode_start_refusal_for(
+            self.is_save_pending(),
+            self.is_streaming_in_progress(),
+            self.value_filter_is_active(),
+        )
+    }
+
+    /// The rule itself, apart from the widget so a unit can pin it.
+    fn edit_mode_start_refusal_for(
+        save_pending: bool,
+        streaming_in_progress: bool,
+        value_filter_active: bool,
+    ) -> Option<String> {
+        if save_pending {
+            return Some("Cannot begin edit mode while save is in progress.".to_string());
         }
-        if self.is_streaming_in_progress() {
-            return false;
+        if streaming_in_progress {
+            return Some("Cannot begin edit mode while query rows are still loading.".to_string());
         }
         // A value filter hides rows, and an edit session pairs its per-row
         // state with the rows on screen. Editing a filtered view and then
         // clearing the filter would leave that pairing pointing at the wrong
         // rows, so the two are kept apart from both directions — the filter
-        // refuses while editing, and editing refuses while filtered.
-        if self.value_filter_is_active() {
+        // refuses while editing (`value_filter_refusal`), and editing refuses
+        // while filtered.
+        if value_filter_active {
+            return Some(
+                "Cannot begin edit mode while a value filter hides rows. Clear the value filter \
+                 first."
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    pub fn can_begin_edit_mode(&self) -> bool {
+        if self.edit_mode_start_refusal().is_some() {
             return false;
         }
 
@@ -6874,11 +6907,11 @@ impl ResultTableWidget {
     }
 
     pub fn begin_edit_mode(&mut self) -> Result<String, String> {
-        if self.is_save_pending() {
-            return Err("Cannot begin edit mode while save is in progress.".to_string());
-        }
-        if self.is_streaming_in_progress() {
-            return Err("Cannot begin edit mode while query rows are still loading.".to_string());
+        // The DO asks the same refusal the CAN derives from, so a stale
+        // checkbox cannot start a session over a value filter — the state
+        // whose clear would replace the rows the session is paired with.
+        if let Some(reason) = self.edit_mode_start_refusal() {
+            return Err(reason);
         }
 
         if self.is_edit_mode_enabled() {
@@ -10309,6 +10342,16 @@ impl ResultTableWidget {
 
     /// Put every filtered-out row back. Returns false when nothing was hidden.
     pub fn clear_value_filter(&mut self) -> bool {
+        // A filter and an edit session cannot coexist — the filter refuses
+        // while editing (`value_filter_refusal`) and editing refuses while
+        // filtered (`edit_mode_start_refusal`) — so this arm is defensive: a
+        // future road that reopens either direction must land on a refusal
+        // here, not on a restore that swaps the rows the session's per-row
+        // state is paired with (the staged cell values live IN those rows, so
+        // the swap would discard them and mis-pair every dirty mark).
+        if self.is_edit_mode_enabled() {
+            return false;
+        }
         let restored = self
             .unfiltered_data
             .lock()
@@ -10322,6 +10365,25 @@ impl ResultTableWidget {
             return false;
         };
         self.replace_visible_rows(rows);
+        // The backup holds the rows in their pre-filter order, but the header
+        // arrow (`sort_state`) declares the user's CURRENT ordering — which a
+        // sort applied while the filter was on gave to the filtered subset
+        // only. Re-apply it to the restored full set so the arrow keeps
+        // telling the truth; when the sort predates the filter this is a
+        // no-op re-sort of already-ordered rows.
+        if let Some(state) = self.current_sort_state() {
+            if Self::apply_sort_to_table_data(
+                &self.full_data,
+                &self.edit_session,
+                &self.column_kinds,
+                &self.null_text,
+                &self.sort_null_ordering,
+                state.col_idx,
+                state.direction,
+            ) {
+                self.table.redraw();
+            }
+        }
         true
     }
 
@@ -15735,6 +15797,185 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         any(target_os = "macos", target_os = "linux"),
         ignore = "FLTK widget tests require a native UI test environment"
     )]
+    fn begin_edit_mode_refuses_while_a_value_filter_hides_rows() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        let rows = vec![vec!["AA".to_string(), "SMITH".to_string()]];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rows.clone();
+        let filter = crate::ui::grid_value_filter::build(
+            &rows,
+            (0, 1, 0, 1),
+            &HiddenColumns::automatic(None),
+            "NULL",
+            false,
+        )
+        .expect("filter");
+        widget
+            .value_filters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(filter);
+
+        // The DO refuses, not only the CAN: the checkbox that offers this can
+        // go stale (no filter road refreshes it), so `begin_edit_mode` itself
+        // must be what keeps an edit session from pairing with filtered rows.
+        assert_eq!(
+            widget.begin_edit_mode(),
+            Err(
+                "Cannot begin edit mode while a value filter hides rows. Clear the value filter \
+                 first."
+                    .to_string()
+            )
+        );
+        assert!(!widget.can_begin_edit_mode());
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
+    )]
+    fn clearing_a_value_filter_refuses_under_a_live_edit_session() {
+        let mut widget = ResultTableWidget::new();
+        let filtered_rows = vec![vec!["AA".to_string(), "SMITH".to_string()]];
+        let backup_rows = vec![
+            vec!["AA".to_string(), "SMITH".to_string()],
+            vec!["AB".to_string(), "JONES".to_string()],
+        ];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = filtered_rows.clone();
+        *widget
+            .unfiltered_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(backup_rows);
+        let filter = crate::ui::grid_value_filter::build(
+            &filtered_rows,
+            (0, 1, 0, 1),
+            &HiddenColumns::automatic(None),
+            "NULL",
+            false,
+        )
+        .expect("filter");
+        widget
+            .value_filters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(filter);
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AA".to_string(),
+                dirty_cols: HashSet::new(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+
+        // The two directions' refusals make this state unreachable today; a
+        // future road that reopens one must land on this refusal instead of a
+        // restore that swaps the rows the session's per-row state pairs with.
+        assert!(!widget.clear_value_filter());
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "the filtered rows the session is paired with must stay on screen"
+        );
+        assert!(
+            widget.value_filter_is_active(),
+            "the filter stays declared, so the strip and the menu keep telling the truth"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
+    )]
+    fn clearing_a_value_filter_reapplies_the_declared_sort() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec!["N".to_string()];
+        // The backup holds the PRE-filter order; the user sorted while the
+        // filter was on, so the arrow declares Ascending.
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![vec!["2".to_string()]];
+        *widget
+            .unfiltered_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(vec![
+            vec!["2".to_string()],
+            vec!["3".to_string()],
+            vec!["1".to_string()],
+        ]);
+        let filter = crate::ui::grid_value_filter::build(
+            &[vec!["2".to_string()]],
+            (0, 0, 0, 0),
+            &HiddenColumns::automatic(None),
+            "NULL",
+            false,
+        )
+        .expect("filter");
+        widget
+            .value_filters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(filter);
+        *widget
+            .sort_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ColumnSortState {
+            col_idx: 0,
+            direction: SortDirection::Ascending,
+        });
+
+        assert!(widget.clear_value_filter());
+        let restored = widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            restored,
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()],
+            ],
+            "the restored rows must follow the sort the header arrow still declares"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
+    )]
     fn delete_selected_rows_returns_error_when_selection_has_no_staged_rows() {
         let mut widget = ResultTableWidget::new();
         widget.table.set_rows(1);
@@ -17245,6 +17486,34 @@ mod tests {
         );
         assert_eq!(ResultTableWidget::sort_marker_for_column(desc, 0), None);
         assert_eq!(ResultTableWidget::sort_marker_for_column(None, 1), None);
+    }
+
+    #[test]
+    fn edit_mode_start_refusal_names_each_blocker() {
+        assert_eq!(
+            ResultTableWidget::edit_mode_start_refusal_for(false, false, false),
+            None
+        );
+        assert!(
+            ResultTableWidget::edit_mode_start_refusal_for(true, true, true)
+                .expect("refused")
+                .contains("save is in progress"),
+            "a pending save outranks the other blockers"
+        );
+        assert!(
+            ResultTableWidget::edit_mode_start_refusal_for(false, true, true)
+                .expect("refused")
+                .contains("still loading"),
+            "streaming outranks the filter"
+        );
+        // The arm the collision came through: an edit session pairs its
+        // per-row state with the rows on screen, and a value filter's clear
+        // swaps those rows, so starting an edit over a filter must refuse.
+        assert!(
+            ResultTableWidget::edit_mode_start_refusal_for(false, false, true)
+                .expect("refused")
+                .contains("value filter"),
+        );
     }
 
     #[test]

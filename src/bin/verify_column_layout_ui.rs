@@ -258,6 +258,56 @@ fn main() {
         Some(vec!["1".to_string(), "alpha".to_string()]),
     );
 
+    // ---- An edit session cannot start over a filter, and clearing keeps ----
+    // ---- the sort the header arrow declares --------------------------------
+    const FILTERED_EDIT_REFUSAL: &str =
+        "Cannot begin edit mode while a value filter hides rows. Clear the value filter first.";
+    grid.capture_tour_select_range(0, 1, 0, 1);
+    let filter = grid
+        .value_filter_from_selection(false)
+        .unwrap_or_else(|err| fail(format!("build filter for edit check: {err}")));
+    let _ = grid
+        .apply_value_filter(filter)
+        .unwrap_or_else(|err| fail(format!("apply filter for edit check: {err}")));
+    // The DO refuses, not only the CAN: the checkbox that offers this can go
+    // stale (no filter road refreshes it), so `begin_edit_mode` itself is what
+    // keeps an edit session from pairing with filtered rows.
+    let begin_while_filtered = grid.begin_edit_mode();
+    report.check(
+        "beginning an edit over a filtered grid is refused by the action itself",
+        begin_while_filtered == Err(FILTERED_EDIT_REFUSAL.to_string()),
+        format!("begin answered {begin_while_filtered:?}"),
+    );
+    report.check(
+        "the enablement agrees with the action",
+        !grid.can_begin_edit_mode(),
+        "can_begin_edit_mode offered an edit the action refuses".to_string(),
+    );
+    // Sort the FILTERED subset descending, then clear: the restored FULL set
+    // must follow the sort the header arrow still declares.
+    grid.capture_tour_sort_column(0);
+    grid.capture_tour_sort_column(0);
+    report.check(
+        "clearing a sorted filter reports it did something",
+        grid.clear_value_filter(),
+        String::new(),
+    );
+    app::check();
+    report.eq(
+        "the restored rows follow the declared sort",
+        (0..grid.capture_tour_row_count())
+            .filter_map(|row| grid.capture_tour_row(row))
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec!["3".to_string(), "2".to_string(), "1".to_string()],
+    );
+    let begin_after_clear = grid.begin_edit_mode();
+    report.check(
+        "after the clear, the filter arm releases its hold on edit",
+        begin_after_clear != Err(FILTERED_EDIT_REFUSAL.to_string()),
+        format!("begin still answered {begin_after_clear:?}"),
+    );
+
     // ---- A new result drops a live filter rather than restoring into it ---
     grid.capture_tour_select_range(0, 1, 0, 1);
     let filter = grid
