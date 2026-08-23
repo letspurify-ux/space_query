@@ -1091,6 +1091,14 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
             .connect(target.connection_info())
             .map_err(|e| format!("reconnect: {e}"))?;
     }
+    // What the GUI's connect road always does after replacing the connection:
+    // publish the new identity to the tab's bound runtime. Without it the
+    // runtime keeps naming the generation before the reconnect, and every road
+    // that plans from the runtime (the toolbar COMMIT/ROLLBACK below in
+    // S23/S28) honestly refuses for an incarnation that no longer exists — on
+    // Oracle only, because the MySQL family's post-batch refresh repairs the
+    // cache incidentally.
+    h.editor.refresh_bound_runtime_from_connection();
     h.check(
         "S16 the tab kept its pin across the reconnect",
         h.editor.tab_auto_commit_override_value() == Some(true),

@@ -2578,6 +2578,30 @@ impl DbPoolSessionContext {
         }
     }
 
+    /// The CONNECTION's own auto-commit, as the FALLBACK a tab's effective
+    /// resolution folds its override over (`auto_commit_for_execution`).
+    ///
+    /// Read-only, and that is the whole contract: session preparation must
+    /// still state whose settings a session is for through
+    /// [`PooledSessionPurpose`] — this exists so a road that resolves a TAB's
+    /// effective settings lock-free can use the same connection default the
+    /// lock-holding roads read from `ConnectionLockGuard::auto_commit`. The two
+    /// are the same fact: the default is written at connect and by
+    /// `clear_connection_state` only, so it is a constant of the generation
+    /// this context names, and a cached context serves it exactly.
+    pub(crate) fn connection_auto_commit(&self) -> bool {
+        self.connection_auto_commit
+    }
+
+    /// The CONNECTION's own transaction mode, as the FALLBACK a tab's
+    /// effective resolution folds its override over
+    /// (`transaction_mode_for_execution`). Same contract and same
+    /// generation-constant reasoning as
+    /// [`Self::connection_auto_commit`].
+    pub(crate) fn connection_transaction_mode(&self) -> TransactionMode {
+        self.connection_transaction_mode
+    }
+
     fn cache_epoch_is_current(&self) -> bool {
         self.cache_epoch_token.load(Ordering::Acquire) == self.cache_epoch
     }

@@ -2692,14 +2692,35 @@ struct TransactionActionRequest<'a> {
     current_oracle_thin_cancel_context: &'a Arc<Mutex<Option<OracleThinCancelHandle>>>,
     current_query_cancel_handle: &'a Arc<Mutex<OperationCancelTarget>>,
     current_mysql_cancel_context: &'a Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-    tab_auto_commit_override: &'a TabPin<bool>,
-    tab_transaction_mode_override: &'a TabPin<TransactionMode>,
     cancel_flag: &'a Arc<Mutex<bool>>,
     query_timeout: Option<Duration>,
     activity_label: &'static str,
     resolution_action: RetainedSessionResolutionAction,
     oracle_action: OracleTransactionAction,
     mysql_sql: &'static str,
+    /// The identity and the facts the backends used to re-derive from a
+    /// `ConnectionLockGuard`, resolved by the caller — the identity CHECKED
+    /// lock-free against the plan's `RetainedSessionTarget`
+    /// (`confirm_retained_session_connection`), the effective settings through
+    /// the one resolver pair from the connection defaults that same check
+    /// vouched for. Handing them in is what took this road off the connection
+    /// mutex: a COMMIT on the tab's own pooled session was refused whenever a
+    /// NEIGHBOUR tab held it.
+    db_type: DatabaseType,
+    connection_generation: u64,
+    /// The OPERATION's own activity row — the one the status bar is showing
+    /// and the registry can cancel — which is what the take must publish the
+    /// session canceler under. Not a row of this road's own making: that would
+    /// be a second entry beside the operation's.
+    resolution_activity: crate::db::DbActivityGuard,
+    /// REFUSED upstream, never defaulted: the take publishes a session
+    /// canceler built from this, and on the MySQL family that canceler opens a
+    /// control connection with it to send `KILL QUERY`.
+    resolution_connection_info: crate::db::ConnectionInfo,
+    /// The TAB's effective settings (default + override through
+    /// `auto_commit_for_execution` / `transaction_mode_for_execution`).
+    auto_commit: bool,
+    transaction_mode: TransactionMode,
 }
 
 trait TransactionActionBackend: Sync {
@@ -2714,11 +2735,12 @@ trait TransactionActionBackend: Sync {
         session_is_usable: bool,
     ) -> bool;
 
-    fn run_transaction_action(
-        &self,
-        conn_guard: crate::db::ConnectionLockGuard<'_>,
-        request: TransactionActionRequest<'_>,
-    ) -> Result<(), String>;
+    /// No `ConnectionLockGuard` parameter, deliberately: everything the
+    /// backends read from one is carried in the request, resolved lock-free
+    /// against the plan's `RetainedSessionTarget`. The COMMIT/ROLLBACK runs on
+    /// the TAB's own pooled session, so a neighbour's hold on the connection
+    /// mutex says nothing about it and may not refuse it.
+    fn run_transaction_action(&self, request: TransactionActionRequest<'_>) -> Result<(), String>;
 
     fn run_retained_session_close_action(
         &self,
@@ -2940,11 +2962,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 && !SqlEditorWidget::oracle_error_message_has_connection_error(message.trim()))
     }
 
-    fn run_transaction_action(
-        &self,
-        mut conn_guard: crate::db::ConnectionLockGuard<'_>,
-        request: TransactionActionRequest<'_>,
-    ) -> Result<(), String> {
+    fn run_transaction_action(&self, request: TransactionActionRequest<'_>) -> Result<(), String> {
         let TransactionActionRequest {
             pooled_db_session,
             hand_back_owner,
@@ -2956,42 +2974,11 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
             activity_label,
             resolution_action,
             oracle_action,
+            connection_generation,
+            resolution_activity,
+            resolution_connection_info,
             ..
         } = request;
-
-        let connection_generation = conn_guard.connection_generation();
-        let resolution_activity = conn_guard.activity();
-        // REFUSED, not defaulted. The row is not decoration: the take below
-        // publishes a session canceler built from this `ConnectionInfo`, and on
-        // the MySQL family that canceler opens a control connection with it to
-        // send `KILL QUERY` — from a blank one it can reach no server at all.
-        // Carrying on meant a UI-thread round trip on the tab's session with a
-        // Cancel button that reaches nothing. The push roads were given this
-        // rule when the same fallback was found there; `.unwrap_or_default()` is
-        // the spelling their `ConnectionInfo::default()` ban could not see.
-        //
-        // And it answers what is TRUE rather than what failed: the context can
-        // only fail when this connection is down, and a connection that went
-        // down retired the generation the tab's session was taken under
-        // (`clear_connection_state` bumps whenever there was a connection to
-        // lose), so that session is already gone. The user pressed COMMIT, so
-        // what they are owed is the loss — not the phrase "Not connected".
-        let resolution_connection_info = match conn_guard.pool_session_context() {
-            Ok(context) => context.connection_info,
-            Err(_) => {
-                drop(conn_guard);
-                // The slot is read with the connection lock already RELEASED:
-                // this arm is reached rarely enough that nothing would exercise
-                // a `DB_CONNECTION -> SESSION_LEASE` nesting introduced here,
-                // and a nesting nothing exercises is one the order checker
-                // cannot see.
-                let lost = pooled_db_session
-                    .snapshot()
-                    .map(|snapshot| snapshot.retained_state())
-                    .unwrap_or_default();
-                return Err(SqlEditorWidget::retained_session_unreachable_message(lost));
-            }
-        };
         // The COMMIT/ROLLBACK runs on this session inside this function, so the
         // cancel button's reach over it lasts exactly as long as the action.
         // It used to end at the `into_*` conversion below, which is where the
@@ -3007,14 +2994,12 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         ) {
             crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
             crate::db::RetainedLeaseTake::Empty => {
-                drop(conn_guard);
                 return Err("No retained DB session for this tab.".to_string());
             }
             // There WAS one, and this take closed it. Saying "no retained DB
             // session" would describe the slot after the loss rather than the
             // loss, on the very button the user pressed to keep their work.
             crate::db::RetainedLeaseTake::Unreachable { retained_state } => {
-                drop(conn_guard);
                 return Err(SqlEditorWidget::retained_session_unreachable_message(
                     retained_state,
                 ));
@@ -3031,7 +3016,6 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         let taken_retained_state = retained_session.retained_state();
         let Some((lease, prior_retained_state)) = retained_session.into_lease_with_retained_state()
         else {
-            drop(conn_guard);
             return Err(SqlEditorWidget::required_session_gone_message(
                 taken_retained_state,
             ));
@@ -3043,7 +3027,6 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                     prior_retained_state,
                     resolution_action,
                 ) {
-                    drop(conn_guard);
                     let _ = SqlEditorWidget::restore_pooled_session(
                         pooled_db_session,
                         hand_back_owner,
@@ -3057,7 +3040,6 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 }
                 let prior_transaction_state = prior_retained_state.transaction_state();
 
-                drop(conn_guard);
                 thin_conn.reset_pending_cancel();
                 let cancel_handle = thin_conn.cancel_handle();
                 SqlEditorWidget::set_current_oracle_thin_cancel_context(
@@ -3201,7 +3183,6 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 return result;
             }
             foreign @ DbSessionLease::MySQL { .. } => {
-                drop(conn_guard);
                 // The take emptied the slot, so this session is GONE whatever
                 // this road says: it leaves through the one door that closes it
                 // and reports what it was carrying.
@@ -3217,7 +3198,6 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
             prior_retained_state,
             resolution_action,
         ) {
-            drop(conn_guard);
             let _ = SqlEditorWidget::restore_pooled_session(
                 pooled_db_session,
                 hand_back_owner,
@@ -3231,7 +3211,6 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         }
         let prior_transaction_state = prior_retained_state.transaction_state();
 
-        drop(conn_guard);
         SqlEditorWidget::set_current_query_connection(
             current_query_connection,
             current_query_cancel_handle,
@@ -3477,11 +3456,7 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
         SqlEditorWidget::mysql_error_allows_session_reuse(message)
     }
 
-    fn run_transaction_action(
-        &self,
-        conn_guard: crate::db::ConnectionLockGuard<'_>,
-        request: TransactionActionRequest<'_>,
-    ) -> Result<(), String> {
+    fn run_transaction_action(&self, request: TransactionActionRequest<'_>) -> Result<(), String> {
         let TransactionActionRequest {
             connection,
             pooled_db_session,
@@ -3489,30 +3464,23 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             session_pool_sender,
             current_query_cancel_handle,
             current_mysql_cancel_context,
-            tab_auto_commit_override,
-            tab_transaction_mode_override,
             cancel_flag,
             query_timeout,
             activity_label,
             resolution_action,
             mysql_sql,
+            // The exact family member, carried rather than re-derived: MySQL
+            // and MariaDB share this backend but not their statement rules, and
+            // asking the connection again is the mutex this road was taken off.
+            db_type,
+            auto_commit,
+            transaction_mode,
             ..
         } = request;
 
-        let auto_commit = SqlEditorWidget::auto_commit_for_execution(
-            conn_guard.auto_commit(),
-            tab_auto_commit_override,
-        );
-        let db_type = conn_guard.db_type();
-        let transaction_mode = SqlEditorWidget::transaction_mode_for_execution(
-            db_type,
-            conn_guard.transaction_mode(),
-            tab_transaction_mode_override,
-        );
         let execution_scope = pooled_db_session
             .snapshot()
             .and_then(|snapshot| snapshot.current_scope().map(str::to_string));
-        drop(conn_guard);
         // A transaction action of its own: one call, so its report has nothing
         // to latch against but itself.
         let scope_report = crate::ui::sql_editor::execution::SessionScopeReport::default();
@@ -4538,6 +4506,52 @@ impl SqlEditorWidget {
             db_type,
             connection_lifetime,
         })
+    }
+
+    /// The lock-free twin of
+    /// [`Self::set_current_operation_snapshot_from_available_connection`], for
+    /// an operation on the tab's RETAINED session.
+    ///
+    /// Everything the snapshot needs is already in hand: the identity
+    /// (db type, generation) is the `RetainedSessionTarget` the plan carried,
+    /// and the lifetime and the connection's auto-commit default come from the
+    /// pool context [`Self::confirm_retained_session_connection`] has just
+    /// checked against that target. The defaults are constants of the
+    /// generation the target names (written at connect only), so this resolves
+    /// the same values the lock-holding helper read from the guard — without
+    /// the guard, which is the point: a toolbar COMMIT runs on the tab's own
+    /// pooled session and may not be refused for a neighbour's hold on the
+    /// connection mutex.
+    fn set_current_operation_snapshot_for_retained_target(
+        &self,
+        target: crate::db::RetainedSessionTarget,
+        context: &crate::db::DbPoolSessionContext,
+        sql_kind: crate::db::session_policy::SqlKind,
+        activity_label: &'static str,
+    ) -> StartedTabOperation {
+        let autocommit = Self::auto_commit_for_execution(
+            context.connection_auto_commit(),
+            &self.tab_auto_commit_override,
+        );
+        let operation_id = self.next_operation_id();
+        self.set_current_operation_snapshot(
+            operation_id,
+            target.connection_generation(),
+            target.db_type(),
+            sql_kind,
+            autocommit,
+            activity_label,
+        );
+        StartedTabOperation {
+            token: QueryOperationToken {
+                tab_id: self.owner_tab_id.load(Ordering::Relaxed),
+                editor_id: self.editor_id,
+                operation_id,
+                connection_generation: target.connection_generation(),
+            },
+            db_type: target.db_type(),
+            connection_lifetime: context.activity_lifetime(),
+        }
     }
 
     /// What the activity registry runs when it cancels this tab's work — a
@@ -5931,6 +5945,78 @@ impl SqlEditorWidget {
         }
     }
 
+    /// The toolbar twin of [`Self::retained_session_gone_outcome`]: what the
+    /// toolbar COMMIT/ROLLBACK answers once it knows the tab's session cannot
+    /// be reached from the identity it is allowed to use.
+    ///
+    /// The same two-way split, in `Err` words because the toolbar has no close
+    /// to let finish: a slot that held something lost it — with whatever work
+    /// was in it — and an EMPTY slot lost nothing, so the answer is the one the
+    /// take's own `Empty` arm has always given, never a sentence claiming a
+    /// session that was not there "was closed". (The empty-slot half is what
+    /// the old down-connection arm got wrong: it defaulted the state with
+    /// `.unwrap_or_default()` and reported a loss about nothing.)
+    fn retained_action_session_gone_message(pooled_db_session: &SharedDbSessionLease) -> String {
+        match pooled_db_session
+            .snapshot()
+            .map(|snapshot| snapshot.retained_state())
+        {
+            Some(retained_state) => Self::retained_session_unreachable_message(retained_state),
+            None => "No retained DB session for this tab.".to_string(),
+        }
+    }
+
+    /// Whether a door refusal that folded "busy" and "cannot be read at all"
+    /// means the connection is GONE rather than merely busy.
+    ///
+    /// The two session-ending roads — the close prompt and the toolbar
+    /// COMMIT/ROLLBACK — are the only callers that must keep those apart: a
+    /// busy connection refuses (ask again, the answer is different a moment
+    /// later), a DOWN one means the incarnation the tab's session was taken
+    /// under is retired, so the session is gone and the road reports that
+    /// instead. Only the connection knows which, and asking costs a
+    /// NON-BLOCKING try-lock that runs after the door has already refused: it
+    /// can CLASSIFY the refusal and never resolve the identity, so there is
+    /// still one road to the take. A `None` here is an announced transition or
+    /// a held mutex, both of which are "ask again".
+    fn unreachable_connection_is_gone(connection: &crate::db::SharedConnection) -> bool {
+        matches!(
+            crate::db::try_lock_connection(connection),
+            Some(conn_guard) if conn_guard.pool_session_context().is_err()
+        )
+    }
+
+    /// What the toolbar COMMIT/ROLLBACK answers when
+    /// [`Self::confirm_retained_session_connection`] refuses — stated once,
+    /// because BOTH ends of that road ask it (the plan on the FLTK thread and
+    /// the worker just before the take), and two spellings of the same refusal
+    /// is how one of them drifts.
+    ///
+    /// `NotThisConnection` means whatever is in the tab's slot belongs to a
+    /// retired incarnation (the take would CLOSE it), so the answer is the
+    /// session's — gone, or never there. `Unreachable` folds "busy" and "down",
+    /// and the shared classifier keeps them apart the way the close prompt
+    /// does: busy refuses so the user can ask again, down means the session is
+    /// gone.
+    fn retained_action_refusal_message(
+        refusal: crate::ui::sql_editor::execution::RetainedSessionRefusal,
+        connection: &crate::db::SharedConnection,
+        pooled_db_session: &SharedDbSessionLease,
+    ) -> String {
+        match refusal {
+            crate::ui::sql_editor::execution::RetainedSessionRefusal::NotThisConnection => {
+                Self::retained_action_session_gone_message(pooled_db_session)
+            }
+            crate::ui::sql_editor::execution::RetainedSessionRefusal::Unreachable(_) => {
+                if Self::unreachable_connection_is_gone(connection) {
+                    Self::retained_action_session_gone_message(pooled_db_session)
+                } else {
+                    crate::db::format_connection_busy_message()
+                }
+            }
+        }
+    }
+
     fn run_pooled_session_close_action(
         &self,
         action: CloseSessionAction,
@@ -6009,32 +6095,19 @@ impl SqlEditorWidget {
                 ) => {
                     return Ok(Self::retained_session_gone_outcome(retained_before_close));
                 }
-                // The door folds TWO situations that this road, alone among its
-                // four, must keep apart — and it cannot tell them apart itself.
-                //
-                // The connection is BUSY (a neighbour's statement with nothing
-                // in the pool-context cache to fall back on, or a transition
-                // announced since the check above): refuse, because the answer
-                // is a different one a moment later. Or it cannot be READ AT ALL
-                // because it is down: then the incarnation this tab's session
-                // was taken under is retired and the session is gone — refusing
-                // THERE is what leaves a down connection's tabs unclosable,
-                // which is the whole reason this road has an `Unreachable`
-                // outcome instead of an `Err`.
-                //
-                // Only the connection knows, and asking costs a NON-BLOCKING
-                // try-lock that runs after the door has already refused: it can
-                // classify the refusal and never resolve the identity, so there
-                // is still one road to the take. The predicate is the one round
-                // 44's arm used, so the two answers are the same answers. A
-                // `None` here is an announced transition or a held mutex, both
-                // of which are "ask again".
+                // The door folds TWO situations that only the session-ending
+                // roads must keep apart, and the shared classifier tells them:
+                // a DOWN connection means the session is gone — refusing there
+                // is what leaves a down connection's tabs unclosable, which is
+                // the whole reason this road has an `Unreachable` outcome
+                // instead of an `Err` — while a busy one refuses so the user
+                // can ask again. See
+                // [`SqlEditorWidget::unreachable_connection_is_gone`].
                 Err(crate::ui::sql_editor::execution::RetainedSessionRefusal::Unreachable(_)) => {
-                    return match crate::db::try_lock_connection(&connection) {
-                        Some(conn_guard) if conn_guard.pool_session_context().is_err() => {
-                            Ok(Self::retained_session_gone_outcome(retained_before_close))
-                        }
-                        _ => Err(crate::db::format_connection_busy_message()),
+                    return if Self::unreachable_connection_is_gone(&connection) {
+                        Ok(Self::retained_session_gone_outcome(retained_before_close))
+                    } else {
+                        Err(crate::db::format_connection_busy_message())
                     };
                 }
             }
@@ -6272,6 +6345,26 @@ impl SqlEditorWidget {
         // stops and the session goes, unless it carries something the tab still
         // needs — which no road decides for the user.
         self.cancel_active_lazy_fetch(LazyFetchSessionPolicy::DiscardIdleSession);
+    }
+
+    /// Publish the connection's current identity (state, generation, epoch)
+    /// onto this tab's bound runtime.
+    ///
+    /// **Public for the live verification harnesses**, which replace the
+    /// physical connection directly (`disconnect()` + `connect()` on the shared
+    /// connection) to model a reconnect. In the GUI that replacement always
+    /// goes through the connect road, whose worker publishes the new identity
+    /// to every bound runtime (`ConnectionRuntime::refresh_state_from_connection`
+    /// and the transition machinery); a harness that skips the publication
+    /// leaves the runtime naming the generation before its own reconnect, and
+    /// every road that plans from the runtime — the toolbar COMMIT/ROLLBACK,
+    /// the close prompt, the per-tab pushes — then honestly refuses for an
+    /// incarnation that no longer exists. This is that publication, nothing
+    /// more: the same one call the GUI's own roads make.
+    pub fn refresh_bound_runtime_from_connection(&self) {
+        if let Some(runtime) = self.connection_binding.snapshot().runtime {
+            runtime.refresh_state_from_connection();
+        }
     }
 
     pub fn set_lazy_fetch_batch_size(&self, size: u32) {
@@ -8012,29 +8105,93 @@ impl SqlEditorWidget {
             return;
         }
 
-        let Some(started_operation) = self
-            .set_current_operation_snapshot_from_available_connection(
-                crate::db::session_policy::SqlKind::TransactionControl,
-                activity_label,
-            )
-        else {
+        // LOCK-FREE, the way the close prompt and the three per-tab settings
+        // resolve theirs: this COMMIT/ROLLBACK runs on the TAB's own pooled
+        // session, so a neighbour tab's statement, an Oracle explain plan, an
+        // OCI script after `CONNECT` or a metadata load holding the connection
+        // mutex says nothing about it — and used to refuse it, at two gates,
+        // with "Connection is busy" on the very button the user presses to
+        // KEEP their work. ONE binding snapshot for the runtime and the
+        // connection, so a script `CONNECT` cannot land between two.
+        let Some(runtime) = self.connection_binding.snapshot().runtime else {
             Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
-            let _ = self.ui_action_sender.send(UiActionResult::ConnectionBusy);
+            let _ = self
+                .ui_action_sender
+                .send(action.ui_result(Err(crate::db::NOT_CONNECTED_MESSAGE.to_string())));
             app::awake();
             return;
         };
+        let connection = runtime.connection();
+        // A transition in flight is the one answer that is not knowledge: the
+        // connection may be serving queries again in a moment, so the action
+        // is refused and the user retries.
+        if matches!(
+            runtime.state().liveness_without_connection_lock(),
+            crate::db::RuntimeLiveness::InFlight
+        ) {
+            Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
+            let _ = self
+                .ui_action_sender
+                .send(action.ui_result(Err(crate::db::format_connection_busy_message())));
+            app::awake();
+            return;
+        }
+        // `None` means the runtime is not `Connected`: the generation the
+        // tab's session was taken under is retired, so the honest answer is
+        // about the SESSION — the loss when the slot held one, its plain
+        // absence when it did not — never a sentence about a lock.
+        let Some(target) = runtime.retained_session_target() else {
+            Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
+            let message = Self::retained_action_session_gone_message(&self.pooled_db_session);
+            let _ = self.ui_action_sender.send(action.ui_result(Err(message)));
+            app::awake();
+            return;
+        };
+        // The identity check the door gives the pushes and the close prompt,
+        // minus the door's own row — this road publishes the take's canceler
+        // under its OPERATION's row, begun below. The confirmed context also
+        // serves the two facts the snapshot used to read under the lock (the
+        // activity lifetime and the connection's auto-commit default), which
+        // are constants of the generation the target names.
+        let context =
+            match Self::confirm_retained_session_connection(&connection, activity_label, target) {
+                Ok(context) => context,
+                Err(refusal) => {
+                    Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
+                    let message = Self::retained_action_refusal_message(
+                        refusal,
+                        &connection,
+                        &self.pooled_db_session,
+                    );
+                    let _ = self.ui_action_sender.send(action.ui_result(Err(message)));
+                    app::awake();
+                    return;
+                }
+            };
+        let started_operation = self.set_current_operation_snapshot_for_retained_target(
+            target,
+            &context,
+            crate::db::session_policy::SqlKind::TransactionControl,
+            activity_label,
+        );
+        // The TAB's effective settings, resolved where the plan is built from
+        // the defaults the check above vouched for — the same values the
+        // backends used to read under the connection lock, through the same
+        // resolver pair.
+        let auto_commit = Self::auto_commit_for_execution(
+            context.connection_auto_commit(),
+            &self.tab_auto_commit_override,
+        );
+        let transaction_mode = Self::transaction_mode_for_execution(
+            target.db_type(),
+            context.connection_transaction_mode(),
+            &self.tab_transaction_mode_override,
+        );
         let operation_token = started_operation.token;
         let operation_id = operation_token.operation_id;
         let operation_activity = self.begin_operation_activity(&started_operation, activity_label);
         let current_query_cancel_handle = self
             .install_operation_cancel_handle(operation_token, operation_activity.finish_handle());
-
-        let Some(connection) = self.bound_connection() else {
-            Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
-            let _ = self.ui_action_sender.send(UiActionResult::ConnectionBusy);
-            app::awake();
-            return;
-        };
         let sender = self.ui_action_sender.clone();
         let session_pool_sender =
             Self::operation_progress_sender(self.progress_sender.clone(), operation_token);
@@ -8042,8 +8199,6 @@ impl SqlEditorWidget {
         let current_query_connection = self.current_query_connection.clone();
         let current_oracle_thin_cancel_context = self.current_oracle_thin_cancel_context.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
-        let tab_auto_commit_override = self.tab_auto_commit_override.clone();
-        let tab_transaction_mode_override = self.tab_transaction_mode_override.clone();
         let cancel_flag = self.cancel_flag.clone();
         let pooled_db_session = self.pooled_db_session.clone();
         let active_lazy_fetch = self.active_lazy_fetch.clone();
@@ -8094,27 +8249,32 @@ impl SqlEditorWidget {
                     ) {
                         return action.tracked_ui_result(operation_token, Err(message.to_string()));
                     }
-                    // Under THIS operation's activity: the take below publishes
-                    // the tab's retained session through `conn_guard.activity()`,
-                    // and that has to be the row the status bar is showing —
-                    // not a second entry that disappears with the lock.
-                    let Some(conn_guard) = crate::db::try_lock_connection_for_activity(
+                    // The identity, CHECKED again where the action runs — the
+                    // plan checked it, and the take will a third time; it is
+                    // written nowhere, so a stale answer can only refuse, never
+                    // misdirect. No connection lock: the take publishes the
+                    // session canceler under the OPERATION's own row
+                    // (`operation_activity`), the one the status bar is showing
+                    // and the registry can cancel — not a second entry of this
+                    // road's making, and not a mutex a neighbour's work can
+                    // turn into a refusal.
+                    let context = match SqlEditorWidget::confirm_retained_session_connection(
                         &connection,
-                        &operation_activity,
-                    ) else {
-                        return UiActionResult::QueryAlreadyRunning;
+                        activity_label,
+                        target,
+                    ) {
+                        Ok(context) => context,
+                        Err(refusal) => {
+                            let message = SqlEditorWidget::retained_action_refusal_message(
+                                refusal,
+                                &connection,
+                                &pooled_db_session,
+                            );
+                            return action.tracked_ui_result(operation_token, Err(message));
+                        }
                     };
-                    if conn_guard.connection_generation() != operation_token.connection_generation {
-                        return action.tracked_ui_result(
-                            operation_token,
-                            Err("Connection changed before transaction action started".to_string()),
-                        );
-                    }
-
-                    let db_type = conn_guard.db_type();
-                    let result = transaction_action_backend_for(db_type).run_transaction_action(
-                        conn_guard,
-                        TransactionActionRequest {
+                    let result = transaction_action_backend_for(target.db_type())
+                        .run_transaction_action(TransactionActionRequest {
                             connection: &connection,
                             pooled_db_session: &pooled_db_session,
                             hand_back_owner: &hand_back_owner,
@@ -8123,8 +8283,6 @@ impl SqlEditorWidget {
                             current_oracle_thin_cancel_context: &current_oracle_thin_cancel_context,
                             current_query_cancel_handle: &current_query_cancel_handle,
                             current_mysql_cancel_context: &current_mysql_cancel_context,
-                            tab_auto_commit_override: &tab_auto_commit_override,
-                            tab_transaction_mode_override: &tab_transaction_mode_override,
                             cancel_flag: &cancel_flag,
                             query_timeout,
                             activity_label,
@@ -8133,8 +8291,13 @@ impl SqlEditorWidget {
                                 action.apply_oracle(db_conn.as_ref())
                             }),
                             mysql_sql: action.mysql_sql(),
-                        },
-                    );
+                            db_type: target.db_type(),
+                            connection_generation: target.connection_generation(),
+                            resolution_activity: (*operation_activity).clone(),
+                            resolution_connection_info: context.connection_info,
+                            auto_commit,
+                            transaction_mode,
+                        });
                     action.tracked_ui_result(operation_token, result)
                 }));
 

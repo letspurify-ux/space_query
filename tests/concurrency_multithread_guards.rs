@@ -7317,6 +7317,16 @@ fn a_lease_the_road_did_not_expect_is_closed_and_reported_not_dropped() {
                 "{road} must report the state the take FOUND, not a default that claims nothing \
                  was lost"
             );
+            // The same claim in the spelling the ban above cannot see: an
+            // EMPTY slot defaulted into a state and fed to a loss message said
+            // "a session was closed" about a session that was never there. The
+            // None/Some split lives in `retained_action_session_gone_message`
+            // and `retained_session_gone_outcome`; a road may not collapse it.
+            assert!(
+                !compact_for_pattern(body).contains("retained_state()).unwrap_or_default()"),
+                "{road} must keep an empty slot and a lost session apart, not default one into \
+                 the other"
+            );
         }
     }
 }
@@ -7381,16 +7391,26 @@ fn a_push_that_does_not_speak_for_the_tab_never_reports_an_empty_slot() {
     let close_road = slice_to_end_of_fn(&editor, close_road_start);
     let close_road_range = close_road_start..(close_road_start + close_road.len());
 
+    // ...and so is the toolbar COMMIT/ROLLBACK's, which maps the refusal in ONE
+    // place for both ends of its road (the plan and the worker both ask
+    // `retained_action_refusal_message`, so neither can drift a word away).
+    let toolbar_map_start = editor
+        .find("    fn retained_action_refusal_message(")
+        .expect("the toolbar action's one refusal mapping should exist");
+    let toolbar_map = slice_to_end_of_fn(&editor, toolbar_map_start);
+    let toolbar_map_range = toolbar_map_start..(toolbar_map_start + toolbar_map.len());
+
     // And every mapping of the door's refusal, on all four PUSH roads.
     let mut arms = 0usize;
     let mut close_arms = 0usize;
+    let mut toolbar_arms = 0usize;
     for (source, is_editor) in [(&editor, true), (&execution, false)] {
         let mut from = 0usize;
         while let Some(offset) = source[from..].find("RetainedSessionRefusal::NotThisConnection") {
             let at = from + offset;
             from = at + 1;
             let arm = &source[at..(at + 260).min(source.len())];
-            // Not mappings: the door's own `return`, and the source-level guards
+            // Not mappings: the confirm's own `return`, and the source-level guards
             // in this crate that quote the name inside a string literal.
             if arm.starts_with("RetainedSessionRefusal::NotThisConnection);")
                 || source[..at].ends_with('"')
@@ -7407,6 +7427,16 @@ fn a_push_that_does_not_speak_for_the_tab_never_reports_an_empty_slot() {
                 );
                 continue;
             }
+            if is_editor && toolbar_map_range.contains(&at) {
+                toolbar_arms += 1;
+                assert!(
+                    compact_for_pattern(arm)
+                        .contains("Self::retained_action_session_gone_message(pooled_db_session)"),
+                    "the toolbar action REPORTS the session — gone, or never there — instead of \
+                     going silent or blaming a lock: {arm}"
+                );
+                continue;
+            }
             arms += 1;
             assert!(
                 arm.contains("SkippedOtherConnection"),
@@ -7414,6 +7444,10 @@ fn a_push_that_does_not_speak_for_the_tab_never_reports_an_empty_slot() {
             );
         }
     }
+    assert_eq!(
+        toolbar_arms, 1,
+        "the toolbar action maps the door's refusal exactly once, in its shared message fn"
+    );
     assert_eq!(
         arms, 4,
         "all four per-tab pushes map the door's refusal (auto-commit, transaction mode ×2 \
@@ -7452,27 +7486,50 @@ fn a_push_that_does_not_speak_for_the_tab_never_reports_an_empty_slot() {
     );
 
     // The door folds "busy" and "cannot be read at all" into ONE refusal, and
-    // this road is the only one that must keep them apart: a busy connection
-    // refuses (ask again), a DOWN one reports the loss and lets the tab close —
-    // refusing there is what round 44's arm exists to prevent. So the road asks
-    // the connection, with the same predicate that arm used.
+    // only the two SESSION-ENDING roads must keep them apart: a busy connection
+    // refuses (ask again), a DOWN one means the session is gone — the close
+    // prompt reports it and lets the tab close (refusing there is what round
+    // 44's arm exists to prevent), the toolbar reports it as the action's
+    // answer. The predicate has ONE spelling, in the shared classifier both
+    // roads ask.
+    let classifier = editor
+        .find("    fn unreachable_connection_is_gone(")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the shared busy-vs-down classifier should exist");
+    let classifier = compact_for_pattern(classifier);
     assert!(
-        compact_close_road.contains("Some(conn_guard)ifconn_guard.pool_session_context().is_err()"),
-        "the `Unreachable` arm must tell a DOWN connection from a busy one, or a down \
-         connection's tabs cannot be closed: {close_road}"
+        classifier.contains("Some(conn_guard)ifconn_guard.pool_session_context().is_err()"),
+        "the classifier must tell a DOWN connection from a busy one, or a down connection's \
+         tabs cannot be closed: {classifier}"
     );
-    // ...and only CLASSIFY. A second resolution here would be a second road to
-    // the take, which is what having one door is for.
+    // ...and only CLASSIFY, with a NON-BLOCKING try-lock. A second resolution
+    // here would be a second road to the take, which is what having one door is
+    // for.
     assert_eq!(
-        compact_close_road
-            .matches("crate::db::try_lock_connection(&connection)")
+        classifier
+            .matches("crate::db::try_lock_connection(connection)")
             .count(),
         1,
-        "the classifier's try-lock appears once"
+        "the classifier's try-lock appears once, inside it"
     );
+    for (label, road) in [
+        ("close prompt", &compact_close_road),
+        ("toolbar mapping", &compact_for_pattern(toolbar_map)),
+    ] {
+        assert!(
+            !road.contains("try_lock_connection("),
+            "{label} asks the shared classifier instead of spelling the try-lock itself"
+        );
+        assert_eq!(
+            road.matches("Self::unreachable_connection_is_gone(")
+                .count(),
+            1,
+            "{label} asks the classifier exactly once"
+        );
+    }
     let classifier_at = compact_close_road
-        .find("crate::db::try_lock_connection(&connection)")
-        .expect("the classifier should exist");
+        .find("Self::unreachable_connection_is_gone(")
+        .expect("the classifier call should exist");
     let door_at = compact_close_road
         .find("begin_retained_session_action(")
         .expect("the door should exist");
@@ -7481,13 +7538,27 @@ fn a_push_that_does_not_speak_for_the_tab_never_reports_an_empty_slot() {
         "it runs only AFTER the door has refused — never as a way of resolving the identity"
     );
 
+    // The identity half of the door — the one every road's confirm goes
+    // through, the toolbar action's included — records the refusal, because
+    // nothing else on these roads leaves a trace.
+    let confirm_start = execution
+        .find("    pub(super) fn confirm_retained_session_connection(")
+        .expect("the door's identity half should exist");
+    let confirm = slice_to_end_of_fn(&execution, confirm_start);
+    assert!(
+        confirm.contains("log_warning("),
+        "the confirm records the refusal, because nothing else on this road leaves a trace: \
+         {confirm}"
+    );
+    // And the door is the confirm plus a row — not a second spelling of the
+    // comparison.
     let door_start = execution
         .find("    pub(super) fn begin_retained_session_action(")
         .expect("the one door should exist");
     let door = slice_to_end_of_fn(&execution, door_start);
     assert!(
-        door.contains("log_warning("),
-        "the door records the refusal, because nothing else on this road leaves a trace: {door}"
+        door.contains("Self::confirm_retained_session_connection(shared_connection"),
+        "the door resolves its identity through the confirm: {door}"
     );
 }
 
@@ -14962,27 +15033,90 @@ fn every_action_on_a_retained_session_says_which_connection_it_is_on() {
         );
     }
 
-    // The same rule, on the road that resolves the row ITSELF because it really
-    // does already hold the connection: the Oracle toolbar COMMIT/ROLLBACK,
-    // which is handed a `ConnectionLockGuard` on its own worker thread. It used
-    // to write `.unwrap_or_default()` — the spelling the ban above cannot see —
-    // and then published a canceler over the tab's session from a blank
-    // `ConnectionInfo`, on the very button the user presses to keep their work.
-    let road = "    fn run_transaction_action(\n        &self,\n        mut conn_guard";
-    let body = editor
-        .find(road)
+    // The same rule, on the toolbar COMMIT/ROLLBACK — the LAST session road
+    // that was on the connection mutex. It used to hold a
+    // `ConnectionLockGuard` at two gates (the FLTK-thread operation snapshot
+    // and the worker), so a NEIGHBOUR tab's statement, an Oracle explain plan
+    // or a metadata load refused the button the user presses to KEEP their
+    // work, with "Connection is busy" — while the COMMIT itself runs on this
+    // tab's own pooled session and every backend released the guard before the
+    // wire call. Now the road confirms its identity lock-free at BOTH ends
+    // (the same check the door makes), the take publishes the session canceler
+    // under the OPERATION's own row, and the `ConnectionInfo` comes from the
+    // confirmed context — never a lock, never a default.
+    let spawn_road = editor
+        .find("    fn spawn_tracked_transaction_action(")
         .map(|offset| slice_to_end_of_fn(&editor, offset))
-        .expect("the Oracle toolbar transaction action should exist");
-    let body = compact_for_pattern(body);
+        .expect("the toolbar transaction road should exist");
+    let spawn_road = compact_for_pattern(spawn_road);
+    assert_eq!(
+        spawn_road
+            .matches("Self::confirm_retained_session_connection(")
+            .count(),
+        1,
+        "the plan confirms the identity lock-free (the worker's own confirm is in the closure, \
+         spelled with the widget's name)"
+    );
+    assert_eq!(
+        spawn_road
+            .matches("SqlEditorWidget::confirm_retained_session_connection(")
+            .count(),
+        1,
+        "the worker confirms the identity again where the action runs"
+    );
+    for banned in [
+        "try_lock_connection_for_activity(",
+        "try_lock_connection_with_activity(",
+        "try_lock_connection(",
+        "lock_connection(",
+        "ConnectionInfo::default()",
+        ".unwrap_or_default()",
+    ] {
+        assert!(
+            !spawn_road.contains(banned),
+            "the toolbar road must not reach for the connection mutex or a blank identity \
+             (`{banned}`): a neighbour's hold says nothing about this tab's session"
+        );
+    }
     assert!(
-        body.contains("pool_session_context()"),
-        "{road} must resolve the row it publishes from the pool context"
+        spawn_road.contains("resolution_activity:(*operation_activity).clone()"),
+        "the take publishes the session canceler under the OPERATION's own row — the one the \
+         status bar shows and the registry can cancel — not a second row of this road's making"
     );
     assert!(
-        !body.contains(".map(|context|context.connection_info).unwrap_or_default()"),
-        "{road} must REFUSE a connection it cannot name, not carry on under a blank one that can \
-         reach no server"
+        spawn_road.contains("resolution_connection_info:context.connection_info"),
+        "the canceler's `ConnectionInfo` comes from the confirmed context"
     );
+    // ...and the backends can no longer re-derive any of it: a
+    // `run_transaction_action` body that mentions a guard or the pool context
+    // is a backend reaching for the mutex this road was taken off. Anchored on
+    // the two impl blocks so the TRAIT's own declaration (same signature, `;`)
+    // is not sliced.
+    for backend in [
+        "impl TransactionActionBackend for OracleTransactionActionBackend {",
+        "impl TransactionActionBackend for MysqlTransactionActionBackend {",
+    ] {
+        let impl_at = editor
+            .find(backend)
+            .unwrap_or_else(|| panic!("{backend} should exist"));
+        let action_at = editor[impl_at..]
+            .find("fn run_transaction_action(")
+            .map(|offset| impl_at + offset)
+            .unwrap_or_else(|| panic!("{backend} should implement run_transaction_action"));
+        let body = compact_for_pattern(slice_to_end_of_fn(&editor, action_at));
+        for banned in [
+            "conn_guard",
+            "pool_session_context()",
+            "ConnectionInfo::default()",
+            ".unwrap_or_default()",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "{backend}: a transaction-action backend must use the request's CHECKED facts, \
+                 not re-derive them (`{banned}`): {body}"
+            );
+        }
+    }
 
     // And the bind-parameter probe, which HAS a context and reached for the raw
     // helper beside it — the same shape round 4's F8 fixed for the schema

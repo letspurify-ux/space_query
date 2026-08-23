@@ -4711,6 +4711,31 @@ impl SqlEditorWidget {
         db_activity: &str,
         target: crate::db::RetainedSessionTarget,
     ) -> Result<RetainedSessionAction, RetainedSessionRefusal> {
+        let context =
+            Self::confirm_retained_session_connection(shared_connection, db_activity, target)?;
+        Ok(RetainedSessionAction {
+            activity: context.track_operation_activity(db_activity.to_string()),
+            connection_info: context.connection_info,
+        })
+    }
+
+    /// The identity half of [`Self::begin_retained_session_action`]: ONE
+    /// lock-free pool-context read, compared against the target the plan
+    /// carried.
+    ///
+    /// Split from the door because the door also PUBLISHES a row
+    /// (`track_operation_activity`), and one road — the toolbar
+    /// COMMIT/ROLLBACK — already has a row: its operation's own, bound to the
+    /// connection when the operation was published, which is the row the take
+    /// must publish the session canceler under (a second row would be the "row
+    /// that disappears with the lock" shape with the lock removed). That road
+    /// confirms through here and keeps its own row; every other road takes the
+    /// whole door. The comparison itself has exactly one spelling either way.
+    pub(super) fn confirm_retained_session_connection(
+        shared_connection: &crate::db::SharedConnection,
+        db_activity: &str,
+        target: crate::db::RetainedSessionTarget,
+    ) -> Result<crate::db::DbPoolSessionContext, RetainedSessionRefusal> {
         let db_type = target.db_type();
         let context =
             match crate::db::pool_session_context_for_shared_connection(shared_connection, None) {
@@ -4741,10 +4766,7 @@ impl SqlEditorWidget {
             );
             return Err(RetainedSessionRefusal::NotThisConnection);
         }
-        Ok(RetainedSessionAction {
-            activity: context.track_operation_activity(db_activity.to_string()),
-            connection_info: context.connection_info,
-        })
+        Ok(context)
     }
 
     /// A fresh MySQL-family pooled session, held together with the cancel
@@ -37353,7 +37375,22 @@ mod query_execution_cleanup_tests {
                 execution,
                 "pub(super) fn begin_retained_session_action(",
                 METHOD,
+                "confirm_retained_session_connection",
+            ),
+            (
+                execution,
+                "pub(super) fn confirm_retained_session_connection(",
+                METHOD,
                 "pool_session_context_for_shared_connection",
+            ),
+            // The toolbar COMMIT/ROLLBACK plan, which used to take the mutex at
+            // two gates (the FLTK-thread operation snapshot and the worker) and
+            // refused the button for a NEIGHBOUR's hold.
+            (
+                editor,
+                "    fn spawn_tracked_transaction_action(",
+                METHOD,
+                "confirm_retained_session_connection",
             ),
             (
                 db,
@@ -37450,12 +37487,22 @@ mod query_execution_cleanup_tests {
             source[start..end].to_string()
         };
 
-        // The door asks the question, once, for everyone.
+        // The door asks the question, once, for everyone — the comparison lives
+        // in its identity half, which the toolbar action (whose row is its
+        // operation's own) confirms through directly.
+        let confirm = body_of(
+            execution,
+            "pub(super) fn confirm_retained_session_connection(",
+        );
+        assert!(
+            confirm.contains("context.connection_generation != target.connection_generation()")
+                && confirm.contains("RetainedSessionRefusal::NotThisConnection"),
+            "the confirm must refuse a push whose connection has moved on: {confirm}"
+        );
         let door = body_of(execution, "pub(super) fn begin_retained_session_action(");
         assert!(
-            door.contains("context.connection_generation != target.connection_generation()")
-                && door.contains("RetainedSessionRefusal::NotThisConnection"),
-            "the door must refuse a push whose connection has moved on: {door}"
+            door.contains("confirm_retained_session_connection("),
+            "the door resolves its identity through the confirm, not a second spelling: {door}"
         );
 
         for (source, signature) in [

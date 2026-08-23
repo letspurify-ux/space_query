@@ -14,7 +14,7 @@
 //
 // Usage: verify_commit_close_live <thin|oci|mysql|mariadb|all>
 
-use fltk::{app, input::IntInput};
+use fltk::{app, input::IntInput, prelude::*, window::Window};
 use space_query::db::{
     retained_session_state_preflight_decision, ConnectionInfo, DatabaseConnection, DatabaseType,
     OracleDriverMode, RetainedSessionPreflightAction, RetainedSessionPreflightDecision,
@@ -1001,12 +1001,124 @@ fn verify(target: Target) -> Result<bool, String> {
     }
     let _ = h.run("COMMIT");
 
+    // S-BUSY-TOOLBAR: the toolbar COMMIT while a NEIGHBOUR holds the connection
+    // mutex — the same defect one road over. `spawn_tracked_transaction_action`
+    // used to take the mutex at TWO gates (the FLTK-thread operation snapshot's
+    // `try_lock_connection` and the worker's `try_lock_connection_for_activity`),
+    // so the BUTTON the user presses to KEEP their work answered "Connection is
+    // busy" for a hold that says nothing about this tab's session — which the
+    // COMMIT runs on, with every backend releasing the guard before the wire
+    // call anyway. The refusal arrives as a modal alert; the auto-dismiss keeps
+    // a reproduction a scenario failure instead of a hung harness.
+    //
+    // What "fixed" looks like differs by FAMILY, deliberately: Oracle's action
+    // takes the tab's lease directly, so its COMMIT lands WHILE the neighbour
+    // holds the mutex; the MySQL family's action goes through the same
+    // per-statement acquire a typed COMMIT uses, which waits for the mutex at
+    // startup — so it lands after the release, exactly like the statement.
+    // Neither may ALERT, and both must reach the server.
+    println!("  --- toolbar COMMIT while a neighbour holds the connection mutex ---");
+    let v_before = read_v(&mut h)?;
+    let _ = h.run("COMMIT");
+    h.run(target.dml())?;
+    h.report("after DML");
+    let state_before_commit = h.retained_transaction_state();
+    let dismiss_active = Arc::new(AtomicBool::new(true));
+    let alert_seen = Arc::new(AtomicBool::new(false));
+    arm_alert_auto_dismiss(Arc::clone(&dismiss_active), Arc::clone(&alert_seen));
+    let neighbour_shared = Arc::clone(&shared);
+    let neighbour_holding = Arc::new(AtomicBool::new(false));
+    let neighbour_release = Arc::new(AtomicBool::new(false));
+    let holding = Arc::clone(&neighbour_holding);
+    let release = Arc::clone(&neighbour_release);
+    let neighbour = std::thread::spawn(move || {
+        let _guard = neighbour_shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        holding.store(true, Ordering::SeqCst);
+        // BOUNDED, for the same reason as the close-prompt twin above.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    h.pump_until("the neighbour to take the connection mutex", || {
+        neighbour_holding.load(Ordering::SeqCst)
+    })?;
+    h.editor.commit();
+    if target.is_oracle() {
+        // The sharpest half of the fix: the Oracle COMMIT must land while the
+        // neighbour still holds the mutex. A dismissed alert also ends the
+        // wait, so a reproduction reports instead of timing out.
+        h.pump_until(
+            "the toolbar COMMIT to land during the hold (or the refusal to alert)",
+            || {
+                alert_seen.load(Ordering::SeqCst)
+                    || h.retained_transaction_state() != state_before_commit
+            },
+        )?;
+    }
+    neighbour_release.store(true, Ordering::SeqCst);
+    neighbour.join().map_err(|_| "neighbour thread panicked")?;
+    h.pump_until("the toolbar COMMIT worker to finish", || {
+        !h.editor.is_query_running()
+    })?;
+    dismiss_active.store(false, Ordering::SeqCst);
+    if alert_seen.load(Ordering::SeqCst) {
+        println!(
+            ">>> BUG REPRODUCED: the toolbar COMMIT alerted for a mutex hold that says nothing \
+             about this tab's session"
+        );
+        reproduced = true;
+    }
+    // ...and the COMMIT really reached the server: `V + 1` survives a ROLLBACK.
+    let _ = h.run("ROLLBACK");
+    let v_after = read_v(&mut h)?;
+    match (v_before, v_after) {
+        (Some(before), Some(after)) if after == before + 1 => {
+            println!("    OK: the toolbar COMMIT survived a later ROLLBACK (V {before} -> {after})")
+        }
+        (before, after) => {
+            println!(
+                ">>> BUG REPRODUCED: the toolbar COMMIT did not reach the server while a \
+                 neighbour held the mutex (V {before:?} -> {after:?})"
+            );
+            reproduced = true;
+        }
+    }
+    let _ = h.run("COMMIT");
+
     for sql in target.teardown() {
         let _ = h.run(&sql);
     }
     let _ = h.run("COMMIT");
 
     Ok(reproduced)
+}
+
+/// Arm a repeating timeout that closes any modal "Alert" window the app opens,
+/// recording that one was seen.
+///
+/// The busy-refusal the toolbar S-BUSY scenario reproduces arrives as a modal
+/// alert whose nested event loop would swallow the harness pump for good — a
+/// reproduction must surface as a scenario failure, not a hang. The timeout
+/// fires inside the modal loop too, which is what lets the dismissal reach it.
+fn arm_alert_auto_dismiss(active: Arc<AtomicBool>, dismissed: Arc<AtomicBool>) {
+    app::add_timeout3(0.05, move |_| {
+        if !active.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut current = app::first_window().map(|window| unsafe { Window::from_widget(window) });
+        while let Some(mut window) = current {
+            current = app::next_window(&window).map(|next| unsafe { Window::from_widget(next) });
+            if window.shown() && window.label() == "Alert" {
+                println!("    (auto-dismissing an alert the action raised)");
+                dismissed.store(true, Ordering::SeqCst);
+                window.hide();
+            }
+        }
+        arm_alert_auto_dismiss(Arc::clone(&active), Arc::clone(&dismissed));
+    });
 }
 
 /// Kill, from a second raw connection, every session the server reports as

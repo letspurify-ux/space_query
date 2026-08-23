@@ -804,7 +804,7 @@ blocked state keeps the preserved session and lets the statement run on it,
 surfacing problems as ordinary statement errors the user can resolve with
 Commit/Rollback.
 
-### The close prompt resolves its identity lock-free, like the three settings
+### The session-ending roads resolve their identity lock-free, like the three settings
 
 `SqlEditorWidget::run_pooled_session_close_action` runs the prompt's
 Commit/Rollback on the UI thread, on the TAB's own pooled session. It used to
@@ -815,7 +815,39 @@ its statement, an Oracle explain plan, an OCI script after `CONNECT`, a metadata
 load. None of those has anything to do with this tab's session, and the guard was
 released before the take anyway, so it was never providing exclusion either. The
 three per-tab pushes were moved off that mutex for exactly this reason; the
-prompt the user presses to KEEP their work was the road left on it.
+prompt the user presses to KEEP their work was a road left on it — and the
+toolbar COMMIT/ROLLBACK (`spawn_tracked_transaction_action`) was the other,
+found one round later: it held the mutex at TWO gates (the FLTK-thread
+operation snapshot and its worker's `try_lock_connection_for_activity`), so the
+button answered "Connection is busy" for the same foreign holds, while every
+backend released the guard before the wire call.
+
+The toolbar road now confirms the same identity at BOTH ends —
+`confirm_retained_session_connection`, the door's identity half, at the plan
+and again on the worker just before the take (checked three times in all,
+written nowhere) — and carries what the backends used to re-derive from the
+guard in the request itself: the exact db type and generation from the
+`RetainedSessionTarget`, the `ConnectionInfo` from the confirmed context, the
+tab's effective auto-commit and transaction mode resolved at the plan from the
+context's connection defaults (constants of the generation, so a cached context
+serves them exactly), and the OPERATION's own activity row for the take's
+canceler — the row the status bar shows and the registry can cancel, never a
+second row of the road's making. Its refusals have one spelling
+(`retained_action_refusal_message`): a retired incarnation or a down connection
+answers about the SESSION — the loss when the slot held one, its plain absence
+when it did not — and only a genuinely busy-or-in-transition connection answers
+"busy", through the shared `unreachable_connection_is_gone` classifier both
+session-ending roads ask.
+
+One family difference is deliberate and matches the typed statement: the Oracle
+action takes the tab's lease directly, so its COMMIT lands while a neighbour
+still holds the mutex, while the MySQL family's action goes through the same
+per-statement acquire a typed `COMMIT` uses
+(`acquire_mysql_pooled_session`, whose startup takes the connection lock), so
+it WAITS there exactly as the statement would — bounded by the neighbour's own
+operation — and never refuses. `verify_commit_close_live`'s toolbar S-BUSY
+scenario asserts both shapes: no alert on any backend, the commit reaching the
+server on all four, and on Oracle that it lands during the hold.
 
 It now asks the runtime for the identity
 (`ConnectionRuntime::retained_session_target`) and comes through the same door
