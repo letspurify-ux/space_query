@@ -973,10 +973,16 @@ fn mysql_lazy_select_preserves_full_retained_session_state() {
         helper.contains("if !prior_retained_state.requires_physical_session_preservation()"),
         "MySQL lazy SELECT must not reapply autocommit while a retained transaction, lock, or transaction-mode override exists"
     );
+    // The retain road is named `..._with_state_and_scope` and no longer
+    // `..._if_current_with_state_and_scope`: it stopped taking the connection
+    // mutex to name the family (the caller carries it now), and the currency
+    // question it asked on the way is `DbSessionLeaseSlot::filing_decision`'s,
+    // asked under the slot lock. What this pins is unchanged — the cleanup must
+    // hand the session back through the road that carries BOTH the state and
+    // the owning tab's scope.
     assert!(
         helper.contains("Self::mysql_retained_session_state_after_statement(")
-            && helper
-                .contains("Self::retain_mysql_pooled_session_if_current_with_state_and_scope(")
+            && helper.contains("Self::retain_mysql_pooled_session_with_state_and_scope(")
             && helper.contains("execution_scope.clone()"),
         "MySQL lazy SELECT cleanup must store RetainedSessionState with the owning tab scope so lock metadata survives"
     );
@@ -2476,10 +2482,191 @@ fn every_per_tab_setting_builds_its_retained_plan_without_the_connection_mutex()
     assert!(
         target.contains("ConnectionRuntimeState::Connected")
             && target.contains("self.connection_generation()")
-            && target.contains("self.pool_context_epoch()")
             && target.contains("self.sanitized_info().db_type"),
         "and the refusals it keeps — not connected, connecting, failed, transitioning — are \
          asked of the published state rather than of whoever holds the mutex: {target}"
+    );
+    // And it answers ONLY facts that are checked. The pool-context epoch used to
+    // travel with them and was the one value a push WROTE — onto the tab's
+    // session, as the stamp the next execution's take compares. A stale
+    // generation refuses a push; a stale stamp locked the tab out of executing.
+    assert!(
+        !target.contains("pool_context_epoch"),
+        "the identity a per-tab push carries must hold no value that gets written onto the \
+         session — see `RetainedSessionTarget`: {target}"
+    );
+}
+
+/// The runtime's pool-context epoch is a CACHE that only a few roads refresh,
+/// so it may name an epoch the connection has already left. That is safe for a
+/// fact nothing decides on, and only for that.
+///
+/// It stopped being one: `retained_session_target` read it, and the three
+/// per-tab pushes then stamped the tab's retained session with it. The stamp is
+/// what the next execution's take compares
+/// (`DbSessionLeaseEntry::matches_context`), and a work-carrying session whose
+/// stamp does not match is answered `BlockedContextMismatch` — "Commit,
+/// rollback, or discard it first" — so a cache nobody had kept current could
+/// refuse the user's next Execute.
+#[test]
+fn the_cached_pool_context_epoch_decides_nothing() {
+    let runtime = read_source("src/db/runtime.rs");
+    let production = runtime
+        .split("#[cfg(test)]")
+        .next()
+        .expect("runtime.rs should have production code before its tests");
+
+    let self_reads = production
+        .lines()
+        .filter(|line| line.contains("self.pool_context_epoch()"))
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    assert!(
+        self_reads.is_empty(),
+        "nothing the runtime itself answers may be computed from the cache — \
+         `retained_session_target` read it here, and the per-tab pushes stamped the tab's \
+         session with what it said: {self_reads:?}"
+    );
+
+    // Its one consumer, named: `ExecutionOrigin` payload for query history and
+    // result routing, where both sides of any comparison come from this same
+    // cache and staleness therefore cancels out.
+    let origin_reads = production
+        .lines()
+        .filter(|line| line.contains("runtime.pool_context_epoch()"))
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        origin_reads,
+        vec!["pool_context_epoch: runtime.pool_context_epoch(),"],
+        "...and that one consumer is `TabConnectionSnapshot::execution_origin`: {origin_reads:?}"
+    );
+
+    // And nowhere else in the app reaches a runtime for it.
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for file in collect_rust_files(&src) {
+        if file.ends_with("db/runtime.rs") {
+            continue;
+        }
+        let content = fs::read_to_string(&file).expect("read source");
+        assert!(
+            !content.contains("runtime.pool_context_epoch()")
+                && !content.contains("runtime().pool_context_epoch()"),
+            "{} asks a connection runtime for its cached pool-context epoch; the live one comes \
+             from a connection guard or a pool context",
+            file.display()
+        );
+    }
+}
+
+/// No per-tab push may re-stamp the tab's session with a pool-context epoch it
+/// did not FIND on that session.
+///
+/// The three pushes — auto-commit, transaction mode, scope — change a SESSION
+/// setting or a TAB's scope. None of them moves the connection's pool context,
+/// so the stamp the take found is still the true one and handing it back
+/// unchanged is the whole rule. They used to hand back the epoch their PLAN was
+/// built with instead: a value read from the runtime's cache, which nothing
+/// keeps current, written onto the session as the fact the next execution's take
+/// refuses on.
+///
+/// `RetainedSessionTarget` no longer carries an epoch, so the compiler refuses
+/// the old spelling. This refuses the next one — reading a LIVE epoch at the
+/// door and stamping that would be just as wrong, in the other direction: it
+/// would wave a genuinely out-of-context session through.
+#[test]
+fn no_per_tab_push_restamps_the_session_with_an_epoch_it_did_not_find() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+
+    for (source, signature) in [
+        (
+            &execution,
+            "pub(super) fn apply_mysql_autocommit_to_reusable_pooled_session(",
+        ),
+        (
+            &execution,
+            "pub(super) fn apply_oracle_transaction_mode_to_reusable_pooled_session(",
+        ),
+        (
+            &execution,
+            "pub(super) fn apply_mysql_transaction_mode_to_reusable_pooled_session(",
+        ),
+        (&editor, "pub fn apply_current_scope_to_retained_session("),
+    ] {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must exist"));
+        let body = slice_to_end_of_fn(source, start);
+        // Vacuity guard: the extraction must reach the take, or the pins below
+        // hold about nothing.
+        assert!(
+            body.contains("take_reusable_lease_for_context_update("),
+            "{signature} body was not extracted whole"
+        );
+        // Comments are stripped: these bodies explain the rule they obey, and a
+        // rule its own explanation trips is unwritable.
+        let code = body
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(comment) => &line[..comment],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("restore_into_moved_pool_context"),
+            "{signature} must not re-stamp the session: it did not move the connection's pool \
+             context"
+        );
+        for line in code
+            .lines()
+            .filter(|line| line.contains("pool_context_epoch"))
+        {
+            assert!(
+                line.contains("taken_pool_context_epoch"),
+                "{signature} may only hand back the stamp the take found: {line}"
+            );
+        }
+    }
+}
+
+/// Both Oracle drivers publish a refreshed pool-context epoch the same way.
+///
+/// They had drifted, and in a shape that hides: thin published from OUTSIDE its
+/// `if/else`, so both of its arms were covered, while OCI published from INSIDE
+/// the schema-sync arm — so a `DROP USER` of the tracked schema refreshed the
+/// batch's own epoch and left the runtime naming the one before it, on one
+/// driver and not the other, for the same statement. One helper, one call per
+/// road, is what stops the two from disagreeing again.
+#[test]
+fn both_oracle_drivers_publish_a_refreshed_pool_context_epoch_through_one_door() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    let helper = "fn note_refreshed_pool_context_epoch_on_runtime(";
+    assert!(
+        execution.contains(helper),
+        "the one publication door must exist"
+    );
+
+    let direct = execution
+        .lines()
+        .filter(|line| line.contains("update_connection_context("))
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        direct,
+        vec!["runtime.update_connection_context(connection_generation, refreshed_epoch);"],
+        "no road may tell the runtime about a refreshed epoch except through that door: {direct:?}"
+    );
+
+    let calls = execution
+        .matches("note_refreshed_pool_context_epoch_on_runtime(")
+        .count();
+    assert_eq!(
+        calls, 3,
+        "the definition plus exactly one call per Oracle road (OCI, thin) — a road with two \
+         calls is a road with two arms that can drift apart again"
     );
 }
 
@@ -6771,6 +6958,218 @@ fn the_three_per_tab_settings_refuse_on_work_in_the_same_words() {
     );
 }
 
+/// A control that offers a WRITE asks every half of "would it be refused".
+///
+/// Two independent settings can refuse a write before it reaches the server:
+/// the connection profile's `read_only` switch, and the ACCESS half of the
+/// transaction mode the statement will be judged under — which a tab inherits
+/// from the profile's `default_transaction_access_mode` when it has pinned
+/// nothing. They are not linked, so asking one is not asking the other.
+///
+/// The object browser's card has held both halves apart in `CardWriteRefusal`
+/// since the round that found the menus offering Drop, Truncate and Import on a
+/// pinned tab. The result-grid edit checkbox asked only the connection — and its
+/// own comment says why that is not enough: it hides the checkbox "rather than
+/// letting the user stage edits and meet the refusal at Save", which is exactly
+/// what a READ ONLY tab got, because the save goes out through
+/// `execute_sql_text` like any typed `UPDATE`.
+#[test]
+fn a_control_that_offers_a_write_asks_every_half_of_the_refusal() {
+    let main_window = read_source("src/ui/main_window.rs");
+
+    let answer = main_window
+        .find("    fn active_tab_write_would_be_refused(")
+        .map(|at| slice_to_end_of_fn(&main_window, at))
+        .expect("the one answer for the write controls should exist");
+    assert!(
+        answer.contains("active_connection_is_read_only()")
+            && answer.contains("transaction_control_state()")
+            && answer.contains("active_tab_is_pinned_read_only()"),
+        "it must ask the connection flag, the EFFECTIVE mode, and — when the connection cannot \
+         be read — the tab's own pin, which can only raise the refusal: {answer}"
+    );
+
+    let grid = main_window
+        .find("    fn refresh_result_edit_controls(")
+        .map(|at| slice_to_end_of_fn(&main_window, at))
+        .expect("the result-grid edit control refresh should exist");
+    assert!(
+        grid.contains("!self.active_tab_write_would_be_refused()"),
+        "the result-grid edit checkbox asks the whole answer, not the connection half: {grid}"
+    );
+    assert!(
+        !grid.contains("!self.active_connection_is_read_only()"),
+        "...and not the connection half on its own"
+    );
+
+    // The pin half has ONE spelling, so the browser card and the fallback tier
+    // cannot drift apart.
+    assert_eq!(
+        main_window
+            .matches("tab_transaction_mode_override_value()\n            .is_some_and(|mode| mode.access_mode == TransactionAccessMode::ReadOnly)")
+            .count(),
+        1,
+        "the tab's READ ONLY pin is read in one place (`active_tab_is_pinned_read_only`)"
+    );
+}
+
+/// A lease the road did not expect leaves through a door, and says what it cost.
+///
+/// Once a take succeeds the tab's slot is EMPTY, so anything the road then
+/// declines to use is a session that is gone. Three roads — the Oracle toolbar
+/// COMMIT/ROLLBACK and both backends' close actions — answered a lease of the
+/// wrong family with a sentence about the TYPE and let the value drop: on the
+/// MySQL family that hands a live server session back to its pool with the
+/// user's open transaction still on it and nothing left in the app able to name
+/// it. Two more answered "the lease is gone" with
+/// `RetainedSessionState::default()`, which does not mean "I do not know" but
+/// "and nothing was lost" — asserted where the road knows least, on the prompt
+/// the user pressed to keep their work.
+///
+/// The execution roads have answered both since the take gained its third
+/// answer. These are now the same rule.
+#[test]
+fn a_lease_the_road_did_not_expect_is_closed_and_reported_not_dropped() {
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+
+    let door = "unexpected_retained_session_family_message(";
+    let door_body = editor
+        .find(&format!("pub(crate) fn {door}"))
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the one answer for a foreign lease should exist");
+    assert!(
+        door_body.contains("lease.discard_physical(log_context)")
+            && door_body.contains("RETAINED_SESSION_LOST_WITH_WORK"),
+        "it must CLOSE the session and say what went with it: {door_body}"
+    );
+    assert_eq!(
+        editor.matches(door).count(),
+        4,
+        "the definition plus the three roads that can meet a foreign lease (the Oracle \
+         toolbar action and both backends' close actions)"
+    );
+
+    // And the mismatch sentence lives only inside that answer, so no road can
+    // say it while dropping the session on the floor.
+    assert_eq!(
+        editor.matches("retained session but found").count(),
+        1,
+        "the type mismatch is worded once, in the answer that also closes the session"
+    );
+
+    // A `default()` retained state is a CLAIM about the user's work. Where the
+    // road holds the take's own answer, it must use it.
+    for road in [
+        "    fn run_pooled_session_close_action(",
+        "    fn run_transaction_action(",
+    ] {
+        let mut from = 0usize;
+        while let Some(at) = editor[from..].find(road) {
+            let start = from + at;
+            from = start + 1;
+            let body = slice_to_end_of_fn(&editor, start);
+            assert!(
+                !body.contains(
+                    "retained_session_unreachable_message(RetainedSessionState::default())"
+                ) && !body
+                    .contains("required_session_gone_message(RetainedSessionState::default())"),
+                "{road} must report the state the take FOUND, not a default that claims nothing \
+                 was lost"
+            );
+        }
+    }
+}
+
+/// A push that does not speak for the tab's slot never reports an empty slot.
+///
+/// "There is no connection to push onto" and "the tab holds no session" are
+/// opposite facts, and all four roads that meet the first used to answer with
+/// the second (`NoSession`) — or, on the scope push alone, with an alerting
+/// `FailedRestored("Not connected")` for the very same condition. It matters
+/// because of what the refusal BUYS: `take_reusable_lease_for_context_update`
+/// CLOSES a lease whose generation does not match, so refusing to reach the
+/// slot is the whole point, and saying the slot was empty describes the
+/// opposite of what happened.
+///
+/// It does not alert either way — the tab's setting is recorded and its next
+/// execution states it to whatever session the tab then holds — so the record
+/// is the door's log line, which is asked for here too.
+#[test]
+fn a_push_that_does_not_speak_for_the_tab_never_reports_an_empty_slot() {
+    let main_window = read_source("src/ui/main_window.rs");
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    let start = main_window
+        .find("    fn nothing_to_push_onto(")
+        .expect("the plan's no-connection answer should exist");
+    let body = slice_to_end_of_fn(&main_window, start);
+    assert!(
+        body.contains("RetainedSessionMutationOutcome::SkippedOtherConnection")
+            && !body.contains("RetainedSessionMutationOutcome::NoSession"),
+        "a runtime that is not up means the push has no connection to speak for, not that the \
+         tab's slot is empty: {body}"
+    );
+
+    // The editor's own copy of that question, on all three pushes.
+    for signature in [
+        "    pub fn apply_auto_commit_to_retained_session(",
+        "    pub fn apply_transaction_mode_to_retained_session(",
+        "    pub fn apply_current_scope_to_retained_session(",
+    ] {
+        let start = editor
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must exist"));
+        let body = slice_to_end_of_fn(&editor, start);
+        let refusal = body
+            .find("let Some(connection) = self.bound_connection() else {")
+            .map(|at| &body[at..(at + 240).min(body.len())])
+            .unwrap_or_else(|| panic!("{signature} must refuse when the tab is on no connection"));
+        assert!(
+            refusal.contains("SkippedOtherConnection"),
+            "{signature} answers the no-connection case in the same words as its siblings: \
+             {refusal}"
+        );
+    }
+
+    // And every mapping of the door's refusal, on all four roads.
+    let mut arms = 0usize;
+    for source in [&editor, &execution] {
+        let mut from = 0usize;
+        while let Some(offset) = source[from..].find("RetainedSessionRefusal::NotThisConnection") {
+            let at = from + offset;
+            from = at + 1;
+            let arm = &source[at..(at + 260).min(source.len())];
+            // Not mappings: the door's own `return`, and the source-level guards
+            // in this crate that quote the name inside a string literal.
+            if arm.starts_with("RetainedSessionRefusal::NotThisConnection);")
+                || source[..at].ends_with('"')
+            {
+                continue;
+            }
+            arms += 1;
+            assert!(
+                arm.contains("SkippedOtherConnection"),
+                "a `NotThisConnection` refusal must answer that the slot was left alone: {arm}"
+            );
+        }
+    }
+    assert_eq!(
+        arms, 4,
+        "all four per-tab pushes map the door's refusal (auto-commit, transaction mode ×2 \
+         backends, scope)"
+    );
+
+    let door_start = execution
+        .find("    pub(super) fn begin_retained_session_action(")
+        .expect("the one door should exist");
+    let door = slice_to_end_of_fn(&execution, door_start);
+    assert!(
+        door.contains("log_warning("),
+        "the door records the refusal, because nothing else on this road leaves a trace: {door}"
+    );
+}
+
 /// The retained-session option-change rule has ONE spelling.
 ///
 /// The rule is two steps — the backend's own "this pending one-shot can simply
@@ -6817,6 +7216,49 @@ fn the_retained_option_change_rule_has_one_spelling() {
             ),
         "the one gate must hold both steps of the rule"
     );
+
+    // And every road that asks it names the TAB's family rather than a literal.
+    //
+    // `DatabaseType::Oracle` is allowed and the MySQL family's two are not,
+    // because that is the actual rule: Oracle is one db type covering both its
+    // drivers, while `is_same_type_as` holds MySQL and MariaDB apart everywhere
+    // else in the app. The MySQL-family transaction-mode push reached this gate
+    // through a helper that named `DatabaseType::MySQL` outright, so a MariaDB
+    // tab's mode pick — and every MySQL-family statement road with it — was
+    // judged by MySQL's rule. The two answers agree today only because
+    // `can_replace_retained_transaction_mode` is the shared `MysqlBackend`'s;
+    // the classifier that produces the effects those roads pass in is already
+    // per-db-type (`statement_session_post_processor_for`).
+    for file in [
+        "src/ui/main_window.rs",
+        "src/ui/sql_editor/mod.rs",
+        "src/ui/sql_editor/execution.rs",
+    ] {
+        let source = read_source(file);
+        let mut from = 0usize;
+        while let Some(offset) =
+            source[from..].find("ensure_retained_session_option_change_allowed(")
+        {
+            let at = from + offset;
+            from = at + 1;
+            let before = &source[..at];
+            // The DB layer's own two-argument rule, and the definition itself.
+            if before.ends_with("crate::db::DatabaseConnection::")
+                || before.ends_with("pub(crate) fn ")
+                || before.ends_with("fn ")
+            {
+                continue;
+            }
+            let arguments = &source[at..(at + 160).min(source.len())];
+            assert!(
+                !arguments.contains("DatabaseType::MySQL")
+                    && !arguments.contains("DatabaseType::MariaDB"),
+                "{file}:{} names a MySQL-family db type at the option-change gate; the family has \
+                 two and the road knows which one it is on: {arguments}",
+                before.matches('\n').count() + 1
+            );
+        }
+    }
 }
 
 /// The thin batch tells a pending cancel about SERVER failures only.
@@ -7333,10 +7775,25 @@ fn a_tabs_read_only_pin_cannot_be_erased_from_its_browser_card() {
         let neighbourhood =
             sync_lines[index.saturating_sub(8)..(index + 8).min(sync_lines.len())].join("\n");
         assert!(
-            neighbourhood.contains("TransactionAccessMode::ReadOnly"),
+            neighbourhood.contains("TransactionAccessMode::ReadOnly")
+                // Or through the ONE named reading of the pin. The predicate was
+                // extracted when a second reader appeared (the result-grid edit
+                // control, which asked only the connection half), and its body
+                // is pinned below — so this still checks the substance and not
+                // just the spelling.
+                || neighbourhood.contains("active_tab_is_pinned_read_only()"),
             "with the tab's own access mode"
         );
     }
+    let pin_reader = main_window
+        .find("    fn active_tab_is_pinned_read_only(")
+        .map(|at| slice_to_end_of_fn(&main_window, at))
+        .expect("the one named reading of the tab's pin should exist");
+    assert!(
+        pin_reader.contains("tab_transaction_mode_override_value()")
+            && pin_reader.contains("mode.access_mode == TransactionAccessMode::ReadOnly"),
+        "and that reading is the tab's OWN pin, access half: {pin_reader}"
+    );
     let push = sync_body
         .find("set_tab_mode_refuses_writes(")
         .expect("the sync must tell the tab's card about the pin");
@@ -10906,7 +11363,7 @@ fn a_lazy_fetch_gives_up_its_force_target_before_it_gives_back_its_session() {
         (
             "fn start_mysql_lazy_select(",
             &[
-                "Self::retain_mysql_pooled_session_if_current_with_state_and_scope(",
+                "Self::retain_mysql_pooled_session_with_state_and_scope(",
                 "Self::discard_mysql_pooled_connection(",
             ][..],
         ),
@@ -10919,6 +11376,15 @@ fn a_lazy_fetch_gives_up_its_force_target_before_it_gives_back_its_session() {
             .map_or(execution.len(), |offset| start + worker.len() + offset);
         let body = &execution[start..end];
         for release in releases {
+            // A release this scan cannot FIND is a release it cannot judge, and
+            // the loop below would pass about nothing. It nearly did: the MySQL
+            // road's retain was renamed (`..._if_current_with_state_and_scope`
+            // → `..._with_state_and_scope`, when it stopped taking the
+            // connection mutex) and this guard went silently green.
+            assert!(
+                body.contains(release),
+                "{worker} no longer names `{release}` — the scan below would hold about nothing"
+            );
             for (offset, _) in body.match_indices(release) {
                 let before = &body[..offset];
                 // TWO doors, and both end the reach first — `discard_lazy_fetch_session`
@@ -14161,6 +14627,34 @@ fn every_action_on_a_retained_session_says_which_connection_it_is_on() {
         assert!(
             !compact_for_pattern(body).contains("ConnectionInfo::default()"),
             "{road} must not fall back to a connection info that can reach no server"
+        );
+    }
+
+    // The same rule, on the two roads that resolve the row THEMSELVES because
+    // they already hold the connection: the Oracle toolbar COMMIT/ROLLBACK and
+    // the close prompt's. Both used to write `.unwrap_or_default()` — the
+    // spelling the ban above cannot see — and both then published a canceler
+    // over the tab's session from a blank `ConnectionInfo`, on the very buttons
+    // the user presses to keep their work.
+    for (source, road) in [
+        (
+            &editor,
+            "    fn run_transaction_action(\n        &self,\n        mut conn_guard",
+        ),
+        (&editor, "    fn run_pooled_session_close_action("),
+    ] {
+        let body = source
+            .find(road)
+            .map(|offset| slice_to_end_of_fn(source, offset))
+            .unwrap_or_else(|| panic!("{road} should exist"));
+        let body = compact_for_pattern(body);
+        assert!(
+            body.contains("pool_session_context()"),
+            "{road} must resolve the row it publishes from the pool context"
+        );
+        assert!(
+            !body.contains(".map(|context|context.connection_info).unwrap_or_default()"),
+            "{road} must REFUSE a connection it cannot name, not carry on under a blank one              that can reach no server"
         );
     }
 

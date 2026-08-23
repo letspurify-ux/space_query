@@ -1966,6 +1966,28 @@ pub enum RetainedSessionMutationOutcome {
     /// Neither alerts the user, so nothing was ever wrong on screen — this is
     /// the log and the next reader.
     NotApplicable,
+    /// The tab is on no connection, or on an incarnation this push does not
+    /// speak for, so its session slot was NOT TOUCHED.
+    ///
+    /// Distinct from [`Self::NoSession`] for the same reason
+    /// [`Self::NotApplicable`] is: the slot may well hold a session, and
+    /// `NoSession` says it was empty. On this road the difference is what the
+    /// refusal bought — `take_reusable_lease_for_context_update` CLOSES a lease
+    /// whose generation does not match, so "I would not reach it" and "there
+    /// was nothing to reach" are opposite facts about the same slot, and the
+    /// three pushes said the second about the first.
+    ///
+    /// It does not alert, and that is deliberate: the tab's setting is already
+    /// recorded, and the next execution states it to whatever session the tab
+    /// then holds — the scope before every statement on all four backends
+    /// (`prepare_mysql_pooled_session_database` moves even a work-carrying
+    /// session's database, and both Oracle drivers re-assert the tab's schema),
+    /// and auto-commit and the transaction mode in each batch's session setup,
+    /// which is reached whenever the option gate would have let the push
+    /// through. So nothing is left wrong on screen. What was missing was the
+    /// RECORD, and `SqlEditorWidget::begin_retained_session_action` writes it
+    /// where the refusal is actually decided.
+    SkippedOtherConnection,
     Applied,
     AppliedWithWarning(String),
     DiscardedBecauseStale,
@@ -1981,9 +2003,11 @@ impl RetainedSessionMutationOutcome {
             | Self::BlockedRequiresResolution(message)
             | Self::FailedRestored(message)
             | Self::FailedDiscarded(message) => Some(message.as_str()),
-            Self::NoSession | Self::NotApplicable | Self::Applied | Self::DiscardedBecauseStale => {
-                None
-            }
+            Self::NoSession
+            | Self::NotApplicable
+            | Self::SkippedOtherConnection
+            | Self::Applied
+            | Self::DiscardedBecauseStale => None,
         }
     }
 
@@ -2026,13 +2050,17 @@ impl RetainedSessionMutationOutcome {
     }
 
     pub fn should_alert_user(&self) -> bool {
-        !matches!(self, Self::NoSession | Self::NotApplicable | Self::Applied)
+        !matches!(
+            self,
+            Self::NoSession | Self::NotApplicable | Self::SkippedOtherConnection | Self::Applied
+        )
     }
 
     pub fn status_label(&self) -> &'static str {
         match self {
             Self::NoSession => "no retained session",
             Self::NotApplicable => "nothing to apply to this session",
+            Self::SkippedOtherConnection => "not this connection's session",
             Self::Applied => "applied",
             Self::AppliedWithWarning(_) => "applied with cleanup warning",
             Self::DiscardedBecauseStale => "discarded stale retained session",
@@ -2416,11 +2444,30 @@ impl PooledSessionLeaseSnapshot {
 /// reaches the take, and answers `NotThisConnection` (touch nothing) when it has
 /// moved.
 ///
-/// The pool-context EPOCH here is only the stamp the session is re-filed under
-/// (`file_into_slot` compares it to decide whether the slot already holds this
-/// same entry). It refuses nothing — `filing_decision` refuses, on the
-/// generation — so it is carried rather than re-read for the same reason the
-/// rest is.
+/// **Every fact here is CHECKED, and none is written.** That is the invariant,
+/// and it is what makes carrying a possibly-stale value safe at all: `db_type`
+/// and `connection_generation` are matched at the door and again by the take, so
+/// a stale one REFUSES the push instead of acting on it.
+///
+/// The pool-context EPOCH used to travel here too, and it was the one value that
+/// was written rather than checked — the pushes handed it to
+/// `TakenDbSessionLease::restore_into_moved_pool_context`, which STAMPS the tab's
+/// session with it. A stamp is not a matching criterion: the NEXT execution's
+/// take compares it (`DbSessionLeaseEntry::matches_context`) and answers
+/// `BlockedContextMismatch` for a session that carries work, which the user
+/// meets as "Commit, rollback, or discard it first". So a plan-time epoch that
+/// had gone stale did not refuse the push — it locked the tab out of executing,
+/// the same lockout the execution road was fixed for once already (its in-batch
+/// epoch refresh), reached through a different door. The doc that made it look
+/// free read only `file_into_slot`, which does no more than stamp; it is the
+/// later READER of the stamp that refuses.
+///
+/// Nothing carries it now, and no push needs it: a per-tab push does not move
+/// the connection's pool context — auto-commit and the transaction mode are
+/// SESSION settings, and a tab's scope is the TAB's, not the connection's — so
+/// the stamp the take found is still the true one and every push hands it back
+/// unchanged ([`TakenDbSessionLease::restore`] and its siblings, which keep the
+/// take's own epoch).
 ///
 /// It carries only the facts ALL THREE settings need. A value that also held,
 /// say, the resolved default isolation would be one two of its three users had
@@ -2431,15 +2478,13 @@ impl PooledSessionLeaseSnapshot {
 pub struct RetainedSessionTarget {
     db_type: DatabaseType,
     connection_generation: u64,
-    pool_context_epoch: u64,
 }
 
 impl RetainedSessionTarget {
-    pub fn new(db_type: DatabaseType, connection_generation: u64, pool_context_epoch: u64) -> Self {
+    pub fn new(db_type: DatabaseType, connection_generation: u64) -> Self {
         Self {
             db_type,
             connection_generation,
-            pool_context_epoch,
         }
     }
 
@@ -2449,10 +2494,6 @@ impl RetainedSessionTarget {
 
     pub fn connection_generation(self) -> u64 {
         self.connection_generation
-    }
-
-    pub fn pool_context_epoch(self) -> u64 {
-        self.pool_context_epoch
     }
 }
 
@@ -4438,26 +4479,64 @@ impl TakenDbSessionLease {
         self,
         retained_state: RetainedSessionState,
     ) -> SessionHandBack {
-        let pool_context_epoch = self.pool_context_epoch;
         let current_scope = self.current_scope.clone();
-        self.hand_back(pool_context_epoch, retained_state, current_scope)
+        self.restore_with_retained_state_and_scope(retained_state, current_scope)
     }
 
-    pub fn restore_with_context_epoch(
+    /// Put the session back where the tab's scope now says it is, under the
+    /// pool-context stamp this take FOUND.
+    ///
+    /// A scope is the TAB's and the stamp is the CONNECTION's, which is why
+    /// only one of the two moves here. See
+    /// `Self::restore_into_moved_pool_context` for the one caller that may
+    /// move the other.
+    pub fn restore_with_retained_state_and_scope(
         self,
-        pool_context_epoch: u64,
-        retained_state: RetainedSessionState,
-    ) -> SessionHandBack {
-        let current_scope = self.current_scope.clone();
-        self.hand_back(pool_context_epoch, retained_state, current_scope)
-    }
-
-    pub fn restore_with_context_epoch_and_scope(
-        self,
-        pool_context_epoch: u64,
         retained_state: RetainedSessionState,
         current_scope: Option<String>,
     ) -> SessionHandBack {
+        let pool_context_epoch = self.pool_context_epoch;
+        self.hand_back(pool_context_epoch, retained_state, current_scope)
+    }
+
+    /// Re-stamp the session with a pool-context epoch the caller has just MOVED
+    /// the connection to, and file it.
+    ///
+    /// The narrow door, named for its one legitimate caller: something that has
+    /// changed this connection's pool context (its database, its schema) and
+    /// read the new epoch back FROM THE CONNECTION, holding it. Everything else
+    /// restores through [`Self::restore_with_retained_state`], which keeps the
+    /// stamp the take found.
+    ///
+    /// The distinction is not bookkeeping. The stamp is what the NEXT
+    /// execution's take compares (`DbSessionLeaseEntry::matches_context`), and
+    /// a session carrying work whose stamp does not match is answered with
+    /// `BlockedContextMismatch` — the tab cannot execute until the user commits
+    /// or rolls back. Stamping an epoch the session was not actually brought
+    /// into therefore does not fail safe in either direction: too old locks the
+    /// tab out, too new waves a genuinely out-of-context session through. The
+    /// three per-tab pushes used to reach this with a plan-time value and are
+    /// the reason it says so; see [`RetainedSessionTarget`].
+    ///
+    /// `#[cfg(test)]`, and that is a statement about production rather than
+    /// about tests: **no production road moves a connection's pool context while
+    /// holding a taken lease.** The batch roads that learn a refreshed epoch
+    /// file through `hand_back_worker_session` with it, and the UI-level
+    /// connection-scope switch that would need this (`switch_mysql_database` /
+    /// `switch_oracle_current_schema`) is unreachable now that every browser
+    /// card picks a scope for its TAB. Leaving it callable would leave the one
+    /// spelling that re-stamps a session in the vocabulary, one call away from a
+    /// push reaching for it again — the same reason no public `store_if_empty_*`
+    /// sits beside `file_into_slot`. The MySQL
+    /// session-retention fixture still exercises it, because it still performs
+    /// exactly the act described above.
+    #[cfg(test)]
+    pub(crate) fn restore_into_moved_pool_context(
+        self,
+        pool_context_epoch: u64,
+        retained_state: RetainedSessionState,
+    ) -> SessionHandBack {
+        let current_scope = self.current_scope.clone();
         self.hand_back(pool_context_epoch, retained_state, current_scope)
     }
 
@@ -8962,14 +9041,9 @@ impl DatabaseConnection {
     /// costs no lock ([`crate::db::ConnectionRuntime::retained_session_target`]).
     /// This is for a caller that is already holding the connection (the live
     /// verification harnesses, which have no window and no runtime), so the
-    /// three facts are still stated in ONE place rather than assembled per
-    /// harness.
+    /// facts are still stated in ONE place rather than assembled per harness.
     pub fn retained_session_target(&self) -> RetainedSessionTarget {
-        RetainedSessionTarget::new(
-            self.info.db_type,
-            self.connection_generation,
-            self.pool_context_epoch(),
-        )
+        RetainedSessionTarget::new(self.info.db_type, self.connection_generation)
     }
 
     pub fn transaction_mode_statements_for(

@@ -352,9 +352,9 @@ impl Harness {
     /// the tab, then apply the change to the tab's retained DB session.
     /// `set_tab_auto_commit` on its own is only the first half.
     fn menu_auto_commit(&mut self, enabled: bool) -> String {
-        // The same three facts the GUI's plan carries, from the one
-        // constructor that states them (`RetainedSessionTarget`); a harness has
-        // no runtime, so it reads them off the connection it already holds.
+        // The same facts the GUI's plan carries, from the one constructor that
+        // states them (`RetainedSessionTarget`); a harness has no runtime, so it
+        // reads them off the connection it already holds.
         let target = {
             let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             guard.retained_session_target()

@@ -2009,6 +2009,16 @@ impl MySqlBatchSessionEffects {
         }
     }
 
+    /// The family these effects were accumulated for.
+    ///
+    /// Exposed so the gate that judges them asks the backend rule of the SAME
+    /// value it is judging, instead of being handed a db type beside it — the
+    /// batch gate used to name `DatabaseType::MySQL` outright, which is a
+    /// MariaDB batch judged by MySQL's rule.
+    pub(crate) fn db_type(&self) -> DatabaseType {
+        self.db_type
+    }
+
     /// See [`RetainedSessionState::with_session_transaction_mode_override_adopted`]:
     /// the batch adopted a successful session-scoped transaction-mode change
     /// into the tab's setting, so the accumulated session-scope override

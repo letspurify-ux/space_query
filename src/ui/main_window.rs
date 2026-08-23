@@ -422,12 +422,19 @@ impl RetainedSessionOptionChangePlan {
     }
 
     /// What every editor's push answers when there is no connection to push
-    /// onto. `NoSession` does not alert, which is what the blocking identity
-    /// read this replaces answered in the same situation.
+    /// onto — a runtime that is `Connecting`, `Failed`, `Disconnected` or
+    /// `Transitioning`, or none at all.
+    ///
+    /// It does not alert, which is what the blocking identity read this
+    /// replaces answered in the same situation. It no longer says `NoSession`:
+    /// a tab whose connection is mid-transition may be holding a session, and
+    /// `NoSession` claims the slot is empty. This is the same fact the editor's
+    /// own `bound_connection()` refusal and the door's `NotThisConnection`
+    /// state, so all four spell it the same way.
     fn nothing_to_push_onto(&self) -> Vec<RetainedSessionMutationOutcome> {
         self.retained_editors
             .iter()
-            .map(|_| RetainedSessionMutationOutcome::NoSession)
+            .map(|_| RetainedSessionMutationOutcome::SkippedOtherConnection)
             .collect()
     }
 
@@ -3210,6 +3217,55 @@ impl AppState {
             .is_some_and(|runtime| runtime.sanitized_info().read_only)
     }
 
+    /// Whether the active tab's own transaction-mode pin is READ ONLY.
+    ///
+    /// The tab's half of "would a write be refused", and the half that needs no
+    /// connection: the ACCESS mode survives every sanitization
+    /// (`effective_transaction_mode` only ever replaces an isolation a backend
+    /// cannot express), so the raw pin answers it.
+    ///
+    /// One spelling, because it had two readers and only one of them asked. The
+    /// object browser's card asks it so a pinned tab stops offering Drop,
+    /// Truncate and Import; the result-grid edit control did not, so a tab
+    /// pinned READ ONLY still offered the checkbox — and the user could stage
+    /// edits and meet the refusal at Save, which is the exact thing
+    /// `refresh_result_edit_controls` hides the checkbox to prevent for a
+    /// read-only CONNECTION.
+    fn active_tab_is_pinned_read_only(&self) -> bool {
+        self.sql_editor
+            .tab_transaction_mode_override_value()
+            .is_some_and(|mode| mode.access_mode == TransactionAccessMode::ReadOnly)
+    }
+
+    /// Whether a write started from the ACTIVE tab would be refused before it
+    /// reached the server, by the connection's own read-only flag or by the
+    /// transaction mode `transaction_mode_refusal_for_statement` will judge it
+    /// under.
+    ///
+    /// Every half, because a control that offers a write must ask every half —
+    /// and the two settings are independent: `ConnectionInfo::read_only` is the
+    /// profile's "this connection is read-only" switch, while
+    /// `default_transaction_access_mode` is the profile's default ACCESS mode,
+    /// which every tab with no pin of its own inherits. A tab can be refused by
+    /// the second with the first off.
+    ///
+    /// Two tiers, the same two the object browser's `CardWriteRefusal` uses and
+    /// for the same reason: the EFFECTIVE mode when the connection can be read,
+    /// and — when it cannot, because a neighbour tab's statement holds the mutex
+    /// — the tab's own pin, which is knowable without it and can only RAISE the
+    /// refusal.
+    fn active_tab_write_would_be_refused(&self) -> bool {
+        if self.active_connection_is_read_only() {
+            return true;
+        }
+        match self.transaction_control_state() {
+            Some((_, is_connected, mode, _)) => {
+                is_connected && mode.access_mode == TransactionAccessMode::ReadOnly
+            }
+            None => self.active_tab_is_pinned_read_only(),
+        }
+    }
+
     fn bind_active_unbound_tab_to_selected_database(&mut self) -> Result<(), String> {
         let tab_id = self.active_editor_tab_id;
         let Some(tab_index) = self.find_tab_index(tab_id) else {
@@ -5162,11 +5218,7 @@ impl AppState {
             // half of it survives every sanitization, so it can be stated
             // here — and only ever RAISED, because the connection's own
             // read-only flag is the half this cannot read.
-            if self
-                .sql_editor
-                .tab_transaction_mode_override_value()
-                .is_some_and(|mode| mode.access_mode == TransactionAccessMode::ReadOnly)
-            {
+            if self.active_tab_is_pinned_read_only() {
                 let active_tab_id = self.active_editor_tab_id;
                 self.object_browser
                     .set_tab_mode_refuses_writes(active_tab_id, true);
@@ -5619,10 +5671,15 @@ impl AppState {
             }
         }
         let origin_is_current = self.active_result_origin_is_current();
-        // A read-only connection hides the checkbox rather than letting the
-        // user stage edits and meet the refusal at Save.
+        // A tab whose writes would be refused hides the checkbox rather than
+        // letting the user stage edits and meet the refusal at Save. BOTH
+        // halves: the connection's read-only flag, and the tab's own READ ONLY
+        // pin — the save goes out through `execute_sql_text`, so
+        // `transaction_mode_refusal_for_statement` refuses it exactly as it
+        // refuses a typed `UPDATE`, and this control was the one place that
+        // asked only the connection.
         let can_edit = origin_is_current
-            && !self.active_connection_is_read_only()
+            && !self.active_tab_write_would_be_refused()
             && self.result_tabs.can_current_begin_edit_mode();
         let edit_active = self.result_tabs.is_current_edit_mode_enabled();
         let save_pending = self.result_tabs.is_current_save_pending();

@@ -2961,10 +2961,37 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
 
         let connection_generation = conn_guard.connection_generation();
         let resolution_activity = conn_guard.activity();
-        let resolution_connection_info = conn_guard
-            .pool_session_context()
-            .map(|context| context.connection_info)
-            .unwrap_or_default();
+        // REFUSED, not defaulted. The row is not decoration: the take below
+        // publishes a session canceler built from this `ConnectionInfo`, and on
+        // the MySQL family that canceler opens a control connection with it to
+        // send `KILL QUERY` — from a blank one it can reach no server at all.
+        // Carrying on meant a UI-thread round trip on the tab's session with a
+        // Cancel button that reaches nothing. The push roads were given this
+        // rule when the same fallback was found there; `.unwrap_or_default()` is
+        // the spelling their `ConnectionInfo::default()` ban could not see.
+        //
+        // And it answers what is TRUE rather than what failed: the context can
+        // only fail when this connection is down, and a connection that went
+        // down retired the generation the tab's session was taken under
+        // (`clear_connection_state` bumps whenever there was a connection to
+        // lose), so that session is already gone. The user pressed COMMIT, so
+        // what they are owed is the loss — not the phrase "Not connected".
+        let resolution_connection_info = match conn_guard.pool_session_context() {
+            Ok(context) => context.connection_info,
+            Err(_) => {
+                drop(conn_guard);
+                // The slot is read with the connection lock already RELEASED:
+                // this arm is reached rarely enough that nothing would exercise
+                // a `DB_CONNECTION -> SESSION_LEASE` nesting introduced here,
+                // and a nesting nothing exercises is one the order checker
+                // cannot see.
+                let lost = pooled_db_session
+                    .snapshot()
+                    .map(|snapshot| snapshot.retained_state())
+                    .unwrap_or_default();
+                return Err(SqlEditorWidget::retained_session_unreachable_message(lost));
+            }
+        };
         // The COMMIT/ROLLBACK runs on this session inside this function, so the
         // cancel button's reach over it lasts exactly as long as the action.
         // It used to end at the `into_*` conversion below, which is where the
@@ -2995,10 +3022,19 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         };
         let pool_context_epoch = retained_session.pool_context_epoch();
         let current_scope = retained_session.current_scope().map(str::to_string);
+        // What the take FOUND, read before the unwrap can take it away: if the
+        // lease is not there, the slot is empty and this session is gone, so the
+        // answer is the LOSS and not a sentence about what this road expected —
+        // the same rule its execution twin has followed since the take gained
+        // its third answer, on the very button the user pressed to keep the
+        // work.
+        let taken_retained_state = retained_session.retained_state();
         let Some((lease, prior_retained_state)) = retained_session.into_lease_with_retained_state()
         else {
             drop(conn_guard);
-            return Err("Expected Oracle retained session".to_string());
+            return Err(SqlEditorWidget::required_session_gone_message(
+                taken_retained_state,
+            ));
         };
         let db_conn = match lease {
             DbSessionLease::Oracle(db_conn) => db_conn,
@@ -3164,9 +3200,17 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 );
                 return result;
             }
-            DbSessionLease::MySQL { .. } => {
+            foreign @ DbSessionLease::MySQL { .. } => {
                 drop(conn_guard);
-                return Err("Expected Oracle retained session".to_string());
+                // The take emptied the slot, so this session is GONE whatever
+                // this road says: it leaves through the one door that closes it
+                // and reports what it was carrying.
+                return Err(SqlEditorWidget::unexpected_retained_session_family_message(
+                    foreign,
+                    DatabaseType::Oracle,
+                    prior_retained_state,
+                    activity_label,
+                ));
             }
         };
         if let Err(message) = ensure_retained_session_transaction_action_allowed(
@@ -3312,7 +3356,6 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         query_timeout: Option<Duration>,
         restore: RetainedSessionRestore<'_>,
     ) -> Result<(), String> {
-        let actual_db_type = lease.db_type();
         match lease {
             DbSessionLease::Oracle(conn) => {
                 let result = SqlEditorWidget::run_oracle_action_with_timeout(
@@ -3365,9 +3408,14 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                     }
                 }
             }
-            DbSessionLease::MySQL { .. } => Err(format!(
-                "Expected {expected_db_type} retained session but found {actual_db_type}"
-            )),
+            foreign @ DbSessionLease::MySQL { .. } => {
+                Err(SqlEditorWidget::unexpected_retained_session_family_message(
+                    foreign,
+                    expected_db_type,
+                    restore.retained_state,
+                    "Closing query tab",
+                ))
+            }
         }
     }
 
@@ -3517,15 +3565,19 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
         query_timeout: Option<Duration>,
         restore: RetainedSessionRestore<'_>,
     ) -> Result<(), String> {
-        let actual_db_type = lease.db_type();
-        let DbSessionLease::MySQL {
-            mut conn,
-            db_type: retained_db_type,
-        } = lease
-        else {
-            return Err(format!(
-                "Expected {expected_db_type} retained session but found {actual_db_type}"
-            ));
+        // The other families are NAMED, never swallowed by a `_`: a new physical
+        // session variant must come back here and state what closing a tab does
+        // with it (`non_test_source_matches_physical_session_enums_without_wildcard_arms`).
+        let (mut conn, retained_db_type) = match lease {
+            DbSessionLease::MySQL { conn, db_type } => (conn, db_type),
+            foreign @ (DbSessionLease::Oracle(_) | DbSessionLease::OracleThin(_)) => {
+                return Err(SqlEditorWidget::unexpected_retained_session_family_message(
+                    foreign,
+                    expected_db_type,
+                    restore.retained_state,
+                    "Closing query tab",
+                ));
+            }
         };
         let timeout_restore = match crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout_with_restore_for_db(
                 &mut conn,
@@ -5615,7 +5667,6 @@ impl SqlEditorWidget {
     ) -> RetainedSessionMutationOutcome {
         let db_type = target.db_type();
         let connection_generation = target.connection_generation();
-        let pool_context_epoch = target.pool_context_epoch();
         SqlEditorWidget::ui_action_on_retained_session(|loss| {
             // This runs on the FLTK thread, so the tab's timeout has to bound it
             // like it bounds the close-path commit/rollback.
@@ -5639,21 +5690,25 @@ impl SqlEditorWidget {
             // with the user's transaction, to a scope pick carrying the
             // generation before it.
             let db_activity = format!("Applying scope to retained {db_type} session");
+            // A tab on no connection at all is the same fact this push's two
+            // siblings answer with, and now in the same words: whatever is in
+            // the slot, this push does not speak for it. It used to alert with
+            // "not connected" here while they stayed silent — one condition,
+            // two answers, on a road the caller has already refused to reach
+            // unless the tab's runtime is `Connected`.
             let Some(connection) = self.bound_connection() else {
-                return RetainedSessionMutationOutcome::FailedRestored(
-                    crate::db::NOT_CONNECTED_MESSAGE.to_string(),
-                );
+                return RetainedSessionMutationOutcome::SkippedOtherConnection;
             };
             let action =
                 match Self::begin_retained_session_action(&connection, &db_activity, target) {
                     Ok(action) => action,
-                    // The slot is untouched: the take is a discard road, and a
-                    // push that cannot speak for what is in there must not
-                    // reach it.
+                    // The slot is untouched, and the answer SAYS so: the take is
+                    // a discard road, and a push that cannot speak for what is
+                    // in there must not reach it.
                     Err(
                         crate::ui::sql_editor::execution::RetainedSessionRefusal::NotThisConnection,
                     ) => {
-                        return RetainedSessionMutationOutcome::NoSession;
+                        return RetainedSessionMutationOutcome::SkippedOtherConnection;
                     }
                     Err(crate::ui::sql_editor::execution::RetainedSessionRefusal::Unreachable(
                         message,
@@ -5698,8 +5753,7 @@ impl SqlEditorWidget {
                 target_scope,
             ) {
                 return Self::retained_session_hand_back_outcome(
-                    retained_session.restore_with_context_epoch_and_scope(
-                        pool_context_epoch,
+                    retained_session.restore_with_retained_state_and_scope(
                         retained_state,
                         Some(target_scope.to_string()),
                     ),
@@ -5745,8 +5799,7 @@ impl SqlEditorWidget {
             );
             match result {
                 Ok(()) => Self::retained_session_hand_back_outcome(
-                    retained_session.restore_with_context_epoch_and_scope(
-                        pool_context_epoch,
+                    retained_session.restore_with_retained_state_and_scope(
                         retained_state,
                         Some(target_scope.to_string()),
                     ),
@@ -5834,20 +5887,48 @@ impl SqlEditorWidget {
         let Some(connection) = self.bound_connection() else {
             return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string());
         };
+        // Read before the connection lock is taken, so the arm below that needs
+        // it introduces no `DB_CONNECTION -> SESSION_LEASE` nesting — one that
+        // only a down connection would reach, and therefore one the order
+        // checker would never see.
+        let retained_before_close = self
+            .pooled_db_session
+            .snapshot()
+            .map(|snapshot| snapshot.retained_state());
         let (connection_generation, db_type, close_activity, close_connection_info) = {
             let Some(mut conn_guard) =
                 crate::db::try_lock_connection_with_activity(&connection, "Closing query tab")
             else {
                 return Err(crate::db::format_connection_busy_message());
             };
+            // REFUSED, not defaulted, for the reason its toolbar twin states:
+            // a blank `ConnectionInfo` builds a session canceler that can reach
+            // no server, and this road then runs the user's COMMIT on the tab's
+            // session with it.
+            //
+            // The answer is an OUTCOME and not an `Err`, and the difference is
+            // the tab closing: `apply_pooled_session_resolution` reads `Err` as
+            // "refuse the close", and the only way to get here is a connection
+            // that is down — which retired the generation the tab's session was
+            // taken under, so the session is gone and there is nothing left to
+            // retry. Reporting it and letting the close finish is what this
+            // outcome exists for.
+            let connection_info = match conn_guard.pool_session_context() {
+                Ok(context) => context.connection_info,
+                Err(_) => {
+                    let Some(retained_state) = retained_before_close else {
+                        return Ok(RetainedSessionCloseOutcome::NothingToResolve);
+                    };
+                    return Ok(RetainedSessionCloseOutcome::Unreachable(
+                        Self::retained_session_unreachable_message(retained_state),
+                    ));
+                }
+            };
             (
                 conn_guard.connection_generation(),
                 conn_guard.db_type(),
                 conn_guard.activity(),
-                conn_guard
-                    .pool_session_context()
-                    .map(|context| context.connection_info)
-                    .unwrap_or_default(),
+                connection_info,
             )
         };
         // Three different situations used to answer `Ok(())` here, and the
@@ -5883,12 +5964,17 @@ impl SqlEditorWidget {
         };
         let retained_pool_context_epoch = retained_session.pool_context_epoch();
         let current_scope = retained_session.current_scope().map(str::to_string);
+        // What the take FOUND. It used to answer this arm with
+        // `RetainedSessionState::default()`, which says "and nothing was lost" —
+        // a claim, made where the road knows least, on the prompt the user
+        // pressed to keep their work. The state is right here.
+        let taken_retained_state = retained_session.retained_state();
         let Some((lease, retained_state)) = retained_session.into_lease_with_retained_state()
         else {
             // The take handed over a lease that is not there any more. Nothing
             // was committed, so this must not read as success either.
             return Ok(RetainedSessionCloseOutcome::Unreachable(
-                Self::retained_session_unreachable_message(RetainedSessionState::default()),
+                Self::retained_session_unreachable_message(taken_retained_state),
             ));
         };
         if let Err(message) = ensure_retained_session_resolution_action_allowed(
@@ -5923,6 +6009,43 @@ impl SqlEditorWidget {
                 },
             )
             .map(|()| RetainedSessionCloseOutcome::Resolved)
+    }
+
+    /// A lease whose FAMILY this road did not expect: what to do with it, and
+    /// what to say.
+    ///
+    /// The take has already emptied the tab's slot, so the session is out of the
+    /// app's bookkeeping — and the three roads that met this returned the
+    /// mismatch and let the value DROP. Dropping it hands a live server session
+    /// back to its pool with nothing left in the app able to name it, on the
+    /// MySQL family with the user's open transaction still on it, and tells the
+    /// user about a TYPE where every other road tells them about their work. The
+    /// execution roads have answered this since the take gained its third
+    /// answer (`report_retained_session_lost_with_work`); the transaction and
+    /// close roads only said what they expected.
+    ///
+    /// It closes the session and says what went with it. Restoring is not the
+    /// alternative: a slot whose connection is another family now would have the
+    /// next take discard this session anyway, and that take reports nothing to
+    /// the user who is standing at this prompt.
+    pub(crate) fn unexpected_retained_session_family_message(
+        lease: DbSessionLease,
+        expected_db_type: DatabaseType,
+        retained_state: RetainedSessionState,
+        log_context: &str,
+    ) -> String {
+        let actual_db_type = lease.db_type();
+        lease.discard_physical(log_context);
+        let mismatch =
+            format!("Expected {expected_db_type} retained session but found {actual_db_type}");
+        if retained_state.may_have_uncommitted_work() {
+            format!(
+                "{mismatch}\n{}",
+                crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK
+            )
+        } else {
+            mismatch
+        }
     }
 
     /// What a session-ending action must say when the tab's session could not
@@ -6280,8 +6403,11 @@ impl SqlEditorWidget {
         enabled: bool,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
+        // One answer for one condition, shared with the two sibling pushes: a
+        // tab on no connection is a tab whose slot this push does not speak for,
+        // and saying `NoSession` claimed the slot was empty.
         let Some(connection) = self.bound_connection() else {
-            return RetainedSessionMutationOutcome::NoSession;
+            return RetainedSessionMutationOutcome::SkippedOtherConnection;
         };
         transaction_action_backend_for(target.db_type()).apply_auto_commit_to_retained_session(
             &connection,
@@ -6299,8 +6425,10 @@ impl SqlEditorWidget {
         default_transaction_isolation: TransactionIsolation,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
+        // Same condition, same answer as its two siblings — see the auto-commit
+        // twin.
         let Some(connection) = self.bound_connection() else {
-            return RetainedSessionMutationOutcome::NoSession;
+            return RetainedSessionMutationOutcome::SkippedOtherConnection;
         };
         // The tab's own timeout, resolved here because this is where the tab
         // is: the same value the close-path commit/rollback and the scope push

@@ -441,6 +441,21 @@ impl ConnectionRuntime {
         self.connection_generation.load(Ordering::Acquire)
     }
 
+    /// This runtime's CACHED copy of its connection's pool-context epoch, which
+    /// may name an epoch the connection has already left.
+    ///
+    /// It is refreshed only where somebody remembered to
+    /// ([`Self::record_connection_context`]'s few writers), while the epoch
+    /// itself moves under the connection mutex wherever the connection's pool
+    /// context does. So this answer is best-effort by construction, and the rule
+    /// that keeps that safe is: **nothing may DECIDE on it.** Its one consumer
+    /// is [`ExecutionOrigin`], where it is payload for query history and result
+    /// routing and both sides of any comparison come from this same cache.
+    ///
+    /// `retained_session_target` used to read it, and the per-tab pushes then
+    /// stamped the tab's session with it — a decision, taken on a value nothing
+    /// keeps current, whose cost was a tab that could not execute. Guarded by
+    /// `the_cached_pool_context_epoch_decides_nothing`.
     pub fn pool_context_epoch(&self) -> u64 {
         self.pool_context_epoch.load(Ordering::Acquire)
     }
@@ -459,6 +474,13 @@ impl ConnectionRuntime {
     /// and it is the same question `retained_scope_update_for_tab` already asks
     /// of the runtime and the connection's own `can_reuse_pool_session` asked
     /// under the lock.
+    ///
+    /// The POOL-CONTEXT EPOCH is deliberately not among the facts it answers,
+    /// and [`Self::pool_context_epoch`] states why: what this runtime holds is a
+    /// cache only a few roads refresh, so it may name an epoch the connection
+    /// has left. Harmless for a fact that is CHECKED — a stale generation
+    /// refuses the push — and not harmless at all for one that is WRITTEN onto
+    /// the tab's session. See [`crate::db::RetainedSessionTarget`].
     pub fn retained_session_target(&self) -> Option<crate::db::RetainedSessionTarget> {
         if !matches!(self.state(), ConnectionRuntimeState::Connected) {
             return None;
@@ -466,7 +488,6 @@ impl ConnectionRuntime {
         Some(crate::db::RetainedSessionTarget::new(
             self.sanitized_info().db_type,
             self.connection_generation(),
-            self.pool_context_epoch(),
         ))
     }
 
