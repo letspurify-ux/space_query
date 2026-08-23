@@ -6958,6 +6958,148 @@ fn the_three_per_tab_settings_refuse_on_work_in_the_same_words() {
     );
 }
 
+/// A CLAIM ABOUT THE SCREEN BELONGS ONLY TO THE TAB THAT IS THE SCREEN.
+///
+/// `record_displayed_auto_commit` / `record_displayed_transaction_mode` are what
+/// execution startup checks its own resolution against, and they say *this is
+/// what the user saw*. There is one screen, and both recorders state
+/// `AppState::sql_editor` — the ACTIVE tab — so the slots are only ever true for
+/// that tab.
+///
+/// They live per tab because the checkpoint reads them from the WORKER, which
+/// cannot reach the window; the storage was right and the LIFETIME was missing.
+/// A background tab kept the claim it had when it was last on screen, and both
+/// tab-fact handlers re-sync the ACTIVE tab's controls (their own comments say
+/// so) — so a batch adopting a transaction mode on a BACKGROUND tab moved that
+/// tab's pin and left its claim behind, and the next execution on it (a
+/// follow-up table browse fires from a timer, with no user action at all) was
+/// refused against a screen nobody was looking at.
+#[test]
+fn only_the_tab_on_screen_carries_a_claim_about_the_screen() {
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let main_window = read_source("src/ui/main_window.rs");
+
+    let withdraw = editor
+        .find("    pub(crate) fn withdraw_displayed_state(&self) {")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("a tab that leaves the screen must have a way to give the claim up");
+    let withdraw = compact_for_pattern(withdraw);
+    assert!(
+        withdraw.contains("self.record_displayed_auto_commit(None);")
+            && withdraw.contains("self.record_displayed_transaction_mode(None);"),
+        "BOTH slots: they are one claim about one screen, and `None` is the value the checkpoint \
+         already reads as 'no claim'"
+    );
+
+    // The one writer of the active tab that leaves a tab ALIVE and off screen.
+    // (The other sets it to 0 once the last tab has been closed, and a closed
+    // tab's claim goes with its editor.)
+    let activate = main_window
+        .find("    fn set_active_editor_tab_with_display_stabilization(")
+        .map(|at| slice_to_end_of_fn(&main_window, at))
+        .expect("the tab activation road should exist");
+    let compact_activate = compact_for_pattern(activate);
+    assert!(
+        compact_activate.contains("previous.sql_editor.withdraw_displayed_state();"),
+        "the outgoing tab gives its claim up where the screen changes hands: {activate}"
+    );
+    assert!(
+        compact_activate.contains("ifprevious_tab_id!=tab_id{"),
+        "...and only when the tab really changed — withdrawing on a re-activation of the SAME tab \
+         would drop a claim that is still true: {activate}"
+    );
+    // The other half: the tab that BECOMES the screen gets one back before this
+    // returns, or the withdrawal would be a one-way loss.
+    let withdraw_at = activate
+        .find("withdraw_displayed_state();")
+        .expect("the withdrawal should be in this function");
+    for restate in [
+        "self.sync_transaction_mode_controls();",
+        "self.render_status_bar();",
+    ] {
+        let at = activate
+            .find(restate)
+            .unwrap_or_else(|| panic!("{restate} should re-state the incoming tab's claim"));
+        assert!(
+            at > withdraw_at,
+            "{restate} must run AFTER the withdrawal, or the tab on screen carries no claim"
+        );
+    }
+    assert_eq!(
+        main_window.matches("withdraw_displayed_state()").count(),
+        1,
+        "one caller: a second place deciding when a claim dies is a second lifetime rule"
+    );
+}
+
+/// A VALIDATOR ASKS ABOUT THE VALUE THE RUNTIME REALLY BUILDS.
+///
+/// A connection profile carries `default_transaction_isolation` and
+/// `default_transaction_access_mode`, and they are NOT one transaction mode.
+/// `connect_blocking_with_policy` takes the ACCESS half into
+/// `DatabaseConnection::transaction_mode` and sends the isolation down its own
+/// channel (`sync_default_transaction_isolation` → the pool's session
+/// preparation); on Oracle the two never meet, because
+/// `transaction_mode_with_default_substituted` substitutes a connection default
+/// into a `Default` isolation for the MySQL family only.
+///
+/// `validate_oracle` formed the pair anyway and asked
+/// `transaction_mode_selection_error` about it, so a profile of `Read committed`
+/// (the field's own DEFAULT) plus `Read only` — one dropdown away for anyone
+/// making a connection read-only — was refused with a sentence about read-only
+/// transactions that never named the fix, for a configuration the app runs
+/// perfectly well. A validator that forms a value the runtime does not form is
+/// validating a different program, so both sides ask ONE function.
+#[test]
+fn the_connection_mode_a_profile_is_validated_for_is_the_one_connect_builds() {
+    let connection = read_source("src/db/connection.rs");
+    let production = connection
+        .find("\n#[cfg(test)]\n")
+        .map(|at| &connection[..at])
+        .expect("connection.rs should have a test module to cut at");
+
+    let mode = production
+        .find("    pub(crate) fn connection_transaction_mode(&self) -> TransactionMode {")
+        .map(|at| slice_to_end_of_fn(production, at))
+        .expect("the profile's own answer for the mode a connection is born with should exist");
+    let mode = compact_for_pattern(mode);
+    assert!(
+        mode.contains("TransactionIsolation::Default,")
+            && mode.contains("self.default_transaction_access_mode,"),
+        "the ACCESS half only — the isolation reaches the server as session state: {mode}"
+    );
+
+    for (road, signature) in [
+        ("the connect road", "    fn connect_blocking_with_policy("),
+        ("the Oracle validator", "    fn validate_oracle("),
+    ] {
+        let body = production
+            .find(signature)
+            .map(|at| slice_to_end_of_fn(production, at))
+            .unwrap_or_else(|| panic!("{signature} should exist"));
+        let body = compact_for_pattern(body);
+        assert!(
+            body.contains("connection_transaction_mode()"),
+            "{road} must ask the profile for the mode a connection is born with"
+        );
+        assert!(
+            !body.contains("self.default_transaction_isolation,"),
+            "{road} must not build a mode out of the isolation half: the two fields are two \
+             channels, and pairing them is what refused a configuration the connect road forms \
+             without complaint"
+        );
+    }
+
+    // And nothing else may pair them either.
+    assert_eq!(
+        production
+            .matches("TransactionMode::new(\n                self.default_transaction_isolation,")
+            .count(),
+        0,
+        "the profile's two transaction fields are never formed into one mode"
+    );
+}
+
 /// A control that offers a WRITE asks every half of "would it be refused".
 ///
 /// Two independent settings can refuse a write before it reaches the server:
@@ -7002,6 +7144,48 @@ fn a_control_that_offers_a_write_asks_every_half_of_the_refusal() {
         "...and not the connection half on its own"
     );
 
+    // HIDING A CONTROL MAY NOT STRAND WORK THE USER HAS ALREADY STAGED.
+    //
+    // `can_edit` answers "may a write be started here". Hiding the whole control
+    // group on it took the two ways OUT of an open edit session with it — the
+    // checkbox, whose other position cancels, and Cancel itself — so a tab
+    // pinned READ ONLY mid-edit left the staged rows in the grid with nothing to
+    // discard them and nothing to save them. Abandoning staged work is not a
+    // write, so it is not the refusal's to hide.
+    let compact_grid = compact_for_pattern(grid);
+    assert!(
+        compact_grid.contains("letexit_is_reachable=edit_active&&origin_is_current;"),
+        "an OPEN edit session whose result still belongs to the tab must stay exitable: {grid}"
+    );
+    assert!(
+        compact_grid.contains("letshow_edit_check=can_edit||exit_is_reachable;")
+            && compact_grid.contains("letshow_cancel_action=exit_is_reachable;"),
+        "...so the checkbox and Cancel follow that, not `can_edit`: {grid}"
+    );
+    assert!(
+        compact_grid.contains("letshow_write_actions=edit_active&&can_edit;"),
+        "...while Insert/Delete/Save — the controls that OFFER a write — still follow the \
+         refusal: {grid}"
+    );
+    assert!(
+        compact_grid.contains("letdesired_checked=edit_active;"),
+        "the mark says whether a session is OPEN: a shown-but-unchecked box over a live session \
+         would start a new edit on the next click, where the user meant to leave: {grid}"
+    );
+    // One writer for the checkbox's enablement, because the two conditions that
+    // used to state it can now disagree.
+    assert_eq!(
+        compact_grid
+            .matches("self.result_edit_check.activate();")
+            .count()
+            + compact_grid
+                .matches("self.result_edit_check.deactivate();")
+                .count(),
+        3,
+        "the checkbox's enablement is stated once, with its visibility (activate + deactivate in \
+         the shown arm's if/else, and deactivate in the hidden arm): {grid}"
+    );
+
     // The pin half has ONE spelling, so the browser card and the fallback tier
     // cannot drift apart.
     assert_eq!(
@@ -7010,6 +7194,63 @@ fn a_control_that_offers_a_write_asks_every_half_of_the_refusal() {
             .count(),
         1,
         "the tab's READ ONLY pin is read in one place (`active_tab_is_pinned_read_only`)"
+    );
+
+    // ...AND IT IS RE-ASKED WHEN THE ANSWER MOVES.
+    //
+    // A gate has two halves — what it asks and WHEN it is asked — and this one
+    // had only the first. `refresh_result_edit_controls` is called from ~40
+    // query-lifecycle and tab-switch sites, from none of the roads that move a
+    // per-tab setting, and from `render_status_bar` only when it has just
+    // reconciled an orphaned fetch. So pinning a tab READ ONLY with a grid open
+    // left the checkbox offered — the user stages edits and meets the refusal at
+    // Save, the very state the assertions above exist to prevent — unpinning
+    // left it hidden, and a browser scope pick left it offering a save the stale
+    // result origin would refuse.
+    let publisher = main_window
+        .find("    fn refresh_result_edit_controls_if_their_answer_moved(")
+        .map(|at| slice_to_end_of_fn(&main_window, at))
+        .expect("the write controls' answer must have something that watches it");
+    let compact_publisher = compact_for_pattern(publisher);
+    assert!(
+        compact_publisher.contains("self.active_tab_write_would_be_refused()")
+            && compact_publisher.contains("self.active_result_origin_is_current()")
+            && compact_publisher.contains("self.refresh_result_edit_controls();"),
+        "it watches BOTH facts the three per-tab settings move — the write refusal, and whether \
+         the shown result still belongs to the tab's binding, which a SCOPE change moves — and \
+         re-asks the controls: {publisher}"
+    );
+    assert!(
+        compact_publisher.contains("self.active_editor_tab_id,"),
+        "keyed by tab, so a switch cannot be mistaken for 'nothing moved': {publisher}"
+    );
+
+    let sync_start = main_window
+        .find("    fn sync_transaction_mode_controls(")
+        .expect("the toolbar sync should exist");
+    let sync = slice_to_end_of_fn(&main_window, sync_start);
+    let watch_at = sync
+        .find("self.refresh_result_edit_controls_if_their_answer_moved();")
+        .expect(
+            "the one place the tab's effective access mode is derived is the place that re-asks \
+             the controls reading it — it runs on every status tick and from every road that \
+             moves the mode",
+        );
+    let arms_at = sync
+        .find("let Some((db_type, is_connected, mode, default_isolation)) =")
+        .expect("the sync's two arms should still be selected by one read");
+    assert!(
+        watch_at < arms_at,
+        "before the arms, so a connection that cannot be READ — the case that leaves only the \
+         tab's own pin knowable — is covered by the same call: {sync}"
+    );
+    assert_eq!(
+        main_window
+            .matches("self.refresh_result_edit_controls_if_their_answer_moved();")
+            .count(),
+        1,
+        "exactly one caller: a second is a second place that could disagree about when the \
+         controls are re-asked"
     );
 }
 
@@ -7132,9 +7373,18 @@ fn a_push_that_does_not_speak_for_the_tab_never_reports_an_empty_slot() {
         );
     }
 
-    // And every mapping of the door's refusal, on all four roads.
+    // The close prompt comes through the same door and may NOT answer it in the
+    // same words, so its arms are counted apart from the pushes' below.
+    let close_road_start = editor
+        .find("    fn run_pooled_session_close_action(")
+        .expect("the close prompt's road should exist");
+    let close_road = slice_to_end_of_fn(&editor, close_road_start);
+    let close_road_range = close_road_start..(close_road_start + close_road.len());
+
+    // And every mapping of the door's refusal, on all four PUSH roads.
     let mut arms = 0usize;
-    for source in [&editor, &execution] {
+    let mut close_arms = 0usize;
+    for (source, is_editor) in [(&editor, true), (&execution, false)] {
         let mut from = 0usize;
         while let Some(offset) = source[from..].find("RetainedSessionRefusal::NotThisConnection") {
             let at = from + offset;
@@ -7145,6 +7395,16 @@ fn a_push_that_does_not_speak_for_the_tab_never_reports_an_empty_slot() {
             if arm.starts_with("RetainedSessionRefusal::NotThisConnection);")
                 || source[..at].ends_with('"')
             {
+                continue;
+            }
+            if is_editor && close_road_range.contains(&at) {
+                close_arms += 1;
+                assert!(
+                    compact_for_pattern(arm)
+                        .contains("Ok(Self::retained_session_gone_outcome(retained_before_close))"),
+                    "the close prompt REPORTS a session it cannot speak for instead of going \
+                     silent, and does not refuse the close: {arm}"
+                );
                 continue;
             }
             arms += 1;
@@ -7158,6 +7418,67 @@ fn a_push_that_does_not_speak_for_the_tab_never_reports_an_empty_slot() {
         arms, 4,
         "all four per-tab pushes map the door's refusal (auto-commit, transaction mode ×2 \
          backends, scope)"
+    );
+
+    // The SESSION-ENDING road answers it differently, and must: a push that
+    // cannot speak for the tab's session is SILENT because the tab's setting is
+    // recorded and its next execution states it to whatever session the tab
+    // holds by then. The close prompt has no next execution — the tab is going —
+    // and the user pressed Commit on it precisely so their work would not be
+    // lost, so the same refusal has to be REPORTED. What it must not do is
+    // refuse: `apply_pooled_session_resolution` reads `Err` as "do not close",
+    // and the incarnation the session belonged to is retired, so there is
+    // nothing to retry.
+    assert_eq!(
+        close_arms, 1,
+        "the close prompt maps the door's refusal exactly once"
+    );
+    let compact_close_road = compact_for_pattern(close_road);
+    assert!(
+        !compact_close_road.contains("SkippedOtherConnection"),
+        "...and the pushes' silent answer has no place on a road the tab is closing behind"
+    );
+    let gone = editor
+        .find("    fn retained_session_gone_outcome(")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the session-ending roads' one answer should exist");
+    let gone = compact_for_pattern(gone);
+    assert!(
+        gone.contains("RetainedSessionCloseOutcome::Unreachable(")
+            && gone.contains("RetainedSessionCloseOutcome::NothingToResolve")
+            && !gone.contains("Err("),
+        "an empty slot lost nothing and a full one lost its work; neither refuses the close: \
+         {gone}"
+    );
+
+    // The door folds "busy" and "cannot be read at all" into ONE refusal, and
+    // this road is the only one that must keep them apart: a busy connection
+    // refuses (ask again), a DOWN one reports the loss and lets the tab close —
+    // refusing there is what round 44's arm exists to prevent. So the road asks
+    // the connection, with the same predicate that arm used.
+    assert!(
+        compact_close_road.contains("Some(conn_guard)ifconn_guard.pool_session_context().is_err()"),
+        "the `Unreachable` arm must tell a DOWN connection from a busy one, or a down \
+         connection's tabs cannot be closed: {close_road}"
+    );
+    // ...and only CLASSIFY. A second resolution here would be a second road to
+    // the take, which is what having one door is for.
+    assert_eq!(
+        compact_close_road
+            .matches("crate::db::try_lock_connection(&connection)")
+            .count(),
+        1,
+        "the classifier's try-lock appears once"
+    );
+    let classifier_at = compact_close_road
+        .find("crate::db::try_lock_connection(&connection)")
+        .expect("the classifier should exist");
+    let door_at = compact_close_road
+        .find("begin_retained_session_action(")
+        .expect("the door should exist");
+    assert!(
+        door_at < classifier_at,
+        "it runs only AFTER the door has refused — never as a way of resolving the identity"
     );
 
     let door_start = execution
@@ -14611,6 +14932,12 @@ fn every_action_on_a_retained_session_says_which_connection_it_is_on() {
             "pub(super) fn apply_oracle_transaction_mode_to_reusable_pooled_session(",
         ),
         (&editor, "pub fn apply_current_scope_to_retained_session("),
+        // FIVE roads now: the close prompt used to resolve the row itself
+        // because it already held the connection — and holding it was the
+        // defect, not the reason. A neighbour tab's statement, an Oracle explain
+        // plan or a metadata load made the prompt refuse a COMMIT that runs on
+        // THIS tab's own pooled session.
+        (&editor, "    fn run_pooled_session_close_action("),
     ] {
         let body = source
             .find(road)
@@ -14619,6 +14946,11 @@ fn every_action_on_a_retained_session_says_which_connection_it_is_on() {
         assert!(
             compact_for_pattern(body).contains("begin_retained_session_action("),
             "{road} must publish its row through the door that names its connection"
+        );
+        assert!(
+            !compact_for_pattern(body).contains("try_lock_connection_with_activity("),
+            "{road} must not wait on — or refuse for — a connection mutex that says nothing \
+             about the tab's own session"
         );
         assert!(
             !compact_for_pattern(body).contains("crate::db::track_db_activity(db_activity,"),
@@ -14630,33 +14962,27 @@ fn every_action_on_a_retained_session_says_which_connection_it_is_on() {
         );
     }
 
-    // The same rule, on the two roads that resolve the row THEMSELVES because
-    // they already hold the connection: the Oracle toolbar COMMIT/ROLLBACK and
-    // the close prompt's. Both used to write `.unwrap_or_default()` — the
-    // spelling the ban above cannot see — and both then published a canceler
-    // over the tab's session from a blank `ConnectionInfo`, on the very buttons
-    // the user presses to keep their work.
-    for (source, road) in [
-        (
-            &editor,
-            "    fn run_transaction_action(\n        &self,\n        mut conn_guard",
-        ),
-        (&editor, "    fn run_pooled_session_close_action("),
-    ] {
-        let body = source
-            .find(road)
-            .map(|offset| slice_to_end_of_fn(source, offset))
-            .unwrap_or_else(|| panic!("{road} should exist"));
-        let body = compact_for_pattern(body);
-        assert!(
-            body.contains("pool_session_context()"),
-            "{road} must resolve the row it publishes from the pool context"
-        );
-        assert!(
-            !body.contains(".map(|context|context.connection_info).unwrap_or_default()"),
-            "{road} must REFUSE a connection it cannot name, not carry on under a blank one              that can reach no server"
-        );
-    }
+    // The same rule, on the road that resolves the row ITSELF because it really
+    // does already hold the connection: the Oracle toolbar COMMIT/ROLLBACK,
+    // which is handed a `ConnectionLockGuard` on its own worker thread. It used
+    // to write `.unwrap_or_default()` — the spelling the ban above cannot see —
+    // and then published a canceler over the tab's session from a blank
+    // `ConnectionInfo`, on the very button the user presses to keep their work.
+    let road = "    fn run_transaction_action(\n        &self,\n        mut conn_guard";
+    let body = editor
+        .find(road)
+        .map(|offset| slice_to_end_of_fn(&editor, offset))
+        .expect("the Oracle toolbar transaction action should exist");
+    let body = compact_for_pattern(body);
+    assert!(
+        body.contains("pool_session_context()"),
+        "{road} must resolve the row it publishes from the pool context"
+    );
+    assert!(
+        !body.contains(".map(|context|context.connection_info).unwrap_or_default()"),
+        "{road} must REFUSE a connection it cannot name, not carry on under a blank one that can \
+         reach no server"
+    );
 
     // And the bind-parameter probe, which HAS a context and reached for the raw
     // helper beside it — the same shape round 4's F8 fixed for the schema

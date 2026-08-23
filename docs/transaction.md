@@ -535,6 +535,24 @@ unexpressible pair is not adopted
 (`adopt_session_transaction_mode_change_after_statement`), leaving the
 conservative session residue in place.
 
+**A CONNECTION PROFILE is not where such a pair is chosen.** Its
+`default_transaction_isolation` and `default_transaction_access_mode` are two
+CHANNELS, not one mode: `connect_blocking_with_policy` takes the ACCESS half into
+`DatabaseConnection::transaction_mode` and sends the isolation through
+`sync_default_transaction_isolation` to the pool's session preparation
+(`ALTER SESSION SET ISOLATION_LEVEL` / `SET SESSION TRANSACTION ISOLATION LEVEL`).
+On Oracle they never meet at all — `transaction_mode_with_default_substituted`
+substitutes a connection default into a `Default` isolation for the MySQL family
+only. `validate_oracle` used to pair them anyway and ask the selection rule about
+the result, which refused `Read committed` + `Read only` — the isolation field's
+own DEFAULT plus the one access mode a user changes to make a connection
+read-only — for a configuration the connect road forms without complaint, with a
+message that never named the fix. Both sides now ask
+`ConnectionAdvancedSettings::connection_transaction_mode()`, so a validator
+cannot judge a value the runtime does not build; the isolation keeps its own
+check, which is whether the backend has that level at all. Guard:
+`the_connection_mode_a_profile_is_validated_for_is_the_one_connect_builds`.
+
 ### The screen's picture of the active tab's connection has one writer
 
 Everything the window shows about the ACTIVE TAB's connection — which
@@ -576,6 +594,26 @@ requires resolution). The guard test
 `transaction_mode_state_has_a_single_source_of_truth`
 (`tests/concurrency_multithread_guards.rs`) pins the resolver chain, the
 display cross-check, and the adoption wiring.
+
+**A claim about the screen belongs only to the tab that IS the screen.** Both
+recorders state `AppState::sql_editor` — the ACTIVE tab — because there is one
+screen; the slots live per tab only because the checkpoint reads them from the
+WORKER, which cannot reach the window. The storage was right and the LIFETIME was
+missing: a background tab kept the claim it had when it was last on screen, and
+both tab-fact handlers re-sync the ACTIVE tab's controls, so a batch adopting a
+mode or an auto-commit on a BACKGROUND tab moved that tab's pin and left its
+claim behind. The next execution on it — a follow-up table browse is scheduled
+from a timer and needs no user action at all — was then refused against a screen
+nobody was looking at, and its result tab marked failed.
+
+`SqlEditorWidget::withdraw_displayed_state` gives the claim up, and
+`set_active_editor_tab_with_display_stabilization` is where it is called: the one
+writer of the active tab that leaves a tab alive and OFF screen (the other sets
+it to 0 once the last tab has closed, and a closed tab's claim goes with its
+editor). It is not a weakening — `None` is the value the checkpoint already reads
+as *no claim*, and a tab with no screen has nothing to disagree with — and the
+same function re-states both for the tab that becomes the screen before it
+returns. Guard: `only_the_tab_on_screen_carries_a_claim_about_the_screen`.
 
 ### MySQL/MariaDB: an already-correct session is left alone
 
@@ -678,6 +716,49 @@ refill it. `synchronize_scope_for_tab` therefore decides its metadata repair
 from whatever was BEHIND — the binding or the card — rather than from the
 binding alone, and retiring a catalog and ordering its reload are one step.
 
+### A gate has two halves: what it asks, and when it is asked
+
+The screen facts above are simply RE-STATED by the tick, which is affordable
+because stating them is a `set_value` and a menu flag. The result grid's EDIT
+control is the one consumer of these settings that cannot work that way:
+`refresh_result_edit_controls` re-lays out the result toolbar, so calling it per
+frame would be a layout and a redraw per frame. It was therefore left to events —
+~40 query-lifecycle and tab-switch call sites — and when it learned to ask the
+tab's READ ONLY pin beside the connection's read-only flag, none of those events
+was a per-tab setting moving. Pinning a tab READ ONLY with a grid open left the
+checkbox offered, so the user staged edits and met the refusal at Save, which is
+the exact state the control hides itself to prevent; unpinning left it hidden;
+and a browser scope pick left it offering a save the stale result origin would
+refuse.
+
+So the tick carries the ANSWER instead of the restatement.
+`AppState::refresh_result_edit_controls_if_their_answer_moved` watches exactly
+the two facts these settings move — `active_tab_write_would_be_refused()` and
+`active_result_origin_is_current()` — keyed by tab, and re-asks the control only
+when one of them changes. It is called from
+`sync_transaction_mode_controls`, before that function's two arms, because that
+is the one place the tab's effective access mode is derived: it runs on every
+status tick, from every road that moves the mode, and it is already the publisher
+of the same fact's other half to the tab's browser card. `can_begin_edit_mode` is
+deliberately NOT watched — it parses the result's SQL, and every road that moves
+it is one of the ~40 that already call the refresh. Guard:
+`a_control_that_offers_a_write_asks_every_half_of_the_refusal`.
+
+**Hiding a control may not strand work the user has already staged.** Making the
+pin re-ask this control exposed the other half of the same question: the whole
+control group was hidden on `can_edit`, which is *may a write be STARTED here* —
+and that took the two ways OUT of an open edit session with it, the Cancel button
+and the checkbox whose other position cancels. A tab pinned READ ONLY mid-edit
+then left the staged rows in the grid with nothing to discard them and nothing to
+save them. Abandoning staged work is not a write, so it is not the refusal's to
+hide: Insert/Delete/Save follow `can_edit`, while the checkbox and Cancel follow
+`edit_active && origin_is_current`, and the checkbox's MARK says whether a session
+is OPEN (a shown-but-unchecked box over a live session would begin a NEW edit on
+the next click, where the user meant to leave). `origin_is_current` is part of it
+because the exit has to WORK: `clone_result_tabs_for_edit_action` refuses a stale
+origin for Cancel as well as for Save, so a stale-origin session keeps the
+behaviour it has always had rather than being offered a button that only alerts.
+
 ## Central preflight
 
 Every execution, setting change, and connection-lifecycle action is checked as
@@ -722,6 +803,57 @@ is discarded silently and the statement runs on a fresh session; every other
 blocked state keeps the preserved session and lets the statement run on it,
 surfacing problems as ordinary statement errors the user can resolve with
 Commit/Rollback.
+
+### The close prompt resolves its identity lock-free, like the three settings
+
+`SqlEditorWidget::run_pooled_session_close_action` runs the prompt's
+Commit/Rollback on the UI thread, on the TAB's own pooled session. It used to
+open with `try_lock_connection_with_activity` and answer
+`format_connection_busy_message()` — which `apply_pooled_session_resolution`
+reads as "refuse the close" — whenever a NEIGHBOUR tab held the connection mutex:
+its statement, an Oracle explain plan, an OCI script after `CONNECT`, a metadata
+load. None of those has anything to do with this tab's session, and the guard was
+released before the take anyway, so it was never providing exclusion either. The
+three per-tab pushes were moved off that mutex for exactly this reason; the
+prompt the user presses to KEEP their work was the road left on it.
+
+It now asks the runtime for the identity
+(`ConnectionRuntime::retained_session_target`) and comes through the same door
+the pushes use (`begin_retained_session_action`), which resolves the row and the
+`ConnectionInfo` from one pool-context read, never blocks, and refuses rather
+than carrying on under a blank one. Three answers, each already established
+elsewhere:
+
+- a transition in flight (`RuntimeLiveness::InFlight`) is the one answer that is
+  not knowledge — the connection may be serving queries again in a moment — so
+  the close is REFUSED and the user retries,
+- a runtime that is not `Connected`, or a generation the door says has moved
+  (`NotThisConnection`), means the incarnation this tab's session was taken under
+  is retired: the session is gone, which is reported through
+  `retained_session_gone_outcome` and lets the close finish. Refusing there is
+  what would leave a down connection's tabs unclosable,
+- otherwise the take runs, with an identity that is CHECKED at the door and again
+  by the take and written nowhere, so a stale cached generation can only refuse
+  this action, never misdirect it.
+
+The door's own `Unreachable` folds TWO of those, and this road is the only caller
+that must keep them apart: the connection is BUSY (a neighbour's statement with
+nothing in the pool-context cache to fall back on, or a transition announced since
+the check above) — refuse; or it cannot be READ AT ALL because it is down — report
+and let the tab close. Mapping both to a refusal is exactly the regression the
+down-connection arm exists to prevent, so the arm asks the connection itself with
+a NON-BLOCKING try-lock, using the same `pool_session_context().is_err()`
+predicate that arm always used. It runs only after the door has refused and can
+only CLASSIFY, never resolve — there is still one road to the take, which the
+guard pins. And the road takes ONE binding snapshot for both the runtime and the
+connection: two would let a script `CONNECT` land between them and hand the door
+the old connection with the new runtime's identity, which reads as "another
+incarnation" and would report a healthy session as lost.
+
+Live: `verify_commit_close_live`'s neighbour-holds-the-mutex scenario, on all
+four backends — the close prompt's COMMIT reaches the server while another
+thread holds the connection, and the `V + 1` it committed survives a later
+`ROLLBACK`.
 
 ## User resolution
 

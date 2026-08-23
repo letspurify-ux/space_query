@@ -20,7 +20,7 @@ use space_query::db::{
     OracleDriverMode, RetainedSessionPreflightAction, RetainedSessionPreflightDecision,
     TransactionSessionState,
 };
-use space_query::ui::sql_editor::{QueryProgress, SqlEditorWidget};
+use space_query::ui::sql_editor::{QueryProgress, RetainedSessionCloseOutcome, SqlEditorWidget};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -672,10 +672,27 @@ fn verify(target: Target) -> Result<bool, String> {
             return Err("expected an open lazy fetch after the cross join".into());
         };
         messages.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        last_rows.lock().unwrap_or_else(|p| p.into_inner()).clear();
         h.editor
             .request_lazy_fetch(sid, space_query::ui::sql_editor::LazyFetchRequest::All);
-        // On the wire now, not merely requested.
-        h.pump_for(Duration::from_millis(150));
+        // ON THE WIRE — waited for by EVIDENCE, not by a guess.
+        //
+        // This used to be a flat `pump_for(150ms)`, which is a PROXY for "the
+        // fetch has reached the server" and not the thing itself: on a cold
+        // Oracle the 150ms elapsed with the worker still setting up, so the
+        // check silently measured the OTHER case — a cancel that OVERTAKES its
+        // call, which used to cost the session and is now its own unit test
+        // (`a_cancel_the_answer_overtook_is_settled_on_every_protocol`). Rows
+        // arriving prove the worker really is talking to the server; the short
+        // pump after them is margin so the cancel lands inside the NEXT fetch
+        // call rather than between two.
+        h.pump_until("the fetch to put rows on the wire", || {
+            !last_rows
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+        })?;
+        h.pump_for(Duration::from_millis(50));
         h.editor
             .request_lazy_fetch(sid, space_query::ui::sql_editor::LazyFetchRequest::Cancel);
         h.pump_until("the broken fetch to finish", || {
@@ -874,6 +891,115 @@ fn verify(target: Target) -> Result<bool, String> {
         h.editor.clear_pooled_db_session();
         let _ = h.run("COMMIT");
     }
+
+    // S-BUSY: the close prompt's COMMIT while a NEIGHBOUR holds the connection
+    // mutex.
+    //
+    // The COMMIT runs on THIS tab's own pooled session and touches nothing the
+    // neighbour holds, but the road used to open with
+    // `try_lock_connection_with_activity` and answer
+    // `format_connection_busy_message()` — which `apply_pooled_session_resolution`
+    // reads as "refuse the close". So a neighbour tab's long statement, an Oracle
+    // explain plan or a metadata load made the prompt the user presses to KEEP
+    // their work refuse to run, with the work still open.
+    //
+    // The mutex is held by a thread that does no DB work at all, which is the
+    // honest shape of the bug: the refusal was about the LOCK, never about the
+    // session.
+    println!("  --- close-prompt COMMIT while a neighbour holds the connection mutex ---");
+    let read_v = |h: &mut Harness| -> Result<Option<i64>, String> {
+        h.last_rows
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        h.run("SELECT MAX(V) AS V FROM SQ_TXCLOSE_T")?;
+        if let Some(sid) = h.editor.active_lazy_fetch_session() {
+            h.editor
+                .request_lazy_fetch(sid, space_query::ui::sql_editor::LazyFetchRequest::All);
+            h.pump_until("V to drain", || {
+                h.editor.active_lazy_fetch_session().is_none()
+            })?;
+        }
+        Ok(h.last_rows
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|cell| cell.trim().parse::<i64>().ok()))
+    };
+    let v_before = read_v(&mut h)?;
+    let _ = h.run("COMMIT");
+    h.run(target.dml())?;
+    h.report("after DML");
+    let neighbour_shared = Arc::clone(&shared);
+    let neighbour_holding = Arc::new(AtomicBool::new(false));
+    let neighbour_release = Arc::new(AtomicBool::new(false));
+    let holding = Arc::clone(&neighbour_holding);
+    let release = Arc::clone(&neighbour_release);
+    let neighbour = std::thread::spawn(move || {
+        let _guard = neighbour_shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        holding.store(true, Ordering::SeqCst);
+        // BOUNDED. A regression that made the close prompt WAIT on the mutex
+        // instead of refusing would otherwise deadlock this harness for good —
+        // the release below only happens after the commit returns — and a
+        // deadlock is not a test result. Let go after a deadline instead, so
+        // such a regression surfaces as a scenario failure.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    h.pump_until("the neighbour to take the connection mutex", || {
+        neighbour_holding.load(Ordering::SeqCst)
+    })?;
+    let outcome = h.editor.commit_pooled_session_for_close();
+    neighbour_release.store(true, Ordering::SeqCst);
+    neighbour.join().map_err(|_| "neighbour thread panicked")?;
+    match &outcome {
+        Ok(RetainedSessionCloseOutcome::Resolved) => {
+            println!("    OK: the close prompt committed on the tab's own session")
+        }
+        Ok(RetainedSessionCloseOutcome::NothingToResolve) => {
+            println!(
+                ">>> BUG REPRODUCED: the close prompt found no session to commit while a \
+                 neighbour held the mutex"
+            );
+            reproduced = true;
+        }
+        Ok(RetainedSessionCloseOutcome::Unreachable(message)) => {
+            println!(
+                ">>> BUG REPRODUCED: the close prompt gave up the tab's session for a lock that \
+                 says nothing about it ({message})"
+            );
+            reproduced = true;
+        }
+        Err(message) => {
+            println!(
+                ">>> BUG REPRODUCED: the close prompt REFUSED for a lock that says nothing about \
+                 this tab's session ({message})"
+            );
+            reproduced = true;
+        }
+    }
+    // ...and the COMMIT really reached the server: the DML's `V + 1` survives a
+    // ROLLBACK, which it cannot do unless it was committed.
+    let _ = h.run("ROLLBACK");
+    let v_after = read_v(&mut h)?;
+    match (v_before, v_after) {
+        (Some(before), Some(after)) if after == before + 1 => {
+            println!("    OK: the committed work survived a later ROLLBACK (V {before} -> {after})")
+        }
+        (before, after) => {
+            println!(
+                ">>> BUG REPRODUCED: the close prompt's COMMIT did not reach the server \
+                 (V {before:?} -> {after:?})"
+            );
+            reproduced = true;
+        }
+    }
+    let _ = h.run("COMMIT");
 
     for sql in target.teardown() {
         let _ = h.run(&sql);

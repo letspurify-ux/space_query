@@ -4950,6 +4950,37 @@ impl SqlEditorWidget {
         store_mutex_transaction_mode_option(&self.ui_displayed_transaction_mode, displayed);
     }
 
+    /// This tab is no longer the one on screen, so what it recorded the screen
+    /// as saying has stopped being knowledge.
+    ///
+    /// Both slots hold a claim about THE SCREEN, and there is only one screen.
+    /// They live per tab because the checkpoint that reads them runs on the
+    /// worker, which cannot reach the window — so the storage was right and only
+    /// the LIFETIME was missing. A background tab kept the claim it had when it
+    /// was last on screen, and both tab-fact handlers state the ACTIVE tab's
+    /// controls (their own comments say so), so a batch adopting a mode or an
+    /// auto-commit on a BACKGROUND tab moved that tab's pin and left its claim
+    /// behind. The next execution on it — a follow-up table browse is scheduled
+    /// on a timer and needs no user action — was then refused by
+    /// `transaction_mode_display_mismatch_error` against a screen nobody was
+    /// looking at, and its result tab marked failed.
+    ///
+    /// Withdrawing is not weakening the checkpoint: `None` is the value it
+    /// already reads as *no claim*, and a tab with no screen has nothing to
+    /// disagree with. `set_active_editor_tab_with_display_stabilization` states
+    /// both again before it returns, so the tab that IS the screen always
+    /// carries a claim.
+    ///
+    /// The one thing it costs is `revert_transaction_mode_controls_to_displayed`
+    /// falling back to "leave the combos alone" for a pick refused in the window
+    /// where the connection could not be read AND the tab was activated in that
+    /// same window. The toolbar sync re-arms itself and settles them a fraction
+    /// of a second later, which is the road that window already depends on.
+    pub(crate) fn withdraw_displayed_state(&self) {
+        self.record_displayed_auto_commit(None);
+        self.record_displayed_transaction_mode(None);
+    }
+
     /// What the app RECORDED the screen as saying for this tab, which is the
     /// one source of truth for putting the toolbar's combos back after a pick
     /// the app did not apply.
@@ -5879,57 +5910,134 @@ impl SqlEditorWidget {
         RetainedSessionMutationOutcome::Applied
     }
 
+    /// What a session-ending road answers once it knows the tab's session cannot
+    /// be reached from the identity it is allowed to use.
+    ///
+    /// Two answers and not one, because the road knows which: an EMPTY slot lost
+    /// nothing, and a slot that held something lost it — with whatever work was
+    /// in it, which is what `retained_session_unreachable_message` says. Neither
+    /// is an `Err`: `apply_pooled_session_resolution` reads `Err` as "refuse the
+    /// close", and there is nothing left to retry once the incarnation the
+    /// session belonged to is retired, so refusing would leave the loss
+    /// unexplained AND the tab unclosable.
+    fn retained_session_gone_outcome(
+        retained_before_close: Option<RetainedSessionState>,
+    ) -> RetainedSessionCloseOutcome {
+        match retained_before_close {
+            Some(retained_state) => RetainedSessionCloseOutcome::Unreachable(
+                Self::retained_session_unreachable_message(retained_state),
+            ),
+            None => RetainedSessionCloseOutcome::NothingToResolve,
+        }
+    }
+
     fn run_pooled_session_close_action(
         &self,
         action: CloseSessionAction,
     ) -> Result<RetainedSessionCloseOutcome, String> {
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
-        let Some(connection) = self.bound_connection() else {
+        // ONE snapshot for both the runtime and the connection. Taking two
+        // (`bound_connection()` beside a second `snapshot()`) let a script
+        // `CONNECT` land between them, which would hand the door the OLD
+        // connection and the NEW runtime's identity — a mismatch it reads as
+        // "another incarnation", so a perfectly healthy session would have been
+        // reported to the user as lost.
+        let Some(runtime) = self.connection_binding.snapshot().runtime else {
             return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string());
         };
-        // Read before the connection lock is taken, so the arm below that needs
-        // it introduces no `DB_CONNECTION -> SESSION_LEASE` nesting — one that
-        // only a down connection would reach, and therefore one the order
-        // checker would never see.
+        let connection = runtime.connection();
         let retained_before_close = self
             .pooled_db_session
             .snapshot()
             .map(|snapshot| snapshot.retained_state());
+        // LOCK-FREE, the way the three per-tab settings resolve theirs.
+        //
+        // This used to open with `try_lock_connection_with_activity` and answer
+        // `format_connection_busy_message()` — a REFUSAL of the close — whenever
+        // a NEIGHBOUR tab held the connection mutex: its statement, an Oracle
+        // explain plan, an OCI script after `CONNECT`, a metadata load. None of
+        // those has anything to do with this tab's session, which is what the
+        // COMMIT below runs on, and the guard was released before the take
+        // anyway, so it was never providing exclusion either. The three per-tab
+        // pushes were moved off the mutex for exactly this reason; the prompt the
+        // user presses to keep their work was the road left on it.
+        //
+        // The identity is CHECKED twice and written nowhere — at the door here
+        // and again by the take — so a cached generation that has gone stale can
+        // only refuse this action, never misdirect it. See
+        // [`crate::db::RetainedSessionTarget`].
+        //
+        // A transition in flight is the one answer that is not knowledge: the
+        // connection may be serving queries again in a moment, so the close is
+        // refused and the user retries. Everything else the runtime can say is
+        // settled below.
+        if matches!(
+            runtime.state().liveness_without_connection_lock(),
+            crate::db::RuntimeLiveness::InFlight
+        ) {
+            return Err(crate::db::format_connection_busy_message());
+        }
         let (connection_generation, db_type, close_activity, close_connection_info) = {
-            let Some(mut conn_guard) =
-                crate::db::try_lock_connection_with_activity(&connection, "Closing query tab")
-            else {
-                return Err(crate::db::format_connection_busy_message());
+            // `None` means the runtime is not `Connected`, and a connection that
+            // went down retired the generation this tab's session was taken
+            // under — so the session is gone, which is a thing to REPORT and not
+            // a reason to refuse the close. `Err` is what
+            // `apply_pooled_session_resolution` reads as "refuse", and refusing
+            // here would leave a down connection's tabs unclosable.
+            let Some(target) = runtime.retained_session_target() else {
+                return Ok(Self::retained_session_gone_outcome(retained_before_close));
             };
-            // REFUSED, not defaulted, for the reason its toolbar twin states:
-            // a blank `ConnectionInfo` builds a session canceler that can reach
-            // no server, and this road then runs the user's COMMIT on the tab's
-            // session with it.
-            //
-            // The answer is an OUTCOME and not an `Err`, and the difference is
-            // the tab closing: `apply_pooled_session_resolution` reads `Err` as
-            // "refuse the close", and the only way to get here is a connection
-            // that is down — which retired the generation the tab's session was
-            // taken under, so the session is gone and there is nothing left to
-            // retry. Reporting it and letting the close finish is what this
-            // outcome exists for.
-            let connection_info = match conn_guard.pool_session_context() {
-                Ok(context) => context.connection_info,
-                Err(_) => {
-                    let Some(retained_state) = retained_before_close else {
-                        return Ok(RetainedSessionCloseOutcome::NothingToResolve);
-                    };
-                    return Ok(RetainedSessionCloseOutcome::Unreachable(
-                        Self::retained_session_unreachable_message(retained_state),
-                    ));
+            // The door the three per-tab pushes come through. It resolves the row
+            // and the connection info from ONE pool-context read, never blocks,
+            // and REFUSES rather than carrying on under a blank `ConnectionInfo`
+            // — which matters here for the reason it matters there: the take
+            // publishes a session canceler built from it, and on the MySQL family
+            // that canceler opens a control connection with it to send
+            // `KILL QUERY`.
+            match Self::begin_retained_session_action(&connection, "Closing query tab", target) {
+                Ok(action) => (
+                    target.connection_generation(),
+                    target.db_type(),
+                    action.activity,
+                    action.connection_info,
+                ),
+                // Whatever is in the slot belongs to another incarnation, and the
+                // take would CLOSE it. The incarnation it belongs to is retired,
+                // so the honest answer is the same one a down connection gets.
+                Err(
+                    crate::ui::sql_editor::execution::RetainedSessionRefusal::NotThisConnection,
+                ) => {
+                    return Ok(Self::retained_session_gone_outcome(retained_before_close));
                 }
-            };
-            (
-                conn_guard.connection_generation(),
-                conn_guard.db_type(),
-                conn_guard.activity(),
-                connection_info,
-            )
+                // The door folds TWO situations that this road, alone among its
+                // four, must keep apart — and it cannot tell them apart itself.
+                //
+                // The connection is BUSY (a neighbour's statement with nothing
+                // in the pool-context cache to fall back on, or a transition
+                // announced since the check above): refuse, because the answer
+                // is a different one a moment later. Or it cannot be READ AT ALL
+                // because it is down: then the incarnation this tab's session
+                // was taken under is retired and the session is gone — refusing
+                // THERE is what leaves a down connection's tabs unclosable,
+                // which is the whole reason this road has an `Unreachable`
+                // outcome instead of an `Err`.
+                //
+                // Only the connection knows, and asking costs a NON-BLOCKING
+                // try-lock that runs after the door has already refused: it can
+                // classify the refusal and never resolve the identity, so there
+                // is still one road to the take. The predicate is the one round
+                // 44's arm used, so the two answers are the same answers. A
+                // `None` here is an announced transition or a held mutex, both
+                // of which are "ask again".
+                Err(crate::ui::sql_editor::execution::RetainedSessionRefusal::Unreachable(_)) => {
+                    return match crate::db::try_lock_connection(&connection) {
+                        Some(conn_guard) if conn_guard.pool_session_context().is_err() => {
+                            Ok(Self::retained_session_gone_outcome(retained_before_close))
+                        }
+                        _ => Err(crate::db::format_connection_busy_message()),
+                    };
+                }
+            }
         };
         // Three different situations used to answer `Ok(())` here, and the
         // caller could not tell them apart: an empty slot (nothing to do), a

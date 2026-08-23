@@ -1132,6 +1132,35 @@ impl ConnectionAdvancedSettings {
         settings
     }
 
+    /// The transaction mode a CONNECTION is born with from these settings.
+    ///
+    /// The isolation is deliberately NOT part of it, and this function exists so
+    /// that fact has one statement instead of two. These two profile fields are
+    /// not one transaction mode: the ACCESS half becomes
+    /// [`DatabaseConnection::transaction_mode`] at connect, while the ISOLATION
+    /// half travels down its own channel — `sync_default_transaction_isolation`
+    /// resolves it and the pool states it on every session it prepares
+    /// (`ALTER SESSION SET ISOLATION_LEVEL` / `SET SESSION TRANSACTION ISOLATION
+    /// LEVEL`). On Oracle the two never meet at all:
+    /// [`DatabaseConnection::transaction_mode_with_default_substituted`]
+    /// substitutes a connection default into a `Default` isolation only for the
+    /// MySQL family.
+    ///
+    /// `validate_oracle` used to form the pair itself and ask
+    /// [`DatabaseConnection::transaction_mode_selection_error`] about it, which
+    /// refused `Read committed` + `Read only` — the field's own DEFAULT
+    /// isolation plus the one access mode a user is likely to change — for a
+    /// configuration this function shows the connection never builds, with a
+    /// message that never named the fix. A validator that forms a value the
+    /// runtime does not form is validating a different program, so both sides
+    /// ask this.
+    pub(crate) fn connection_transaction_mode(&self) -> TransactionMode {
+        TransactionMode::new(
+            TransactionIsolation::Default,
+            self.default_transaction_access_mode,
+        )
+    }
+
     pub fn validate_for_db(
         &self,
         db_type: DatabaseType,
@@ -1178,12 +1207,18 @@ impl ConnectionAdvancedSettings {
                     .to_string(),
             );
         }
+        // The mode this profile really forms, not the isolation/access PAIR it
+        // used to be asked about — see
+        // [`ConnectionAdvancedSettings::connection_transaction_mode`]. No access
+        // mode fails it today, and saying so is the point: it is the RULE ("a
+        // connection may not be born into a mode it has no statement for")
+        // rather than a filter doing work, and the value it asks about is now
+        // the one the connect road builds. The isolation is checked on its own
+        // question — does this backend have the level at all — by
+        // `validate_for_db` before this runs.
         if let Some(reason) = DatabaseConnection::transaction_mode_selection_error(
             DatabaseType::Oracle,
-            TransactionMode::new(
-                self.default_transaction_isolation,
-                self.default_transaction_access_mode,
-            ),
+            self.connection_transaction_mode(),
         ) {
             return Err(reason);
         }
@@ -7631,10 +7666,11 @@ impl DatabaseConnection {
         self.info = info;
         self.oracle_current_schema = None;
         self.sync_default_transaction_isolation(db_type);
-        self.transaction_mode = TransactionMode::new(
-            TransactionIsolation::Default,
-            self.info.advanced.default_transaction_access_mode,
-        );
+        // The ACCESS half only — the isolation went down its own channel in
+        // `sync_default_transaction_isolation` just above. Stated through the
+        // settings' own function so the validator asks about the mode this line
+        // really builds; see `ConnectionAdvancedSettings::connection_transaction_mode`.
+        self.transaction_mode = self.info.advanced.connection_transaction_mode();
         self.connected = true;
         backend_for(db_type).after_connect(self);
         self.last_disconnect_reason = None;
@@ -19135,26 +19171,82 @@ mod tests {
         assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_err());
     }
 
+    /// The profile's two transaction fields are not one transaction mode, so
+    /// the validator asks about the mode the CONNECTION will really form.
+    ///
+    /// It used to form `TransactionMode::new(default_transaction_isolation,
+    /// default_transaction_access_mode)` and refuse the pair Oracle has no
+    /// single statement for. That pair is one `connect_blocking_with_policy`
+    /// never builds — it takes the ACCESS half only, and the isolation reaches
+    /// the server as session state — so the refusal fell on the DEFAULT
+    /// isolation (`Read committed`) plus the one access mode a user is likely
+    /// to change, for a configuration the app runs perfectly well.
     #[test]
-    fn oracle_advanced_validation_rejects_read_only_with_explicit_isolation() {
+    fn oracle_advanced_validation_asks_about_the_mode_the_connection_will_form() {
         let mut oracle = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
-        oracle.default_transaction_access_mode = TransactionAccessMode::ReadOnly;
-        oracle.default_transaction_isolation = TransactionIsolation::ReadCommitted;
+        assert_eq!(
+            oracle.default_transaction_isolation,
+            TransactionIsolation::ReadCommitted,
+            "the field this used to be refused for is the one a new profile starts with"
+        );
 
+        oracle.default_transaction_access_mode = TransactionAccessMode::ReadOnly;
+        assert!(
+            oracle.validate_for_db(DatabaseType::Oracle, false).is_ok(),
+            "a read-only Oracle connection whose sessions run at READ COMMITTED is expressible: \
+             the access half is `SET TRANSACTION READ ONLY` and the isolation half is \
+             `ALTER SESSION SET ISOLATION_LEVEL`"
+        );
+        assert_eq!(
+            oracle.connection_transaction_mode(),
+            TransactionMode::new(
+                TransactionIsolation::Default,
+                TransactionAccessMode::ReadOnly
+            ),
+            "...which is exactly the mode the connect road builds from it"
+        );
+        assert!(DatabaseConnection::transaction_mode_selection_error(
+            DatabaseType::Oracle,
+            oracle.connection_transaction_mode()
+        )
+        .is_none());
+
+        for isolation in [
+            TransactionIsolation::Default,
+            TransactionIsolation::ReadCommitted,
+            TransactionIsolation::Serializable,
+        ] {
+            oracle.default_transaction_isolation = isolation;
+            assert!(
+                oracle.validate_for_db(DatabaseType::Oracle, false).is_ok(),
+                "{isolation:?} is a level Oracle supports, and the access mode beside it is a \
+                 separate channel"
+            );
+        }
+
+        // The isolation is still validated — on its OWN question, which is
+        // whether this backend has the level at all.
+        oracle.default_transaction_isolation = TransactionIsolation::RepeatableRead;
         let err = oracle
             .validate_for_db(DatabaseType::Oracle, false)
-            .expect_err("Oracle cannot run a read-committed read-only transaction");
+            .expect_err("Oracle has no REPEATABLE READ");
+        assert!(err.contains("Repeatable read"), "{err}");
+    }
 
+    /// The pair the validator no longer forms is still refused where it is
+    /// really formed: a TAB picking it in the toolbar.
+    #[test]
+    fn an_unrunnable_oracle_pair_is_still_refused_where_a_tab_can_choose_it() {
+        let err = DatabaseConnection::transaction_mode_selection_error(
+            DatabaseType::Oracle,
+            TransactionMode::new(
+                TransactionIsolation::ReadCommitted,
+                TransactionAccessMode::ReadOnly,
+            ),
+        )
+        .expect("Oracle cannot run a read-committed read-only transaction");
         assert!(err.contains("READ ONLY"));
         assert!(err.contains("isolation"));
-
-        // Serializable + Read only is what SET TRANSACTION READ ONLY provides,
-        // so it validates.
-        oracle.default_transaction_isolation = TransactionIsolation::Serializable;
-        assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_ok());
-
-        oracle.default_transaction_isolation = TransactionIsolation::Default;
-        assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_ok());
     }
 
     #[test]

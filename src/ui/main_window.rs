@@ -2239,6 +2239,16 @@ pub struct AppState {
     /// connection's tab. Written only by
     /// [`AppState::refresh_active_connection_view`].
     cached_connection_defaults: CachedConnectionDefaults,
+    /// The answer the controls that offer a write were last given: the tab, the
+    /// write refusal, and whether the displayed result still belongs to that
+    /// tab's binding.
+    ///
+    /// Written only by
+    /// [`AppState::refresh_result_edit_controls_if_their_answer_moved`]. It
+    /// exists so those controls can be re-asked when the per-tab settings move
+    /// the answer, without re-laying out the result toolbar on every status
+    /// tick.
+    published_write_refusal: Option<(QueryTabId, bool, bool)>,
     pending_connection_metadata_refresh: bool,
     pending_metadata_refresh_tabs: HashSet<QueryTabId>,
     latest_schema_request_id: u64,
@@ -3010,8 +3020,23 @@ impl AppState {
             return false;
         };
         let previous_tab_id = self.active_editor_tab_id;
-        if previous_tab_id != tab_id && self.pending_connection_metadata_refresh {
-            self.remember_pending_metadata_tab(previous_tab_id);
+        if previous_tab_id != tab_id {
+            if self.pending_connection_metadata_refresh {
+                self.remember_pending_metadata_tab(previous_tab_id);
+            }
+            // The claim about the SCREEN leaves with the tab. This is the only
+            // writer of `active_editor_tab_id` that leaves a tab alive and off
+            // screen — the other one runs when the last tab has been closed, and
+            // a closed tab's claim goes with its editor — so it is where the
+            // lifetime of that claim is stated. See
+            // `SqlEditorWidget::withdraw_displayed_state`.
+            if let Some(previous) = self
+                .editor_tabs
+                .iter()
+                .find(|tab| tab.tab_id == previous_tab_id)
+            {
+                previous.sql_editor.withdraw_displayed_state();
+            }
         }
         let tab = self.editor_tabs[index].clone();
         self.active_editor_tab_id = tab_id;
@@ -3264,6 +3289,56 @@ impl AppState {
             }
             None => self.active_tab_is_pinned_read_only(),
         }
+    }
+
+    /// Re-ask the controls that OFFER a write when the per-tab settings have
+    /// moved the answer they were last given.
+    ///
+    /// A gate has two halves — WHAT it asks and WHEN it is asked — and the grid's
+    /// edit control had only the first. It learned to ask the tab's READ ONLY pin
+    /// beside the connection's read-only flag, and then nothing re-asked it when
+    /// that pin moved: `refresh_result_edit_controls` is called from ~40
+    /// query-lifecycle and tab-switch sites, from none of the roads that move a
+    /// per-tab setting, and from `render_status_bar` only when it has just
+    /// reconciled an orphaned fetch. So pinning a tab READ ONLY with a grid open
+    /// left the checkbox offered — the user stages edits and meets the refusal at
+    /// Save, the exact state the control hides itself to prevent — unpinning left
+    /// it hidden, and a browser scope pick left it offering a save the stale
+    /// result origin would refuse.
+    ///
+    /// The tab's other three screen facts are simply re-stated by the status
+    /// tick. This one cannot be: `refresh_result_edit_controls` re-lays out the
+    /// result toolbar, so restating it
+    /// at tick rate would be a layout and a redraw
+    /// per frame. The ANSWER is what the tick carries instead, and the control is
+    /// re-asked only when it moves.
+    ///
+    /// Exactly the two facts the three per-tab settings move, and no more: the
+    /// write refusal (auto-commit is not among its halves, and the transaction
+    /// mode and the connection's flag are) and whether the displayed result still
+    /// belongs to the tab's current binding, which is what a SCOPE change moves.
+    /// `can_current_begin_edit_mode` is deliberately not watched — it parses the
+    /// result's SQL, and every road that moves it is one of the ~40 that already
+    /// call the refresh.
+    ///
+    /// Keyed by tab, so switching to a tab whose answer happens to match does not
+    /// suppress anything: `activate_tab` refreshes on its own.
+    ///
+    /// Called from [`Self::sync_transaction_mode_controls`] — the one place the
+    /// tab's effective access mode is derived, on every status tick and from
+    /// every road that moves it, and already the publisher of the same fact's
+    /// other half to the tab's browser card.
+    fn refresh_result_edit_controls_if_their_answer_moved(&mut self) {
+        let answer = (
+            self.active_editor_tab_id,
+            self.active_tab_write_would_be_refused(),
+            self.active_result_origin_is_current(),
+        );
+        if self.published_write_refusal == Some(answer) {
+            return;
+        }
+        self.published_write_refusal = Some(answer);
+        self.refresh_result_edit_controls();
     }
 
     fn bind_active_unbound_tab_to_selected_database(&mut self) -> Result<(), String> {
@@ -5196,6 +5271,15 @@ impl AppState {
         }
         self.transaction_mode_sync_retry_armed = false;
 
+        // Before the two arms below and not inside either of them: the tab's
+        // access mode is the fact this function exists to state, and the result
+        // grid's edit control is the second thing that reads it — beside the
+        // browser card, whose half each arm states in its own words. One call
+        // answers for BOTH arms because it re-derives the joined refusal itself,
+        // including the "connection could not be read, so the tab's pin is all
+        // that is knowable" tier the arm below states to the card.
+        self.refresh_result_edit_controls_if_their_answer_moved();
+
         let Some((db_type, is_connected, mode, default_isolation)) =
             self.transaction_control_state()
         else {
@@ -5684,7 +5768,29 @@ impl AppState {
         let edit_active = self.result_tabs.is_current_edit_mode_enabled();
         let save_pending = self.result_tabs.is_current_save_pending();
         let query_running = self.sql_editor.is_query_running();
-        let show_edit_check = can_edit;
+        // A control that OFFERS a write is hidden when the write would be
+        // refused — that is what this function is for. A control that ABANDONS
+        // staged work is not a write, and an edit session that is ALREADY open
+        // must stay exitable: the checkbox (whose other position cancels) and
+        // Cancel are the only two ways out of one, and `cancel_current_edit_mode`
+        // is what discards the staged rows.
+        //
+        // Hiding both on `can_edit` alone stranded the user — staged rows in the
+        // grid with no way to discard them and no way to save them. Making the
+        // tab's own READ ONLY pin re-ask this control (the point of
+        // `refresh_result_edit_controls_if_their_answer_moved`) put that one
+        // toolbar pick away, so the exit is stated here rather than left to the
+        // refusal's shape.
+        //
+        // `origin_is_current` and not `edit_active` alone, because the exit has
+        // to WORK: `clone_result_tabs_for_edit_action` — which both the checkbox
+        // and Cancel go through — refuses a stale origin outright, for Cancel as
+        // well as for Save. Offering a button that only alerts would be the same
+        // dead end wearing a different face, so a stale-origin session stays as
+        // it has always been (both hidden). That is a pre-existing dead end this
+        // is deliberately not widening into.
+        let exit_is_reachable = edit_active && origin_is_current;
+        let show_edit_check = can_edit || exit_is_reachable;
         if show_edit_check {
             self.result_toolbar
                 .fixed(&self.result_one_tab_edit_gap, RESULT_CHECKBOX_GROUP_GAP);
@@ -5714,48 +5820,63 @@ impl AppState {
             self.result_toolbar.fixed(&self.result_one_tab_edit_gap, 0);
             self.result_toolbar.fixed(&self.result_edit_check, 0);
         }
-        let desired_checked = edit_active && can_edit;
+        // The MARK says whether a session is open, not whether it may be opened.
+        // With `can_edit` folded in, a shown-but-unchecked box over a live edit
+        // session would run `begin_current_edit_mode` on the next click — the
+        // callback reads the box's NEW value — where the user meant to leave.
+        let desired_checked = edit_active;
         if self.result_edit_check.value() != desired_checked {
             self.result_edit_check.set(desired_checked);
         }
 
-        let show_action_buttons = edit_active && can_edit;
-        let actions_enabled = show_action_buttons && !save_pending && !query_running;
+        let show_write_actions = edit_active && can_edit;
+        let show_cancel_action = exit_is_reachable;
+        // Neither Cancel nor the checkbox may act while a save is in flight or a
+        // query is running: `cancel_edit_mode` refuses in both states, so
+        // offering it live would only produce an alert.
+        let actions_enabled = !save_pending && !query_running;
         set_result_action_button_visibility(
             &mut self.result_toolbar,
             &mut self.result_insert_btn,
-            show_action_buttons,
+            show_write_actions,
         );
         set_result_action_button_visibility(
             &mut self.result_toolbar,
             &mut self.result_delete_btn,
-            show_action_buttons,
+            show_write_actions,
         );
         set_result_action_button_visibility(
             &mut self.result_toolbar,
             &mut self.result_save_btn,
-            show_action_buttons,
+            show_write_actions,
         );
         set_result_action_button_visibility(
             &mut self.result_toolbar,
             &mut self.result_cancel_btn,
-            show_action_buttons,
+            show_cancel_action,
         );
-        if show_action_buttons {
+        if show_write_actions {
             if actions_enabled {
                 self.result_insert_btn.activate();
                 self.result_delete_btn.activate();
                 self.result_save_btn.activate();
-                self.result_cancel_btn.activate();
-                self.result_edit_check.activate();
             } else {
                 self.result_insert_btn.deactivate();
                 self.result_delete_btn.deactivate();
                 self.result_save_btn.deactivate();
-                self.result_cancel_btn.deactivate();
-                self.result_edit_check.deactivate();
             }
         }
+        if show_cancel_action {
+            if actions_enabled {
+                self.result_cancel_btn.activate();
+            } else {
+                self.result_cancel_btn.deactivate();
+            }
+        }
+        // The checkbox's enablement is stated ONCE, with its visibility above:
+        // it used to be stated again here under a different condition, so which
+        // of the two ran last decided it — and after the split above the two
+        // conditions really can disagree.
         self.result_toolbar.layout();
         self.result_toolbar.redraw();
     }
@@ -10026,6 +10147,7 @@ impl MainWindow {
             connection_info: Arc::new(Mutex::new(None)),
             has_live_connection: false,
             cached_connection_defaults: CachedConnectionDefaults::default(),
+            published_write_refusal: None,
             pending_connection_metadata_refresh: false,
             pending_metadata_refresh_tabs: HashSet::new(),
             latest_schema_request_id: 0,

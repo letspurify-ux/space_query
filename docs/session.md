@@ -430,6 +430,41 @@ explain, object-browser Drop/Truncate, CSV import, and the grid's staged save.
 For a restriction the server enforces, use the connection's `READ ONLY`
 transaction access mode or an account without write privileges.
 
+## A cancel that lost its race with the call is over, not a handshake to run
+
+Oracle Thin's break/reset handshake exists because a break normally interrupts a
+call and leaves the server's break response pending on the socket:
+`settle_interrupted_read` sees the cancel flag, `finish_cancelled_read` drains
+the wire back to a request boundary, and a drain that cannot complete marks the
+session broken so the pool discards it.
+
+**But the break RACES the call it is aimed at, and it can lose.** The server
+finishes the call, answers it in full, and never acts on the marker — the read
+SUCCEEDS. The handshake then waited for a response nothing was going to send:
+quiet for `CANCEL_RESET_DRAIN_TIMEOUT`, read as a handshake that failed, session
+broken. On a lazy fetch that cost the tab its open transaction, for a cancel that
+never reached the statement. Traced on protocol 319: `SETTLE(read_ok=true) ;
+PKT(Quiet) ; DRAIN-ERR(cancel break response timed out)`. It is reachable without
+a user at all — the app cancels fetches from the pool-slot eviction, a tab close
+and the stale sweep.
+
+**A read that SUCCEEDED is the one unambiguous proof that the wire is back at a
+request boundary**: the server's complete answer to our request was consumed, so
+the cancel is simply over and there is nothing to drain.
+`clear_pending_cancel_when_the_answer_settled_it` states that for every protocol.
+The rule was not new — the legacy (go-ora) mapping had always done it — but it
+sat behind a legacy-only gate, because the ERROR half beside it really is
+legacy-only and the two came out as one condition. That half stays where it was:
+on a modern protocol a real cancel's `ORA-01013` arrives as PART of the
+break/reset sequence, and `error_looks_like_oracle_response` matches any `ORA-`
+text, so treating an error as "the answer settled" there would skip the drain the
+wire really needs. Unit:
+`a_cancel_the_answer_overtook_is_settled_on_every_protocol` and
+`an_oracle_error_settles_a_cancel_only_on_the_legacy_protocols`; live: the whole
+`live_tns` suite on 314/315/318/319, plus `verify_commit_close_live`'s
+cancel-a-fetch-on-the-wire rounds driven at a 2 ms gap (which reproduced it
+before the fix).
+
 ## A cancel this app sent is not the session's answer
 
 A break / `KILL QUERY` interrupts the call that is **running**. When the work

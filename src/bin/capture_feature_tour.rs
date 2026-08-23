@@ -662,37 +662,39 @@ fn assert_result_page_control_layout(expected_sizes: &[(i32, i32)]) {
 }
 
 fn assert_result_page_control_feedback() {
-    fn assert_control<W: WidgetBase>(control: &mut W) {
-        let base = control.color();
-        let _ = control.handle_event(Event::Enter);
-        pump(20);
-        if control.color() != theme::hover_feedback_color(base) {
-            fail("result page control did not apply its hover color");
-        }
-        let _ = control.handle_event(Event::Leave);
-        pump(20);
-        if control.color() != base {
-            fail("result page control did not restore its default color");
-        }
-    }
-
+    // Through the one helper: this used to be a second copy of it, with its own
+    // pump and its own wording, so the race the helper documents could be fixed
+    // in one of them and left in the other.
     let mut next = app::widget_from_id::<fltk::button::Button>("result_page_next")
         .unwrap_or_else(|| fail("result next-page button is missing"));
     let mut unit = app::widget_from_id::<fltk::menu::Choice>("result_page_unit")
         .unwrap_or_else(|| fail("result page unit control is missing"));
-    assert_control(&mut next);
-    assert_control(&mut unit);
+    assert_hover_feedback(&mut next, "result next-page button");
+    assert_hover_feedback(&mut unit, "result page unit control");
 }
 
+/// DELIBERATELY WITHOUT PUMPING THE EVENT LOOP.
+///
+/// `theme::install_hover_feedback` sets the colour inside the handler, so the
+/// answer is there the moment `handle_event` returns; pumping adds nothing to
+/// the question and hands the widget back to the APPLICATION in between.
+///
+/// That is not hypothetical. This check force-activates a control whose
+/// enablement the app owns, and the transaction-isolation choice is one the app
+/// keeps DISABLED while there is no live connection — which is every tour, whose
+/// connection is presented rather than opened. A 20ms pump let the status tick
+/// run `sync_transaction_mode_controls`, which deactivated it again; the theme
+/// then correctly restored the base colour on `Event::Deactivate`, and the check
+/// read that as "the hover colour was never applied". Measured, not guessed:
+/// with the pump removed the same control reports `color_is_hover=true`
+/// immediately after `Event::Enter`, and `active=false` right after the pump.
 fn assert_hover_feedback<W: WidgetBase>(control: &mut W, name: &str) {
     let base = control.color();
     let _ = control.handle_event(Event::Enter);
-    pump(20);
     if control.color() != theme::hover_feedback_color(base) {
         fail(format!("{name} did not apply its hover color"));
     }
     let _ = control.handle_event(Event::Leave);
-    pump(20);
     if control.color() != base {
         fail(format!("{name} did not restore its default color"));
     }

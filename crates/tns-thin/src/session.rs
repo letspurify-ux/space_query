@@ -1090,14 +1090,53 @@ impl OracleThinSession {
         }
     }
 
-    fn clear_go_ora_cancel_if_response_completed<T>(&self, response: &Result<T, OracleThinError>) {
-        if !protocol_uses_go_ora_legacy_mappings(self.capabilities.protocol_version)
-            || !self.cancel_flag.load(Ordering::SeqCst)
-        {
+    /// A cancel this session sent has nothing left to settle once the CALL'S OWN
+    /// ANSWER has been read in full.
+    ///
+    /// [`Self::settle_interrupted_read`] runs the break/reset handshake whenever
+    /// the cancel flag is set, and that is right for the case it was written
+    /// for: a break normally interrupts a call and leaves the server's break
+    /// response pending on the socket, so the wire has to be drained back to a
+    /// request boundary.
+    ///
+    /// **But a break RACES the call it is aimed at, and it can lose.** The
+    /// server finishes the call, answers it in full and never acts on the
+    /// marker; the read then SUCCEEDS, and the handshake that follows waits for
+    /// a response nothing is going to send. It goes quiet for
+    /// `CANCEL_RESET_DRAIN_TIMEOUT`, `finish_cancelled_read` reads that as a
+    /// handshake that could not complete, and the session is marked broken — so
+    /// a cancel that did not even reach the statement costs the session, and on
+    /// a lazy fetch the tab's open transaction with it. Traced on protocol 319:
+    /// `SETTLE(read_ok=true) ; PKT(Quiet) ; DRAIN-ERR(cancel break response
+    /// timed out)`.
+    ///
+    /// A read that SUCCEEDED is the one unambiguous proof that the wire is back
+    /// at a request boundary — the server's complete answer to our request was
+    /// consumed — so the cancel is simply over and there is nothing to drain.
+    /// That rule is not new and not protocol-specific: it is what the legacy
+    /// (go-ora) mapping has always done. It was written behind a legacy-only
+    /// gate because the ERROR half below is legacy-only, and the two facts came
+    /// out as one condition — so every modern protocol lost the half that is
+    /// true everywhere.
+    ///
+    /// The error half stays where it was. On a modern protocol a real cancel's
+    /// ORA-01013 arrives as PART of the break/reset sequence, and
+    /// `error_looks_like_oracle_response` matches any `ORA-` text — so treating
+    /// an error as "the answer settled" there would skip the drain the wire
+    /// really needs.
+    fn clear_pending_cancel_when_the_answer_settled_it<T>(
+        &self,
+        response: &Result<T, OracleThinError>,
+    ) {
+        if !self.cancel_flag.load(Ordering::SeqCst) {
             return;
         }
-        if response.is_ok()
-            || response
+        if response.is_ok() {
+            self.reset_pending_cancel();
+            return;
+        }
+        if protocol_uses_go_ora_legacy_mappings(self.capabilities.protocol_version)
+            && response
                 .as_ref()
                 .err()
                 .is_some_and(error_looks_like_oracle_response)
@@ -2250,7 +2289,7 @@ impl OracleThinSession {
             close_sequence.is_some(),
             Some(cancel_state),
         );
-        self.clear_go_ora_cancel_if_response_completed(&response);
+        self.clear_pending_cancel_when_the_answer_settled_it(&response);
         if let Some(error) = self.settle_interrupted_read(&response) {
             return Err(error);
         }
@@ -3277,7 +3316,7 @@ impl OracleThinSession {
             skip_empty_end_of_response,
             Some(cancel_state),
         );
-        self.clear_go_ora_cancel_if_response_completed(&response);
+        self.clear_pending_cancel_when_the_answer_settled_it(&response);
         if let Some(error) = self.settle_interrupted_read(&response) {
             let _ = self.free_temp_lobs_and_fetched(&temp_lob_locators);
             return Err(error);
@@ -3496,7 +3535,7 @@ impl OracleThinSession {
             !pending_cursor_closes.is_empty(),
             Some(cancel_state),
         );
-        self.clear_go_ora_cancel_if_response_completed(&response);
+        self.clear_pending_cancel_when_the_answer_settled_it(&response);
         if let Some(error) = self.settle_interrupted_read(&response) {
             return Err(error);
         }
@@ -15840,6 +15879,90 @@ mod tests {
         assert_eq!(flags, TNS_DATA_FLAGS_EOF);
         assert_eq!(payload, vec![0xaa, 0xbb]);
         server.join().unwrap();
+    }
+
+    /// A session whose only job is to hold state the rule below reads.
+    fn session_on_a_dead_socket(protocol_version: u16) -> OracleThinSession {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+        let stream = TcpStream::connect(addr).unwrap();
+        let _server_side = accepted.join().unwrap().unwrap();
+        let mut session = test_session_with_stream(stream);
+        session.capabilities.protocol_version = Some(protocol_version);
+        session
+    }
+
+    /// A CANCEL THAT LOST ITS RACE WITH THE CALL IS OVER, ON EVERY PROTOCOL.
+    ///
+    /// A break races the call it is aimed at. When it loses — the server
+    /// finishes the call and answers it in full without ever acting on the
+    /// marker — the read SUCCEEDS, and the break/reset handshake that used to
+    /// follow waited for a response nothing was going to send: quiet for
+    /// `CANCEL_RESET_DRAIN_TIMEOUT`, then the session marked broken. On a lazy
+    /// fetch that cost the tab its open transaction for a cancel that never
+    /// reached the statement.
+    ///
+    /// The rule was already written — and gated to the LEGACY protocols,
+    /// because the error half beside it really is legacy-only and the two came
+    /// out as one condition. A successful read proves the wire is at a request
+    /// boundary whatever the protocol version says.
+    #[test]
+    fn a_cancel_the_answer_overtook_is_settled_on_every_protocol() {
+        for protocol_version in [314u16, 315, 318, 319] {
+            let session = session_on_a_dead_socket(protocol_version);
+            session
+                .cancel_flag
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+
+            session
+                .clear_pending_cancel_when_the_answer_settled_it(
+                    &Ok::<(), crate::OracleThinError>(()),
+                );
+
+            assert!(
+                !session
+                    .cancel_flag
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "protocol {protocol_version}: a read that succeeded leaves nothing for the \
+                 break/reset handshake to drain, so the cancel must not still be pending"
+            );
+        }
+    }
+
+    /// ...and an ERROR does not settle it on a modern protocol.
+    ///
+    /// The other half of the same condition, kept where it was: on a modern
+    /// protocol a real cancel's `ORA-01013` arrives as PART of the break/reset
+    /// sequence, and `error_looks_like_oracle_response` matches any `ORA-` text
+    /// — so reading an error as "the answer settled" there would skip the drain
+    /// the wire really needs and leave the next call reading the last one's
+    /// response.
+    #[test]
+    fn an_oracle_error_settles_a_cancel_only_on_the_legacy_protocols() {
+        for (protocol_version, settles) in
+            [(314u16, true), (315, false), (318, false), (319, false)]
+        {
+            let session = session_on_a_dead_socket(protocol_version);
+            session
+                .cancel_flag
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+
+            session.clear_pending_cancel_when_the_answer_settled_it(&Err::<(), _>(
+                crate::OracleThinError::new(
+                    "ORA-01013: user requested cancel of current operation",
+                ),
+            ));
+
+            assert_eq!(
+                !session
+                    .cancel_flag
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                settles,
+                "protocol {protocol_version}: an ORA- error settles a pending cancel only where \
+                 the legacy mapping produced it instead of the break/reset sequence"
+            );
+        }
     }
 
     #[test]
