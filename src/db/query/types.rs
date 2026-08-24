@@ -80,6 +80,10 @@ pub struct ProcedureArgument {
     pub data_scale: Option<i32>,
     pub type_owner: Option<String>,
     pub type_name: Option<String>,
+    /// Third part of a composite type's name (`ALL_ARGUMENTS.TYPE_SUBNAME`):
+    /// for a type declared inside a package, `type_owner.type_name` is the
+    /// package and this is the type itself. Oracle only; `None` elsewhere.
+    pub type_subname: Option<String>,
     pub pls_type: Option<String>,
     pub overload: Option<i32>,
     pub default_value: Option<String>,

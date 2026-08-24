@@ -38496,6 +38496,7 @@ fn build_signature_label_formats_params_and_spans() {
             data_scale: None,
             type_owner: None,
             type_name: None,
+            type_subname: None,
             pls_type: None,
             overload: None,
             default_value: None,

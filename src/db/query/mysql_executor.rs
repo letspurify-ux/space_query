@@ -18,6 +18,43 @@ pub struct MysqlExecutor;
 
 pub struct MysqlObjectBrowser;
 
+/// Which routine namespace a MySQL-family argument lookup targets.
+///
+/// MySQL and MariaDB keep procedures and functions in SEPARATE namespaces, so
+/// one name can be both at once — `INFORMATION_SCHEMA.PARAMETERS` then holds
+/// BOTH routines' rows under a single SPECIFIC_NAME, interleaved by
+/// ORDINAL_POSITION. An argument lookup must therefore say which routine it
+/// means; fetching by name alone hands back a merged parameter list that
+/// matches neither routine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MysqlRoutineKind {
+    Procedure,
+    Function,
+}
+
+impl MysqlRoutineKind {
+    /// The catalog's ROUTINE_TYPE spelling for this kind.
+    pub fn as_routine_type(self) -> &'static str {
+        match self {
+            Self::Procedure => "PROCEDURE",
+            Self::Function => "FUNCTION",
+        }
+    }
+
+    /// The kind a routine-type string names, `None` for anything else (the
+    /// object browser's package-routine "UNKNOWN" never reaches a
+    /// MySQL-family lookup).
+    pub fn from_routine_type(routine_type: &str) -> Option<Self> {
+        if routine_type.eq_ignore_ascii_case("PROCEDURE") {
+            Some(Self::Procedure)
+        } else if routine_type.eq_ignore_ascii_case("FUNCTION") {
+            Some(Self::Function)
+        } else {
+            None
+        }
+    }
+}
+
 const MYSQL_CANCEL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Which `KILL` a cancel sends. Named so the two tiers cannot be told apart
@@ -1482,6 +1519,22 @@ impl MysqlObjectBrowser {
             .map(ToOwned::to_owned)
     }
 
+    /// The schema a PREPARED metadata lookup must bind EXPLICITLY.
+    ///
+    /// `COALESCE(?, DATABASE())` inside a prepared statement does not mean
+    /// "the session's database at execute time": MySQL 8 and MariaDB fold
+    /// `DATABASE()` to a CONSTANT when the statement is first prepared, and
+    /// the per-connection statement cache keeps that plan across `USE` — a
+    /// pooled session that served another scope then answers a schema-less
+    /// lookup from the database it was in back then. So a missing schema is
+    /// resolved HERE, over the text protocol (never prepared, never folded),
+    /// and the bind parameter is always the authoritative value; the
+    /// prepared SQL must not mention `DATABASE()` at all.
+    fn effective_schema_param(conn: &mut Conn, schema_name: Option<&str>) -> Option<String> {
+        Self::optional_schema_param(schema_name)
+            .or_else(|| MysqlExecutor::session_current_database(conn))
+    }
+
     fn escape_identifier(identifier: &str) -> String {
         identifier.replace('`', "``")
     }
@@ -2153,6 +2206,7 @@ impl MysqlObjectBrowser {
             data_scale: None,
             type_owner: None,
             type_name: None,
+            type_subname: None,
             pls_type: None,
             overload: None,
             default_value,
@@ -2234,6 +2288,7 @@ impl MysqlObjectBrowser {
                         data_scale: None,
                         type_owner: None,
                         type_name: None,
+                        type_subname: None,
                         pls_type: None,
                         overload: None,
                         default_value: None,
@@ -2249,30 +2304,45 @@ impl MysqlObjectBrowser {
         conn: &mut Conn,
         schema_name: Option<&str>,
         routine_name: &str,
+        kind: MysqlRoutineKind,
     ) -> Option<Vec<ProcedureArgument>> {
         let schema_name = Self::optional_schema_param(schema_name);
-        let routine_type: Option<String> = conn
-            .exec_first(
-                "SELECT ROUTINE_TYPE \
-                 FROM INFORMATION_SCHEMA.ROUTINES \
-                 WHERE ROUTINE_SCHEMA = COALESCE(?, DATABASE()) AND ROUTINE_NAME = ? \
-                 LIMIT 1",
-                (schema_name.clone(), routine_name),
-            )
-            .ok()
-            .flatten();
-        let routine_type = routine_type?;
         let ddl = Self::get_create_object_in_schema(
             conn,
             schema_name.as_deref(),
-            &routine_type,
+            kind.as_routine_type(),
             routine_name,
         )
         .ok()?;
         if ddl.trim().is_empty() {
             return None;
         }
-        Self::parse_routine_arguments_from_create_ddl(&ddl, &routine_type)
+        Self::parse_routine_arguments_from_create_ddl(&ddl, kind.as_routine_type())
+    }
+
+    /// The kind `routine_name` resolves to when nothing narrowed it down.
+    /// `ORDER BY ROUTINE_TYPE` makes a name that is both a FUNCTION and a
+    /// PROCEDURE resolve to the function ('FUNCTION' sorts first) — the same
+    /// preference [`Self::get_routine_arguments_in_schema_any_kind`] applies
+    /// when parameter rows are present.
+    fn discovered_kind_for_routine(
+        conn: &mut Conn,
+        schema_name: Option<&str>,
+        routine_name: &str,
+    ) -> Option<MysqlRoutineKind> {
+        let schema_name = Self::effective_schema_param(conn, schema_name);
+        let routine_type: Option<String> = conn
+            .exec_first(
+                "SELECT ROUTINE_TYPE \
+                 FROM INFORMATION_SCHEMA.ROUTINES \
+                 WHERE ROUTINE_SCHEMA = ? AND ROUTINE_NAME = ? \
+                 ORDER BY ROUTINE_TYPE \
+                 LIMIT 1",
+                (schema_name, routine_name),
+            )
+            .ok()
+            .flatten();
+        MysqlRoutineKind::from_routine_type(&routine_type?)
     }
 
     pub fn get_tables(conn: &mut Conn) -> Result<Vec<String>, MysqlError> {
@@ -2432,12 +2502,12 @@ impl MysqlObjectBrowser {
         schema_name: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<IndexInfo>, MysqlError> {
-        let schema_name = Self::optional_schema_param(schema_name);
+        let schema_name = Self::effective_schema_param(conn, schema_name);
         let rows: Vec<(String, u64, Option<String>)> = conn.exec(
             "SELECT INDEX_NAME, NON_UNIQUE, \
              GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ', ') \
              FROM INFORMATION_SCHEMA.STATISTICS \
-             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
              GROUP BY INDEX_NAME, NON_UNIQUE \
              ORDER BY INDEX_NAME",
             (schema_name, table_name),
@@ -2494,7 +2564,7 @@ impl MysqlObjectBrowser {
         schema_name: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<TableColumnDetail>, MysqlError> {
-        let schema_name = Self::optional_schema_param(schema_name);
+        let schema_name = Self::effective_schema_param(conn, schema_name);
         let rows: Vec<(
             String,
             String,
@@ -2508,7 +2578,7 @@ impl MysqlObjectBrowser {
             "SELECT COLUMN_NAME, COLUMN_TYPE, CHARACTER_MAXIMUM_LENGTH, \
              NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY \
              FROM INFORMATION_SCHEMA.COLUMNS \
-             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
              ORDER BY ORDINAL_POSITION",
             (schema_name, table_name),
         )?;
@@ -2601,7 +2671,7 @@ impl MysqlObjectBrowser {
         schema_name: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<ConstraintInfo>, MysqlError> {
-        let schema_name = Self::optional_schema_param(schema_name);
+        let schema_name = Self::effective_schema_param(conn, schema_name);
         let rows: Vec<(String, String, Option<String>, Option<String>)> = conn.exec(
             "SELECT tc.CONSTRAINT_NAME, tc.CONSTRAINT_TYPE, \
              GROUP_CONCAT(kcu.COLUMN_NAME ORDER BY kcu.ORDINAL_POSITION SEPARATOR ', ') AS columns, \
@@ -2615,7 +2685,7 @@ impl MysqlObjectBrowser {
                ON tc.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA \
               AND tc.TABLE_NAME = rc.TABLE_NAME \
               AND tc.CONSTRAINT_NAME = rc.CONSTRAINT_NAME \
-             WHERE tc.TABLE_SCHEMA = COALESCE(?, DATABASE()) AND tc.TABLE_NAME = ? \
+             WHERE tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ? \
              GROUP BY tc.CONSTRAINT_NAME, tc.CONSTRAINT_TYPE, rc.REFERENCED_TABLE_NAME \
              ORDER BY tc.CONSTRAINT_TYPE, tc.CONSTRAINT_NAME",
             (schema_name, table_name),
@@ -2646,12 +2716,12 @@ impl MysqlObjectBrowser {
         schema_name: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<ForeignKeyInfo>, MysqlError> {
-        let schema_name = Self::optional_schema_param(schema_name);
+        let schema_name = Self::effective_schema_param(conn, schema_name);
         let rows: Vec<(String, String, String, String)> = conn.exec(
             "SELECT kcu.CONSTRAINT_NAME, kcu.COLUMN_NAME, \
              kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME \
              FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
-             WHERE kcu.TABLE_SCHEMA = COALESCE(?, DATABASE()) AND kcu.TABLE_NAME = ? \
+             WHERE kcu.TABLE_SCHEMA = ? AND kcu.TABLE_NAME = ? \
                AND kcu.REFERENCED_TABLE_NAME IS NOT NULL \
              ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
             (schema_name, table_name),
@@ -2734,19 +2804,19 @@ impl MysqlObjectBrowser {
         schema_name: Option<&str>,
         object_name: &str,
     ) -> Result<Vec<String>, MysqlError> {
-        let schema_name = Self::optional_schema_param(schema_name);
+        let schema_name = Self::effective_schema_param(conn, schema_name);
 
         let mut object_types: Vec<String> = conn.exec(
             "SELECT CASE WHEN TABLE_TYPE = 'VIEW' THEN 'VIEW' ELSE 'TABLE' END \
              FROM INFORMATION_SCHEMA.TABLES \
-             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ?",
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
             (schema_name.clone(), object_name),
         )?;
 
         let mut routine_types: Vec<String> = conn.exec(
             "SELECT ROUTINE_TYPE \
              FROM INFORMATION_SCHEMA.ROUTINES \
-             WHERE ROUTINE_SCHEMA = COALESCE(?, DATABASE()) AND ROUTINE_NAME = ?",
+             WHERE ROUTINE_SCHEMA = ? AND ROUTINE_NAME = ?",
             (schema_name.clone(), object_name),
         )?;
         object_types.append(&mut routine_types);
@@ -2754,7 +2824,7 @@ impl MysqlObjectBrowser {
         let mut trigger_types: Vec<String> = conn.exec(
             "SELECT 'TRIGGER' \
              FROM INFORMATION_SCHEMA.TRIGGERS \
-             WHERE TRIGGER_SCHEMA = COALESCE(?, DATABASE()) AND TRIGGER_NAME = ?",
+             WHERE TRIGGER_SCHEMA = ? AND TRIGGER_NAME = ?",
             (schema_name.clone(), object_name),
         )?;
         object_types.append(&mut trigger_types);
@@ -2762,7 +2832,7 @@ impl MysqlObjectBrowser {
         let mut sequence_types: Vec<String> = conn.exec(
             "SELECT 'SEQUENCE' \
              FROM INFORMATION_SCHEMA.TABLES \
-             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
                AND TABLE_TYPE = 'SEQUENCE'",
             (schema_name.clone(), object_name),
         )?;
@@ -2771,7 +2841,7 @@ impl MysqlObjectBrowser {
         let mut event_types: Vec<String> = conn.exec(
             "SELECT 'EVENT' \
              FROM INFORMATION_SCHEMA.EVENTS \
-             WHERE EVENT_SCHEMA = COALESCE(?, DATABASE()) AND EVENT_NAME = ?",
+             WHERE EVENT_SCHEMA = ? AND EVENT_NAME = ?",
             (schema_name, object_name),
         )?;
         object_types.append(&mut event_types);
@@ -2781,42 +2851,128 @@ impl MysqlObjectBrowser {
         Ok(object_types)
     }
 
-    pub fn get_routine_arguments(
+    /// One `INFORMATION_SCHEMA.PARAMETERS` row, with the ROUTINE_TYPE that
+    /// says which of the (up to two) same-named routines it belongs to.
+    fn fetch_routine_parameter_rows(
         conn: &mut Conn,
+        schema_name: Option<String>,
         routine_name: &str,
-    ) -> Result<Vec<ProcedureArgument>, MysqlError> {
-        Self::get_routine_arguments_in_schema(conn, None, routine_name)
+    ) -> Result<MysqlRoutineParameterRows, MysqlError> {
+        let schema_name = Self::effective_schema_param(conn, schema_name.as_deref());
+        conn.exec(
+            "SELECT PARAMETER_NAME, ORDINAL_POSITION, PARAMETER_MODE, DTD_IDENTIFIER, \
+             CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, ROUTINE_TYPE \
+             FROM INFORMATION_SCHEMA.PARAMETERS \
+             WHERE SPECIFIC_SCHEMA = ? AND SPECIFIC_NAME = ? \
+             ORDER BY ORDINAL_POSITION",
+            (schema_name, routine_name),
+        )
+    }
+
+    fn routine_parameter_row_kind(row: &MysqlRoutineParameterRow) -> Option<MysqlRoutineKind> {
+        row.7
+            .as_deref()
+            .and_then(MysqlRoutineKind::from_routine_type)
+    }
+
+    fn routine_parameter_row_to_argument(row: MysqlRoutineParameterRow) -> ProcedureArgument {
+        let (name, position, parameter_mode, data_type, data_length, data_precision, data_scale, _) =
+            row;
+        let in_out = if position == 0 && name.is_none() {
+            Some("RETURN".to_string())
+        } else {
+            parameter_mode
+        };
+
+        ProcedureArgument {
+            name,
+            position: i32::try_from(position).ok().unwrap_or(i32::MAX),
+            sequence: i32::try_from(position).ok().unwrap_or(i32::MAX),
+            data_type,
+            in_out,
+            data_length: data_length.and_then(|value| i32::try_from(value).ok()),
+            data_precision: data_precision.and_then(|value| i32::try_from(value).ok()),
+            data_scale: data_scale.and_then(|value| i32::try_from(value).ok()),
+            type_owner: None,
+            type_name: None,
+            type_subname: None,
+            pls_type: None,
+            overload: None,
+            default_value: None,
+        }
     }
 
     pub fn get_routine_arguments_in_schema(
         conn: &mut Conn,
         schema_name: Option<&str>,
         routine_name: &str,
+        kind: MysqlRoutineKind,
     ) -> Result<Vec<ProcedureArgument>, MysqlError> {
         let schema_name = Self::optional_schema_param(schema_name);
-        let query_schema_name = schema_name.clone();
-        let rows_result: Result<
-            Vec<(
-                Option<String>,
-                u64,
-                Option<String>,
-                Option<String>,
-                Option<u64>,
-                Option<u64>,
-                Option<u64>,
-            )>,
-            MysqlError,
-        > = conn.exec(
-            "SELECT PARAMETER_NAME, ORDINAL_POSITION, PARAMETER_MODE, DTD_IDENTIFIER, \
-             CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE \
-             FROM INFORMATION_SCHEMA.PARAMETERS \
-             WHERE SPECIFIC_SCHEMA = COALESCE(?, DATABASE()) AND SPECIFIC_NAME = ? \
-             ORDER BY ORDINAL_POSITION",
-            (query_schema_name, routine_name),
-        );
+        let rows_result =
+            Self::fetch_routine_parameter_rows(conn, schema_name.clone(), routine_name);
 
         let fallback_arguments = |conn: &mut Conn| {
-            Self::fallback_routine_arguments_from_ddl(conn, schema_name.as_deref(), routine_name)
+            Self::fallback_routine_arguments_from_ddl(
+                conn,
+                schema_name.as_deref(),
+                routine_name,
+                kind,
+            )
+        };
+
+        let rows = match rows_result {
+            Ok(rows) => {
+                let rows: Vec<MysqlRoutineParameterRow> = rows
+                    .into_iter()
+                    .filter(|row| Self::routine_parameter_row_kind(row) == Some(kind))
+                    .collect();
+                if rows.is_empty() {
+                    // No rows for THIS kind covers both "no such routine" and
+                    // "routine with no parameters" — the DDL fallback settles
+                    // it (`SHOW CREATE` fails on a missing routine).
+                    return Ok(fallback_arguments(conn).unwrap_or_default());
+                }
+                rows
+            }
+            Err(err) => {
+                if let Some(arguments) = fallback_arguments(conn) {
+                    return Ok(arguments);
+                }
+                return Err(err);
+            }
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(Self::routine_parameter_row_to_argument)
+            .collect())
+    }
+
+    /// Arguments for whichever routine carries `routine_name`, for callers
+    /// that cannot know the kind (signature help over free-typed SQL). When
+    /// BOTH a function and a procedure carry the name, the function wins: one
+    /// deterministic routine's list beats a merged list that matches neither,
+    /// and the popup fires inside expressions far more often than inside
+    /// `CALL`.
+    pub fn get_routine_arguments_in_schema_any_kind(
+        conn: &mut Conn,
+        schema_name: Option<&str>,
+        routine_name: &str,
+    ) -> Result<Vec<ProcedureArgument>, MysqlError> {
+        let schema_name = Self::optional_schema_param(schema_name);
+        let rows_result =
+            Self::fetch_routine_parameter_rows(conn, schema_name.clone(), routine_name);
+
+        let fallback_arguments = |conn: &mut Conn| {
+            let kind =
+                Self::discovered_kind_for_routine(conn, schema_name.as_deref(), routine_name)?;
+            Self::fallback_routine_arguments_from_ddl(
+                conn,
+                schema_name.as_deref(),
+                routine_name,
+                kind,
+            )
         };
 
         let rows = match rows_result {
@@ -2832,44 +2988,36 @@ impl MysqlObjectBrowser {
             }
         };
 
+        let chosen_kind = [MysqlRoutineKind::Function, MysqlRoutineKind::Procedure]
+            .into_iter()
+            .find(|kind| {
+                rows.iter()
+                    .any(|row| Self::routine_parameter_row_kind(row) == Some(*kind))
+            });
         Ok(rows
             .into_iter()
-            .map(
-                |(
-                    name,
-                    position,
-                    parameter_mode,
-                    data_type,
-                    data_length,
-                    data_precision,
-                    data_scale,
-                )| {
-                    let in_out = if position == 0 && name.is_none() {
-                        Some("RETURN".to_string())
-                    } else {
-                        parameter_mode
-                    };
-
-                    ProcedureArgument {
-                        name,
-                        position: i32::try_from(position).ok().unwrap_or(i32::MAX),
-                        sequence: i32::try_from(position).ok().unwrap_or(i32::MAX),
-                        data_type,
-                        in_out,
-                        data_length: data_length.and_then(|value| i32::try_from(value).ok()),
-                        data_precision: data_precision.and_then(|value| i32::try_from(value).ok()),
-                        data_scale: data_scale.and_then(|value| i32::try_from(value).ok()),
-                        type_owner: None,
-                        type_name: None,
-                        pls_type: None,
-                        overload: None,
-                        default_value: None,
-                    }
-                },
-            )
+            .filter(|row| match chosen_kind {
+                Some(kind) => Self::routine_parameter_row_kind(row) == Some(kind),
+                // No row named a recognizable kind (the catalog should make
+                // this unreachable): the raw list beats an empty answer.
+                None => true,
+            })
+            .map(Self::routine_parameter_row_to_argument)
             .collect())
     }
 }
+
+type MysqlRoutineParameterRow = (
+    Option<String>, // PARAMETER_NAME
+    u64,            // ORDINAL_POSITION
+    Option<String>, // PARAMETER_MODE
+    Option<String>, // DTD_IDENTIFIER
+    Option<u64>,    // CHARACTER_MAXIMUM_LENGTH
+    Option<u64>,    // NUMERIC_PRECISION
+    Option<u64>,    // NUMERIC_SCALE
+    Option<String>, // ROUTINE_TYPE
+);
+type MysqlRoutineParameterRows = Vec<MysqlRoutineParameterRow>;
 
 #[cfg(test)]
 mod tests {

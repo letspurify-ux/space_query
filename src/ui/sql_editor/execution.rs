@@ -47,6 +47,15 @@ use crate::utils::arithmetic::{safe_div, safe_rem};
 
 use super::*;
 
+/// One routine a bind-prompt type lookup fetches: written qualifier, routine
+/// name, and — on the MySQL family — which namespace the call site named,
+/// since one name can be a procedure and a function at once.
+type BindPromptRoutineKey = (
+    Option<String>,
+    String,
+    Option<crate::db::query::mysql_executor::MysqlRoutineKind>,
+);
+
 #[derive(Default)]
 struct SelectTransformState {
     break_index: Option<usize>,
@@ -11740,10 +11749,17 @@ impl SqlEditorWidget {
         }
 
         // One statement usually calls one routine, and the same routine may
-        // hold several placeholders. Fetch each parameter list once.
-        let mut routines: Vec<(Option<String>, String)> = Vec::new();
+        // hold several placeholders. Fetch each parameter list once — keyed
+        // WITH the call site's routine namespace, because on the MySQL family
+        // one name can be a procedure and a function at once and the two have
+        // different parameter lists.
+        let mut routines: Vec<BindPromptRoutineKey> = Vec::new();
         for (_, anchor) in &anchors {
-            let routine = (anchor.qualifier.clone(), anchor.routine.clone());
+            let routine = (
+                anchor.qualifier.clone(),
+                anchor.routine.clone(),
+                anchor.mysql_routine_kind,
+            );
             if !routines.contains(&routine) {
                 routines.push(routine);
             }
@@ -11752,8 +11768,10 @@ impl SqlEditorWidget {
 
         let mut types = HashMap::new();
         for (key, anchor) in anchors {
-            let Some(index) = routines.iter().position(|(qualifier, routine)| {
-                *qualifier == anchor.qualifier && *routine == anchor.routine
+            let Some(index) = routines.iter().position(|(qualifier, routine, kind)| {
+                *qualifier == anchor.qualifier
+                    && *routine == anchor.routine
+                    && *kind == anchor.mysql_routine_kind
             }) else {
                 continue;
             };
@@ -11771,7 +11789,7 @@ impl SqlEditorWidget {
     /// as the column load below: off the UI thread, bounded, silent on failure.
     fn load_routine_arguments_for_bind_prompt(
         &self,
-        routines: &[(Option<String>, String)],
+        routines: &[BindPromptRoutineKey],
     ) -> HashMap<usize, Vec<crate::db::ProcedureArgument>> {
         let mut loaded = HashMap::new();
         let Some(connection) = self.connection_binding.metadata_connection() else {
@@ -11784,11 +11802,12 @@ impl SqlEditorWidget {
         let tab_scope = self.connection_binding.snapshot().scope;
         let (sender, receiver) = mpsc::channel::<(usize, Vec<crate::db::ProcedureArgument>)>();
         let mut spawned = 0usize;
-        for (index, (qualifier, routine)) in routines.iter().enumerate() {
+        for (index, (qualifier, routine, mysql_routine_kind)) in routines.iter().enumerate() {
             let sender = sender.clone();
             let connection = connection.clone();
             let qualifier = qualifier.clone();
             let routine = routine.clone();
+            let mysql_routine_kind = *mysql_routine_kind;
             let tab_scope = tab_scope.clone();
             let task = move || {
                 let activity = format!("Bind parameter types {routine}");
@@ -11821,6 +11840,7 @@ impl SqlEditorWidget {
                         &mut acquired,
                         &routine,
                         qualifier.as_deref(),
+                        mysql_routine_kind,
                     )
                 })();
                 let arguments = match resolved {

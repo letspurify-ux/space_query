@@ -1898,9 +1898,9 @@ pub(crate) fn q_quote_closing_byte(delimiter: u8) -> u8 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct QQuotePrefix {
-    prefix_len: usize,
-    closing_delimiter: u8,
+pub(crate) struct QQuotePrefix {
+    pub(crate) prefix_len: usize,
+    pub(crate) closing_delimiter: u8,
 }
 
 #[inline]
@@ -1912,8 +1912,13 @@ fn is_q_quote_prefix_boundary(bytes: &[u8], idx: usize) -> bool {
             .is_some_and(is_identifier_byte)
 }
 
+/// The q-quote opener starting at `idx`, if one starts there: `q'X` (or the
+/// national/unicode `nq'X` / `uq'X` forms), with the closing delimiter `X`
+/// maps to. The one canonical recognizer — any scanner that skips Oracle
+/// string literals must consult this, because a q-quote body may contain
+/// lone `'` characters that desync a plain `'...'` skipper.
 #[inline]
-fn q_quote_prefix_at(bytes: &[u8], idx: usize) -> Option<QQuotePrefix> {
+pub(crate) fn q_quote_prefix_at(bytes: &[u8], idx: usize) -> Option<QQuotePrefix> {
     if !is_q_quote_prefix_boundary(bytes, idx) {
         return None;
     }

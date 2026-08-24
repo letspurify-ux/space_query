@@ -17,6 +17,14 @@
 // refuse a routine that writes and leave the table untouched, while a routine
 // that only reads must still run.
 //
+// Finally it round-trips the SCRIPT GENERATION itself: for routines with the
+// argument shapes that used to break (Oracle composite/record/ref-cursor
+// parameters; a MySQL-family name that is BOTH a procedure and a function;
+// a MariaDB function with an OUT parameter), it fetches the arguments through
+// the same db-layer entry points the object browser uses, builds the script
+// with the browser's own builder, and executes that script through the
+// editor — asserting the generated SQL really runs on every backend.
+//
 // Usage: verify_proc_exec_live <thin|oci|mysql|mariadb|all>
 // Env: see docs/oracle.md.
 
@@ -63,16 +71,7 @@ impl Target {
                 } else {
                     OracleDriverMode::Oci
                 };
-                let host = env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-                let port = env::var("ORACLE_TEST_PORT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1521);
-                let service = env::var("ORACLE_TEST_SERVICE_NAME")
-                    .or_else(|_| env::var("ORACLE_TEST_SERVICE"))
-                    .unwrap_or_else(|_| "FREE".into());
-                let user = env::var("ORACLE_TEST_USERNAME").unwrap_or_else(|_| "system".into());
-                let pass = env::var("ORACLE_TEST_PASSWORD").unwrap_or_else(|_| "password".into());
+                let (host, port, service, user, pass) = oracle_env();
                 let mut info = ConnectionInfo::new_with_type(
                     mode.label(),
                     &user,
@@ -178,6 +177,20 @@ impl Target {
     }
 }
 
+fn oracle_env() -> (String, u16, String, String, String) {
+    let host = env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let port = env::var("ORACLE_TEST_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1521);
+    let service = env::var("ORACLE_TEST_SERVICE_NAME")
+        .or_else(|_| env::var("ORACLE_TEST_SERVICE"))
+        .unwrap_or_else(|_| "FREE".into());
+    let user = env::var("ORACLE_TEST_USERNAME").unwrap_or_else(|_| "system".into());
+    let pass = env::var("ORACLE_TEST_PASSWORD").unwrap_or_else(|_| "password".into());
+    (host, port, service, user, pass)
+}
+
 fn progress_inner(event: &QueryProgress) -> &QueryProgress {
     match event {
         QueryProgress::Operation { progress, .. }
@@ -216,12 +229,26 @@ impl Harness {
     }
 
     fn run(&mut self, sql: &str) -> Result<Vec<QueryProgress>, String> {
+        self.run_inner(sql, false)
+    }
+
+    /// Run multi-statement text the way F5 runs a script — the way the user
+    /// runs what "Execute Procedure" opened in a tab.
+    fn run_script(&mut self, sql: &str) -> Result<Vec<QueryProgress>, String> {
+        self.run_inner(sql, true)
+    }
+
+    fn run_inner(&mut self, sql: &str, script_mode: bool) -> Result<Vec<QueryProgress>, String> {
         self.events
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
         self.done.store(false, Ordering::SeqCst);
-        self.editor.execute_sql_text(sql);
+        if script_mode {
+            self.editor.execute_script_text(sql);
+        } else {
+            self.editor.execute_sql_text(sql);
+        }
         let done = Arc::clone(&self.done);
         self.pump_until("statement to finish", || done.load(Ordering::SeqCst))?;
         Ok(self
@@ -485,6 +512,515 @@ fn read_only_routine_scenario(h: &mut Harness, target: Target) -> Result<(), Str
     Ok(())
 }
 
+/// Every statement a generated script ran, each of which must have succeeded.
+fn script_success(label: &str, events: &[QueryProgress]) -> Result<(), String> {
+    let mut seen = 0usize;
+    for event in events {
+        if let QueryProgress::StatementFinished { result, .. } = progress_inner(event) {
+            seen += 1;
+            if !result.success {
+                return Err(format!(
+                    "{label}: generated script statement failed: {:?}",
+                    result.message
+                ));
+            }
+        }
+    }
+    if seen == 0 {
+        return Err(format!("{label}: generated script ran no statements"));
+    }
+    Ok(())
+}
+
+const GEN_PKG: &str = "SQ_GEN_PKG";
+const GEN_OBJ: &str = "SQ_GEN_OBJ";
+const GEN_DUP: &str = "SQ_GEN_DUP";
+const GEN_OUTFN: &str = "SQ_GEN_OUTFN";
+const GEN_FOLD_DB: &str = "SQ_GEN_FOLD_DB";
+const GEN_FOLDP: &str = "SQ_GEN_FOLDP";
+
+/// The package's routine list through the same entry points the browser
+/// tree uses — the q-quoted constant in the spec used to desync the source
+/// parser, replacing the whole list with a phantom from the literal's body.
+fn fetch_oracle_package_routines(
+    target: Target,
+    package_name: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let (host, port, service, user, pass) = oracle_env();
+    let routines = match target {
+        Target::OracleOci => {
+            let conn =
+                oracle::Connection::connect(&user, &pass, format!("//{host}:{port}/{service}"))
+                    .map_err(|e| format!("OCI metadata connect: {e}"))?;
+            space_query::db::query::ObjectBrowser::get_package_routines(&conn, package_name)
+                .map_err(|e| e.to_string())?
+        }
+        Target::OracleThin => {
+            let mut config = tns_thin::OracleThinConfig::new(
+                tns_thin::ConnectTarget::service_name(host, port, service),
+                user,
+                pass,
+            );
+            config.connect_options.disable_oob_probe = true;
+            let mut session = tns_thin::OracleThinSession::connect(config)
+                .map_err(|e| format!("thin metadata connect: {e}"))?;
+            space_query::db::query::ObjectBrowser::get_thin_package_routines(
+                &mut session,
+                package_name,
+            )?
+        }
+        _ => return Err("fetch_oracle_package_routines called for a non-Oracle target".into()),
+    };
+    Ok(routines
+        .into_iter()
+        .map(|routine| (routine.name, routine.routine_type))
+        .collect())
+}
+
+fn fetch_oracle_package_arguments(
+    target: Target,
+    package_name: &str,
+    routine_name: &str,
+) -> Result<Vec<space_query::db::ProcedureArgument>, String> {
+    let (host, port, service, user, pass) = oracle_env();
+    match target {
+        Target::OracleOci => {
+            let conn =
+                oracle::Connection::connect(&user, &pass, format!("//{host}:{port}/{service}"))
+                    .map_err(|e| format!("OCI metadata connect: {e}"))?;
+            space_query::db::query::ObjectBrowser::get_package_procedure_arguments(
+                &conn,
+                package_name,
+                routine_name,
+            )
+            .map_err(|e| e.to_string())
+        }
+        Target::OracleThin => {
+            let mut config = tns_thin::OracleThinConfig::new(
+                tns_thin::ConnectTarget::service_name(host, port, service),
+                user,
+                pass,
+            );
+            config.connect_options.disable_oob_probe = true;
+            let mut session = tns_thin::OracleThinSession::connect(config)
+                .map_err(|e| format!("thin metadata connect: {e}"))?;
+            space_query::db::query::ObjectBrowser::get_thin_package_procedure_arguments(
+                &mut session,
+                package_name,
+                routine_name,
+            )
+        }
+        _ => Err("fetch_oracle_package_arguments called for a non-Oracle target".into()),
+    }
+}
+
+/// Round-trip the script GENERATION for the Oracle argument shapes that used
+/// to produce uncompilable declarations: a package record, an associative
+/// array, a `%ROWTYPE` record, an object type, and OUT ref cursors. Arguments
+/// come through the same db-layer entry points the object browser uses, the
+/// script through the browser's own builder, and the script must then RUN.
+fn oracle_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), String> {
+    println!("  [generation round-trip: composite argument shapes]");
+    let setup = [
+        format!("CREATE OR REPLACE TYPE {GEN_OBJ} AS OBJECT (id NUMBER, label VARCHAR2(20))"),
+        format!(
+            "CREATE OR REPLACE PACKAGE {GEN_PKG} AS\n\
+             \x20 c_doc CONSTANT VARCHAR2(100) := q'[don't run PROCEDURE phantom now]';\n\
+             \x20 TYPE t_rec IS RECORD (id NUMBER, name VARCHAR2(10));\n\
+             \x20 TYPE t_tab IS TABLE OF NUMBER INDEX BY PLS_INTEGER;\n\
+             \x20 TYPE t_cur IS REF CURSOR RETURN t_rec;\n\
+             \x20 PROCEDURE p_shapes(r IN t_rec, t IN t_tab, u IN all_users%ROWTYPE, \
+             o IN {GEN_OBJ}, rf IN REF {GEN_OBJ}, n IN NUMBER, msg OUT VARCHAR2);\n\
+             \x20 PROCEDURE p_cur(rc OUT t_cur, min_id IN NUMBER);\n\
+             \x20 PROCEDURE p_quoted(\"my arg\" IN NUMBER, \"lower\" OUT VARCHAR2);\n\
+             \x20 FUNCTION f_add(a IN NUMBER, b IN NUMBER) RETURN NUMBER;\n\
+             \x20 PROCEDURE dup(a IN NUMBER);\n\
+             \x20 FUNCTION dup(b IN VARCHAR2) RETURN NUMBER;\n\
+             END;"
+        ),
+        format!(
+            "CREATE OR REPLACE PACKAGE BODY {GEN_PKG} AS\n\
+             \x20 PROCEDURE p_shapes(r IN t_rec, t IN t_tab, u IN all_users%ROWTYPE, \
+             o IN {GEN_OBJ}, rf IN REF {GEN_OBJ}, n IN NUMBER, msg OUT VARCHAR2) IS\n\
+             \x20 BEGIN\n\
+             \x20   msg := 'ok:' || TO_CHAR(n);\n\
+             \x20 END;\n\
+             \x20 PROCEDURE p_cur(rc OUT t_cur, min_id IN NUMBER) IS\n\
+             \x20 BEGIN\n\
+             \x20   OPEN rc FOR SELECT min_id AS id, 'x' AS name FROM dual;\n\
+             \x20 END;\n\
+             \x20 PROCEDURE p_quoted(\"my arg\" IN NUMBER, \"lower\" OUT VARCHAR2) IS\n\
+             \x20 BEGIN\n\
+             \x20   \"lower\" := TO_CHAR(\"my arg\");\n\
+             \x20 END;\n\
+             \x20 FUNCTION f_add(a IN NUMBER, b IN NUMBER) RETURN NUMBER IS\n\
+             \x20 BEGIN\n\
+             \x20   RETURN a + b;\n\
+             \x20 END;\n\
+             \x20 PROCEDURE dup(a IN NUMBER) IS\n\
+             \x20 BEGIN\n\
+             \x20   NULL;\n\
+             \x20 END;\n\
+             \x20 FUNCTION dup(b IN VARCHAR2) RETURN NUMBER IS\n\
+             \x20 BEGIN\n\
+             \x20   RETURN LENGTH(b);\n\
+             \x20 END;\n\
+             END;"
+        ),
+    ];
+    for sql in &setup {
+        let events = h.run(sql)?;
+        let (success, msg) =
+            terminal_success(&events).ok_or_else(|| format!("setup {sql:?}: no result"))?;
+        if !success {
+            return Err(format!("generation setup failed: {msg:?} for {sql:?}"));
+        }
+    }
+    let _ = h.run("COMMIT");
+
+    // The spec's q-quoted constant must corrupt nothing: the browser-tree
+    // listing has to name every real routine with its right type and no
+    // phantom from the literal's body.
+    let routines = fetch_oracle_package_routines(target, GEN_PKG)?;
+    for expected in [
+        ("P_SHAPES", "PROCEDURE"),
+        ("P_CUR", "PROCEDURE"),
+        ("P_QUOTED", "PROCEDURE"),
+        ("F_ADD", "FUNCTION"),
+    ] {
+        if !routines
+            .iter()
+            .any(|(name, kind)| name == expected.0 && kind == expected.1)
+        {
+            return Err(format!(
+                "package listing lost {expected:?}: got {routines:?}"
+            ));
+        }
+    }
+    if routines.iter().any(|(name, _)| name == "PHANTOM") {
+        return Err(format!(
+            "package listing invented a routine from a q-quoted literal: {routines:?}"
+        ));
+    }
+    println!("    OK: package listing survives a q-quoted spec constant");
+
+    struct Case {
+        routine: &'static str,
+        routine_type: &'static str,
+        must_contain: &'static [&'static str],
+    }
+    let cases = [
+        Case {
+            routine: "P_SHAPES",
+            routine_type: "PROCEDURE",
+            // The dictionary keywords must be gone, replaced by declarable
+            // names; composites must be declared bare (no `:= NULL`).
+            must_contain: &[
+                ".T_REC;",
+                ".T_TAB;",
+                "ALL_USERS%ROWTYPE;",
+                "SQ_GEN_OBJ;",
+                "  v_rf REF ",
+            ],
+        },
+        Case {
+            routine: "P_CUR",
+            routine_type: "PROCEDURE",
+            must_contain: &["VAR v_rc REFCURSOR", "RC => :v_rc"],
+        },
+        Case {
+            routine: "P_QUOTED",
+            routine_type: "PROCEDURE",
+            // Quoted-created parameter names must be re-quoted in named
+            // association; bare they fail to parse or name a DIFFERENT
+            // (normalized-uppercase) parameter.
+            must_contain: &["\"my arg\" => ", "\"lower\" => "],
+        },
+        Case {
+            routine: "F_ADD",
+            routine_type: "FUNCTION",
+            must_contain: &["VAR v_result NUMBER", ":v_result := "],
+        },
+        // One name overloaded across BOTH kinds (legal): the script must
+        // call the overload whose shape matches the clicked label, not
+        // blindly the first one.
+        Case {
+            routine: "DUP",
+            routine_type: "PROCEDURE",
+            must_contain: &["A => v_a"],
+        },
+        Case {
+            routine: "DUP",
+            routine_type: "FUNCTION",
+            must_contain: &["VAR v_result NUMBER", "B => v_b"],
+        },
+    ];
+
+    let mut result = Ok(());
+    for case in &cases {
+        let args = fetch_oracle_package_arguments(target, GEN_PKG, case.routine)?;
+        if args.is_empty() {
+            result = Err(format!("{}: argument fetch returned nothing", case.routine));
+            break;
+        }
+        let script = space_query::ui::ObjectBrowserWidget::routine_script_for_harness(
+            DatabaseType::Oracle,
+            &format!("{GEN_PKG}.{}", case.routine),
+            case.routine_type,
+            &args,
+        );
+        println!("    --- {} script ---\n{script}", case.routine);
+        if script.contains("PL/SQL") {
+            result = Err(format!(
+                "{}: script still spells a dictionary keyword as a type",
+                case.routine
+            ));
+            break;
+        }
+        if let Some(missing) = case
+            .must_contain
+            .iter()
+            .find(|needle| !script.contains(**needle))
+        {
+            result = Err(format!("{}: script lacks {missing:?}", case.routine));
+            break;
+        }
+        let events = h.run_script(&script)?;
+        if let Err(err) = script_success(case.routine, &events) {
+            result = Err(err);
+            break;
+        }
+        let _ = h.run("COMMIT");
+        println!("    OK: {} generated script ran", case.routine);
+    }
+
+    let _ = h.run(&format!("DROP PACKAGE {GEN_PKG}"));
+    let _ = h.run(&format!("DROP TYPE {GEN_OBJ}"));
+    let _ = h.run("COMMIT");
+    result
+}
+
+fn mysql_metadata_conn(target: Target) -> Result<mysql::Conn, String> {
+    let info = target.connection_info();
+    let opts = mysql::OptsBuilder::new()
+        .ip_or_hostname(Some(info.host.clone()))
+        .tcp_port(info.port)
+        .user(Some(info.username.clone()))
+        .pass(Some(info.password.clone()))
+        .db_name(Some(info.service_name.clone()));
+    mysql::Conn::new(opts).map_err(|e| format!("mysql metadata connect: {e}"))
+}
+
+/// Round-trip the script GENERATION for the MySQL-family defects: a name that
+/// is BOTH a procedure and a function must resolve to the requested namespace
+/// (a name-only lookup used to hand back the two parameter lists merged), and
+/// a MariaDB function with an OUT parameter must use the SET calling shape
+/// (`SELECT fn(@v)` is refused by the server, ER 4187).
+fn mysql_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), String> {
+    use mysql::prelude::Queryable;
+    use space_query::db::query::mysql_executor::{MysqlObjectBrowser, MysqlRoutineKind};
+
+    println!("  [generation round-trip: same-named routines + OUT-parameter function]");
+    let db_type = target.connection_info().db_type;
+    let mut conn = mysql_metadata_conn(target)?;
+
+    let run_ddl = |conn: &mut mysql::Conn, sql: String| {
+        conn.query_drop(&sql)
+            .map_err(|e| format!("generation setup {sql:?}: {e}"))
+    };
+    run_ddl(&mut conn, format!("DROP PROCEDURE IF EXISTS {GEN_DUP}"))?;
+    run_ddl(&mut conn, format!("DROP FUNCTION IF EXISTS {GEN_DUP}"))?;
+    run_ddl(
+        &mut conn,
+        format!("CREATE PROCEDURE {GEN_DUP}(IN a INT, OUT b VARCHAR(20)) SET b = CONCAT('n:', a)"),
+    )?;
+    run_ddl(
+        &mut conn,
+        format!("CREATE FUNCTION {GEN_DUP}(x INT) RETURNS INT DETERMINISTIC RETURN x + 1"),
+    )?;
+
+    let mut result = (|| {
+        // Execute Function on the shared name: only the function's parameter
+        // list may reach the script.
+        let fn_args = MysqlObjectBrowser::get_routine_arguments_in_schema(
+            &mut conn,
+            None,
+            GEN_DUP,
+            MysqlRoutineKind::Function,
+        )
+        .map_err(|e| format!("function argument fetch: {e}"))?;
+        if fn_args.len() != 2 {
+            return Err(format!(
+                "function argument fetch returned {} rows (want RETURN + x); the procedure's \
+                 parameters leaked in: {:?}",
+                fn_args.len(),
+                fn_args.iter().map(|a| a.name.clone()).collect::<Vec<_>>()
+            ));
+        }
+        let script = space_query::ui::ObjectBrowserWidget::routine_script_for_harness(
+            db_type, GEN_DUP, "FUNCTION", &fn_args,
+        );
+        println!("    --- function script ---\n{script}");
+        let events = h.run_script(&script)?;
+        script_success("function script", &events)?;
+        match first_cell(&events).as_deref() {
+            Some("1") => {}
+            other => return Err(format!("function script returned {other:?}, want \"1\"")),
+        }
+        let _ = h.run("COMMIT");
+        println!("    OK: Execute Function picked the function's own arguments");
+
+        // Execute Procedure on the same name: the procedure's list, with its
+        // OUT parameter surfaced.
+        let proc_args = MysqlObjectBrowser::get_routine_arguments_in_schema(
+            &mut conn,
+            None,
+            GEN_DUP,
+            MysqlRoutineKind::Procedure,
+        )
+        .map_err(|e| format!("procedure argument fetch: {e}"))?;
+        let proc_names: Vec<_> = proc_args.iter().filter_map(|a| a.name.clone()).collect();
+        if proc_names != ["a", "b"] {
+            return Err(format!(
+                "procedure argument fetch returned {proc_names:?}, want [\"a\", \"b\"]"
+            ));
+        }
+        let script = space_query::ui::ObjectBrowserWidget::routine_script_for_harness(
+            db_type,
+            GEN_DUP,
+            "PROCEDURE",
+            &proc_args,
+        );
+        println!("    --- procedure script ---\n{script}");
+        if !script.contains("CALL ") || !script.contains("@v_b") {
+            return Err(format!(
+                "procedure script lost its CALL/OUT shape: {script:?}"
+            ));
+        }
+        let events = h.run_script(&script)?;
+        script_success("procedure script", &events)?;
+        match first_cell(&events).as_deref() {
+            Some("n:0") => {}
+            other => return Err(format!("procedure OUT read back {other:?}, want \"n:0\"")),
+        }
+        let _ = h.run("COMMIT");
+        println!("    OK: Execute Procedure picked the procedure's own arguments");
+
+        // MariaDB allows OUT parameters on functions; the generated script
+        // must use the SET calling shape the server accepts.
+        if target == Target::MariaDb {
+            run_ddl(&mut conn, format!("DROP FUNCTION IF EXISTS {GEN_OUTFN}"))?;
+            // DELIMITER is a client-side artifact — over the wire the whole
+            // body is one statement.
+            run_ddl(
+                &mut conn,
+                format!(
+                    "CREATE FUNCTION {GEN_OUTFN}(OUT o INT) RETURNS INT DETERMINISTIC \
+                     BEGIN SET o = 7; RETURN 1; END"
+                ),
+            )?;
+            let args = MysqlObjectBrowser::get_routine_arguments_in_schema(
+                &mut conn,
+                None,
+                GEN_OUTFN,
+                MysqlRoutineKind::Function,
+            )
+            .map_err(|e| format!("OUT-function argument fetch: {e}"))?;
+            let script = space_query::ui::ObjectBrowserWidget::routine_script_for_harness(
+                db_type, GEN_OUTFN, "FUNCTION", &args,
+            );
+            println!("    --- OUT-function script ---\n{script}");
+            if !script.contains("SET @v_result = ") {
+                return Err(format!(
+                    "OUT-parameter function script kept the SELECT calling shape the server \
+                     refuses: {script:?}"
+                ));
+            }
+            let events = h.run_script(&script)?;
+            script_success("OUT-function script", &events)?;
+            // The last SELECT surfaces the OUT value the call wrote.
+            match first_cell(&events).as_deref() {
+                Some("7") => {}
+                other => return Err(format!("OUT value read back {other:?}, want \"7\"")),
+            }
+            let _ = h.run("COMMIT");
+            println!("    OK: OUT-parameter function used the SET calling shape");
+        }
+
+        // DATABASE()-fold regression: both engines fold `DATABASE()` to a
+        // constant when an INFORMATION_SCHEMA statement is first PREPARED,
+        // and the connection's statement cache keeps that plan across `USE`.
+        // A schema-less lookup on a session that has since switched
+        // databases must answer for the database it is in NOW.
+        let original_db = target.connection_info().service_name;
+        run_ddl(
+            &mut conn,
+            format!("CREATE DATABASE IF NOT EXISTS {GEN_FOLD_DB}"),
+        )?;
+        run_ddl(&mut conn, format!("DROP PROCEDURE IF EXISTS {GEN_FOLDP}"))?;
+        run_ddl(
+            &mut conn,
+            format!("DROP PROCEDURE IF EXISTS {GEN_FOLD_DB}.{GEN_FOLDP}"),
+        )?;
+        run_ddl(
+            &mut conn,
+            format!("CREATE PROCEDURE {GEN_FOLDP}(IN a_main INT) SELECT 1"),
+        )?;
+        run_ddl(
+            &mut conn,
+            format!("CREATE PROCEDURE {GEN_FOLD_DB}.{GEN_FOLDP}(IN a_other INT) SELECT 1"),
+        )?;
+        let fold_probe = |conn: &mut mysql::Conn| -> Result<Vec<String>, String> {
+            MysqlObjectBrowser::get_routine_arguments_in_schema(
+                conn,
+                None,
+                GEN_FOLDP,
+                MysqlRoutineKind::Procedure,
+            )
+            .map(|args| args.into_iter().filter_map(|a| a.name).collect())
+            .map_err(|e| format!("fold probe fetch: {e}"))
+        };
+        let before = fold_probe(&mut conn)?;
+        if before != ["a_main"] {
+            return Err(format!(
+                "fold probe in {original_db} returned {before:?}, want [\"a_main\"]"
+            ));
+        }
+        conn.query_drop(format!("USE {GEN_FOLD_DB}"))
+            .map_err(|e| format!("USE {GEN_FOLD_DB}: {e}"))?;
+        let after = fold_probe(&mut conn);
+        conn.query_drop(format!("USE {original_db}"))
+            .map_err(|e| format!("USE {original_db}: {e}"))?;
+        match after?.as_slice() {
+            [name] if name.as_str() == "a_other" => {}
+            other => {
+                return Err(format!(
+                    "BUG: after USE {GEN_FOLD_DB} the schema-less lookup answered {other:?} \
+                     (want [\"a_other\"]) — the prepared statement is still bound to the \
+                     database it was first prepared in"
+                ));
+            }
+        }
+        println!("    OK: schema-less lookup follows the session's CURRENT database");
+        Ok(())
+    })();
+
+    for sql in [
+        format!("DROP PROCEDURE IF EXISTS {GEN_DUP}"),
+        format!("DROP FUNCTION IF EXISTS {GEN_DUP}"),
+        format!("DROP FUNCTION IF EXISTS {GEN_OUTFN}"),
+        format!("DROP PROCEDURE IF EXISTS {GEN_FOLDP}"),
+        format!("DROP DATABASE IF EXISTS {GEN_FOLD_DB}"),
+    ] {
+        if let Err(e) = run_ddl(&mut conn, sql) {
+            if result.is_ok() {
+                result = Err(e);
+            }
+        }
+    }
+    result
+}
+
 fn verify(target: Target) -> Result<(), String> {
     println!("\n########## {} ##########", target.label());
 
@@ -548,6 +1084,12 @@ fn verify(target: Target) -> Result<(), String> {
     }
 
     read_only_routine_scenario(&mut h, target)?;
+
+    if target.is_oracle() {
+        oracle_generation_round_trip(&mut h, target)?;
+    } else {
+        mysql_generation_round_trip(&mut h, target)?;
+    }
 
     // Cleanup.
     for sql in target.teardown() {

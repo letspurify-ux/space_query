@@ -685,6 +685,11 @@ pub struct BindCallAnchor {
     pub qualifier: Option<String>,
     pub routine: String,
     pub parameter: CallParameter,
+    /// The routine namespace the STATEMENT already names, when it does:
+    /// MySQL-family `CALL name(...)` can only invoke a procedure, and a call
+    /// written anywhere else in that family's SQL can only be a function.
+    /// `None` on backends whose routines share one namespace (Oracle).
+    pub mysql_routine_kind: Option<crate::db::query::mysql_executor::MysqlRoutineKind>,
 }
 
 /// Which parameter of the call a placeholder fills.
@@ -749,11 +754,42 @@ fn call_anchor_at(
     } else {
         (call.name, call.qualifier)
     };
+    let mysql_routine_kind = mysql
+        .then(|| mysql_call_site_routine_kind(masked, call.open_paren))
+        .flatten();
     Some(BindCallAnchor {
         qualifier,
         routine,
         parameter,
+        mysql_routine_kind,
     })
+}
+
+/// The routine namespace a MySQL-family call site names, read from the text
+/// before the call's `(`: after walking back across the (possibly qualified,
+/// possibly quoted) routine reference, a `CALL` keyword means the routine can
+/// only be a procedure, and anything else means it can only be a function —
+/// the two namespaces are separate, so the statement has already chosen.
+/// `None` when the reference cannot be walked (the lookup then has to ask for
+/// whichever routine carries the name).
+pub fn mysql_call_site_routine_kind(
+    text: &str,
+    open_paren: usize,
+) -> Option<crate::db::query::mysql_executor::MysqlRoutineKind> {
+    let mut head = text.get(..open_paren)?.trim_end();
+    loop {
+        let part = trailing_identifier(head)?;
+        head = head.get(..head.len() - part.raw_len)?.trim_end();
+        match head.strip_suffix('.') {
+            Some(rest) => head = rest.trim_end(),
+            None => break,
+        }
+    }
+    if trailing_word(head).eq_ignore_ascii_case("CALL") {
+        Some(crate::db::query::mysql_executor::MysqlRoutineKind::Procedure)
+    } else {
+        Some(crate::db::query::mysql_executor::MysqlRoutineKind::Function)
+    }
 }
 
 /// The parameter name in `p_cursor => :rc`, when the argument was written with

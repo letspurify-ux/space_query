@@ -9486,6 +9486,7 @@ impl ObjectBrowser {
                         AND a.package_name = p.object_name
                         AND a.object_name = p.procedure_name
                         AND a.position = 0
+                        AND a.data_level = 0
                         AND (a.overload = p.overload OR (a.overload IS NULL AND p.overload IS NULL))
                     ) THEN 'FUNCTION'
                     ELSE 'PROCEDURE'
@@ -9546,7 +9547,8 @@ impl ObjectBrowser {
 
     /// Parse package specification source to extract routine names and types.
     /// Looks for top-level PROCEDURE/FUNCTION keywords, skipping those inside
-    /// comments, string literals, and type/cursor declarations.
+    /// comments, string literals (q-quoted forms included), and type/cursor
+    /// declarations.
     fn parse_package_spec_routines(source: &str) -> Vec<PackageRoutine> {
         let mut routines: Vec<PackageRoutine> = Vec::new();
         let mut seen = HashSet::new();
@@ -9569,6 +9571,22 @@ impl ObjectBrowser {
                     i += 1;
                 }
                 i += 2;
+                continue;
+            }
+            // Skip q-quoted literals (`q'[...]'`, `nq'{...}'`, ...) BEFORE the
+            // plain skipper: their bodies may hold lone quotes and the very
+            // keywords this scan looks for, and the `''` skipper below would
+            // desync inside them — one such constant used to replace a whole
+            // package's routine list with the literal's contents.
+            if let Some(prefix) = sql_text::q_quote_prefix_at(bytes, i) {
+                i += prefix.prefix_len;
+                while i < len {
+                    if bytes[i] == prefix.closing_delimiter && bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
                 continue;
             }
             // Skip string literals
@@ -9688,6 +9706,7 @@ impl ObjectBrowser {
                             AND a.package_name = p.object_name
                             AND a.object_name = p.procedure_name
                             AND a.position = 0
+                            AND a.data_level = 0
                             AND (a.overload = p.overload OR (a.overload IS NULL AND p.overload IS NULL))
                         ) THEN 'FUNCTION'
                         ELSE 'PROCEDURE'
@@ -9709,6 +9728,7 @@ impl ObjectBrowser {
                             WHERE a.package_name = p.object_name
                             AND a.object_name = p.procedure_name
                             AND a.position = 0
+                            AND a.data_level = 0
                             AND (a.overload = p.overload OR (a.overload IS NULL AND p.overload IS NULL))
                         ) THEN 'FUNCTION'
                         ELSE 'PROCEDURE'
@@ -9921,6 +9941,7 @@ impl ObjectBrowser {
                     TO_CHAR(data_scale),
                     NVL(type_owner, ''),
                     NVL(type_name, ''),
+                    NVL(type_subname, ''),
                     NVL(pls_type, ''),
                     TO_CHAR(overload),
                     CAST(NULL AS VARCHAR2(1)) AS default_value
@@ -9928,6 +9949,8 @@ impl ObjectBrowser {
                 WHERE owner = :1
                   AND package_name = :2
                   AND object_name = :3
+                  AND data_level = 0
+                  AND data_type IS NOT NULL
                 ORDER BY NVL(overload, 0), position, sequence
                 "#
             }
@@ -9944,6 +9967,7 @@ impl ObjectBrowser {
                     TO_CHAR(data_scale),
                     NVL(type_owner, ''),
                     NVL(type_name, ''),
+                    NVL(type_subname, ''),
                     NVL(pls_type, ''),
                     TO_CHAR(overload),
                     CAST(NULL AS VARCHAR2(1)) AS default_value
@@ -9951,6 +9975,8 @@ impl ObjectBrowser {
                 WHERE owner = :1
                   AND package_name IS NULL
                   AND object_name = :2
+                  AND data_level = 0
+                  AND data_type IS NOT NULL
                 ORDER BY NVL(overload, 0), position, sequence
                 "#
             }
@@ -9966,7 +9992,7 @@ impl ObjectBrowser {
                 OracleThinBindValue::Text(procedure_name),
             ],
         };
-        let rows = Self::thin_query_text_rows(conn, sql, 13, binds)?;
+        let rows = Self::thin_query_text_rows(conn, sql, 14, binds)?;
         Ok(rows
             .into_iter()
             .map(|row| ProcedureArgument {
@@ -9988,12 +10014,15 @@ impl ObjectBrowser {
                 data_scale: row.get(7).and_then(|value| Self::thin_optional_i32(value)),
                 type_owner: row.get(8).and_then(|value| Self::thin_optional_text(value)),
                 type_name: row.get(9).and_then(|value| Self::thin_optional_text(value)),
-                pls_type: row
+                type_subname: row
                     .get(10)
                     .and_then(|value| Self::thin_optional_text(value)),
-                overload: row.get(11).and_then(|value| Self::thin_optional_i32(value)),
+                pls_type: row
+                    .get(11)
+                    .and_then(|value| Self::thin_optional_text(value)),
+                overload: row.get(12).and_then(|value| Self::thin_optional_i32(value)),
                 default_value: row
-                    .get(12)
+                    .get(13)
                     .and_then(|value| Self::thin_optional_text(value)),
             })
             .collect())
@@ -10033,6 +10062,7 @@ impl ObjectBrowser {
                     data_scale,
                     type_owner,
                     type_name,
+                    type_subname,
                     pls_type,
                     overload,
                     default_value
@@ -10040,6 +10070,8 @@ impl ObjectBrowser {
                 WHERE owner = :1
                   AND package_name = :2
                   AND object_name = :3
+                  AND data_level = 0
+                  AND data_type IS NOT NULL
                 ORDER BY NVL(overload, 0), position, sequence
                 "#
             }
@@ -10056,6 +10088,7 @@ impl ObjectBrowser {
                     data_scale,
                     type_owner,
                     type_name,
+                    type_subname,
                     pls_type,
                     overload,
                     default_value
@@ -10063,6 +10096,8 @@ impl ObjectBrowser {
                 WHERE owner = :1
                   AND package_name IS NULL
                   AND object_name = :2
+                  AND data_level = 0
+                  AND data_type IS NOT NULL
                 ORDER BY NVL(overload, 0), position, sequence
                 "#
             }
@@ -10168,21 +10203,28 @@ impl ObjectBrowser {
                     return Err(err);
                 }
             };
-            let pls_type: Option<String> = match row.get(10) {
+            let type_subname: Option<String> = match row.get(10) {
                 Ok(value) => value,
                 Err(err) => {
                     logging::log_error("executor", &format!("Database operation failed: {err}"));
                     return Err(err);
                 }
             };
-            let overload: Option<i32> = match row.get(11) {
+            let pls_type: Option<String> = match row.get(11) {
                 Ok(value) => value,
                 Err(err) => {
                     logging::log_error("executor", &format!("Database operation failed: {err}"));
                     return Err(err);
                 }
             };
-            let default_value: Option<String> = match row.get(12) {
+            let overload: Option<i32> = match row.get(12) {
+                Ok(value) => value,
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
+            let default_value: Option<String> = match row.get(13) {
                 Ok(value) => value,
                 Err(err) => {
                     logging::log_warning(
@@ -10204,6 +10246,7 @@ impl ObjectBrowser {
                 data_scale,
                 type_owner,
                 type_name,
+                type_subname,
                 pls_type,
                 overload,
                 default_value,
@@ -12022,5 +12065,110 @@ mod oracle_lazy_fetch_integration_tests {
         assert_eq!(remaining.len(), 50);
         assert_eq!(remaining.first().map(String::as_str), Some("201"));
         assert_eq!(remaining.last().map(String::as_str), Some("250"));
+    }
+}
+
+#[cfg(test)]
+mod package_spec_routine_parse_tests {
+    use super::ObjectBrowser;
+
+    fn names_and_types(source: &str) -> Vec<(String, String)> {
+        ObjectBrowser::parse_package_spec_routines(source)
+            .into_iter()
+            .map(|routine| (routine.name, routine.routine_type))
+            .collect()
+    }
+
+    /// A q-quoted constant used to DESYNC the literal skipper: the parser
+    /// found "routines" inside the literal's body and the closing `]'`
+    /// opened a phantom string that swallowed the real declarations — one
+    /// constant replaced the whole package's routine list.
+    #[test]
+    fn a_q_quoted_literal_hides_neither_real_routines_nor_invents_phantoms() {
+        let source = "CREATE OR REPLACE PACKAGE demo AS\n\
+             c_msg CONSTANT VARCHAR2(100) := q'[don't run PROCEDURE phantom now]';\n\
+             PROCEDURE real_proc(a IN NUMBER);\n\
+             c_two CONSTANT VARCHAR2(50) := 'plain literal';\n\
+             FUNCTION real_func RETURN NUMBER;\n\
+             END;";
+        assert_eq!(
+            names_and_types(source),
+            // The parser reports routines sorted by name.
+            vec![
+                ("REAL_FUNC".to_string(), "FUNCTION".to_string()),
+                ("REAL_PROC".to_string(), "PROCEDURE".to_string()),
+            ]
+        );
+    }
+
+    /// Every opener form the server accepts: `Q'(...)'`, `nq'{...}'`, and a
+    /// non-bracket delimiter that closes with itself.
+    #[test]
+    fn q_quote_opener_variants_are_all_skipped() {
+        let source = "PACKAGE demo AS\n\
+             a CONSTANT VARCHAR2(50) := Q'(don't PROCEDURE p1)';\n\
+             b CONSTANT NVARCHAR2(50) := nq'{isn't FUNCTION f1}';\n\
+             c CONSTANT VARCHAR2(50) := q'!won't PROCEDURE p2!';\n\
+             PROCEDURE real_proc;\n\
+             END;";
+        assert_eq!(
+            names_and_types(source),
+            vec![("REAL_PROC".to_string(), "PROCEDURE".to_string())]
+        );
+    }
+
+    /// The closing delimiter only closes when followed by a quote: `]` alone
+    /// inside the body is content, and an unterminated literal must end the
+    /// scan without panicking.
+    #[test]
+    fn q_quote_bodies_with_bare_delimiters_and_unterminated_literals_stay_safe() {
+        let source = "PACKAGE demo AS\n\
+             a CONSTANT VARCHAR2(50) := q'[a ] b PROCEDURE not_me ]';\n\
+             FUNCTION real_func RETURN NUMBER;\n\
+             END;";
+        assert_eq!(
+            names_and_types(source),
+            vec![("REAL_FUNC".to_string(), "FUNCTION".to_string())]
+        );
+
+        let unterminated = "PACKAGE demo AS\n\
+             a CONSTANT VARCHAR2(50) := q'[never closed\n\
+             PROCEDURE swallowed;\n\
+             END;";
+        assert_eq!(names_and_types(unterminated), Vec::new());
+    }
+
+    /// An identifier ENDING in q followed by a plain literal is not a
+    /// q-quote: `myq` is a name and `'x'` an ordinary string.
+    #[test]
+    fn an_identifier_ending_in_q_does_not_start_a_q_quote() {
+        let source = "PACKAGE demo AS\n\
+             a CONSTANT VARCHAR2(10) := myq'x''y';\n\
+             PROCEDURE real_proc;\n\
+             END;";
+        assert_eq!(
+            names_and_types(source),
+            vec![("REAL_PROC".to_string(), "PROCEDURE".to_string())]
+        );
+    }
+
+    /// The pre-existing skip rules stay intact alongside the q-quote branch.
+    #[test]
+    fn comments_and_plain_literals_are_still_skipped() {
+        let source = "PACKAGE demo AS\n\
+             -- PROCEDURE commented_out;\n\
+             /* FUNCTION also_commented RETURN NUMBER; */\n\
+             c CONSTANT VARCHAR2(30) := 'PROCEDURE in_string';\n\
+             PROCEDURE real_proc(a IN NUMBER);\n\
+             FUNCTION real_func RETURN NUMBER;\n\
+             END;";
+        assert_eq!(
+            names_and_types(source),
+            // The parser reports routines sorted by name.
+            vec![
+                ("REAL_FUNC".to_string(), "FUNCTION".to_string()),
+                ("REAL_PROC".to_string(), "PROCEDURE".to_string()),
+            ]
+        );
     }
 }

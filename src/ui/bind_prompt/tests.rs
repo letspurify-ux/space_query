@@ -363,6 +363,43 @@ fn a_plain_argument_list_gives_the_parameter_by_position() {
     );
 }
 
+/// On the MySQL family the statement itself names the routine namespace —
+/// `CALL name(` can only be a procedure, any other call only a function — and
+/// one name can be BOTH at once, so the anchor must carry that choice to the
+/// lookup instead of letting the two routines answer for each other.
+#[test]
+fn a_mysql_call_site_names_its_routine_namespace() {
+    use crate::db::query::mysql_executor::MysqlRoutineKind;
+
+    let kinds = |sql: &str, db_type: DatabaseType| -> Vec<Option<MysqlRoutineKind>> {
+        bind_call_anchors(sql, db_type)
+            .into_iter()
+            .map(|(_, anchor)| anchor.mysql_routine_kind)
+            .collect()
+    };
+
+    assert_eq!(
+        kinds("CALL sq_dup(:a)", MYSQL),
+        vec![Some(MysqlRoutineKind::Procedure)]
+    );
+    assert_eq!(
+        kinds("CALL `db`.`sq_dup`(:a)", MARIADB),
+        vec![Some(MysqlRoutineKind::Procedure)]
+    );
+    assert_eq!(
+        kinds("SELECT sq_dup(:x)", MYSQL),
+        vec![Some(MysqlRoutineKind::Function)]
+    );
+    // The enclosing call for :x is the inner function, not the CALLed
+    // procedure around it.
+    assert_eq!(
+        kinds("CALL sq_proc(sq_fn(:x))", MYSQL),
+        vec![Some(MysqlRoutineKind::Function)]
+    );
+    // Oracle keeps its routines in one namespace: nothing to choose.
+    assert_eq!(kinds("BEGIN pkg.load(:a); END;", ORACLE), vec![None]);
+}
+
 #[test]
 fn no_routine_is_claimed_where_the_statement_calls_none() {
     // A built-in has no entry in any argument view, and its arguments are
@@ -393,6 +430,7 @@ fn procedure_argument(
         data_scale: None,
         type_owner: None,
         type_name: None,
+        type_subname: None,
         pls_type: None,
         overload,
         default_value: None,

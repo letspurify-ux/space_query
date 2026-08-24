@@ -123,6 +123,7 @@ trait SignatureBackend: Sync {
         usability: &crate::db::PoolSessionUsability,
         name: &str,
         qualifier: Option<&str>,
+        mysql_routine_kind: Option<crate::db::query::mysql_executor::MysqlRoutineKind>,
     ) -> Result<Option<Vec<ProcedureArgument>>, String>;
 }
 
@@ -184,12 +185,23 @@ fn resolve_mysql_signature_arguments(
     conn: &mut mysql::PooledConn,
     name: &str,
     qualifier: Option<&str>,
+    routine_kind: Option<crate::db::query::mysql_executor::MysqlRoutineKind>,
 ) -> Result<Option<Vec<ProcedureArgument>>, mysql::Error> {
-    crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_arguments_in_schema(
-        conn.as_mut(),
-        qualifier,
-        name,
-    )
+    // The call site names the namespace when the statement is a CALL; a call
+    // site that could not be read asks for whichever routine carries the name
+    // (function preferred when both do).
+    match routine_kind {
+        Some(kind) => {
+            crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_arguments_in_schema(
+                conn.as_mut(),
+                qualifier,
+                name,
+                kind,
+            )
+        }
+        None => crate::db::query::mysql_executor::MysqlObjectBrowser::
+            get_routine_arguments_in_schema_any_kind(conn.as_mut(), qualifier, name),
+    }
     .map(non_empty)
 }
 
@@ -269,6 +281,7 @@ impl SqlEditorWidget {
         db_type: crate::db::DatabaseType,
         name: &str,
         qualifier: Option<&str>,
+        mysql_routine_kind: Option<crate::db::query::mysql_executor::MysqlRoutineKind>,
     ) -> Result<Option<Vec<ProcedureArgument>>, String> {
         let timeout_restore = match crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout_with_restore_for_db(
             conn,
@@ -290,7 +303,7 @@ impl SqlEditorWidget {
             }
         };
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            resolve_mysql_signature_arguments(conn, name, qualifier).map_err(|err| {
+            resolve_mysql_signature_arguments(conn, name, qualifier, mysql_routine_kind).map_err(|err| {
                 Self::mysql_error_message(&err, Some(SIGNATURE_METADATA_TIMEOUT))
             })
         }));
@@ -334,6 +347,7 @@ impl SignatureBackend for OracleSignatureBackend {
         _usability: &crate::db::PoolSessionUsability,
         name: &str,
         qualifier: Option<&str>,
+        _mysql_routine_kind: Option<crate::db::query::mysql_executor::MysqlRoutineKind>,
     ) -> Result<Option<Vec<ProcedureArgument>>, String> {
         match session {
             crate::db::DbPoolSession::Oracle(conn) => {
@@ -359,11 +373,17 @@ impl SignatureBackend for MysqlSignatureBackend {
         usability: &crate::db::PoolSessionUsability,
         name: &str,
         qualifier: Option<&str>,
+        mysql_routine_kind: Option<crate::db::query::mysql_executor::MysqlRoutineKind>,
     ) -> Result<Option<Vec<ProcedureArgument>>, String> {
         match session {
             crate::db::DbPoolSession::MySQL { conn, db_type } => {
                 SqlEditorWidget::resolve_mysql_signature_with_timeout(
-                    conn, usability, *db_type, name, qualifier,
+                    conn,
+                    usability,
+                    *db_type,
+                    name,
+                    qualifier,
+                    mysql_routine_kind,
                 )
             }
             crate::db::DbPoolSession::Oracle(_) | crate::db::DbPoolSession::OracleThin(_) => {
@@ -385,8 +405,15 @@ impl SqlEditorWidget {
         name: &str,
         qualifier: Option<&str>,
         display_name: &str,
+        mysql_routine_kind: Option<crate::db::query::mysql_executor::MysqlRoutineKind>,
     ) -> Result<Option<SignatureLabel>, String> {
-        let args = Self::resolve_routine_arguments(db_type, session, name, qualifier)?;
+        let args = Self::resolve_routine_arguments(
+            db_type,
+            session,
+            name,
+            qualifier,
+            mysql_routine_kind,
+        )?;
         Ok(args.map(|args| Self::build_signature_label(display_name, &args)))
     }
 
@@ -397,6 +424,7 @@ impl SqlEditorWidget {
         session: &mut crate::db::AcquiredPoolSession,
         name: &str,
         qualifier: Option<&str>,
+        mysql_routine_kind: Option<crate::db::query::mysql_executor::MysqlRoutineKind>,
     ) -> Result<Option<Vec<ProcedureArgument>>, String> {
         // Cloned BEFORE the borrow, because the borrow is exclusive: this is
         // the whole reason the flag is a shared value rather than a method on
@@ -405,7 +433,7 @@ impl SqlEditorWidget {
         let Some(session) = session.session_mut() else {
             return Err("The signature metadata session was already given up".to_string());
         };
-        signature_backend_for(db_type).resolve(session, &usability, name, qualifier)
+        signature_backend_for(db_type).resolve(session, &usability, name, qualifier, mysql_routine_kind)
     }
 
     pub(crate) fn hide_signature_popup(&self) {
@@ -807,6 +835,15 @@ impl SqlEditorWidget {
             return;
         };
         let local_open_paren = call.open_paren;
+        // On the MySQL family the call site itself names the routine
+        // namespace (`CALL name(` is a procedure, anything else a function);
+        // carried into the lookup AND the cache key so a name that is both at
+        // once never shows one namespace's signature at the other's call.
+        let mysql_routine_kind = mysql_compatible
+            .then(|| {
+                crate::ui::bind_prompt::mysql_call_site_routine_kind(&scan_text, local_open_paren)
+            })
+            .flatten();
         call.open_paren += scan_offset;
 
         // Built-ins are resolved from the versioned manual catalog because
@@ -837,7 +874,11 @@ impl SqlEditorWidget {
             }
         }
 
-        let key = Self::signature_key(&call);
+        let mut key = Self::signature_key(&call);
+        if let Some(kind) = mysql_routine_kind {
+            key.push('#');
+            key.push_str(kind.as_routine_type());
+        }
 
         enum Action {
             Show(SignatureLabel, usize),
@@ -893,6 +934,7 @@ impl SqlEditorWidget {
                     display_name,
                     lookup_name,
                     lookup_qualifier,
+                    mysql_routine_kind,
                 );
             }
         }
@@ -904,6 +946,7 @@ impl SqlEditorWidget {
         display_name: String,
         lookup_name: String,
         qualifier: Option<String>,
+        mysql_routine_kind: Option<crate::db::query::mysql_executor::MysqlRoutineKind>,
     ) {
         let Some(connection) = self.bound_connection() else {
             let _ = self.ui_action_sender.send(UiActionResult::SignatureArguments {
@@ -954,6 +997,7 @@ impl SqlEditorWidget {
                     &lookup_name,
                     qualifier.as_deref(),
                     &display_name,
+                    mysql_routine_kind,
                 )?;
                 if !crate::db::cached_pool_session_context_matches_shared_connection(
                     &connection,
@@ -1359,10 +1403,16 @@ impl SqlEditorWidget {
                     }
                 }
                 "FUNCTION" | "PROCEDURE" => {
+                    let kind = if object_type_upper == "FUNCTION" {
+                        crate::db::query::mysql_executor::MysqlRoutineKind::Function
+                    } else {
+                        crate::db::query::mysql_executor::MysqlRoutineKind::Procedure
+                    };
                     let args = MysqlObjectBrowser::get_routine_arguments_in_schema(
                         conn,
                         qualifier,
                         &object_name,
+                        kind,
                     )
                     .map_err(|err| err.to_string())?;
                     let content =

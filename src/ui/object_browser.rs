@@ -3711,21 +3711,23 @@ impl ObjectBrowserWidget {
         );
         thread::spawn(move || {
             let activity = format!("Generating {} DDL for {}", object_type, object_name);
-            let result = ObjectBrowserWidget::with_pooled_object_session(
-                &connection,
-                selected_scope.as_deref(),
-                activity,
-                |context, session| {
-                    object_browser_behavior_for(context.connection_info.db_type)
-                        .generate_object_ddl(
-                            context,
-                            session,
-                            selected_scope.as_deref(),
-                            &object_type,
-                            &object_name,
-                        )
-                },
-            );
+            let result = Self::run_object_action_work("Generate DDL", || {
+                ObjectBrowserWidget::with_pooled_object_session(
+                    &connection,
+                    selected_scope.as_deref(),
+                    activity,
+                    |context, session| {
+                        object_browser_behavior_for(context.connection_info.db_type)
+                            .generate_object_ddl(
+                                context,
+                                session,
+                                selected_scope.as_deref(),
+                                &object_type,
+                                &object_name,
+                            )
+                    },
+                )
+            });
             let _ = sender.send(ObjectActionResult::Ddl(result));
             app::awake();
         });
@@ -4064,12 +4066,14 @@ impl ObjectBrowserWidget {
         thread::spawn(move || {
             let activity = format!("Loading package members for {}", package_name);
             let scope = ObjectBrowserWidget::scope_snapshot(&selected_scope);
-            let result = object_browser_behavior_for(db_type).load_package_routines(
-                &connection,
-                activity,
-                scope.as_deref(),
-                &package_name,
-            );
+            let result = Self::run_object_action_work("Load package routines", || {
+                object_browser_behavior_for(db_type).load_package_routines(
+                    &connection,
+                    activity,
+                    scope.as_deref(),
+                    &package_name,
+                )
+            });
 
             let _ = sender.send(ObjectActionResult::PackageRoutines {
                 package_name,
@@ -4218,15 +4222,17 @@ impl ObjectBrowserWidget {
         thread::spawn(move || {
             let activity = format!("Loading columns for {}", table_name);
             let scope = ObjectBrowserWidget::scope_snapshot(&selected_scope);
-            let result = ObjectBrowserWidget::with_pooled_object_session(
-                &connection,
-                scope.as_deref(),
-                activity,
-                |context, session| {
-                    object_browser_behavior_for(context.connection_info.db_type)
-                        .load_table_structure(context, session, scope.as_deref(), &table_name)
-                },
-            );
+            let result = Self::run_object_action_work("Load table columns", || {
+                ObjectBrowserWidget::with_pooled_object_session(
+                    &connection,
+                    scope.as_deref(),
+                    activity,
+                    |context, session| {
+                        object_browser_behavior_for(context.connection_info.db_type)
+                            .load_table_structure(context, session, scope.as_deref(), &table_name)
+                    },
+                )
+            });
             let _ = sender.send(ObjectActionResult::TableColumns {
                 table_name,
                 result,
@@ -5041,6 +5047,26 @@ impl ObjectBrowserWidget {
         object_browser_behavior_for(db_type).build_simple_function_script(qualified_name)
     }
 
+    /// The routine-call script `Execute Procedure`/`Execute Function` opens,
+    /// built from already-fetched arguments — the exact per-backend builder
+    /// the context menu uses. `#[doc(hidden)]`, for the live verification
+    /// harness (`verify_proc_exec_live`), which fetches arguments through the
+    /// same db-layer entry points the browser uses and asserts the generated
+    /// script really runs on every backend.
+    #[doc(hidden)]
+    pub fn routine_script_for_harness(
+        db_type: crate::db::DatabaseType,
+        qualified_name: &str,
+        routine_type: &str,
+        arguments: &[ProcedureArgument],
+    ) -> String {
+        object_browser_behavior_for(db_type).build_routine_script(
+            qualified_name,
+            routine_type,
+            arguments,
+        )
+    }
+
     fn build_simple_routine_script_for_db(
         db_type: crate::db::DatabaseType,
         qualified_name: &str,
@@ -5080,7 +5106,7 @@ impl ObjectBrowserWidget {
         routine_type: &str,
         arguments: &[ProcedureArgument],
     ) -> String {
-        let selected_args = Self::select_overload_arguments(arguments);
+        let selected_args = Self::select_overload_arguments(arguments, routine_type);
         if selected_args.is_empty() {
             return Self::build_simple_mysql_routine_script(qualified_name, routine_type);
         }
@@ -5167,10 +5193,27 @@ impl ObjectBrowserWidget {
         }
 
         if routine_type.eq_ignore_ascii_case("FUNCTION") {
-            if multiline_args.is_empty() {
-                script.push_str(&format!("SELECT {}() AS result;\n", target));
+            let call_expr = if multiline_args.is_empty() {
+                format!("{}()", target)
             } else {
-                script.push_str(&format!("SELECT {}{} AS result;\n", target, multiline_args));
+                format!("{}{}", target, multiline_args)
+            };
+            if post_lines.is_empty() {
+                script.push_str(&format!("SELECT {} AS result;\n", call_expr));
+            } else {
+                // A function with OUT/INOUT parameters (MariaDB allows them)
+                // cannot be invoked from a SELECT — the server refuses the
+                // session-variable argument (ER 4187). SET is the calling
+                // shape it accepts, and the trailing SELECTs surface what
+                // the call wrote.
+                let result_var =
+                    format!("@{}", Self::unique_var_name("result", 0, &mut used_names));
+                script.push_str(&format!("SET {} = {};\n", result_var, call_expr));
+                script.push_str(&format!("SELECT {} AS result;\n", result_var));
+                for line in post_lines {
+                    script.push_str(&line);
+                    script.push('\n');
+                }
             }
             return script;
         }
@@ -5207,12 +5250,16 @@ impl ObjectBrowserWidget {
         )
     }
 
-    fn build_procedure_script(qualified_name: &str, arguments: &[ProcedureArgument]) -> String {
+    fn build_procedure_script(
+        qualified_name: &str,
+        routine_type: &str,
+        arguments: &[ProcedureArgument],
+    ) -> String {
         if arguments.is_empty() {
             return Self::build_simple_procedure_script(qualified_name);
         }
 
-        let selected_args = Self::select_overload_arguments(arguments);
+        let selected_args = Self::select_overload_arguments(arguments, routine_type);
         if selected_args.is_empty() {
             return Self::build_simple_procedure_script(qualified_name);
         }
@@ -5262,24 +5309,26 @@ impl ObjectBrowserWidget {
             } else if is_out && Self::is_ref_cursor(arg) {
                 bind_decls.push((var_name.clone(), "REFCURSOR".to_string()));
                 let target = format!(":{}", var_name);
-                let call_expr = match &arg_label {
-                    Some(label) => format!("{} => {}", label, target),
-                    None => target,
-                };
-                call_args.push(call_expr);
+                call_args.push(Self::oracle_call_argument_expr(
+                    arg_label.as_deref(),
+                    &target,
+                ));
             } else {
                 let type_str = Self::format_argument_type(arg);
-                if is_in {
-                    let default_expr = Self::default_value_for_argument(arg, &type_str);
-                    local_decls.push(format!("  {} {} := {};", var_name, type_str, default_expr));
+                let initializer = if is_in {
+                    Self::in_argument_initializer(arg, &type_str)
                 } else {
-                    local_decls.push(format!("  {} {};", var_name, type_str));
-                }
-                let call_expr = match &arg_label {
-                    Some(label) => format!("{} => {}", label, var_name),
-                    None => var_name,
+                    None
                 };
-                call_args.push(call_expr);
+                match initializer {
+                    Some(default_expr) => local_decls
+                        .push(format!("  {} {} := {};", var_name, type_str, default_expr)),
+                    None => local_decls.push(format!("  {} {};", var_name, type_str)),
+                }
+                call_args.push(Self::oracle_call_argument_expr(
+                    arg_label.as_deref(),
+                    &var_name,
+                ));
             }
         }
 
@@ -5366,20 +5415,42 @@ impl ObjectBrowserWidget {
         head.parse::<u32>().ok()
     }
 
-    fn select_overload_arguments(arguments: &[ProcedureArgument]) -> Vec<ProcedureArgument> {
-        let mut selected: Vec<ProcedureArgument> = Vec::new();
-        let mut selected_overload: Option<i32> = None;
+    /// The overload group Execute should call: the FIRST one whose SHAPE
+    /// agrees with the menu's routine kind. A package may legally overload
+    /// one name across BOTH kinds (`PROCEDURE dup(..)` + `FUNCTION dup(..)`),
+    /// so the first overload is not necessarily the kind the user clicked —
+    /// a group is a function exactly when it carries the return-value row
+    /// (position 0, no name). When no group agrees, or the kind is unknown,
+    /// the first group keeps the long-standing behavior. Rows arrive sorted
+    /// by overload, so equal overloads are contiguous.
+    fn select_overload_arguments(
+        arguments: &[ProcedureArgument],
+        routine_type: &str,
+    ) -> Vec<ProcedureArgument> {
+        let mut groups: Vec<Vec<ProcedureArgument>> = Vec::new();
+        let mut current_overload: Option<Option<i32>> = None;
         for arg in arguments {
-            if selected_overload.is_none() {
-                selected_overload = arg.overload;
+            if current_overload != Some(arg.overload) {
+                current_overload = Some(arg.overload);
+                groups.push(Vec::new());
             }
-            if arg.overload == selected_overload {
-                selected.push(arg.clone());
-            } else {
-                break;
+            if let Some(group) = groups.last_mut() {
+                group.push(arg.clone());
             }
         }
-        selected
+
+        let wants_function = routine_type.eq_ignore_ascii_case("FUNCTION");
+        let wants_procedure = routine_type.eq_ignore_ascii_case("PROCEDURE");
+        let matching = (wants_function || wants_procedure).then(|| {
+            groups.iter().position(|group| {
+                let is_function = group
+                    .iter()
+                    .any(|arg| arg.position == 0 && arg.name.is_none());
+                is_function == wants_function
+            })
+        });
+        let index = matching.flatten().unwrap_or(0);
+        groups.into_iter().nth(index).unwrap_or_default()
     }
 
     fn is_ref_cursor(arg: &ProcedureArgument) -> bool {
@@ -5404,7 +5475,82 @@ impl ObjectBrowserWidget {
         false
     }
 
+    /// The declarable name of a composite-typed argument, `None` for scalars.
+    ///
+    /// `ALL_ARGUMENTS.DATA_TYPE` spells composites as dictionary keywords —
+    /// `PL/SQL RECORD`, `PL/SQL TABLE` (associative array), `TABLE` (nested
+    /// table), `VARRAY`, `OBJECT`, `OPAQUE/XMLTYPE`, `REF` (an object
+    /// reference, declared `REF owner.type`) — which are not valid PL/SQL
+    /// type names, so a DECLARE built from them cannot compile. The name a
+    /// declaration can use is TYPE_OWNER/TYPE_NAME(/TYPE_SUBNAME): for a
+    /// type declared inside a package the subname is the type itself, and a
+    /// `PL/SQL RECORD` with NO subname is a table's implicit record, spelled
+    /// `table%ROWTYPE`. TYPE_OWNER `PUBLIC` (a synonym-resolved owner) is
+    /// not a schema a reference may name, so it is dropped.
+    ///
+    /// `REF` is matched EXACTLY: `REF CURSOR` must stay out, because a
+    /// cursor row's TYPE_NAME/TYPE_SUBNAME describe the cursor's RETURN
+    /// record — declaring by that name would produce a record variable, not
+    /// a cursor. Cursors keep their `SYS_REFCURSOR` spelling.
+    fn composite_argument_type_name(arg: &ProcedureArgument) -> Option<String> {
+        let data_type = arg.data_type.as_deref()?.trim().to_uppercase();
+        let is_composite = matches!(
+            data_type.as_str(),
+            "PL/SQL RECORD"
+                | "PL/SQL TABLE"
+                | "TABLE"
+                | "VARRAY"
+                | "OBJECT"
+                | "OPAQUE/XMLTYPE"
+                | "REF"
+        );
+        if !is_composite {
+            return None;
+        }
+        let type_name = arg
+            .type_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())?;
+        let owner = arg
+            .type_owner
+            .as_deref()
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty() && !owner.eq_ignore_ascii_case("PUBLIC"));
+        let subname = arg
+            .type_subname
+            .as_deref()
+            .map(str::trim)
+            .filter(|subname| !subname.is_empty());
+
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(owner) = owner {
+            parts.push(crate::db::DatabaseConnection::quote_oracle_identifier(
+                owner,
+            ));
+        }
+        parts.push(crate::db::DatabaseConnection::quote_oracle_identifier(
+            type_name,
+        ));
+        if let Some(subname) = subname {
+            parts.push(crate::db::DatabaseConnection::quote_oracle_identifier(
+                subname,
+            ));
+        }
+        let joined = parts.join(".");
+        if data_type == "PL/SQL RECORD" && subname.is_none() {
+            return Some(format!("{}%ROWTYPE", joined));
+        }
+        if data_type == "REF" {
+            return Some(format!("REF {}", joined));
+        }
+        Some(joined)
+    }
+
     fn format_argument_type(arg: &ProcedureArgument) -> String {
+        if let Some(composite) = Self::composite_argument_type_name(arg) {
+            return composite;
+        }
         if let Some(pls_type) = arg.pls_type.as_deref() {
             let trimmed = pls_type.trim();
             if !trimmed.is_empty() {
@@ -5472,15 +5618,44 @@ impl ObjectBrowserWidget {
         len.clamp(1, 32767)
     }
 
+    /// One call argument as the generated CALL writes it: `label => value`
+    /// with the label spelled as an identifier, or just the value when the
+    /// dictionary gave no name.
+    ///
+    /// The label MUST go through identifier quoting: a quoted-created
+    /// parameter name (`"my arg"`, `"lower"`) reaches ARGUMENT_NAME verbatim,
+    /// and written bare it either fails to parse or normalizes to a DIFFERENT
+    /// (uppercase) name than the parameter's. Ordinary uppercase names come
+    /// back from [`crate::db::DatabaseConnection::quote_oracle_identifier`]
+    /// byte-identical, so this changes nothing for them.
+    fn oracle_call_argument_expr(arg_label: Option<&str>, value: &str) -> String {
+        match arg_label {
+            Some(label) => format!(
+                "{} => {}",
+                crate::db::DatabaseConnection::quote_oracle_identifier(label),
+                value
+            ),
+            None => value.to_string(),
+        }
+    }
+
+    /// The initializer an IN argument's declaration carries, `None` when the
+    /// type cannot take one: `:= NULL` on a cursor variable, a record or an
+    /// associative array is a compile error, and declared bare each of them
+    /// already holds its neutral value (atomically null / empty).
+    fn in_argument_initializer(arg: &ProcedureArgument, type_str: &str) -> Option<String> {
+        if Self::is_ref_cursor(arg) || Self::composite_argument_type_name(arg).is_some() {
+            return None;
+        }
+        Some(Self::default_value_for_argument(arg, type_str))
+    }
+
     fn default_value_for_argument(arg: &ProcedureArgument, type_str: &str) -> String {
         if let Some(default_value) = arg.default_value.as_deref() {
             let trimmed = default_value.trim();
             if !trimmed.is_empty() {
                 return trimmed.to_string();
             }
-        }
-        if Self::is_ref_cursor(arg) {
-            return "NULL".to_string();
         }
 
         let base = Self::normalize_type_base(type_str);
@@ -5763,12 +5938,14 @@ impl ObjectBrowserWidget {
                 "Resolving package routine type for {}.{}",
                 qualified_package, routine_name
             );
-            let result = object_browser_behavior_for(db_type).load_package_routines(
-                &connection,
-                activity,
-                selected_scope.as_deref(),
-                &package_name,
-            );
+            let result = Self::run_object_action_work("Resolve package routine type", || {
+                object_browser_behavior_for(db_type).load_package_routines(
+                    &connection,
+                    activity,
+                    selected_scope.as_deref(),
+                    &package_name,
+                )
+            });
 
             let _ = sender.send(ObjectActionResult::PackageRoutineContextMenu {
                 item,
@@ -6728,26 +6905,37 @@ impl ObjectBrowserWidget {
                         thread::spawn(move || {
                             let activity =
                                 format!("Loading {} arguments for {}", routine_type, object_name);
-                            let mut qualified_name = object_name.clone();
-                            let mut db_type = db_type;
-                            let result = ObjectBrowserWidget::with_pooled_object_session(
-                                &connection,
+                            // Scope-qualified UP FRONT, so the simple-script
+                            // fallback a failed argument load produces still
+                            // targets the browsed scope. The load's own
+                            // qualification replaces this on success.
+                            let mut qualified_name = Self::qualify_object_name_for_scope(
+                                db_type,
                                 selected_scope.as_deref(),
-                                activity,
-                                |context, session| {
-                                    db_type = context.connection_info.db_type;
-                                    let data = object_browser_behavior_for(db_type)
-                                        .load_routine_script(
-                                            context,
-                                            session,
-                                            selected_scope.as_deref(),
-                                            &object_name,
-                                            &routine_type,
-                                        )?;
-                                    qualified_name = data.qualified_name;
-                                    Ok(data.sql)
-                                },
+                                &object_name,
                             );
+                            let mut db_type = db_type;
+                            let result =
+                                Self::run_object_action_work("Load routine arguments", || {
+                                    ObjectBrowserWidget::with_pooled_object_session(
+                                        &connection,
+                                        selected_scope.as_deref(),
+                                        activity,
+                                        |context, session| {
+                                            db_type = context.connection_info.db_type;
+                                            let data = object_browser_behavior_for(db_type)
+                                                .load_routine_script(
+                                                    context,
+                                                    session,
+                                                    selected_scope.as_deref(),
+                                                    &object_name,
+                                                    &routine_type,
+                                                )?;
+                                            qualified_name = data.qualified_name;
+                                            Ok(data.sql)
+                                        },
+                                    )
+                                });
 
                             let _ = sender.send(ObjectActionResult::RoutineScript {
                                 qualified_name,
@@ -6803,18 +6991,21 @@ impl ObjectBrowserWidget {
                                 status_routine_type, qualified_name
                             );
                             let mut resolved_routine_type = routine_type.clone();
-                            let result = object_browser_behavior_for(db_type)
-                                .load_package_routine_script(
-                                    &connection,
-                                    activity,
-                                    selected_scope.as_deref(),
-                                    &package_name,
-                                    &routine_name,
-                                    &routine_type,
-                                )
-                                .map(|data| {
-                                    resolved_routine_type = data.resolved_routine_type;
-                                    data.sql
+                            let result =
+                                Self::run_object_action_work("Load routine arguments", || {
+                                    object_browser_behavior_for(db_type)
+                                        .load_package_routine_script(
+                                            &connection,
+                                            activity,
+                                            selected_scope.as_deref(),
+                                            &package_name,
+                                            &routine_name,
+                                            &routine_type,
+                                        )
+                                        .map(|data| {
+                                            resolved_routine_type = data.resolved_routine_type;
+                                            data.sql
+                                        })
                                 });
 
                             let _ = sender.send(ObjectActionResult::RoutineScript {
@@ -6850,14 +7041,15 @@ impl ObjectBrowserWidget {
                             &format!("Checking compilation status for {}", object_name),
                         );
                         thread::spawn(move || {
-                            let result = object_browser_behavior_for(db_type)
-                                .load_compilation_errors(
+                            let result = Self::run_object_action_work("Check compilation", || {
+                                object_browser_behavior_for(db_type).load_compilation_errors(
                                     &connection,
                                     format!("Checking compilation status for {}", object_name),
                                     selected_scope.as_deref(),
                                     &object_name,
                                     &object_type,
-                                );
+                                )
+                            });
                             let (status, result) = match result {
                                 Ok((status, errors)) => (status, Ok(errors)),
                                 Err(err) => (String::new(), Err(err)),
@@ -6907,22 +7099,26 @@ impl ObjectBrowserWidget {
                         let file_label_for_thread = file_label.clone();
                         thread::spawn(move || {
                             let activity = format!("Loading table structure for {}", table_name);
-                            let result = read_import_file(&path).and_then(|text| {
-                                ObjectBrowserWidget::with_pooled_object_session(
-                                    &connection,
-                                    selected_scope.as_deref(),
-                                    activity,
-                                    |context, session| {
-                                        object_browser_behavior_for(context.connection_info.db_type)
+                            let result = Self::run_object_action_work("Prepare import", || {
+                                read_import_file(&path).and_then(|text| {
+                                    ObjectBrowserWidget::with_pooled_object_session(
+                                        &connection,
+                                        selected_scope.as_deref(),
+                                        activity,
+                                        |context, session| {
+                                            object_browser_behavior_for(
+                                                context.connection_info.db_type,
+                                            )
                                             .load_table_structure(
                                                 context,
                                                 session,
                                                 selected_scope.as_deref(),
                                                 &table_name,
                                             )
-                                    },
-                                )
-                                .map(|columns| (text, columns))
+                                        },
+                                    )
+                                    .map(|columns| (text, columns))
+                                })
                             });
                             let _ = sender.send(ObjectActionResult::ImportTarget {
                                 qualified_name: qualified_for_thread,
@@ -6960,20 +7156,22 @@ impl ObjectBrowserWidget {
                         );
                         thread::spawn(move || {
                             let activity = format!("Exporting {}", table_name);
-                            let result = ObjectBrowserWidget::with_pooled_object_session(
-                                &connection,
-                                selected_scope.as_deref(),
-                                activity,
-                                |context, session| {
-                                    object_browser_behavior_for(context.connection_info.db_type)
-                                        .load_table_rows(
-                                            context,
-                                            session,
-                                            selected_scope.as_deref(),
-                                            &table_name,
-                                        )
-                                },
-                            );
+                            let result = Self::run_object_action_work("Export table", || {
+                                ObjectBrowserWidget::with_pooled_object_session(
+                                    &connection,
+                                    selected_scope.as_deref(),
+                                    activity,
+                                    |context, session| {
+                                        object_browser_behavior_for(context.connection_info.db_type)
+                                            .load_table_rows(
+                                                context,
+                                                session,
+                                                selected_scope.as_deref(),
+                                                &table_name,
+                                            )
+                                    },
+                                )
+                            });
                             let _ = sender.send(ObjectActionResult::ExportedTable {
                                 qualified_name: qualified_for_thread,
                                 db_type,
@@ -6993,20 +7191,25 @@ impl ObjectBrowserWidget {
                             &format!("Loading table structure for {}", table_name),
                         );
                         thread::spawn(move || {
-                            let result = ObjectBrowserWidget::with_pooled_object_session(
-                                &connection,
-                                selected_scope.as_deref(),
-                                format!("Loading table structure for {}", table_name),
-                                |context, session| {
-                                    object_browser_behavior_for(context.connection_info.db_type)
-                                        .load_table_structure(
-                                            context,
-                                            session,
-                                            selected_scope.as_deref(),
-                                            &table_name,
-                                        )
-                                },
-                            );
+                            let result =
+                                Self::run_object_action_work("Load table structure", || {
+                                    ObjectBrowserWidget::with_pooled_object_session(
+                                        &connection,
+                                        selected_scope.as_deref(),
+                                        format!("Loading table structure for {}", table_name),
+                                        |context, session| {
+                                            object_browser_behavior_for(
+                                                context.connection_info.db_type,
+                                            )
+                                            .load_table_structure(
+                                                context,
+                                                session,
+                                                selected_scope.as_deref(),
+                                                &table_name,
+                                            )
+                                        },
+                                    )
+                                });
                             let _ = sender
                                 .send(ObjectActionResult::TableStructure { table_name, result });
                             app::awake();
@@ -7022,20 +7225,22 @@ impl ObjectBrowserWidget {
                             &format!("Loading indexes for {}", table_name),
                         );
                         thread::spawn(move || {
-                            let result = ObjectBrowserWidget::with_pooled_object_session(
-                                &connection,
-                                selected_scope.as_deref(),
-                                format!("Loading indexes for {}", table_name),
-                                |context, session| {
-                                    object_browser_behavior_for(context.connection_info.db_type)
-                                        .load_table_indexes(
-                                            context,
-                                            session,
-                                            selected_scope.as_deref(),
-                                            &table_name,
-                                        )
-                                },
-                            );
+                            let result = Self::run_object_action_work("Load indexes", || {
+                                ObjectBrowserWidget::with_pooled_object_session(
+                                    &connection,
+                                    selected_scope.as_deref(),
+                                    format!("Loading indexes for {}", table_name),
+                                    |context, session| {
+                                        object_browser_behavior_for(context.connection_info.db_type)
+                                            .load_table_indexes(
+                                                context,
+                                                session,
+                                                selected_scope.as_deref(),
+                                                &table_name,
+                                            )
+                                    },
+                                )
+                            });
                             let _ = sender
                                 .send(ObjectActionResult::TableIndexes { table_name, result });
                             app::awake();
@@ -7051,20 +7256,22 @@ impl ObjectBrowserWidget {
                             &format!("Loading constraints for {}", table_name),
                         );
                         thread::spawn(move || {
-                            let result = ObjectBrowserWidget::with_pooled_object_session(
-                                &connection,
-                                selected_scope.as_deref(),
-                                format!("Loading constraints for {}", table_name),
-                                |context, session| {
-                                    object_browser_behavior_for(context.connection_info.db_type)
-                                        .load_table_constraints(
-                                            context,
-                                            session,
-                                            selected_scope.as_deref(),
-                                            &table_name,
-                                        )
-                                },
-                            );
+                            let result = Self::run_object_action_work("Load constraints", || {
+                                ObjectBrowserWidget::with_pooled_object_session(
+                                    &connection,
+                                    selected_scope.as_deref(),
+                                    format!("Loading constraints for {}", table_name),
+                                    |context, session| {
+                                        object_browser_behavior_for(context.connection_info.db_type)
+                                            .load_table_constraints(
+                                                context,
+                                                session,
+                                                selected_scope.as_deref(),
+                                                &table_name,
+                                            )
+                                    },
+                                )
+                            });
                             let _ = sender
                                 .send(ObjectActionResult::TableConstraints { table_name, result });
                             app::awake();
@@ -7109,21 +7316,23 @@ impl ObjectBrowserWidget {
                                 }
                             };
 
-                            let result = ObjectBrowserWidget::with_pooled_object_session(
-                                &connection,
-                                selected_scope.as_deref(),
-                                format!("Loading {} info for {}", obj_type, name),
-                                |context, session| {
-                                    object_browser_behavior_for(context.connection_info.db_type)
-                                        .load_object_info(
-                                            context,
-                                            session,
-                                            selected_scope.as_deref(),
-                                            &obj_type,
-                                            &name,
-                                        )
-                                },
-                            );
+                            let result = Self::run_object_action_work("Load object info", || {
+                                ObjectBrowserWidget::with_pooled_object_session(
+                                    &connection,
+                                    selected_scope.as_deref(),
+                                    format!("Loading {} info for {}", obj_type, name),
+                                    |context, session| {
+                                        object_browser_behavior_for(context.connection_info.db_type)
+                                            .load_object_info(
+                                                context,
+                                                session,
+                                                selected_scope.as_deref(),
+                                                &obj_type,
+                                                &name,
+                                            )
+                                    },
+                                )
+                            });
                             match result {
                                 Ok(ObjectInfoPayload::Synonym(info)) => {
                                     let _ = sender.send(ObjectActionResult::SynonymInfo(Ok(info)));
@@ -7450,6 +7659,26 @@ impl ObjectBrowserWidget {
             &format!("{context} panicked: {panic_payload}"),
         );
         eprintln!("{context} panicked: {panic_payload}");
+    }
+
+    /// Run one object-action worker's fallible work with the same panic
+    /// discipline as the scope-switch worker: a panic becomes the action's
+    /// ERROR — reported through the action's own channel — instead of a
+    /// dead thread that leaves the status line stuck on "Loading…" with a
+    /// reply that never comes.
+    fn run_object_action_work<T>(
+        action: &str,
+        work: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|payload| {
+            let panic_msg = Self::panic_payload_to_string(payload.as_ref());
+            crate::utils::logging::log_error(
+                "object_browser::action",
+                &format!("{action} worker panicked: {panic_msg}"),
+            );
+            eprintln!("{action} worker panicked: {panic_msg}");
+            Err(format!("{action} failed internally: {panic_msg}"))
+        })
     }
 
     fn emit_sql_callback(callback_slot: &SqlExecuteCallback, action: SqlAction) {
@@ -8161,10 +8390,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn build_routine_script(
         &self,
         qualified_name: &str,
-        _routine_type: &str,
+        routine_type: &str,
         arguments: &[ProcedureArgument],
     ) -> String {
-        ObjectBrowserWidget::build_procedure_script(qualified_name, arguments)
+        ObjectBrowserWidget::build_procedure_script(qualified_name, routine_type, arguments)
     }
 
     fn action_scope<'a>(
@@ -9119,6 +9348,12 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         object_name: &str,
         routine_type: &str,
     ) -> Result<RoutineScriptData, String> {
+        // The menu offered exactly one namespace's routine; carrying that
+        // choice into the lookup keeps a same-named function/procedure pair
+        // from answering for each other.
+        let kind =
+            crate::db::query::mysql_executor::MysqlRoutineKind::from_routine_type(routine_type)
+                .ok_or_else(|| format!("Unsupported MySQL/MariaDB routine type: {routine_type}"))?;
         let conn = self.take_object_action_session(context, session)?;
         let action_scope = self.action_scope(selected_scope, context);
         let qualified_name = self.qualify_object_name(action_scope, object_name);
@@ -9126,6 +9361,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             conn.as_mut(),
             action_scope,
             object_name,
+            kind,
         )
         .map(|arguments| RoutineScriptData {
             qualified_name: qualified_name.clone(),
@@ -11368,9 +11604,30 @@ mod tests {
             data_scale: None,
             type_owner: None,
             type_name: None,
+            type_subname: None,
             pls_type: None,
             overload: None,
             default_value: None,
+        }
+    }
+
+    /// A composite-typed argument as the Oracle dictionary reports it: the
+    /// keyword in DATA_TYPE, the declarable name split across
+    /// TYPE_OWNER/TYPE_NAME/TYPE_SUBNAME.
+    fn composite_procedure_argument(
+        name: Option<&str>,
+        position: i32,
+        data_type: &str,
+        in_out: &str,
+        type_owner: Option<&str>,
+        type_name: Option<&str>,
+        type_subname: Option<&str>,
+    ) -> ProcedureArgument {
+        ProcedureArgument {
+            type_owner: type_owner.map(str::to_string),
+            type_name: type_name.map(str::to_string),
+            type_subname: type_subname.map(str::to_string),
+            ..procedure_argument(name, position, Some(data_type), in_out)
         }
     }
 
@@ -12789,6 +13046,7 @@ mod tests {
                 data_scale: Some(0),
                 type_owner: None,
                 type_name: None,
+                type_subname: None,
                 pls_type: None,
                 overload: None,
                 default_value: None,
@@ -12804,6 +13062,7 @@ mod tests {
                 data_scale: None,
                 type_owner: None,
                 type_name: None,
+                type_subname: None,
                 pls_type: None,
                 overload: None,
                 default_value: None,
@@ -12823,18 +13082,278 @@ mod tests {
 
     #[test]
     fn build_oracle_function_sys_refcursor_return_uses_bind_without_print() {
+        // Uppercase, as the dictionary reports ordinary parameter names — a
+        // lowercase ARGUMENT_NAME means a quoted-created parameter and is
+        // covered by `build_oracle_script_quotes_quoted_parameter_labels`.
         let arguments = vec![
             procedure_argument(None, 0, Some("SYS_REFCURSOR"), "OUT"),
-            procedure_argument(Some("p_min_sal"), 1, Some("NUMBER"), "IN"),
+            procedure_argument(Some("P_MIN_SAL"), 1, Some("NUMBER"), "IN"),
         ];
 
-        let sql = ObjectBrowserWidget::build_procedure_script("DEMO_PKG.GET_ROWS", &arguments);
+        let sql = ObjectBrowserWidget::build_procedure_script(
+            "DEMO_PKG.GET_ROWS",
+            "FUNCTION",
+            &arguments,
+        );
 
         assert!(sql.starts_with("VAR v_result REFCURSOR\n"));
         assert!(sql.contains("  :v_result := DEMO_PKG.GET_ROWS(\n"));
-        assert!(sql.contains("p_min_sal => v_p_min_sal"));
+        assert!(sql.contains("P_MIN_SAL => v_p_min_sal"));
         assert!(!sql.contains("PRINT"));
         assert!(!sql.contains("v_result SYS_REFCURSOR"));
+    }
+
+    /// A quoted-created parameter's ARGUMENT_NAME arrives verbatim
+    /// (`my arg`, `lower`); written bare in named association it either fails
+    /// to parse or normalizes to a DIFFERENT (uppercase) name, so the label
+    /// must be re-quoted. Ordinary uppercase labels stay unquoted.
+    #[test]
+    fn build_oracle_script_quotes_quoted_parameter_labels() {
+        let arguments = vec![
+            procedure_argument(Some("my arg"), 1, Some("NUMBER"), "IN"),
+            procedure_argument(Some("lower"), 2, Some("VARCHAR2"), "OUT"),
+            procedure_argument(Some("P_PLAIN"), 3, Some("NUMBER"), "IN"),
+            composite_procedure_argument(
+                Some("bad cur"),
+                4,
+                "REF CURSOR",
+                "OUT",
+                Some("SCOTT"),
+                Some("SQ_PKG"),
+                Some("T_REC"),
+            ),
+        ];
+
+        let sql =
+            ObjectBrowserWidget::build_procedure_script("SQ_QUOTED_P", "PROCEDURE", &arguments);
+
+        assert!(sql.contains("\"my arg\" => v_my_arg"));
+        assert!(sql.contains("\"lower\" => v_lower"));
+        assert!(sql.contains("P_PLAIN => v_p_plain"));
+        assert!(sql.contains("\"bad cur\" => :v_bad_cur"));
+        assert!(sql.contains("VAR v_bad_cur REFCURSOR\n"));
+    }
+
+    /// The dictionary spells composite argument types as keywords
+    /// (`PL/SQL RECORD`, `PL/SQL TABLE`, `OBJECT`) that are not PL/SQL; a
+    /// declaration must use the qualified name from
+    /// TYPE_OWNER/TYPE_NAME/TYPE_SUBNAME, and composites take no `:=`
+    /// initializer (`:= NULL` on a record or associative array is a compile
+    /// error).
+    #[test]
+    fn build_oracle_script_declares_composite_arguments_by_qualified_type_name() {
+        let arguments = vec![
+            composite_procedure_argument(
+                Some("p_rec"),
+                1,
+                "PL/SQL RECORD",
+                "IN",
+                Some("SCOTT"),
+                Some("SQ_PKG"),
+                Some("T_REC"),
+            ),
+            composite_procedure_argument(
+                Some("p_tab"),
+                2,
+                "PL/SQL TABLE",
+                "IN",
+                Some("SCOTT"),
+                Some("SQ_PKG"),
+                Some("T_TAB"),
+            ),
+            composite_procedure_argument(
+                Some("p_obj"),
+                3,
+                "OBJECT",
+                "IN",
+                Some("SCOTT"),
+                Some("SQ_OBJ_T"),
+                None,
+            ),
+            procedure_argument(Some("p_n"), 4, Some("NUMBER"), "IN"),
+        ];
+
+        let sql =
+            ObjectBrowserWidget::build_procedure_script("SCOTT.SQ_PROC", "PROCEDURE", &arguments);
+
+        assert!(sql.contains("  v_p_rec SCOTT.SQ_PKG.T_REC;\n"));
+        assert!(sql.contains("  v_p_tab SCOTT.SQ_PKG.T_TAB;\n"));
+        assert!(sql.contains("  v_p_obj SCOTT.SQ_OBJ_T;\n"));
+        assert!(sql.contains("  v_p_n NUMBER := 0;\n"));
+        assert!(!sql.contains("PL/SQL"));
+        assert!(!sql.contains("v_p_obj OBJECT"));
+    }
+
+    /// A `PL/SQL RECORD` with no TYPE_SUBNAME is a table's implicit record:
+    /// only the `%ROWTYPE` spelling names it, and a PUBLIC type owner (a
+    /// synonym-resolved name) must not be spelled as a schema.
+    #[test]
+    fn build_oracle_script_spells_rowtype_record_and_drops_public_owner() {
+        let arguments = vec![
+            composite_procedure_argument(
+                Some("p_user"),
+                1,
+                "PL/SQL RECORD",
+                "IN",
+                Some("PUBLIC"),
+                Some("ALL_USERS"),
+                None,
+            ),
+            composite_procedure_argument(
+                Some("p_emp"),
+                2,
+                "PL/SQL RECORD",
+                "OUT",
+                Some("SCOTT"),
+                Some("EMP"),
+                None,
+            ),
+        ];
+
+        let sql =
+            ObjectBrowserWidget::build_procedure_script("SQ_ROW_PROC", "PROCEDURE", &arguments);
+
+        assert!(sql.contains("  v_p_user ALL_USERS%ROWTYPE;\n"));
+        assert!(sql.contains("  v_p_emp SCOTT.EMP%ROWTYPE;\n"));
+        assert!(!sql.contains("PUBLIC"));
+    }
+
+    /// A `REF` argument (an object reference) is declared `REF owner.type`,
+    /// bare — the dictionary keyword alone (`v REF;`) and `:= NULL` are both
+    /// compile errors. `REF CURSOR` must NOT take this path: a cursor row's
+    /// TYPE_NAME/TYPE_SUBNAME name the cursor's RETURN record, so declaring
+    /// by them would produce a record variable — cursors stay
+    /// `SYS_REFCURSOR`.
+    #[test]
+    fn build_oracle_script_declares_ref_argument_by_referenced_type() {
+        let arguments = vec![
+            composite_procedure_argument(
+                Some("p_ref"),
+                1,
+                "REF",
+                "IN",
+                Some("SCOTT"),
+                Some("SQ_OBJ_T"),
+                None,
+            ),
+            // A strong ref cursor: same populated type columns, different
+            // DATA_TYPE — it must keep the cursor spelling.
+            composite_procedure_argument(
+                Some("p_cur"),
+                2,
+                "REF CURSOR",
+                "IN",
+                Some("SCOTT"),
+                Some("SQ_PKG"),
+                Some("T_REC"),
+            ),
+        ];
+
+        let sql =
+            ObjectBrowserWidget::build_procedure_script("SQ_REF_PROC", "PROCEDURE", &arguments);
+
+        assert!(sql.contains("  v_p_ref REF SCOTT.SQ_OBJ_T;\n"));
+        assert!(sql.contains("  v_p_cur SYS_REFCURSOR;\n"));
+        assert!(!sql.contains(":= NULL"));
+        assert!(!sql.contains("v_p_cur SCOTT"));
+    }
+
+    /// A package may overload ONE name across BOTH kinds (legal PL/SQL). The
+    /// script must call the first overload whose SHAPE matches the clicked
+    /// menu label — not blindly the first overload — and an unknown kind
+    /// keeps the long-standing first-group behavior.
+    #[test]
+    fn build_oracle_script_picks_the_overload_matching_the_clicked_kind() {
+        fn overloaded(
+            name: Option<&str>,
+            position: i32,
+            data_type: &str,
+            in_out: &str,
+            overload: i32,
+        ) -> ProcedureArgument {
+            ProcedureArgument {
+                overload: Some(overload),
+                ..procedure_argument(name, position, Some(data_type), in_out)
+            }
+        }
+        // Overload 1: PROCEDURE dup(a NUMBER). Overload 2: FUNCTION dup(b
+        // VARCHAR2) RETURN NUMBER — as the dictionary reports them, sorted.
+        let arguments = vec![
+            overloaded(Some("A"), 1, "NUMBER", "IN", 1),
+            overloaded(None, 0, "NUMBER", "OUT", 2),
+            overloaded(Some("B"), 2, "VARCHAR2", "IN", 2),
+        ];
+
+        let as_function =
+            ObjectBrowserWidget::build_procedure_script("SQ_X_OVL.DUP", "FUNCTION", &arguments);
+        assert!(as_function.starts_with("VAR v_result NUMBER\n"));
+        assert!(as_function.contains("B => v_b"));
+        assert!(!as_function.contains("A => "));
+
+        let as_procedure =
+            ObjectBrowserWidget::build_procedure_script("SQ_X_OVL.DUP", "PROCEDURE", &arguments);
+        assert!(as_procedure.contains("A => v_a"));
+        assert!(!as_procedure.contains("VAR "));
+        assert!(!as_procedure.contains("B => "));
+
+        let unknown =
+            ObjectBrowserWidget::build_procedure_script("SQ_X_OVL.DUP", "UNKNOWN", &arguments);
+        assert!(unknown.contains("A => v_a"));
+        assert!(!unknown.contains("B => "));
+    }
+
+    /// A cursor variable refuses `:= NULL` too: an IN ref-cursor argument is
+    /// declared bare.
+    #[test]
+    fn build_oracle_script_leaves_in_ref_cursor_uninitialized() {
+        let arguments = vec![procedure_argument(
+            Some("p_cur"),
+            1,
+            Some("REF CURSOR"),
+            "IN",
+        )];
+
+        let sql =
+            ObjectBrowserWidget::build_procedure_script("SQ_CUR_PROC", "PROCEDURE", &arguments);
+
+        assert!(sql.contains("  v_p_cur SYS_REFCURSOR;\n"));
+        assert!(!sql.contains(":= NULL"));
+    }
+
+    /// MariaDB accepts OUT/INOUT parameters on FUNCTIONs but refuses to call
+    /// such a function from SELECT (ER 4187): the script must use the SET
+    /// calling shape and still surface the OUT values.
+    #[test]
+    fn build_mysql_function_with_out_parameter_uses_set_call_shape() {
+        let arguments = vec![
+            procedure_argument(None, 0, Some("INT"), "RETURN"),
+            procedure_argument(Some("p_in"), 1, Some("INT"), "IN"),
+            procedure_argument(Some("p_out"), 2, Some("INT"), "OUT"),
+        ];
+
+        let sql =
+            ObjectBrowserWidget::build_mysql_routine_script("demo_fn", "FUNCTION", &arguments);
+
+        assert!(sql.contains("SET @v_result = `demo_fn`(\n"));
+        assert!(sql.contains("    @v_p_out\n"));
+        assert!(sql.contains("SELECT @v_result AS result;\n"));
+        assert!(sql.contains("SELECT @v_p_out AS `p_out`;\n"));
+        assert!(!sql.contains("SELECT `demo_fn`("));
+    }
+
+    #[test]
+    fn build_mysql_function_without_out_parameters_keeps_select_shape() {
+        let arguments = vec![
+            procedure_argument(None, 0, Some("INT"), "RETURN"),
+            procedure_argument(Some("p_in"), 1, Some("INT"), "IN"),
+        ];
+
+        let sql =
+            ObjectBrowserWidget::build_mysql_routine_script("demo_fn", "FUNCTION", &arguments);
+
+        assert!(sql.contains("SELECT `demo_fn`(\n"));
+        assert!(sql.contains(") AS result;\n"));
+        assert!(!sql.contains("SET @"));
     }
 
     #[test]
