@@ -12503,6 +12503,21 @@ mod cancel_watchdog_tests {
         false
     }
 
+    /// `abandon_query_cancel_operation_if_matches` publishes idle only AFTER
+    /// the terminal event is enqueued — so a newer operation cannot overtake
+    /// the abandonment notification — which means receiving
+    /// `OperationAbandoned` does not yet imply the flag has dropped. Waiting
+    /// is the assertion that matches that ordering.
+    fn wait_for_query_running_to_clear(query_running: &Arc<Mutex<bool>>) -> bool {
+        for _ in 0..100 {
+            if !load_mutex_bool(query_running) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
     fn cancel_operation_metadata(
         operation_id: u64,
         connection_generation: u64,
@@ -12899,7 +12914,7 @@ mod cancel_watchdog_tests {
         assert!(wait_for_flag(force_called.as_ref()));
         assert_eq!(current_operation_id.load(Ordering::Relaxed), 0);
         assert!(!load_mutex_bool(&cancel_flag));
-        assert!(!load_mutex_bool(&query_running));
+        assert!(wait_for_query_running_to_clear(&query_running));
         assert!(status_activity.is_finished());
         assert!(matches!(
             *current_query_cancel_handle.lock().unwrap(),
@@ -13077,7 +13092,7 @@ mod cancel_watchdog_tests {
         ));
         assert_eq!(current_operation_id.load(Ordering::Relaxed), 0);
         assert!(!load_mutex_bool(&cancel_flag));
-        assert!(!load_mutex_bool(&query_running));
+        assert!(wait_for_query_running_to_clear(&query_running));
         for _ in 0..100 {
             if !cancel_watchdog_started.load(Ordering::Acquire) {
                 break;
