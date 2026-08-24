@@ -295,14 +295,18 @@ pub(crate) fn show(
         let outcome = Arc::clone(&outcome);
         let mut dialog = dialog.clone();
         import_btn.set_callback(move |_| {
-            let data = match &*state
+            // Cloned out so the `parsed` guard dies before the match: matching
+            // on the guard itself would hold it across the Err arm's modal
+            // alert, and a nested `app::wait` may not run under this lock.
+            let parsed = state
                 .parsed
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-            {
-                Ok(data) => data.clone(),
+                .clone();
+            let data = match parsed {
+                Ok(data) => data,
                 Err(error) => {
-                    crate::ui::alert_on_main(error);
+                    crate::ui::alert_on_main(&error);
                     return;
                 }
             };
@@ -520,11 +524,63 @@ type SummaryRefresh = Box<dyn FnMut() + Send>;
 static SUMMARY_REFRESH: Mutex<Option<SummaryRefresh>> = Mutex::new(None);
 
 fn notify_summary_refresh() {
-    if let Some(refresh) = SUMMARY_REFRESH
+    // take → unlock → invoke → restore, like every other callback slot: the
+    // guard may not be held while the closure runs, or a refresh that asks
+    // for another refresh deadlocks the UI thread on this slot.
+    let mut refresh = SUMMARY_REFRESH
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_mut()
-    {
+        .take();
+    if let Some(refresh) = refresh.as_mut() {
         refresh();
+    }
+    let mut slot = SUMMARY_REFRESH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = refresh;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    /// The slot's guard may not be held while the refresh closure runs: a
+    /// refresh that (transitively) asks for another refresh would deadlock the
+    /// UI thread on this slot. Runs on a worker thread so a regression fails
+    /// this test by timeout instead of hanging the whole run.
+    #[test]
+    fn summary_refresh_slot_is_not_held_while_the_refresh_closure_runs() {
+        let (done_sender, done_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let reentered = Arc::new(AtomicBool::new(false));
+            let reentered_in_refresh = Arc::clone(&reentered);
+            *SUMMARY_REFRESH
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move || {
+                // Once, not recursively: the point is one nested call.
+                if !reentered_in_refresh.swap(true, Ordering::AcqRel) {
+                    notify_summary_refresh();
+                }
+            }));
+            notify_summary_refresh();
+            let _ = done_sender.send(());
+        });
+        done_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a re-entrant summary refresh must not deadlock on the slot lock");
+        worker.join().expect("summary refresh worker");
+        let mut slot = SUMMARY_REFRESH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            slot.is_some(),
+            "the refresh closure must be back in the slot after the call"
+        );
+        *slot = None;
     }
 }
