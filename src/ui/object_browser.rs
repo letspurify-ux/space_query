@@ -442,6 +442,82 @@ struct RoutineScriptData {
     sql: String,
 }
 
+/// What a routine does with ONE of its arguments.
+///
+/// The two facts every `Execute Procedure`/`Execute Function` script is built
+/// from: a value the routine READS has to be given a starting value, and a
+/// value the routine WRITES has to end up somewhere the user can see. Asking
+/// them here — once, for every backend — is what keeps the Oracle and MySQL
+/// builders from answering the same question differently.
+///
+/// The catalogs spell the direction three ways: Oracle's
+/// `ALL_ARGUMENTS.IN_OUT` says `IN` / `OUT` / `IN/OUT`, the MySQL family's
+/// `PARAMETERS.PARAMETER_MODE` says `IN` / `OUT` / `INOUT`, and a function's
+/// return row says `OUT` (Oracle) or `RETURN` (MySQL family).
+#[derive(Clone, Copy)]
+struct RoutineArgumentDirection {
+    reads: bool,
+    writes: bool,
+}
+
+impl RoutineArgumentDirection {
+    fn of(arg: &ProcedureArgument) -> Self {
+        let spelling = arg
+            .in_out
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("IN")
+            .to_ascii_uppercase();
+        // `RETURN` contains neither `IN` nor `OUT`, so the substring test
+        // below would call a return row an argument the routine neither reads
+        // nor writes.
+        if spelling.contains("RETURN") {
+            return Self {
+                reads: false,
+                writes: true,
+            };
+        }
+        Self {
+            reads: spelling.contains("IN"),
+            writes: spelling.contains("OUT"),
+        }
+    }
+}
+
+/// Where a generated Oracle script keeps ONE argument's value.
+///
+/// A local variable stops existing when the block ends, so a value the
+/// routine WROTE into one is lost; a bind is reported back with the result
+/// (`| OUT: :v_x = ...`) and a cursor bind opens its own grid. The choice is
+/// therefore made from two facts and nothing else — does the routine write
+/// the value, and can a bind carry the type — rather than one branch per
+/// argument shape, which is how OUT parameters came to be dropped into
+/// locals while the return value and OUT ref cursors were bound.
+enum OracleValueCarrier {
+    /// `VAR name <type>`: visible after the block runs.
+    Bind(String),
+    /// A `DECLARE` local — the only option for types no bind can carry
+    /// (records, collections, object types, `BOOLEAN`, `INTERVAL`, ...).
+    Local,
+}
+
+/// The longest variable name a generated Oracle script may declare.
+///
+/// 128 bytes is the identifier limit of every Oracle release this app can
+/// reach — the thin driver refuses to negotiate below protocol 314. (A
+/// pre-12.2 server caps identifiers at 30, where a parameter name over 28
+/// characters would still overflow; no supported configuration reaches one.)
+const ORACLE_GENERATED_NAME_MAX: usize = 128;
+
+/// The longest variable name a generated MySQL/MariaDB script may use.
+///
+/// User variables are capped at 64 characters — the same cap as the parameter
+/// identifiers they are built from, which is exactly why the prefix has to be
+/// budgeted for: `@v_` plus a 64-character parameter name is a name the server
+/// refuses outright.
+const MYSQL_GENERATED_NAME_MAX: usize = 64;
+
 enum ObjectInfoPayload {
     Sequence(SequenceInfo),
     Synonym(SynonymInfo),
@@ -493,8 +569,13 @@ trait ObjectBrowserDbBehavior: Sync {
         object_type: &str,
         object_name: &str,
     ) -> Option<String>;
-    fn build_simple_procedure_script(&self, qualified_name: &str) -> String;
-    fn build_simple_function_script(&self, qualified_name: &str) -> String;
+    /// The script for a routine whose argument list is empty or could not be
+    /// read. Takes the KIND because the procedure and function shapes are not
+    /// interchangeable on any backend, and each family spells the empty
+    /// argument list differently (Oracle takes no parentheses, the MySQL
+    /// family requires them) — one entry point so the kind cannot be
+    /// forgotten at a call site.
+    fn build_simple_routine_script(&self, qualified_name: &str, routine_type: &str) -> String;
     fn build_routine_script(
         &self,
         qualified_name: &str,
@@ -5014,37 +5095,36 @@ impl ObjectBrowserWidget {
         )
     }
 
+    /// One MySQL/MariaDB column alias, quoted.
+    ///
+    /// Doubling the backticks is the whole of the job. This used to strip
+    /// leading and trailing backticks first, which is a different question —
+    /// "is this alias already quoted?" — and the callers never ask it: the
+    /// alias is a routine PARAMETER NAME, straight from the catalog and never
+    /// quoted. A parameter name may legally start or end with a backtick
+    /// (`` `b ``, doubled at creation), and stripping it made the read-back
+    /// column claim to be a DIFFERENT parameter — the one thing the alias
+    /// exists to say. Ordinary names come back byte-identical either way.
     fn quote_mysql_alias(alias: &str) -> String {
-        format!("`{}`", alias.trim().trim_matches('`').replace('`', "``"))
+        format!("`{}`", alias.trim().replace('`', "``"))
     }
 
-    fn build_simple_procedure_script(qualified_name: &str) -> String {
-        format!("BEGIN\n  {};\nEND;\n/\n", qualified_name)
-    }
-
-    fn build_simple_function_script(qualified_name: &str) -> String {
-        format!(
-            "SELECT {} AS result\nFROM dual;\n",
-            if qualified_name.contains('(') {
-                qualified_name.to_string()
-            } else {
-                format!("{}()", qualified_name)
-            }
-        )
-    }
-
-    fn build_simple_procedure_script_for_db(
-        db_type: crate::db::DatabaseType,
-        qualified_name: &str,
-    ) -> String {
-        object_browser_behavior_for(db_type).build_simple_procedure_script(qualified_name)
-    }
-
-    fn build_simple_function_script_for_db(
-        db_type: crate::db::DatabaseType,
-        qualified_name: &str,
-    ) -> String {
-        object_browser_behavior_for(db_type).build_simple_function_script(qualified_name)
+    /// The Oracle script for a routine whose argument list is empty or could
+    /// not be read.
+    ///
+    /// The routine KIND picks the shape and the two are not interchangeable:
+    /// a function called as a statement does not resolve as a procedure, and
+    /// a procedure has no value to select. Oracle also takes NO parentheses
+    /// on an empty argument list — `SELECT f() FROM dual` is a syntax error —
+    /// which is the exact opposite of the MySQL family, where they are
+    /// required. (The test module names the exact server errors; this file's
+    /// production text stays out of the driver-marker catalogs' way.)
+    fn build_simple_oracle_routine_script(qualified_name: &str, routine_type: &str) -> String {
+        if routine_type.eq_ignore_ascii_case("FUNCTION") {
+            format!("SELECT {} AS result\nFROM dual;\n", qualified_name)
+        } else {
+            format!("BEGIN\n  {};\nEND;\n/\n", qualified_name)
+        }
     }
 
     /// The routine-call script `Execute Procedure`/`Execute Function` opens,
@@ -5072,11 +5152,8 @@ impl ObjectBrowserWidget {
         qualified_name: &str,
         routine_type: &str,
     ) -> String {
-        if routine_type.eq_ignore_ascii_case("FUNCTION") {
-            Self::build_simple_function_script_for_db(db_type, qualified_name)
-        } else {
-            Self::build_simple_procedure_script_for_db(db_type, qualified_name)
-        }
+        object_browser_behavior_for(db_type)
+            .build_simple_routine_script(qualified_name, routine_type)
     }
 
     fn default_value_for_mysql_argument(arg: &ProcedureArgument, type_str: &str) -> String {
@@ -5095,10 +5172,37 @@ impl ObjectBrowserWidget {
             "DATETIME" | "TIMESTAMP" => "CURRENT_TIMESTAMP".to_string(),
             "TIME" => "CURRENT_TIME".to_string(),
             "BOOLEAN" | "BOOL" => "FALSE".to_string(),
-            "CHAR" | "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM"
-            | "SET" | "JSON" => "''".to_string(),
+            "CHAR" | "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => {
+                "''".to_string()
+            }
+            // Spelled out rather than left to the fallback: these look like
+            // string types and are not. MySQL 8 refuses an empty string in
+            // all three — ER 3140 for JSON, ER 1265 under STRICT_TRANS_TABLES
+            // for an ENUM/SET member that is not literally empty — so the
+            // generated call failed on the engine before the user could edit
+            // it. MariaDB happens to accept `''` for all three (its JSON is a
+            // LONGTEXT alias, and it does not truncate-error here), which is
+            // exactly why the placeholder must not be chosen per engine: NULL
+            // is what BOTH accept, every routine parameter being nullable.
+            "JSON" | "ENUM" | "SET" => "NULL".to_string(),
             _ => "NULL".to_string(),
         }
+    }
+
+    /// The MySQL/MariaDB catalog's own spelling of an argument's type.
+    ///
+    /// `INFORMATION_SCHEMA.PARAMETERS.DTD_IDENTIFIER`, or the `SHOW CREATE`
+    /// fallback's parsed type text, verbatim. Deliberately NOT
+    /// [`Self::format_argument_type`]: that one reads an ORACLE data
+    /// dictionary, and its `CHAR`/`VARCHAR2`/`NUMBER` and composite rules
+    /// answered for a catalog this family does not have — `char(3)` came back
+    /// out of it as `CHAR(3)(3)`.
+    fn mysql_argument_type(arg: &ProcedureArgument) -> String {
+        arg.data_type
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn build_mysql_routine_script(
@@ -5118,7 +5222,9 @@ impl ObjectBrowserWidget {
         let mut post_lines: Vec<String> = Vec::new();
 
         for arg in &selected_args {
-            if arg.position == 0 && arg.name.is_none() {
+            // The return value is not a call argument; the caller assigns or
+            // selects the call expression itself.
+            if Self::is_function_return_row(arg) {
                 continue;
             }
 
@@ -5126,38 +5232,29 @@ impl ObjectBrowserWidget {
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("arg{}", arg.position.max(1)));
-            let direction = arg
-                .in_out
-                .clone()
-                .unwrap_or_else(|| "IN".to_string())
-                .replace('/', " ")
-                .to_uppercase();
-            let type_str = Self::format_argument_type(arg);
+            let direction = RoutineArgumentDirection::of(arg);
+            let type_str = Self::mysql_argument_type(arg);
 
-            if direction.contains("OUT") && !direction.contains("IN") {
+            // Everything the routine WRITES goes through a session variable
+            // the trailing SELECT reads back, so the value cannot be lost;
+            // IN OUT additionally needs its starting value set first.
+            if direction.writes {
                 let session_var = format!(
                     "@{}",
-                    Self::unique_var_name(&arg_label, arg.position, &mut used_names)
+                    Self::unique_var_name(
+                        &arg_label,
+                        arg.position,
+                        &mut used_names,
+                        MYSQL_GENERATED_NAME_MAX,
+                    )
                 );
-                call_args.push(session_var.clone());
-                post_lines.push(format!(
-                    "SELECT {} AS {};",
-                    session_var,
-                    Self::quote_mysql_alias(&arg_label)
-                ));
-                continue;
-            }
-
-            if direction.contains("IN") && direction.contains("OUT") {
-                let session_var = format!(
-                    "@{}",
-                    Self::unique_var_name(&arg_label, arg.position, &mut used_names)
-                );
-                prelude_lines.push(format!(
-                    "SET {} = {};",
-                    session_var,
-                    Self::default_value_for_mysql_argument(arg, &type_str)
-                ));
+                if direction.reads {
+                    prelude_lines.push(format!(
+                        "SET {} = {};",
+                        session_var,
+                        Self::default_value_for_mysql_argument(arg, &type_str)
+                    ));
+                }
                 call_args.push(session_var.clone());
                 post_lines.push(format!(
                     "SELECT {} AS {};",
@@ -5206,8 +5303,10 @@ impl ObjectBrowserWidget {
                 // session-variable argument (ER 4187). SET is the calling
                 // shape it accepts, and the trailing SELECTs surface what
                 // the call wrote.
-                let result_var =
-                    format!("@{}", Self::unique_var_name("result", 0, &mut used_names));
+                let result_var = format!(
+                    "@{}",
+                    Self::unique_var_name("result", 0, &mut used_names, MYSQL_GENERATED_NAME_MAX)
+                );
                 script.push_str(&format!("SET {} = {};\n", result_var, call_expr));
                 script.push_str(&format!("SELECT {} AS result;\n", result_var));
                 for line in post_lines {
@@ -5232,22 +5331,17 @@ impl ObjectBrowserWidget {
         script
     }
 
+    /// The MySQL/MariaDB script for a routine whose argument list is empty or
+    /// could not be read. An empty argument list is written WITH parentheses
+    /// on both engines — the opposite of Oracle, where they are a syntax
+    /// error.
     fn build_simple_mysql_routine_script(qualified_name: &str, routine_type: &str) -> String {
+        let target = Self::quote_mysql_identifier_path(qualified_name);
         if routine_type.eq_ignore_ascii_case("FUNCTION") {
-            return format!(
-                "SELECT {} AS result;\n",
-                if qualified_name.contains('(') {
-                    qualified_name.to_string()
-                } else {
-                    format!("{}()", Self::quote_mysql_identifier_path(qualified_name))
-                }
-            );
+            return format!("SELECT {}() AS result;\n", target);
         }
 
-        format!(
-            "CALL {}();\n",
-            Self::quote_mysql_identifier_path(qualified_name)
-        )
+        format!("CALL {}();\n", target)
     }
 
     fn build_procedure_script(
@@ -5255,79 +5349,77 @@ impl ObjectBrowserWidget {
         routine_type: &str,
         arguments: &[ProcedureArgument],
     ) -> String {
-        if arguments.is_empty() {
-            return Self::build_simple_procedure_script(qualified_name);
-        }
-
         let selected_args = Self::select_overload_arguments(arguments, routine_type);
         if selected_args.is_empty() {
-            return Self::build_simple_procedure_script(qualified_name);
+            return Self::build_simple_oracle_routine_script(qualified_name, routine_type);
         }
 
         let mut used_names: HashSet<String> = HashSet::new();
         let mut local_decls: Vec<String> = Vec::new();
         let mut call_args: Vec<String> = Vec::new();
         let mut bind_decls: Vec<(String, String)> = Vec::new();
-        // Function return value (position=0, name=NULL) must be assigned
-        // via ':=' rather than passed as a call argument.
-        let mut return_var: Option<String> = None;
+        // A bind starts out empty, so an IN OUT argument carried by one is
+        // given its starting value inside the block, before the call.
+        let mut seed_lines: Vec<String> = Vec::new();
+        // Function return value: assigned via ':=' rather than passed as a
+        // call argument.
+        let mut return_target: Option<String> = None;
 
         for arg in &selected_args {
-            let arg_label = arg.name.clone();
-            let direction = arg
-                .in_out
-                .clone()
-                .unwrap_or_else(|| "IN".to_string())
-                .replace('/', " ")
-                .to_uppercase();
-            let is_out = direction.contains("OUT");
-            let is_in = direction.contains("IN");
-
-            // Detect function return value: position=0 with no argument name
-            // and direction is OUT (not IN OUT).
-            let is_return_value = arg.position == 0 && arg.name.is_none() && is_out && !is_in;
-
+            let direction = RoutineArgumentDirection::of(arg);
+            let is_return_value = Self::is_function_return_row(arg);
             let var_base =
-                arg_label
+                arg.name
                     .as_deref()
                     .unwrap_or(if is_return_value { "RESULT" } else { "ARG" });
-            let var_name = Self::unique_var_name(var_base, arg.position, &mut used_names);
+            let var_name = Self::unique_var_name(
+                var_base,
+                arg.position,
+                &mut used_names,
+                ORACLE_GENERATED_NAME_MAX,
+            );
+            let type_str = Self::format_argument_type(arg);
+            // Everything the routine WRITES — the return value and every
+            // OUT/IN OUT parameter alike — goes through a bind whenever a
+            // bind can carry the type, because a local would swallow it.
+            let carrier = match direction.writes {
+                true => Self::bind_type_for_argument(arg, &type_str)
+                    .map(OracleValueCarrier::Bind)
+                    .unwrap_or(OracleValueCarrier::Local),
+                false => OracleValueCarrier::Local,
+            };
+            // The neutral starting value an IN or IN OUT argument needs, from
+            // the one place that knows which types can take one at all.
+            let seed = direction
+                .reads
+                .then(|| Self::in_argument_initializer(arg, &type_str))
+                .flatten();
+
+            let target = match carrier {
+                OracleValueCarrier::Bind(bind_type) => {
+                    bind_decls.push((var_name.clone(), bind_type));
+                    if let Some(seed) = seed {
+                        seed_lines.push(format!("  :{} := {};", var_name, seed));
+                    }
+                    format!(":{}", var_name)
+                }
+                OracleValueCarrier::Local => {
+                    match seed {
+                        Some(seed) => {
+                            local_decls.push(format!("  {} {} := {};", var_name, type_str, seed))
+                        }
+                        None => local_decls.push(format!("  {} {};", var_name, type_str)),
+                    }
+                    var_name
+                }
+            };
 
             if is_return_value {
-                let type_str = Self::format_argument_type(arg);
-                if Self::is_ref_cursor(arg) {
-                    bind_decls.push((var_name.clone(), "REFCURSOR".to_string()));
-                    return_var = Some(format!(":{}", var_name));
-                } else if let Some(bind_type) = Self::bind_type_for_return(&type_str) {
-                    bind_decls.push((var_name.clone(), bind_type));
-                    return_var = Some(format!(":{}", var_name));
-                } else {
-                    // Fallback for unsupported return types: keep local variable assignment.
-                    local_decls.push(format!("  {} {};", var_name, type_str));
-                    return_var = Some(var_name);
-                }
-            } else if is_out && Self::is_ref_cursor(arg) {
-                bind_decls.push((var_name.clone(), "REFCURSOR".to_string()));
-                let target = format!(":{}", var_name);
-                call_args.push(Self::oracle_call_argument_expr(
-                    arg_label.as_deref(),
-                    &target,
-                ));
+                return_target = Some(target);
             } else {
-                let type_str = Self::format_argument_type(arg);
-                let initializer = if is_in {
-                    Self::in_argument_initializer(arg, &type_str)
-                } else {
-                    None
-                };
-                match initializer {
-                    Some(default_expr) => local_decls
-                        .push(format!("  {} {} := {};", var_name, type_str, default_expr)),
-                    None => local_decls.push(format!("  {} {};", var_name, type_str)),
-                }
                 call_args.push(Self::oracle_call_argument_expr(
-                    arg_label.as_deref(),
-                    &var_name,
+                    arg.name.as_deref(),
+                    &target,
                 ));
             }
         }
@@ -5347,6 +5439,11 @@ impl ObjectBrowserWidget {
 
         script.push_str("BEGIN\n");
 
+        for line in &seed_lines {
+            script.push_str(line);
+            script.push('\n');
+        }
+
         // Build the call expression (with or without arguments)
         let call_str = if call_args.is_empty() {
             qualified_name.to_string()
@@ -5360,9 +5457,9 @@ impl ObjectBrowserWidget {
             s
         };
 
-        if let Some(ref ret_var) = return_var {
+        if let Some(ref return_target) = return_target {
             // Function: assign return value via ':='
-            script.push_str(&format!("  {} := {};\n", ret_var, call_str));
+            script.push_str(&format!("  {} := {};\n", return_target, call_str));
         } else {
             // Procedure: plain call
             script.push_str(&format!("  {};\n", call_str));
@@ -5373,7 +5470,24 @@ impl ObjectBrowserWidget {
         script
     }
 
-    fn bind_type_for_return(type_str: &str) -> Option<String> {
+    /// The `VAR` type a bind needs to carry this argument, `None` when no
+    /// bind can carry it.
+    ///
+    /// One answer for the function return value and for every OUT/IN OUT
+    /// parameter: they are the same question — "can the user be shown what
+    /// the routine wrote here?" — and answering it in two places is how the
+    /// return value came to be bound while OUT parameters were not.
+    fn bind_type_for_argument(arg: &ProcedureArgument, type_str: &str) -> Option<String> {
+        if Self::is_ref_cursor(arg) {
+            return Some("REFCURSOR".to_string());
+        }
+        // Records, collections, object types and object references have no
+        // bind spelling at all; `composite_argument_type_name` is the single
+        // place that knows which types those are.
+        if Self::composite_argument_type_name(arg).is_some() {
+            return None;
+        }
+
         let upper = type_str.trim().to_uppercase();
         if upper.is_empty() {
             return None;
@@ -5397,14 +5511,35 @@ impl ObjectBrowserWidget {
                 Some(format!("TIMESTAMP({})", precision))
             }
             "CLOB" | "NCLOB" => Some("CLOB".to_string()),
-            "VARCHAR2" | "NVARCHAR2" | "VARCHAR" | "CHAR" | "NCHAR" | "RAW" => {
-                let size = Self::extract_parenthesized_u32(&upper)
-                    .unwrap_or(4000)
-                    .clamp(1, 4000);
-                Some(format!("VARCHAR2({})", size))
-            }
+            "VARCHAR2" | "NVARCHAR2" | "VARCHAR" | "CHAR" | "NCHAR" => Some(format!(
+                "VARCHAR2({})",
+                Self::bind_character_capacity(&upper, 1)
+            )),
+            // A RAW reaches a VARCHAR2 bind through PL/SQL's implicit
+            // RAW-to-character conversion, which writes HEX: two characters
+            // per declared byte, or the assignment overflows the bind.
+            "RAW" => Some(format!(
+                "VARCHAR2({})",
+                Self::bind_character_capacity(&upper, 2)
+            )),
             _ => None,
         }
+    }
+
+    /// The character capacity a `VARCHAR2` bind needs for a declared type:
+    /// `characters_per_unit` per declared unit, capped at PL/SQL's 32767.
+    ///
+    /// An unstated length means the type carries its maximum — the same
+    /// reading [`Self::clamp_string_length`] gives the declaration itself, so
+    /// the bind is never smaller than the variable it has to receive. (The
+    /// cap can still be reached by a full-size `RAW`, whose hex form is
+    /// simply longer than any `VARCHAR2` can hold.)
+    fn bind_character_capacity(upper: &str, characters_per_unit: u32) -> u32 {
+        const PLSQL_MAX_LENGTH: u32 = 32767;
+        Self::extract_parenthesized_u32(upper)
+            .and_then(|declared| declared.checked_mul(characters_per_unit))
+            .unwrap_or(PLSQL_MAX_LENGTH)
+            .clamp(1, PLSQL_MAX_LENGTH)
     }
 
     fn extract_parenthesized_u32(value: &str) -> Option<u32> {
@@ -5443,14 +5578,27 @@ impl ObjectBrowserWidget {
         let wants_procedure = routine_type.eq_ignore_ascii_case("PROCEDURE");
         let matching = (wants_function || wants_procedure).then(|| {
             groups.iter().position(|group| {
-                let is_function = group
-                    .iter()
-                    .any(|arg| arg.position == 0 && arg.name.is_none());
+                let is_function = group.iter().any(Self::is_function_return_row);
                 is_function == wants_function
             })
         });
         let index = matching.flatten().unwrap_or(0);
         groups.into_iter().nth(index).unwrap_or_default()
+    }
+
+    /// The row that carries a FUNCTION's return value: position 0 with no
+    /// argument name. No catalog in any supported family produces such a row
+    /// for anything else.
+    ///
+    /// The DIRECTION is deliberately NOT part of the question. Oracle spells
+    /// that row `OUT` and the MySQL family `RETURN`, so a direction test here
+    /// is one that has to be written differently per family — which is how
+    /// the group picker (position/name) and the Oracle script builder
+    /// (position/name/direction) came to be able to disagree about which rows
+    /// are return values, leaving the builder free to pass a picked group's
+    /// return row along as a call argument.
+    fn is_function_return_row(arg: &ProcedureArgument) -> bool {
+        arg.position == 0 && arg.name.is_none()
     }
 
     fn is_ref_cursor(arg: &ProcedureArgument) -> bool {
@@ -5639,25 +5787,30 @@ impl ObjectBrowserWidget {
         }
     }
 
-    /// The initializer an IN argument's declaration carries, `None` when the
-    /// type cannot take one: `:= NULL` on a cursor variable, a record or an
-    /// associative array is a compile error, and declared bare each of them
-    /// already holds its neutral value (atomically null / empty).
+    /// The starting value an argument the routine READS is given, `None` when
+    /// the type cannot take one: `:= NULL` on a cursor variable, a record or
+    /// an associative array is a compile error, and declared bare each of
+    /// them already holds its neutral value (atomically null / empty).
+    ///
+    /// The one answer for both carriers — a `DECLARE` local takes it as its
+    /// `:=` initializer, a bind as an assignment inside the block — so an
+    /// IN OUT argument cannot start out initialized under one carrier and
+    /// empty under the other.
     fn in_argument_initializer(arg: &ProcedureArgument, type_str: &str) -> Option<String> {
         if Self::is_ref_cursor(arg) || Self::composite_argument_type_name(arg).is_some() {
             return None;
         }
-        Some(Self::default_value_for_argument(arg, type_str))
+        Some(Self::default_value_for_argument(type_str))
     }
 
-    fn default_value_for_argument(arg: &ProcedureArgument, type_str: &str) -> String {
-        if let Some(default_value) = arg.default_value.as_deref() {
-            let trimmed = default_value.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-
+    /// The neutral value of an Oracle type.
+    ///
+    /// Derived from the TYPE alone. The dictionary's own
+    /// `ALL_ARGUMENTS.DEFAULT_VALUE` is deliberately not consulted: it is a
+    /// LONG holding the default expression's source text, which can span
+    /// lines and name identifiers that are not in scope at the call site, and
+    /// only one of the two Oracle protocols can read it at all.
+    fn default_value_for_argument(type_str: &str) -> String {
         let base = Self::normalize_type_base(type_str);
         if base.contains('.') {
             return "NULL".to_string();
@@ -5690,7 +5843,28 @@ impl ObjectBrowserWidget {
         upper
     }
 
-    fn unique_var_name(base_name: &str, position: i32, used: &mut HashSet<String>) -> String {
+    /// A distinct variable name for one argument, within `max_len`.
+    ///
+    /// The catalog's own parameter name is already inside ITS database's
+    /// identifier limit, but the name generated from it is not the catalog's:
+    /// it carries a `v_` prefix and may carry a `_2` disambiguator, and both
+    /// are ours to budget for. Both families' limits are reachable from a
+    /// perfectly legal routine — a MySQL parameter may be 64 characters, the
+    /// identifier maximum, and `@v_<that>` is then an illegal user-variable
+    /// name the server refuses outright.
+    ///
+    /// Truncating is safe: the name is only ever a LOCAL of the generated
+    /// script. The routine's own parameter name is what the call is written
+    /// with (named association on Oracle, the `AS` alias on the MySQL family),
+    /// so the user can still tell which argument a value belongs to.
+    fn unique_var_name(
+        base_name: &str,
+        position: i32,
+        used: &mut HashSet<String>,
+        max_len: usize,
+    ) -> String {
+        // ASCII by construction, so every length below is both a byte count
+        // and a character count and slicing can never split a character.
         let mut cleaned = base_name
             .chars()
             .map(|ch| {
@@ -5712,14 +5886,17 @@ impl ObjectBrowserWidget {
         {
             cleaned.insert(0, '_');
         }
-        let candidate = format!("v_{}", cleaned);
+        let mut candidate = format!("v_{}", cleaned);
+        candidate.truncate(max_len);
         if used.insert(candidate.clone()) {
             return candidate;
         }
 
         let mut suffix = 2;
         loop {
-            let next = format!("{}_{}", candidate, suffix);
+            let tail = format!("_{}", suffix);
+            let head = max_len.saturating_sub(tail.len()).min(candidate.len());
+            let next = format!("{}{}", &candidate[..head], tail);
             if used.insert(next.clone()) {
                 return next;
             }
@@ -8379,12 +8556,8 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         })
     }
 
-    fn build_simple_procedure_script(&self, qualified_name: &str) -> String {
-        ObjectBrowserWidget::build_simple_procedure_script(qualified_name)
-    }
-
-    fn build_simple_function_script(&self, qualified_name: &str) -> String {
-        ObjectBrowserWidget::build_simple_function_script(qualified_name)
+    fn build_simple_routine_script(&self, qualified_name: &str, routine_type: &str) -> String {
+        ObjectBrowserWidget::build_simple_oracle_routine_script(qualified_name, routine_type)
     }
 
     fn build_routine_script(
@@ -9302,25 +9475,8 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         })
     }
 
-    fn build_simple_procedure_script(&self, qualified_name: &str) -> String {
-        format!(
-            "CALL {}();\n",
-            ObjectBrowserWidget::quote_mysql_identifier_path(qualified_name)
-        )
-    }
-
-    fn build_simple_function_script(&self, qualified_name: &str) -> String {
-        format!(
-            "SELECT {} AS result;\n",
-            if qualified_name.contains('(') {
-                qualified_name.to_string()
-            } else {
-                format!(
-                    "{}()",
-                    ObjectBrowserWidget::quote_mysql_identifier_path(qualified_name)
-                )
-            }
-        )
+    fn build_simple_routine_script(&self, qualified_name: &str, routine_type: &str) -> String {
+        ObjectBrowserWidget::build_simple_mysql_routine_script(qualified_name, routine_type)
     }
 
     fn build_routine_script(
@@ -13107,6 +13263,12 @@ mod tests {
     /// (`my arg`, `lower`); written bare in named association it either fails
     /// to parse or normalizes to a DIFFERENT (uppercase) name, so the label
     /// must be re-quoted. Ordinary uppercase labels stay unquoted.
+    ///
+    /// The labels are what this test pins; each one is asserted against the
+    /// carrier its argument now takes, so a label change and a carrier change
+    /// cannot hide behind each other. `lower` is an OUT scalar and is bound
+    /// (see [`build_oracle_script_binds_out_arguments_so_their_values_show`]),
+    /// which is why its value reads `:v_lower` and not `v_lower`.
     #[test]
     fn build_oracle_script_quotes_quoted_parameter_labels() {
         let arguments = vec![
@@ -13128,7 +13290,7 @@ mod tests {
             ObjectBrowserWidget::build_procedure_script("SQ_QUOTED_P", "PROCEDURE", &arguments);
 
         assert!(sql.contains("\"my arg\" => v_my_arg"));
-        assert!(sql.contains("\"lower\" => v_lower"));
+        assert!(sql.contains("\"lower\" => :v_lower"));
         assert!(sql.contains("P_PLAIN => v_p_plain"));
         assert!(sql.contains("\"bad cur\" => :v_bad_cur"));
         assert!(sql.contains("VAR v_bad_cur REFCURSOR\n"));
@@ -13300,6 +13462,246 @@ mod tests {
             ObjectBrowserWidget::build_procedure_script("SQ_X_OVL.DUP", "UNKNOWN", &arguments);
         assert!(unknown.contains("A => v_a"));
         assert!(!unknown.contains("B => "));
+    }
+
+    /// Whatever the routine WRITES has to be readable once the block ends.
+    /// A local variable stops existing there, so every OUT/IN OUT argument a
+    /// bind can carry is bound — the same treatment the return value and OUT
+    /// ref cursors already had — and the runtime reports the bind back as
+    /// `| OUT: :v_x = ...`. IN arguments are untouched: they stay locals.
+    #[test]
+    fn build_oracle_script_binds_out_arguments_so_their_values_show() {
+        let arguments = vec![
+            procedure_argument(Some("P_IN"), 1, Some("NUMBER"), "IN"),
+            procedure_argument(Some("P_OUT"), 2, Some("VARCHAR2"), "OUT"),
+            procedure_argument(Some("P_BOTH"), 3, Some("NUMBER"), "IN/OUT"),
+        ];
+
+        let sql = ObjectBrowserWidget::build_procedure_script("SQ_OUT_P", "PROCEDURE", &arguments);
+
+        // Written values: bound, and passed to the call as binds.
+        assert!(sql.contains("VAR v_p_out VARCHAR2(32767)\n"));
+        assert!(sql.contains("VAR v_p_both NUMBER\n"));
+        assert!(sql.contains("P_OUT => :v_p_out"));
+        assert!(sql.contains("P_BOTH => :v_p_both"));
+        // A bind starts out empty, so the one the routine also READS is given
+        // its starting value inside the block, before the call.
+        assert!(sql.contains("BEGIN\n  :v_p_both := 0;\n"));
+        assert!(!sql.contains(":v_p_out :="));
+        // Read-only arguments keep the local declaration and its initializer.
+        assert!(sql.contains("  v_p_in NUMBER := 0;\n"));
+        assert!(sql.contains("P_IN => v_p_in"));
+        assert!(!sql.contains("v_p_out VARCHAR2(32767);"));
+    }
+
+    /// No bind can carry a record, a collection, an object type or a
+    /// `BOOLEAN`, so an OUT argument of such a type stays a local — declared
+    /// bare, and passed by name, exactly as before.
+    ///
+    /// A regression guard, not a fail-before: it pins the side of the OUT
+    /// rule that must NOT move when the bindable side does.
+    #[test]
+    fn build_oracle_script_keeps_unbindable_out_arguments_local() {
+        let arguments = vec![
+            composite_procedure_argument(
+                Some("P_REC"),
+                1,
+                "PL/SQL RECORD",
+                "OUT",
+                Some("SCOTT"),
+                Some("SQ_PKG"),
+                Some("T_REC"),
+            ),
+            procedure_argument(Some("P_FLAG"), 2, Some("PL/SQL BOOLEAN"), "OUT"),
+        ];
+
+        let sql =
+            ObjectBrowserWidget::build_procedure_script("SQ_LOCAL_P", "PROCEDURE", &arguments);
+
+        assert!(!sql.contains("VAR "));
+        assert!(sql.contains("  v_p_rec SCOTT.SQ_PKG.T_REC;\n"));
+        assert!(sql.contains("P_REC => v_p_rec"));
+        assert!(sql.contains("P_FLAG => v_p_flag"));
+        assert!(!sql.contains(":v_p_rec"));
+    }
+
+    /// A bind must be able to receive everything the declaration can hold: a
+    /// `VARCHAR2` with no stated length is 32767 in PL/SQL, and a `RAW`
+    /// reaches a character bind as HEX, two characters per byte. A bind
+    /// smaller than the value assigned to it is ORA-06502 at run time.
+    #[test]
+    fn build_oracle_script_binds_are_wide_enough_for_the_declared_type() {
+        let unbounded = vec![procedure_argument(None, 0, Some("VARCHAR2"), "OUT")];
+        let sql = ObjectBrowserWidget::build_procedure_script("SQ_LONG_F", "FUNCTION", &unbounded);
+        assert!(sql.starts_with("VAR v_result VARCHAR2(32767)\n"));
+
+        let sized = vec![ProcedureArgument {
+            data_length: Some(100),
+            ..procedure_argument(None, 0, Some("RAW"), "OUT")
+        }];
+        let sql = ObjectBrowserWidget::build_procedure_script("SQ_RAW_F", "FUNCTION", &sized);
+        assert!(sql.starts_with("VAR v_result VARCHAR2(200)\n"));
+    }
+
+    /// The routine KIND picks the shape when there are no argument rows to
+    /// read — a routine with no parameters, or an argument load that failed.
+    /// Calling a function as a statement is PLS-00221, and Oracle rejects an
+    /// empty argument list written with parentheses (ORA-00936) where the
+    /// MySQL family requires them.
+    #[test]
+    fn simple_routine_scripts_follow_the_routine_kind_on_every_backend() {
+        assert_eq!(
+            ObjectBrowserWidget::build_simple_routine_script_for_db(
+                DatabaseType::Oracle,
+                "SCOTT.SQ_F",
+                "FUNCTION",
+            ),
+            "SELECT SCOTT.SQ_F AS result\nFROM dual;\n"
+        );
+        assert_eq!(
+            ObjectBrowserWidget::build_simple_routine_script_for_db(
+                DatabaseType::Oracle,
+                "SCOTT.SQ_P",
+                "PROCEDURE",
+            ),
+            "BEGIN\n  SCOTT.SQ_P;\nEND;\n/\n"
+        );
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(
+                ObjectBrowserWidget::build_simple_routine_script_for_db(
+                    db_type, "app.fn", "FUNCTION"
+                ),
+                "SELECT `app`.`fn`() AS result;\n"
+            );
+            assert_eq!(
+                ObjectBrowserWidget::build_simple_routine_script_for_db(
+                    db_type,
+                    "app.p",
+                    "PROCEDURE"
+                ),
+                "CALL `app`.`p`();\n"
+            );
+        }
+
+        // The builders reach the same shapes when the argument list they were
+        // handed is empty, so a FUNCTION never comes back as a call statement.
+        assert_eq!(
+            ObjectBrowserWidget::build_procedure_script("SCOTT.SQ_F", "FUNCTION", &[]),
+            "SELECT SCOTT.SQ_F AS result\nFROM dual;\n"
+        );
+        assert_eq!(
+            ObjectBrowserWidget::build_mysql_routine_script("app.fn", "FUNCTION", &[]),
+            "SELECT `app`.`fn`() AS result;\n"
+        );
+    }
+
+    /// `''` is not a value a JSON, ENUM or SET parameter accepts — MySQL
+    /// refuses it as JSON (ER 3140) and strict mode refuses it as an
+    /// ENUM/SET member — so the generated call would fail on the engine
+    /// before the user ever edited it. Real string types keep `''`.
+    #[test]
+    fn mysql_default_arguments_are_values_the_engine_accepts() {
+        let arguments = vec![
+            procedure_argument(Some("p_doc"), 1, Some("json"), "IN"),
+            procedure_argument(Some("p_kind"), 2, Some("enum('a','b')"), "IN"),
+            procedure_argument(Some("p_tags"), 3, Some("set('x','y')"), "IN"),
+            procedure_argument(Some("p_name"), 4, Some("varchar(32)"), "IN"),
+            procedure_argument(Some("p_code"), 5, Some("char(3)"), "IN"),
+            procedure_argument(Some("p_qty"), 6, Some("int"), "IN"),
+        ];
+
+        let sql = ObjectBrowserWidget::build_mysql_routine_script("app.p", "PROCEDURE", &arguments);
+
+        assert_eq!(
+            sql,
+            "CALL `app`.`p`(\n    NULL,\n    NULL,\n    NULL,\n    '',\n    '',\n    0\n);\n"
+        );
+    }
+
+    /// The generated variable name is not the catalog's name — it carries a
+    /// `v_` prefix and may carry a `_2` disambiguator — so it has to be
+    /// budgeted against the backend's identifier limit. Both limits are
+    /// reachable from a legal routine: a 64-character MySQL parameter name is
+    /// the identifier maximum, and `@v_<that>` is a user-variable name the
+    /// server refuses (ER 3061, live-proven). The parameter's OWN name still
+    /// carries the call, so truncating the local costs nothing.
+    #[test]
+    fn generated_variable_names_stay_within_the_backend_identifier_limit() {
+        let long_name = format!("p_{}", "a".repeat(62));
+        assert_eq!(long_name.len(), 64);
+
+        let mysql = ObjectBrowserWidget::build_mysql_routine_script(
+            "app.p",
+            "PROCEDURE",
+            &[procedure_argument(Some(&long_name), 1, Some("int"), "OUT")],
+        );
+        let session_var = mysql
+            .lines()
+            .find_map(|line| line.strip_prefix("    @"))
+            .expect("the OUT argument is passed as a session variable");
+        assert!(
+            session_var.len() <= 64,
+            "user variable name is {} characters: {session_var}",
+            session_var.len()
+        );
+        // The call still names the parameter, so the value stays identifiable.
+        assert!(mysql.contains(&format!("AS `{long_name}`;")));
+
+        // Oracle: 128 bytes, and the disambiguator has to fit too — two names
+        // that truncate to the same head must still come out distinct.
+        // Uppercase, as the dictionary reports ordinary parameter names: a
+        // lowercase one would come back quoted and stop testing length.
+        let oracle_name = format!("P_{}", "A".repeat(126));
+        let second = format!("{}B", &oracle_name[..127]);
+        assert_eq!(oracle_name.len(), 128);
+        assert_eq!(second.len(), 128);
+        let oracle = ObjectBrowserWidget::build_procedure_script(
+            "SQ_LONG_P",
+            "PROCEDURE",
+            &[
+                procedure_argument(Some(&oracle_name), 1, Some("NUMBER"), "IN"),
+                procedure_argument(Some(&second), 2, Some("NUMBER"), "IN"),
+            ],
+        );
+        let declared: Vec<&str> = oracle
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("v_"))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .collect();
+        assert_eq!(declared.len(), 2, "both arguments declare a local");
+        for name in &declared {
+            assert!(
+                name.len() + 2 <= 128,
+                "declared name is {} bytes: v_{name}",
+                name.len() + 2
+            );
+        }
+        assert_ne!(declared[0], declared[1], "truncation must stay unique");
+        assert!(oracle.contains(&format!("{oracle_name} => ")));
+        assert!(oracle.contains(&format!("{second} => ")));
+    }
+
+    /// The read-back alias is the only thing that says WHICH parameter a
+    /// value belongs to, so it has to name the parameter exactly. A parameter
+    /// name may legally start or end with a backtick (doubled at creation,
+    /// and the catalog reports it raw); stripping those made the column claim
+    /// to be a different parameter. Ordinary names are unaffected.
+    #[test]
+    fn mysql_read_back_alias_names_the_parameter_exactly() {
+        let sql = ObjectBrowserWidget::build_mysql_routine_script(
+            "app.p",
+            "PROCEDURE",
+            &[
+                procedure_argument(Some("p_plain"), 1, Some("int"), "OUT"),
+                procedure_argument(Some("`b"), 2, Some("int"), "OUT"),
+                procedure_argument(Some("a`b"), 3, Some("int"), "OUT"),
+            ],
+        );
+
+        assert!(sql.contains("SELECT @v_p_plain AS `p_plain`;"));
+        // A leading backtick is part of the name, not quoting to be undone.
+        assert!(sql.contains("AS ```b`;"));
+        assert!(sql.contains("AS `a``b`;"));
     }
 
     /// A cursor variable refuses `:= NULL` too: an IN ref-cursor argument is

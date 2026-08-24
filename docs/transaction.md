@@ -1039,9 +1039,11 @@ assuming the server default.
 Grid-edit save, file import, and the object browser's Execute
 Procedure/Function are not plain editor statements: the save runs its own
 worker (overriding `DbPoolSessionContext::transaction_mode`), the import runs
-as `SqlAction::ExecuteScript`, and Execute Procedure emits `SqlAction::Execute`
-onto the active tab. Each therefore has to obey the tab's transaction mode and
-auto-commit like any other statement, which their own live probes now pin:
+as `SqlAction::ExecuteScript`, and Execute Procedure/Function emits
+`SqlAction::OpenInNewTab` — it GENERATES a call script and hands it to an
+editor tab, where the user runs it. Each therefore has to obey the tab's
+transaction mode and auto-commit like any other statement, which their own
+live probes now pin:
 
 - `verify_grid_save_live` — a tab pinned READ ONLY refuses the save and leaves
   the row untouched, unpinning lets the identical save through, and a save on
@@ -1055,7 +1057,13 @@ auto-commit like any other statement, which their own live probes now pin:
 - `verify_proc_exec_live` — a READ ONLY tab refuses a routine that WRITES and
   nothing is written, while a routine that only READS still runs (the pin must
   not over-block), and the same call writes once unpinned; a call on an
-  auto-commit tab survives a later `ROLLBACK` too.
+  auto-commit tab survives a later `ROLLBACK` too. Its generation round-trip
+  additionally pins the script itself on all four backends: the shape follows
+  the routine KIND, and every value the routine WRITES has to come back to the
+  user — the OUT report (`| OUT: :V_X = ...`) on Oracle, the trailing
+  `SELECT @v` on the MySQL family. A local variable cannot show a value once
+  the block ends, so an OUT/IN OUT argument is bound whenever a bind can carry
+  its type, exactly as the function return value already was.
 
 A routine call and a grid save leave conservative session residue, so those
 probes discard the session before pinning auto-commit — on such a session the

@@ -9927,6 +9927,14 @@ impl ObjectBrowser {
             (owner, None, procedure_name)
         };
         let owner = Self::thin_owner_or_current_schema(conn, owner)?;
+        // Column for column the same list the OCI path reads
+        // (`get_procedure_arguments_inner`): the object browser builds an
+        // executable call script out of these rows, and a column one protocol
+        // carries and the other does not is a script that differs by protocol
+        // for the same routine. `ALL_ARGUMENTS.DEFAULT_VALUE` is deliberately
+        // absent from BOTH: it is a LONG whose text is the default
+        // expression's source, which neither protocol can safely paste into a
+        // DECLARE, so the type-neutral default is what both produce.
         let sql = match package_name.is_some() {
             true => {
                 r#"
@@ -9943,8 +9951,7 @@ impl ObjectBrowser {
                     NVL(type_name, ''),
                     NVL(type_subname, ''),
                     NVL(pls_type, ''),
-                    TO_CHAR(overload),
-                    CAST(NULL AS VARCHAR2(1)) AS default_value
+                    TO_CHAR(overload)
                 FROM all_arguments
                 WHERE owner = :1
                   AND package_name = :2
@@ -9969,8 +9976,7 @@ impl ObjectBrowser {
                     NVL(type_name, ''),
                     NVL(type_subname, ''),
                     NVL(pls_type, ''),
-                    TO_CHAR(overload),
-                    CAST(NULL AS VARCHAR2(1)) AS default_value
+                    TO_CHAR(overload)
                 FROM all_arguments
                 WHERE owner = :1
                   AND package_name IS NULL
@@ -9992,7 +9998,7 @@ impl ObjectBrowser {
                 OracleThinBindValue::Text(procedure_name),
             ],
         };
-        let rows = Self::thin_query_text_rows(conn, sql, 14, binds)?;
+        let rows = Self::thin_query_text_rows(conn, sql, 13, binds)?;
         Ok(rows
             .into_iter()
             .map(|row| ProcedureArgument {
@@ -10021,9 +10027,7 @@ impl ObjectBrowser {
                     .get(11)
                     .and_then(|value| Self::thin_optional_text(value)),
                 overload: row.get(12).and_then(|value| Self::thin_optional_i32(value)),
-                default_value: row
-                    .get(13)
-                    .and_then(|value| Self::thin_optional_text(value)),
+                default_value: None,
             })
             .collect())
     }
@@ -10048,6 +10052,9 @@ impl ObjectBrowser {
         };
 
         let owner = QueryExecutor::owner_or_current_schema(conn, owner)?;
+        // Column for column the same list the thin path reads
+        // (`get_thin_procedure_arguments_inner`) — see the note there for why
+        // `DEFAULT_VALUE` is read by neither.
         let sql = match package_name.is_some() {
             true => {
                 r#"
@@ -10064,8 +10071,7 @@ impl ObjectBrowser {
                     type_name,
                     type_subname,
                     pls_type,
-                    overload,
-                    default_value
+                    overload
                 FROM all_arguments
                 WHERE owner = :1
                   AND package_name = :2
@@ -10090,8 +10096,7 @@ impl ObjectBrowser {
                     type_name,
                     type_subname,
                     pls_type,
-                    overload,
-                    default_value
+                    overload
                 FROM all_arguments
                 WHERE owner = :1
                   AND package_name IS NULL
@@ -10224,16 +10229,6 @@ impl ObjectBrowser {
                     return Err(err);
                 }
             };
-            let default_value: Option<String> = match row.get(13) {
-                Ok(value) => value,
-                Err(err) => {
-                    logging::log_warning(
-                        "executor",
-                        &format!("Failed to read default_value (ignored): {err}"),
-                    );
-                    None
-                }
-            };
 
             arguments.push(ProcedureArgument {
                 name,
@@ -10249,7 +10244,7 @@ impl ObjectBrowser {
                 type_subname,
                 pls_type,
                 overload,
-                default_value,
+                default_value: None,
             });
         }
 
