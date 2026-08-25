@@ -19,8 +19,8 @@ use crate::utils::logging;
 use super::script::MysqlDelimitedStatementState;
 use super::{
     result_messages, ColumnInfo, ProcedureArgument, QueryCell, QueryResult, ResolvedBind,
-    RoutineDefinition, RoutineDefinitionLookup, RoutineOverload, ScriptItem, SqlValueKind,
-    StatementResultKind, ToolCommand,
+    RoutineDefinition, RoutineDefinitionLookup, RoutineInvocation, RoutineOverload, ScriptItem,
+    SqlValueKind, StatementResultKind, ToolCommand,
 };
 
 pub struct QueryExecutor;
@@ -8595,7 +8595,13 @@ pub struct SynonymInfo {
     pub db_link: String,
 }
 
-#[derive(Debug, Clone)]
+/// One routine a package listing names.
+///
+/// `PartialEq` is what lets a name lookup ask "is every candidate this name
+/// matches the SAME routine?" — a package really can list `DUP` twice with two
+/// different kinds (the wrapped-package dictionary fallback produces exactly
+/// that), and picking one of those by list order is a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRoutine {
     pub name: String,
     pub routine_type: String,
@@ -8608,7 +8614,7 @@ pub struct PackageRoutine {
 /// two answers lead opposite ways: a dictionary that said nothing means the
 /// routine's arguments cannot be trusted, while a dictionary that could not be
 /// asked means nothing at all — see
-/// [`ObjectBrowser::routine_definition_or_error`].
+/// [`ObjectBrowser::routine_definition_lookup`].
 #[derive(Debug, Default)]
 struct RoutineDictionaryEntry {
     /// `ALL_OBJECTS.STATUS` of the object the routine lives in — the routine
@@ -8617,6 +8623,52 @@ struct RoutineDictionaryEntry {
     /// One entry per overload the dictionary listed for THIS routine.
     overloads: Vec<RoutineOverload>,
 }
+
+/// Which spelling of `ALL_PROCEDURES`' invocation columns one dictionary read
+/// asks for.
+///
+/// `SQL_MACRO` and `POLYMORPHIC` were added to the view long after the oldest
+/// release this app can reach (the thin driver refuses to negotiate below
+/// protocol 314 = 12.2), and a column a release does not have is a PARSE
+/// error — which would take the whole read down with it. The read must
+/// therefore degrade per COLUMN, not per read: naming the missing column costs
+/// `PIPELINED`/`AGGREGATE` too, and those have been readable since long before
+/// this app existed.
+///
+/// Both spellings SELECT the same seven columns in the same order — the legacy
+/// one writes typed NULLs where the columns do not exist — so exactly one row
+/// reader serves both, and a server that has neither new column lands on the
+/// answer this app gave before it ever asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutineDictionaryColumns {
+    /// Every invocation column, including the ones a pre-21c server lacks.
+    Full,
+    /// Only the columns every reachable release has.
+    Legacy,
+}
+
+impl RoutineDictionaryColumns {
+    /// Tried in order, first success wins. A failure is not diagnosed — a
+    /// missing column and a connection that just died fail the same way, and
+    /// re-asking with fewer columns costs one statement and answers both.
+    const TIERS: [Self; 2] = [Self::Full, Self::Legacy];
+
+    /// The `SQL_MACRO` / `POLYMORPHIC` select-list expressions for this tier.
+    ///
+    /// The NULLs are CAST so both protocols describe the column the same way;
+    /// an untyped `NULL` leaves its type to the server's own defaulting, which
+    /// is exactly the kind of per-protocol difference the two Oracle readers
+    /// are kept column-for-column identical to avoid.
+    fn invocation_expressions(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Full => ("p.sql_macro", "p.polymorphic"),
+            Self::Legacy => ("CAST(NULL AS VARCHAR2(30))", "CAST(NULL AS VARCHAR2(30))"),
+        }
+    }
+}
+
+/// How many columns every tier's SELECT returns.
+const ROUTINE_DICTIONARY_COLUMN_COUNT: usize = 7;
 
 impl RoutineDictionaryEntry {
     fn absorb(&mut self, row: (Option<String>, Option<RoutineOverload>)) {
@@ -10018,51 +10070,42 @@ impl ObjectBrowser {
     /// silently receives the first bind — which is exactly how the member name
     /// once arrived as the owner and a pipelined package member came back
     /// looking ordinary.
-    fn routine_dictionary_sql(package_member: bool) -> &'static str {
-        match package_member {
-            true => {
-                r#"
+    ///
+    /// `columns` picks which spelling of the invocation columns to ask for —
+    /// see [`RoutineDictionaryColumns`]. Both spellings SELECT the same seven
+    /// columns in the same order, so everything downstream reads one shape.
+    fn routine_dictionary_sql(package_member: bool, columns: RoutineDictionaryColumns) -> String {
+        let (sql_macro, polymorphic) = columns.invocation_expressions();
+        let (object_type_predicate, member_predicate) = match package_member {
+            true => ("object_type = 'PACKAGE'", "p.procedure_name = :3"),
+            false => (
+                "object_type IN ('PROCEDURE', 'FUNCTION')",
+                "p.procedure_name IS NULL",
+            ),
+        };
+        format!(
+            r#"
                 SELECT
                     o.status,
                     CASE WHEN p.object_name IS NULL THEN 'N' ELSE 'Y' END,
                     p.overload,
                     p.pipelined,
-                    p.aggregate
+                    p.aggregate,
+                    {sql_macro},
+                    {polymorphic}
                 FROM (
                     SELECT owner, object_name, status
                     FROM all_objects
                     WHERE owner = :1
                       AND object_name = :2
-                      AND object_type = 'PACKAGE'
+                      AND {object_type_predicate}
                 ) o
                 LEFT JOIN all_procedures p
                   ON p.owner = o.owner
                  AND p.object_name = o.object_name
-                 AND p.procedure_name = :3
+                 AND {member_predicate}
                 "#
-            }
-            false => {
-                r#"
-                SELECT
-                    o.status,
-                    CASE WHEN p.object_name IS NULL THEN 'N' ELSE 'Y' END,
-                    p.overload,
-                    p.pipelined,
-                    p.aggregate
-                FROM (
-                    SELECT owner, object_name, status
-                    FROM all_objects
-                    WHERE owner = :1
-                      AND object_name = :2
-                      AND object_type IN ('PROCEDURE', 'FUNCTION')
-                ) o
-                LEFT JOIN all_procedures p
-                  ON p.owner = o.owner
-                 AND p.object_name = o.object_name
-                 AND p.procedure_name IS NULL
-                "#
-            }
-        }
+        )
     }
 
     /// One dictionary row as the two facts it carries: the object's status and
@@ -10073,6 +10116,8 @@ impl ObjectBrowser {
         overload: Option<String>,
         pipelined: Option<String>,
         aggregate: Option<String>,
+        sql_macro: Option<String>,
+        polymorphic: Option<String>,
     ) -> (Option<String>, Option<RoutineOverload>) {
         let status = status.map(|value| value.trim().to_string());
         if !Self::dictionary_flag_is_yes(found.as_deref()) {
@@ -10082,10 +10127,72 @@ impl ObjectBrowser {
             status,
             Some(RoutineOverload {
                 overload: overload.and_then(|value| value.trim().parse::<i32>().ok()),
-                pipelined: Self::dictionary_flag_is_yes(pipelined.as_deref()),
-                aggregate: Self::dictionary_flag_is_yes(aggregate.as_deref()),
+                invocation: Self::routine_invocation(
+                    pipelined.as_deref(),
+                    aggregate.as_deref(),
+                    sql_macro.as_deref(),
+                    polymorphic.as_deref(),
+                ),
             }),
         )
+    }
+
+    /// The ONE place `ALL_PROCEDURES`' invocation columns become the single
+    /// fact the script generator reads.
+    ///
+    /// The columns describe one property of the routine, so their precedence
+    /// has to be settled once rather than at each reader. `POLYMORPHIC` is
+    /// asked FIRST because it is the only value that says "no script at all":
+    /// a polymorphic table function is declared `PIPELINED ROW POLYMORPHIC`,
+    /// and a release that reported `PIPELINED = YES` for one would otherwise
+    /// get the `TABLE(...)` shape, which its TABLE argument cannot fill.
+    /// (23ai/26ai report `PIPELINED = NO` there — live-checked — so today the
+    /// order is belt and braces.)
+    ///
+    /// An unrecognised `SQL_MACRO` value is the ordinary form: a spelling this
+    /// app has never seen must degrade to the shape it has always written, not
+    /// to a guess.
+    fn routine_invocation(
+        pipelined: Option<&str>,
+        aggregate: Option<&str>,
+        sql_macro: Option<&str>,
+        polymorphic: Option<&str>,
+    ) -> RoutineInvocation {
+        if Self::dictionary_stated_value(polymorphic).is_some() {
+            return RoutineInvocation::Polymorphic;
+        }
+        if Self::dictionary_flag_is_yes(pipelined) {
+            return RoutineInvocation::Pipelined;
+        }
+        if Self::dictionary_flag_is_yes(aggregate) {
+            return RoutineInvocation::Aggregate;
+        }
+        match Self::dictionary_stated_value(sql_macro)
+            .unwrap_or_default()
+            .to_uppercase()
+            .as_str()
+        {
+            "SCALAR" => RoutineInvocation::ScalarMacro,
+            "TABLE" => RoutineInvocation::TableMacro,
+            _ => RoutineInvocation::Ordinary,
+        }
+    }
+
+    /// The value a dictionary column actually STATES, or `None` when it states
+    /// nothing.
+    ///
+    /// `ALL_PROCEDURES.POLYMORPHIC` and `SQL_MACRO` do not hold SQL NULL when
+    /// they do not apply — they hold the four-character STRING `NULL`
+    /// (live-checked: for an ordinary procedure both read back `[NULL]` with
+    /// `x IS NULL` answering false). Reading "not empty" as "the column said
+    /// something" therefore calls every ordinary routine polymorphic, which is
+    /// exactly what the live round trip caught. A column that SAYS null is not
+    /// a column that IS null, and the two are told apart once, here, rather
+    /// than at each reader.
+    fn dictionary_stated_value(value: Option<&str>) -> Option<&str> {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("NULL"))
     }
 
     /// One reading for both spellings of "yes" in the row above: Oracle writes
@@ -10130,16 +10237,33 @@ impl ObjectBrowser {
     ///
     /// `None` is not "the dictionary said nothing" — see
     /// [`Self::routine_definition_lookup`] for why the two must stay apart.
+    ///
+    /// Tried once per [`RoutineDictionaryColumns`] tier, richest first, so a
+    /// release without the newer invocation columns keeps every fact it does
+    /// have instead of losing the whole read to one unknown column name.
     fn read_routine_dictionary(
         conn: &Connection,
         package_name: Option<&str>,
         procedure_name: &str,
     ) -> Option<RoutineDictionaryEntry> {
+        RoutineDictionaryColumns::TIERS
+            .into_iter()
+            .find_map(|columns| {
+                Self::read_routine_dictionary_columns(conn, package_name, procedure_name, columns)
+            })
+    }
+
+    fn read_routine_dictionary_columns(
+        conn: &Connection,
+        package_name: Option<&str>,
+        procedure_name: &str,
+        columns: RoutineDictionaryColumns,
+    ) -> Option<RoutineDictionaryEntry> {
         let (owner, object_name, member_name) =
             Self::routine_dictionary_key(package_name, procedure_name);
         let owner = QueryExecutor::owner_or_current_schema(conn, owner).ok()?;
-        let sql = Self::routine_dictionary_sql(member_name.is_some());
-        let mut stmt = conn.statement(sql).build().ok()?;
+        let sql = Self::routine_dictionary_sql(member_name.is_some(), columns);
+        let mut stmt = conn.statement(&sql).build().ok()?;
         let rows = match member_name.as_deref() {
             Some(member_name) => stmt.query(&[&owner, &object_name, &member_name]),
             None => stmt.query(&[&owner, &object_name]),
@@ -10158,6 +10282,8 @@ impl ObjectBrowser {
                 row.get::<_, Option<String>>(2).ok()?,
                 row.get::<_, Option<String>>(3).ok()?,
                 row.get::<_, Option<String>>(4).ok()?,
+                row.get::<_, Option<String>>(5).ok()?,
+                row.get::<_, Option<String>>(6).ok()?,
             ));
         }
         Some(entry)
@@ -10180,16 +10306,35 @@ impl ObjectBrowser {
         ))
     }
 
-    /// The thin twin of [`Self::read_routine_dictionary`], row for row.
+    /// The thin twin of [`Self::read_routine_dictionary`], row for row and
+    /// tier for tier.
     fn read_thin_routine_dictionary(
         conn: &mut OracleThinSession,
         package_name: Option<&str>,
         procedure_name: &str,
     ) -> Option<RoutineDictionaryEntry> {
+        RoutineDictionaryColumns::TIERS
+            .into_iter()
+            .find_map(|columns| {
+                Self::read_thin_routine_dictionary_columns(
+                    conn,
+                    package_name,
+                    procedure_name,
+                    columns,
+                )
+            })
+    }
+
+    fn read_thin_routine_dictionary_columns(
+        conn: &mut OracleThinSession,
+        package_name: Option<&str>,
+        procedure_name: &str,
+        columns: RoutineDictionaryColumns,
+    ) -> Option<RoutineDictionaryEntry> {
         let (owner, object_name, member_name) =
             Self::routine_dictionary_key(package_name, procedure_name);
         let owner = Self::thin_owner_or_current_schema(conn, owner).ok()?;
-        let sql = Self::routine_dictionary_sql(member_name.is_some());
+        let sql = Self::routine_dictionary_sql(member_name.is_some(), columns);
         let mut binds = vec![
             OracleThinBindValue::Text(owner),
             OracleThinBindValue::Text(object_name),
@@ -10197,13 +10342,14 @@ impl ObjectBrowser {
         if let Some(member_name) = member_name {
             binds.push(OracleThinBindValue::Text(member_name));
         }
-        let rows = Self::thin_query_text_rows(conn, sql, 5, binds).ok()?;
+        let rows =
+            Self::thin_query_text_rows(conn, &sql, ROUTINE_DICTIONARY_COLUMN_COUNT, binds).ok()?;
 
         let mut entry = RoutineDictionaryEntry::default();
         for row in rows {
             // Same rule as the OCI twin: a row that is not the shape the
             // SELECT asked for abandons the read instead of answering it.
-            if row.len() < 5 {
+            if row.len() < ROUTINE_DICTIONARY_COLUMN_COUNT {
                 return None;
             }
             let read = |index: usize| {
@@ -10216,6 +10362,8 @@ impl ObjectBrowser {
                 read(2),
                 read(3),
                 read(4),
+                read(5),
+                read(6),
             ));
         }
         Some(entry)
@@ -12691,8 +12839,7 @@ mod routine_definition_tests {
                     "VALID",
                     vec![super::RoutineOverload {
                         overload: None,
-                        pipelined: false,
-                        aggregate: false,
+                        invocation: super::RoutineInvocation::Ordinary,
                     }],
                 ),
             ),
@@ -12781,25 +12928,73 @@ mod routine_definition_tests {
     #[test]
     fn routine_dictionary_sql_numbers_its_binds_in_appearance_order() {
         for package_member in [true, false] {
-            let sql = ObjectBrowser::routine_dictionary_sql(package_member);
-            let mut seen: Vec<usize> = Vec::new();
-            let bytes = sql.as_bytes();
-            for (index, byte) in bytes.iter().enumerate() {
-                if *byte != b':' {
-                    continue;
+            for columns in super::RoutineDictionaryColumns::TIERS {
+                let sql = ObjectBrowser::routine_dictionary_sql(package_member, columns);
+                let mut seen: Vec<usize> = Vec::new();
+                let bytes = sql.as_bytes();
+                for (index, byte) in bytes.iter().enumerate() {
+                    if *byte != b':' {
+                        continue;
+                    }
+                    let digits: String = sql[index + 1..]
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect();
+                    if let Ok(number) = digits.parse::<usize>() {
+                        seen.push(number);
+                    }
                 }
-                let digits: String = sql[index + 1..]
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect();
-                if let Ok(number) = digits.parse::<usize>() {
-                    seen.push(number);
-                }
+                let expected: Vec<usize> = (1..=seen.len()).collect();
+                assert_eq!(
+                    seen, expected,
+                    "package_member={package_member} columns={columns:?}: placeholders must read \
+                     1, 2, 3 ... in order"
+                );
             }
-            let expected: Vec<usize> = (1..=seen.len()).collect();
+        }
+    }
+
+    /// Every column tier SELECTs the same seven columns in the same order.
+    ///
+    /// That is what lets ONE row reader serve both, and it is the whole reason
+    /// the legacy tier writes typed NULLs instead of simply asking for fewer
+    /// columns: `SQL_MACRO`/`POLYMORPHIC` do not exist on every release this
+    /// app can reach, and naming a column a release does not have is a PARSE
+    /// error that would take `PIPELINED`/`AGGREGATE` down with it.
+    #[test]
+    fn every_routine_dictionary_column_tier_selects_the_same_seven_columns() {
+        for package_member in [true, false] {
+            for columns in super::RoutineDictionaryColumns::TIERS {
+                let sql = ObjectBrowser::routine_dictionary_sql(package_member, columns);
+                let select = sql
+                    .split_once("SELECT")
+                    .and_then(|(_, rest)| rest.split_once("FROM ("))
+                    .map(|(select, _)| select.to_string())
+                    .unwrap_or_else(|| panic!("columns={columns:?}: no select list"));
+                assert_eq!(
+                    select.matches(',').count() + 1,
+                    super::ROUTINE_DICTIONARY_COLUMN_COUNT,
+                    "columns={columns:?}: select list is {select}"
+                );
+            }
+            // Only the two newer columns differ between the tiers.
+            let full = ObjectBrowser::routine_dictionary_sql(
+                package_member,
+                super::RoutineDictionaryColumns::Full,
+            );
+            let legacy = ObjectBrowser::routine_dictionary_sql(
+                package_member,
+                super::RoutineDictionaryColumns::Legacy,
+            );
+            assert!(full.contains("p.sql_macro") && full.contains("p.polymorphic"));
+            assert!(!legacy.contains("p.sql_macro") && !legacy.contains("p.polymorphic"));
             assert_eq!(
-                seen, expected,
-                "package_member={package_member}: placeholders must read 1, 2, 3 ... in order"
+                full.replace("p.sql_macro", "X")
+                    .replace("p.polymorphic", "X"),
+                legacy
+                    .replace("CAST(NULL AS VARCHAR2(30))", "X")
+                    .replace("CAST(NULL AS VARCHAR2(30))", "X"),
+                "the tiers must differ in nothing but the two optional columns"
             );
         }
     }
@@ -12816,7 +13011,9 @@ mod routine_definition_tests {
                 yes("N"),
                 yes("1"),
                 yes("YES"),
-                yes("NO")
+                yes("NO"),
+                None,
+                None
             ),
             (Some("VALID".to_string()), None)
         );
@@ -12826,14 +13023,15 @@ mod routine_definition_tests {
                 yes("Y"),
                 yes("2"),
                 yes("YES"),
-                yes("NO")
+                yes("NO"),
+                None,
+                None
             ),
             (
                 Some("VALID".to_string()),
                 Some(super::RoutineOverload {
                     overload: Some(2),
-                    pipelined: true,
-                    aggregate: false,
+                    invocation: super::RoutineInvocation::Pipelined,
                 })
             )
         );
@@ -12843,16 +13041,97 @@ mod routine_definition_tests {
                 yes("Y"),
                 None,
                 yes("NO"),
-                yes("YES")
+                yes("YES"),
+                None,
+                None
             ),
             (
                 Some("VALID".to_string()),
                 Some(super::RoutineOverload {
                     overload: None,
-                    pipelined: false,
-                    aggregate: true,
+                    invocation: super::RoutineInvocation::Aggregate,
                 })
             )
+        );
+    }
+
+    /// `ALL_PROCEDURES`' invocation columns become ONE fact, with one
+    /// precedence, in one place.
+    ///
+    /// The values are the ones the view really produces (live-checked on
+    /// 23ai/26ai): `PIPELINED`/`AGGREGATE` spell `YES`/`NO`, `SQL_MACRO`
+    /// spells `SCALAR`/`TABLE`/NULL, `POLYMORPHIC` spells `ROW`/NULL. A SQL
+    /// macro reports `NO`/`NO` for the first two, which is exactly why reading
+    /// only those two made a macro indistinguishable from an ordinary function
+    /// — and a PL/SQL block naming one RUNS and hands back the macro's source
+    /// text instead of a value.
+    #[test]
+    fn the_invocation_columns_are_read_as_one_fact_with_one_precedence() {
+        let read = |pipelined, aggregate, sql_macro, polymorphic| {
+            ObjectBrowser::routine_invocation(
+                Some(pipelined),
+                Some(aggregate),
+                sql_macro,
+                polymorphic,
+            )
+        };
+
+        assert_eq!(
+            read("NO", "NO", None, None),
+            super::RoutineInvocation::Ordinary
+        );
+        assert_eq!(
+            read("YES", "NO", None, None),
+            super::RoutineInvocation::Pipelined
+        );
+        assert_eq!(
+            read("NO", "YES", None, None),
+            super::RoutineInvocation::Aggregate
+        );
+        assert_eq!(
+            read("NO", "NO", Some("SCALAR"), None),
+            super::RoutineInvocation::ScalarMacro
+        );
+        assert_eq!(
+            read("NO", "NO", Some("TABLE"), None),
+            super::RoutineInvocation::TableMacro
+        );
+        // A polymorphic table function is declared `PIPELINED ROW
+        // POLYMORPHIC`. 23ai/26ai report PIPELINED = NO for it, but the
+        // "no script at all" answer must win over any shape either way.
+        assert_eq!(
+            read("NO", "NO", None, Some("ROW")),
+            super::RoutineInvocation::Polymorphic
+        );
+        assert_eq!(
+            read("YES", "NO", None, Some("ROW")),
+            super::RoutineInvocation::Polymorphic
+        );
+        // The legacy column tier writes NULLs, and a blank is not a value.
+        assert_eq!(
+            read("NO", "NO", Some("  "), Some("   ")),
+            super::RoutineInvocation::Ordinary
+        );
+        // THE QUIRK: `POLYMORPHIC` and `SQL_MACRO` do not hold SQL NULL when
+        // they do not apply — they hold the four-character STRING `NULL`
+        // (live-checked on 26ai: an ordinary procedure reads back `[NULL]`
+        // with `x IS NULL` false). Reading "not empty" as "the column said
+        // something" calls EVERY ordinary routine polymorphic, and the live
+        // round trip caught exactly that.
+        assert_eq!(
+            read("NO", "NO", Some("NULL"), Some("NULL")),
+            super::RoutineInvocation::Ordinary,
+            "a column that SAYS null is not a column that IS null"
+        );
+        assert_eq!(
+            read("NO", "NO", Some("SCALAR"), Some("NULL")),
+            super::RoutineInvocation::ScalarMacro
+        );
+        // A spelling this app has never seen degrades to the shape it has
+        // always written, never to a guess.
+        assert_eq!(
+            read("NO", "NO", Some("SOMETHING_NEW"), None),
+            super::RoutineInvocation::Ordinary
         );
     }
 }

@@ -583,6 +583,17 @@ const GEN_BAD: &str = "SQ_GEN_BAD";
 const GEN_NOARG: &str = "SQ_GEN_NOARG";
 const GEN_MISSING: &str = "SQ_GEN_MISSING";
 const GEN_CASE_PKG: &str = "SQ_GEN_CASE_PKG";
+const GEN_XKIND: &str = "SQ_GEN_XKIND";
+const GEN_OVL_PKG: &str = "SQ_GEN_OVL_PKG";
+/// SQL macros (21c+) and polymorphic table functions (18c+). Their setup is
+/// allowed to fail on a release that does not have the feature — see
+/// [`create_optional`].
+const GEN_MAC_S: &str = "SQ_GEN_MAC_S";
+const GEN_MAC_T: &str = "SQ_GEN_MAC_T";
+const GEN_MAC_T0: &str = "SQ_GEN_MAC_T0";
+const GEN_MAC_PKG: &str = "SQ_GEN_MAC_PKG";
+const GEN_PTF_PKG: &str = "SQ_GEN_PTF_PKG";
+const GEN_PTF: &str = "SQ_GEN_PTF";
 /// Created quoted on the MySQL family too: both engines accept a `.` in a
 /// routine name and report it verbatim in `INFORMATION_SCHEMA.ROUTINES`.
 const GEN_DOTP: &str = "sq_gen.dotp";
@@ -812,7 +823,7 @@ fn oracle_long_name_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             GEN_LONGP,
             "PROCEDURE",
             &args,
-        );
+        )?;
         println!("    --- {GEN_LONGP} script ---\n{script}");
         // Every generated name the script mentions, however it is spelled:
         // `VAR v_x TYPE`, `  v_x TYPE;`, `:v_x`. None may exceed the limit.
@@ -1135,7 +1146,7 @@ fn oracle_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), S
             &format!("{GEN_PKG}.{}", case.routine),
             case.routine_type,
             &args,
-        );
+        )?;
         println!("    --- {} script ---\n{script}", case.routine);
         if script.contains("PL/SQL") {
             result = Err(format!(
@@ -1191,7 +1202,7 @@ fn oracle_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), S
                 &qualified,
                 routine_type,
                 &space_query::db::RoutineDefinition::from_arguments(Vec::new()),
-            );
+            )?;
             println!("    --- {routine} fallback script ---\n{script}");
             if !script.trim_start().starts_with(expect) || script.contains("()") {
                 result = Err(format!(
@@ -1213,6 +1224,33 @@ fn oracle_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), S
     let _ = h.run(&format!("DROP TYPE {GEN_OBJ}"));
     let _ = h.run("COMMIT");
     result
+}
+
+/// Create objects a release may legitimately not support, reporting whether
+/// the server accepted every one of them.
+///
+/// A feature the server does not have must not fail the phase — but a case
+/// that was silently skipped must SAY so, or a green run stops meaning the
+/// case passed.
+fn create_optional(h: &mut Harness, feature: &str, setup: &[String]) -> bool {
+    for sql in setup {
+        let reported = match h.run(sql) {
+            Ok(events) => terminal_success(&events),
+            Err(err) => Some((false, err)),
+        };
+        match reported {
+            Some((true, _)) => continue,
+            // The reason is printed, not swallowed: "the server does not have
+            // the feature" and "my setup SQL is wrong" look identical from
+            // here, and a silently skipped case makes a green run mean less
+            // than it appears to.
+            other => {
+                println!("    SKIP: {feature} unavailable here - {other:?}");
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The three facts an argument ROW cannot carry, round-tripped end to end:
@@ -1276,6 +1314,31 @@ fn oracle_call_form_round_trip(h: &mut Harness, target: Target) -> Result<(), St
              \x20 BEGIN PIPE ROW(NVL(n, 0)); RETURN; END;\n\
              END;"
         ),
+        format!(
+            "CREATE OR REPLACE PACKAGE {GEN_XKIND} AS\n\
+             \x20 PROCEDURE dup;\n\
+             \x20 FUNCTION dup(b VARCHAR2) RETURN NUMBER;\n\
+             END;"
+        ),
+        format!(
+            "CREATE OR REPLACE PACKAGE BODY {GEN_XKIND} AS\n\
+             \x20 PROCEDURE dup IS BEGIN NULL; END;\n\
+             \x20 FUNCTION dup(b VARCHAR2) RETURN NUMBER IS BEGIN RETURN NVL(LENGTH(b), 0); END;\n\
+             END;"
+        ),
+        format!(
+            "CREATE OR REPLACE PACKAGE {GEN_OVL_PKG} AS\n\
+             \x20 FUNCTION povl(n NUMBER) RETURN {GEN_PIPE_TAB} PIPELINED;\n\
+             \x20 FUNCTION povl(s VARCHAR2) RETURN NUMBER;\n\
+             END;"
+        ),
+        format!(
+            "CREATE OR REPLACE PACKAGE BODY {GEN_OVL_PKG} AS\n\
+             \x20 FUNCTION povl(n NUMBER) RETURN {GEN_PIPE_TAB} PIPELINED IS\n\
+             \x20 BEGIN PIPE ROW(NVL(n, 0)); RETURN; END;\n\
+             \x20 FUNCTION povl(s VARCHAR2) RETURN NUMBER IS BEGIN RETURN NVL(LENGTH(s), 0); END;\n\
+             END;"
+        ),
     ];
     for sql in &setup {
         let events = h.run(sql)?;
@@ -1290,6 +1353,60 @@ fn oracle_call_form_round_trip(h: &mut Harness, target: Target) -> Result<(), St
         "CREATE OR REPLACE PROCEDURE {GEN_BAD}(a IN NUMBER, b OUT VARCHAR2) IS\n\
          BEGIN\n  {GEN_MISSING}(a);\nEND;"
     ));
+
+    // SQL macros are 21c+, polymorphic table functions 18c+. A release that
+    // cannot hold the feature must not fail the phase, so these are created
+    // optionally and their cases are skipped when the server said no.
+    let macros_created = create_optional(
+        h,
+        "SQL macro",
+        &[
+            // The macro's body returns SQL TEXT. Called from a PL/SQL block it
+            // hands that text back as the "value" — no error, a wrong answer —
+            // which is the whole reason the dictionary has to be asked.
+            format!(
+                "CREATE OR REPLACE FUNCTION {GEN_MAC_S}(p IN VARCHAR2) RETURN VARCHAR2 \
+                 SQL_MACRO(SCALAR) IS\nBEGIN\n  RETURN 'UPPER(p)';\nEND;"
+            ),
+            format!(
+                "CREATE OR REPLACE FUNCTION {GEN_MAC_T}(n IN NUMBER) RETURN VARCHAR2 \
+                 SQL_MACRO(TABLE) IS\nBEGIN\n  RETURN 'SELECT n AS one FROM dual';\nEND;"
+            ),
+            format!(
+                "CREATE OR REPLACE FUNCTION {GEN_MAC_T0} RETURN VARCHAR2 SQL_MACRO(TABLE) IS\n\
+                 BEGIN\n  RETURN 'SELECT 1 AS one FROM dual';\nEND;"
+            ),
+            format!(
+                "CREATE OR REPLACE PACKAGE {GEN_MAC_PKG} AS\n\
+                 \x20 FUNCTION m(p VARCHAR2) RETURN VARCHAR2 SQL_MACRO(SCALAR);\nEND;"
+            ),
+            format!(
+                "CREATE OR REPLACE PACKAGE BODY {GEN_MAC_PKG} AS\n\
+                 \x20 FUNCTION m(p VARCHAR2) RETURN VARCHAR2 SQL_MACRO(SCALAR) IS\n\
+                 \x20 BEGIN RETURN 'LOWER(p)'; END;\nEND;"
+            ),
+        ],
+    );
+    let ptf_created = create_optional(
+        h,
+        "polymorphic table function",
+        &[
+            format!(
+                "CREATE OR REPLACE PACKAGE {GEN_PTF_PKG} AS\n\
+                 \x20 FUNCTION describe(tab IN OUT DBMS_TF.TABLE_T) RETURN DBMS_TF.DESCRIBE_T;\n\
+                 END;"
+            ),
+            format!(
+                "CREATE OR REPLACE PACKAGE BODY {GEN_PTF_PKG} AS\n\
+                 \x20 FUNCTION describe(tab IN OUT DBMS_TF.TABLE_T) RETURN DBMS_TF.DESCRIBE_T IS\n\
+                 \x20 BEGIN RETURN NULL; END;\nEND;"
+            ),
+            format!(
+                "CREATE OR REPLACE FUNCTION {GEN_PTF}(t TABLE) RETURN TABLE PIPELINED ROW \
+                 POLYMORPHIC USING {GEN_PTF_PKG}"
+            ),
+        ],
+    );
     let _ = h.run("COMMIT");
 
     let result = (|| {
@@ -1300,7 +1417,7 @@ fn oracle_call_form_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             GEN_PIPE,
             "FUNCTION",
             &definition,
-        );
+        )?;
         println!("    --- {GEN_PIPE} script ---\n{script}");
         if !script.contains("FROM TABLE(") || script.contains("BEGIN") {
             return Err(format!("pipelined script is not a query: {script:?}"));
@@ -1317,7 +1434,7 @@ fn oracle_call_form_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             GEN_AGG,
             "FUNCTION",
             &definition,
-        );
+        )?;
         println!("    --- {GEN_AGG} script ---\n{script}");
         if !script.contains("FROM dual") || script.contains("BEGIN") {
             return Err(format!("aggregate script is not a query: {script:?}"));
@@ -1333,7 +1450,7 @@ fn oracle_call_form_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             &format!("{GEN_CASE_PKG}.PF"),
             "FUNCTION",
             &definition,
-        );
+        )?;
         println!("    --- {GEN_CASE_PKG}.PF script ---\n{script}");
         if !script.contains("FROM TABLE(") {
             return Err(format!(
@@ -1379,7 +1496,7 @@ fn oracle_call_form_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             &format!("{GEN_CASE_PKG}.{member_sql_name}"),
             "PROCEDURE",
             &definition,
-        );
+        )?;
         println!("    --- {GEN_CASE_PKG}.{member_sql_name} script ---\n{script}");
         let events = h.run_script(&script)?;
         script_success("myProc", &events)?;
@@ -1395,7 +1512,7 @@ fn oracle_call_form_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             GEN_PIPE0,
             "FUNCTION",
             &definition,
-        );
+        )?;
         println!("    --- {GEN_PIPE0} script ---\n{script}");
         if !script.contains("FROM TABLE(") || script.contains("()") {
             return Err(format!(
@@ -1405,6 +1522,155 @@ fn oracle_call_form_round_trip(h: &mut Harness, target: Target) -> Result<(), St
         let events = h.run_script(&script)?;
         script_success(GEN_PIPE0, &events)?;
         println!("    OK: parameterless pipelined function script ran");
+
+        // 4c. A cross-kind dup whose PROCEDURE overload is PARAMETERLESS.
+        //     That overload has no ALL_ARGUMENTS rows at all, so only the
+        //     dictionary's per-overload list can say it exists - the picker
+        //     used to fall back to the FUNCTION's visible group, and
+        //     `Execute Procedure` ran the routine the user did not click.
+        //     The right script is the simple call, which PL/SQL resolves to
+        //     the parameterless procedure.
+        let definition = fetch_oracle_package_arguments(target, GEN_XKIND, "DUP")?;
+        let script = space_query::ui::ObjectBrowserWidget::routine_script_for_harness(
+            DatabaseType::Oracle,
+            &format!("{GEN_XKIND}.DUP"),
+            "PROCEDURE",
+            &definition,
+        )?;
+        println!("    --- {GEN_XKIND}.DUP (procedure) script ---\n{script}");
+        if script.contains("B =>") || script.contains("VAR ") {
+            return Err(format!(
+                "Execute Procedure on the parameterless dup built the FUNCTION's script: {script:?}"
+            ));
+        }
+        let events = h.run_script(&script)?;
+        script_success("DUP as procedure", &events)?;
+        // The function half still gets its own overload's script.
+        let script = space_query::ui::ObjectBrowserWidget::routine_script_for_harness(
+            DatabaseType::Oracle,
+            &format!("{GEN_XKIND}.DUP"),
+            "FUNCTION",
+            &definition,
+        )?;
+        println!("    --- {GEN_XKIND}.DUP (function) script ---\n{script}");
+        if !script.contains("B =>") {
+            return Err(format!(
+                "Execute Function on dup lost the function overload: {script:?}"
+            ));
+        }
+        let events = h.run_script(&script)?;
+        script_success("DUP as function", &events)?;
+        println!(
+            "    OK: the parameterless procedure overload wins over the visible function group"
+        );
+
+        // 4d. A PIPELINED member on a NON-NULL overload. The call form is
+        //     keyed by the overload NUMBER, and the two sides of that match
+        //     are produced differently: the arguments query asks the server
+        //     for `TO_CHAR(overload)` while the dictionary query reads
+        //     `p.overload` raw and lets the driver render it. Every earlier
+        //     live case used a routine whose overload is NULL, so the numbers
+        //     had never been made to meet on either protocol - and if they do
+        //     not, a pipelined overload silently degrades to the PL/SQL block
+        //     that cannot compile.
+        let definition = fetch_oracle_package_arguments(target, GEN_OVL_PKG, "POVL")?;
+        let script = space_query::ui::ObjectBrowserWidget::routine_script_for_harness(
+            DatabaseType::Oracle,
+            &format!("{GEN_OVL_PKG}.POVL"),
+            "FUNCTION",
+            &definition,
+        )?;
+        println!("    --- {GEN_OVL_PKG}.POVL script ---\n{script}");
+        if !script.contains("FROM TABLE(") {
+            return Err(format!(
+                "the pipelined overload got the ordinary shape - the dictionary's overload number \
+                 never met the arguments' one: {script:?}"
+            ));
+        }
+        let events = h.run_script(&script)?;
+        script_success("POVL", &events)?;
+        println!("    OK: a pipelined member on a non-null overload keeps the query shape");
+
+        // 4e. SQL MACROS. `ALL_PROCEDURES` reports PIPELINED = NO and
+        //     AGGREGATE = NO for a macro, so reading only those two makes it
+        //     indistinguishable from an ordinary function - and the PL/SQL
+        //     block that used to be written for one RUNS, reporting the
+        //     macro's own SQL text as the routine's value. No error, a wrong
+        //     answer: the one failure mode a "does the script run" assertion
+        //     can never catch, which is why every case here asserts the SHAPE
+        //     as well.
+        if macros_created {
+            let scalar = format!("{GEN_MAC_PKG}.M");
+            let cases: [(&str, &str, bool); 4] = [
+                (GEN_MAC_S, " AS result\nFROM dual;", false),
+                (GEN_MAC_T, "FROM TABLE(", false),
+                // Parameterless: Oracle takes no parentheses on an empty
+                // argument list, and the bare name straight in a FROM clause
+                // is refused - so `TABLE(name)` is the spelling that works.
+                (GEN_MAC_T0, "FROM TABLE(", false),
+                (&scalar, " AS result\nFROM dual;", true),
+            ];
+            for (name, must_contain, is_member) in cases {
+                let definition = match is_member {
+                    true => fetch_oracle_package_arguments(target, GEN_MAC_PKG, "M")?,
+                    false => fetch_oracle_standalone_arguments(target, name)?,
+                };
+                let script = space_query::ui::ObjectBrowserWidget::routine_script_for_harness(
+                    DatabaseType::Oracle,
+                    name,
+                    "FUNCTION",
+                    &definition,
+                )?;
+                println!("    --- {name} script ---\n{script}");
+                if script.contains("BEGIN") || script.contains("VAR ") {
+                    return Err(format!(
+                        "the SQL macro {name} got a PL/SQL block, which RUNS and reports the \
+                         macro's own source text instead of a value: {script:?}"
+                    ));
+                }
+                if !script.contains(must_contain) {
+                    return Err(format!(
+                        "{name} script is missing {must_contain:?}: {script:?}"
+                    ));
+                }
+                let events = h.run_script(&script)?;
+                script_success(name, &events)?;
+            }
+            println!(
+                "    OK: scalar and table SQL macros, standalone and package member, are \
+                      called from SQL"
+            );
+        }
+
+        // 4f. A POLYMORPHIC table function. Its argument is a TABLE, which no
+        //     generated argument list can supply, so the honest answer is a
+        //     refusal - and it has to be a refusal by TYPE, not a block that
+        //     "succeeds" while doing nothing the user asked for (live-proven:
+        //     the old block reported PL/SQL procedure successfully completed).
+        //     Fetching through `fetch_oracle_standalone_arguments` also proves
+        //     the refusal comes from the SHAPE, not from the readability gate:
+        //     that helper turns an unreadable lookup into an error.
+        if ptf_created {
+            let definition = fetch_oracle_standalone_arguments(target, GEN_PTF)?;
+            match space_query::ui::ObjectBrowserWidget::routine_script_for_harness(
+                DatabaseType::Oracle,
+                GEN_PTF,
+                "FUNCTION",
+                &definition,
+            ) {
+                Err(reason)
+                    if reason.contains(GEN_PTF)
+                        && reason.contains("polymorphic table function") =>
+                {
+                    println!("    OK: a polymorphic table function refuses - {reason}");
+                }
+                other => {
+                    return Err(format!(
+                        "{GEN_PTF} must refuse with a sentence naming it, got {other:?}"
+                    ))
+                }
+            }
+        }
 
         // 5. A `.` inside the name is part of the name.
         let dot_name = format!("\"{GEN_DOT}\"");
@@ -1420,7 +1686,7 @@ fn oracle_call_form_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             &dot_name,
             "PROCEDURE",
             &definition,
-        );
+        )?;
         println!("    --- {dot_name} script ---\n{script}");
         let events = h.run_script(&script)?;
         script_success(GEN_DOT, &events)?;
@@ -1473,6 +1739,14 @@ fn oracle_call_form_round_trip(h: &mut Harness, target: Target) -> Result<(), St
         Ok(())
     })();
 
+    let _ = h.run(&format!("DROP FUNCTION {GEN_PTF}"));
+    let _ = h.run(&format!("DROP PACKAGE {GEN_PTF_PKG}"));
+    let _ = h.run(&format!("DROP PACKAGE {GEN_MAC_PKG}"));
+    let _ = h.run(&format!("DROP FUNCTION {GEN_MAC_T0}"));
+    let _ = h.run(&format!("DROP FUNCTION {GEN_MAC_T}"));
+    let _ = h.run(&format!("DROP FUNCTION {GEN_MAC_S}"));
+    let _ = h.run(&format!("DROP PACKAGE {GEN_OVL_PKG}"));
+    let _ = h.run(&format!("DROP PACKAGE {GEN_XKIND}"));
     let _ = h.run(&format!("DROP PACKAGE {GEN_CASE_PKG}"));
     let _ = h.run(&format!("DROP PROCEDURE \"{GEN_DOT}\""));
     let _ = h.run(&format!("DROP PROCEDURE {GEN_NOARG}"));
@@ -1602,6 +1876,35 @@ fn routine_action_round_trip(h: &mut Harness, target: Target) -> Result<(), Stri
         println!("    OK: Execute Routine resolved {requested} to {kind} {name} and it ran");
     }
 
+    // 4. `Execute Routine` on a member the listing cannot settle. The listing
+    //    ANSWERED (no single member is named that), so the refusal must be
+    //    the catalog's own sentence with nothing opened - not the
+    //    could-not-ask road's "Failed to load routine arguments: ..." alert,
+    //    whose delivery rule owns a fallback call script.
+    let (_, kind, alert, sql) = ObjectBrowserWidget::routine_script_delivery_for_harness(
+        &shared,
+        db_type,
+        None,
+        &ObjectItem::PackageRoutine {
+            package_name: ACT_PKG.to_string(),
+            routine_name: "SQ_ACT_NOPE".to_string(),
+            routine_type: "UNKNOWN".to_string(),
+        },
+        "UNKNOWN",
+    );
+    let want = format!("Could not resolve package routine type for {ACT_PKG}.SQ_ACT_NOPE");
+    match (alert, sql) {
+        (Some(alert), None) if alert == want => {
+            println!("    OK: an unresolvable member refuses in the catalog's words - {alert}");
+        }
+        (alert, sql) => {
+            return Err(format!(
+                "Execute Routine on {ACT_PKG}.SQ_ACT_NOPE (kind={kind:?}) must refuse with \
+                 {want:?} and open nothing, got alert={alert:?} sql={sql:?}"
+            ))
+        }
+    }
+
     Ok(())
 }
 
@@ -1712,7 +2015,7 @@ fn mysql_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), St
         }
         let script = space_query::ui::ObjectBrowserWidget::routine_script_for_harness(
             db_type, GEN_DUP, "FUNCTION", &fn_args,
-        );
+        )?;
         println!("    --- function script ---\n{script}");
         let events = h.run_script(&script)?;
         script_success("function script", &events)?;
@@ -1743,7 +2046,7 @@ fn mysql_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             GEN_DUP,
             "PROCEDURE",
             &proc_args,
-        );
+        )?;
         println!("    --- procedure script ---\n{script}");
         if !script.contains("CALL ") || !script.contains("@v_b") {
             return Err(format!(
@@ -1780,7 +2083,7 @@ fn mysql_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             GEN_INOUTP,
             "PROCEDURE",
             &inout_args,
-        );
+        )?;
         println!("    --- IN OUT script ---\n{script}");
         for needle in ["SET @v_c = 0;", "@v_b", "SELECT @v_c AS `c`;"] {
             if !script.contains(needle) {
@@ -1818,7 +2121,7 @@ fn mysql_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             GEN_LONGP,
             "PROCEDURE",
             &long_args,
-        );
+        )?;
         println!("    --- identifier-limit name script ---\n{script}");
         // The parameter's OWN full name still carries the read-back alias.
         if !script.contains(&format!("AS `{long_name}`;")) {
@@ -1866,7 +2169,7 @@ fn mysql_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             GEN_TYPEP,
             "PROCEDURE",
             &type_args,
-        );
+        )?;
         println!("    --- typed-placeholder script ---\n{script}");
         let events = h.run_script(&script)?;
         script_success("typed-placeholder script", &events)?;
@@ -1892,7 +2195,7 @@ fn mysql_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), St
                     .map_err(|e| format!("OUT-function argument fetch: {e}"))?;
             let script = space_query::ui::ObjectBrowserWidget::routine_script_for_harness(
                 db_type, GEN_OUTFN, "FUNCTION", &args,
-            );
+            )?;
             println!("    --- OUT-function script ---\n{script}");
             if !script.contains("SET @v_result = ") {
                 return Err(format!(
@@ -2040,7 +2343,7 @@ fn mysql_generation_round_trip(h: &mut Harness, target: Target) -> Result<(), St
             &format!("{original_db}.`{GEN_DOTP}`"),
             "PROCEDURE",
             &definition,
-        );
+        )?;
         println!("    --- {GEN_DOTP} script ---\n{script}");
         if !script.contains(&format!("`{original_db}`.`{GEN_DOTP}`")) {
             return Err(format!(

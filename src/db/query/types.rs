@@ -89,24 +89,78 @@ pub struct ProcedureArgument {
     pub default_value: Option<String>,
 }
 
-/// How ONE overload of a routine can be invoked at all.
+/// How ONE overload of a routine may be invoked at all — the dictionary's own
+/// answer, and the ONLY thing a script generator may decide its statement
+/// shape from.
 ///
-/// Oracle's `PIPELINED` and `AGGREGATE` functions are callable only from SQL —
-/// `PLS-00653` is what a PL/SQL block gets — and an argument row cannot say
-/// so: an aggregate function's `ALL_ARGUMENTS` rows are indistinguishable from
-/// an ordinary scalar function's. The flag lives in `ALL_PROCEDURES`, per
-/// overload, which is why it is carried per overload here.
+/// An argument row cannot answer this. An `AGGREGATE` function over `NUMBER`
+/// reads exactly like `NUMBER f(NUMBER)` in `ALL_ARGUMENTS`, and a SQL macro
+/// reads like an ordinary `VARCHAR2` function — yet a PL/SQL block naming the
+/// first is `PLS-00653`, and a PL/SQL block naming the second RUNS and hands
+/// back the macro's own source text instead of a value. The facts live in
+/// `ALL_PROCEDURES`, per overload, which is why they are carried per overload
+/// here.
 ///
-/// The MySQL family has no such distinction (a stored routine is always
-/// callable the family's ordinary way), so its loaders leave the list empty
-/// and every overload reads as [`Self::pipelined`]/[`Self::aggregate`] false.
+/// ONE enum rather than one flag per column on purpose: the columns are
+/// mutually exclusive descriptions of a single fact, so a struct of bools
+/// makes states representable (`PIPELINED` *and* `AGGREGATE`) that the
+/// dictionary cannot produce, and leaves every reader to invent its own
+/// precedence. The precedence is decided once, where the row is read.
+///
+/// The MySQL family has no such distinction — a stored routine is always
+/// invoked that family's ordinary way — so its loaders leave the overload list
+/// empty and every overload reads as [`Self::Ordinary`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RoutineInvocation {
+    /// The family's usual form: a PL/SQL block on Oracle, `CALL`/`SELECT` on
+    /// the MySQL family.
+    #[default]
+    Ordinary,
+    /// Oracle `PIPELINED`: rows, and only from a query's `FROM` clause.
+    Pipelined,
+    /// Oracle `AGGREGATE`: a value, and only from a query's select list.
+    Aggregate,
+    /// Oracle `SQL_MACRO(SCALAR)`: the macro text is spliced into the SQL that
+    /// names it, so only a query sees the value. From PL/SQL the call returns
+    /// the macro's own source text — a wrong answer with no error at all.
+    ScalarMacro,
+    /// Oracle `SQL_MACRO(TABLE)`: the same, in a query's `FROM` clause.
+    TableMacro,
+    /// Oracle `POLYMORPHIC` (a polymorphic table function): invoked with a
+    /// TABLE, which no generated argument list can supply. There is no script
+    /// to write, and the PL/SQL block that used to be written for it
+    /// "succeeded" while doing nothing the user asked for.
+    Polymorphic,
+}
+
+/// One overload of a routine, as the dictionary lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutineOverload {
     /// `ALL_PROCEDURES.OVERLOAD`, matching `ALL_ARGUMENTS.OVERLOAD` value for
     /// value (`NULL` for a routine that is not overloaded).
     pub overload: Option<i32>,
-    pub pipelined: bool,
-    pub aggregate: bool,
+    pub invocation: RoutineInvocation,
+}
+
+impl RoutineOverload {
+    /// How the overload the script is being built for may be invoked.
+    ///
+    /// Keyed by overload NUMBER because a package may legally overload one
+    /// name with a pipelined and an ordinary body, and `ALL_PROCEDURES.OVERLOAD`
+    /// matches `ALL_ARGUMENTS.OVERLOAD` value for value including `NULL`
+    /// (live-proven on 23ai for standalone routines, non-overloaded members
+    /// and overloaded members alike, through both protocols' own readers).
+    ///
+    /// An overload with no row — every MySQL-family routine, and any Oracle
+    /// routine whose dictionary row could not be read — is
+    /// [`RoutineInvocation::Ordinary`], the form this app has always written.
+    pub fn invocation_of(overloads: &[Self], overload: Option<i32>) -> RoutineInvocation {
+        overloads
+            .iter()
+            .find(|candidate| candidate.overload == overload)
+            .map(|candidate| candidate.invocation)
+            .unwrap_or_default()
+    }
 }
 
 /// Everything `Execute Procedure`/`Execute Function` needs to know about ONE
@@ -145,9 +199,8 @@ impl RoutineDefinition {
     /// consequence is: the MySQL family, which has no such facts to read, and
     /// Oracle's fail-open path, where `ALL_OBJECTS`/`ALL_PROCEDURES` could not
     /// be reached. Either way every overload reads as
-    /// [`RoutineOverload::pipelined`]/[`RoutineOverload::aggregate`] false —
-    /// the ordinary form, which is the only shape this app can write without
-    /// those facts.
+    /// [`RoutineInvocation::Ordinary`] — the form this app has always written,
+    /// and the only shape it can choose without those facts.
     pub fn from_arguments(arguments: Vec<ProcedureArgument>) -> Self {
         Self {
             arguments,
@@ -255,6 +308,25 @@ pub mod result_messages {
                  may have been dropped, or this connection may not be allowed to see it."
             ),
         }
+    }
+
+    /// `Execute Procedure`/`Execute Function` read the routine perfectly well
+    /// and there is still no call script to write, because the routine can
+    /// only be invoked with something no generated call can supply.
+    ///
+    /// The other half of [`routine_arguments_unreadable`]: both end the action
+    /// with a sentence and no tab, and they are kept apart because they are
+    /// different facts — "the catalog would not describe it" against "the
+    /// catalog described it, and the description says a script cannot call
+    /// it". Oracle's polymorphic table functions are the case today: their
+    /// argument is a TABLE, and their `ALL_ARGUMENTS` rows describe the
+    /// `DBMS_TF` records the implementation package receives, not anything a
+    /// caller writes.
+    pub fn routine_call_not_writable(display_name: &str, reason: &str) -> String {
+        format!(
+            "No call script can be generated for {display_name}: {reason}. Write the call by hand \
+             against the table it reads."
+        )
     }
 
     /// The connection's OWN session was left in a state the app cannot
@@ -777,7 +849,9 @@ impl QueryResult {
 
 #[cfg(test)]
 mod routine_definition_tests {
-    use super::{result_messages, ProcedureArgument, RoutineDefinition, RoutineOverload};
+    use super::{
+        result_messages, ProcedureArgument, RoutineDefinition, RoutineInvocation, RoutineOverload,
+    };
 
     /// One sentence for all four backends.
     ///
@@ -854,10 +928,49 @@ mod routine_definition_tests {
             vec![argument],
             vec![RoutineOverload {
                 overload: None,
-                pipelined: true,
-                aggregate: false,
+                invocation: RoutineInvocation::Pipelined,
             }],
         );
-        assert!(read.overloads[0].pipelined);
+        assert_eq!(read.overloads[0].invocation, RoutineInvocation::Pipelined);
+    }
+
+    /// The invocation form is looked up by overload NUMBER, and a number the
+    /// list does not carry is the ordinary form.
+    ///
+    /// The lookup lives next to the type rather than in the object browser
+    /// because it is the same question on every backend — the MySQL family
+    /// simply always answers it with an empty list.
+    #[test]
+    fn an_overloads_invocation_is_keyed_by_its_number() {
+        let overloads = vec![
+            RoutineOverload {
+                overload: Some(1),
+                invocation: RoutineInvocation::Ordinary,
+            },
+            RoutineOverload {
+                overload: Some(2),
+                invocation: RoutineInvocation::Pipelined,
+            },
+        ];
+
+        assert_eq!(
+            RoutineOverload::invocation_of(&overloads, Some(1)),
+            RoutineInvocation::Ordinary
+        );
+        assert_eq!(
+            RoutineOverload::invocation_of(&overloads, Some(2)),
+            RoutineInvocation::Pipelined
+        );
+        // A `NULL` overload is its own key, not "the first row".
+        assert_eq!(
+            RoutineOverload::invocation_of(&overloads, None),
+            RoutineInvocation::Ordinary
+        );
+        // Nothing known — every MySQL-family routine, and Oracle's fail-open
+        // road — is the ordinary form.
+        assert_eq!(
+            RoutineOverload::invocation_of(&[], None),
+            RoutineInvocation::Ordinary
+        );
     }
 }

@@ -442,25 +442,49 @@ struct RoutineScriptData {
     outcome: RoutineScriptOutcome,
 }
 
+/// One routine-script load's answer, and the backend it ran on.
+///
+/// The backend travels WITH the answer because the delivery rule's
+/// could-not-ask road writes a fallback call script in a FAMILY's syntax, and
+/// the family is a property of the session the load actually used — not of the
+/// widget's snapshot, which a reconnect can leave behind. It is one value
+/// because the two arms of this one action used to answer it two ways.
+struct RoutineScriptLoad {
+    qualified_name: String,
+    /// The kind the load RESOLVED — an `UNKNOWN` package member arrives here
+    /// as the kind the server's own listing gave it.
+    routine_type: String,
+    db_type: crate::db::DatabaseType,
+    result: Result<RoutineScriptOutcome, String>,
+}
+
 /// What a routine-script load produced.
 ///
 /// The two are not the same failure and must not be delivered the same way.
 /// An `Err` around this value means the app could not ASK — a session, a
 /// driver, a connection that went away — and it still knows nothing about the
 /// routine, so the long-standing simple-call fallback gives the user something
-/// to edit. [`Self::Unreadable`] is the catalog's own ANSWER: this routine's
-/// argument list cannot be read, which makes a parameterless call script
+/// to edit. [`Self::Refused`] is the catalog's own ANSWER, and a call script is
 /// precisely the thing that answer rules out.
 ///
 /// They used to arrive as one `Result<String, String>`, so the delivery point
 /// could only treat them alike: it alerted, and then opened the parameterless
 /// script anyway — for a routine the catalog had just said takes two
 /// arguments, or is not there at all.
+#[derive(Debug, PartialEq, Eq)]
 enum RoutineScriptOutcome {
     /// The script to open in a new tab.
     Script(String),
     /// Nothing is opened; the sentence is what the user is told instead.
-    Unreadable(String),
+    ///
+    /// Two answers reach here and both are the catalog's:
+    /// [`crate::db::query::RoutineDefinitionLookup::Unreadable`] — it would
+    /// not describe the routine's arguments — and a routine it described in
+    /// full whose invocation form no generated script can write
+    /// ([`OracleRoutineScript::Unwritable`]). The variant is named for what it
+    /// DOES rather than for one of its causes, because naming it after the
+    /// first cause is what would send the second down the `Err` road.
+    Refused(String),
 }
 
 /// One identifier out of a selected object reference, with the fact a bare
@@ -568,67 +592,57 @@ enum OracleValueCarrier {
     Local,
 }
 
-/// The statement shape a routine can be invoked with at all.
+/// The statement a generated Oracle script for ONE overload is written as.
 ///
-/// Decided from what the ROUTINE IS, never from what its argument list looks
-/// like. Oracle's `PIPELINED` and `AGGREGATE` functions are callable only from
-/// SQL — a PL/SQL block naming one does not compile — and their argument rows
-/// are indistinguishable from an ordinary function's: an aggregate over
-/// `NUMBER` reads as `NUMBER f(NUMBER)` in `ALL_ARGUMENTS`. Asking the
-/// argument list is what produced a script that could never run, and asking it
-/// per BACKEND would not have helped either, because the same routine's
-/// argument-less form accidentally worked (the empty-list path already writes
-/// a `SELECT`) while its parameterised form did not.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum RoutineCallForm {
-    /// The family's ordinary form: a PL/SQL block on Oracle, `CALL`/`SELECT`
-    /// on the MySQL family. Everything the MySQL family has.
-    #[default]
-    Ordinary,
-    /// Oracle `PIPELINED`: rows, and only from a query's `FROM` clause.
-    PipelinedTable,
-    /// Oracle `AGGREGATE`: only from a query's select list.
-    Aggregate,
+/// Decided from what the ROUTINE IS — the dictionary's
+/// [`crate::db::query::RoutineInvocation`] — never from what its argument list
+/// looks like. An `AGGREGATE` function over `NUMBER` reads as
+/// `NUMBER f(NUMBER)` in `ALL_ARGUMENTS`, and a SQL macro reads as an ordinary
+/// `VARCHAR2` function, so asking the argument list produced a script that
+/// could never run in the first case and — worse — one that RUNS and reports
+/// the macro's own source text as the routine's value in the second.
+///
+/// Every invocation form maps onto a shape HERE, in one match, so a form added
+/// to the dictionary reader cannot quietly inherit another one's statement by
+/// falling into a wildcard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OracleRoutineScript {
+    /// The form this app has always written: `BEGIN ... END;`, with
+    /// declarations and binds for whatever the routine reads and writes.
+    PlSqlBlock,
+    /// A query — the only scope that can reach this routine at all.
+    Sql(OracleSqlScopeShape),
+    /// No script exists. The routine is reachable only with something a
+    /// generated argument list cannot supply, so the action says so and opens
+    /// nothing; `reason` is the half of the sentence that names why.
+    Unwritable { reason: &'static str },
 }
 
-impl RoutineCallForm {
-    /// How the overload the script is being built for may be invoked.
+impl OracleRoutineScript {
+    /// The statement shape for the overload the script is being built for.
     ///
-    /// Keyed by overload because a package may legally overload one name with
-    /// a pipelined and an ordinary body, and `ALL_PROCEDURES.OVERLOAD` matches
-    /// `ALL_ARGUMENTS.OVERLOAD` value for value including `NULL` (live-proven
-    /// on 23ai for standalone routines, non-overloaded members and overloaded
-    /// members alike). An overload with no row — every MySQL-family routine,
-    /// and any Oracle routine whose dictionary row could not be matched — is
-    /// [`Self::Ordinary`], the form this app has always written.
+    /// `PIPELINED` and `SQL_MACRO(TABLE)` share the `TABLE(...)` shape and
+    /// `AGGREGATE` and `SQL_MACRO(SCALAR)` share the select-list shape — all
+    /// four live-proven on 23ai/26ai, including the parameterless forms, where
+    /// Oracle's "no parentheses on an empty argument list" rule is what makes
+    /// `TABLE(f)` the spelling that works for a table macro: the bare name
+    /// straight in a `FROM` clause is rejected outright. (The test module
+    /// names the exact server errors; this file's production text stays out of
+    /// the driver-marker catalogs' way.)
     fn of(overloads: &[crate::db::query::RoutineOverload], overload: Option<i32>) -> Self {
-        overloads
-            .iter()
-            .find(|candidate| candidate.overload == overload)
-            .map(
-                |candidate| match (candidate.pipelined, candidate.aggregate) {
-                    (true, _) => Self::PipelinedTable,
-                    (_, true) => Self::Aggregate,
-                    _ => Self::Ordinary,
-                },
-            )
-            .unwrap_or_default()
-    }
-
-    /// The query shape this form needs, or `None` when the family's ordinary
-    /// shape is the right one.
-    ///
-    /// Returning the shape rather than a yes/no is what lets
-    /// [`ObjectBrowserWidget::build_oracle_sql_scope_script`] take a value
-    /// that CANNOT be "ordinary": the two shapes differ in more than their
-    /// text — a query has nowhere to declare a variable, so nothing the
-    /// routine writes can be carried back — and a builder able to receive
-    /// `Ordinary` would need a branch for a case its caller already excluded.
-    fn sql_scope_shape(self) -> Option<OracleSqlScopeShape> {
-        match self {
-            Self::Ordinary => None,
-            Self::PipelinedTable => Some(OracleSqlScopeShape::PipelinedTable),
-            Self::Aggregate => Some(OracleSqlScopeShape::Aggregate),
+        use crate::db::query::RoutineInvocation;
+        match crate::db::query::RoutineOverload::invocation_of(overloads, overload) {
+            RoutineInvocation::Ordinary => Self::PlSqlBlock,
+            RoutineInvocation::Pipelined | RoutineInvocation::TableMacro => {
+                Self::Sql(OracleSqlScopeShape::PipelinedTable)
+            }
+            RoutineInvocation::Aggregate | RoutineInvocation::ScalarMacro => {
+                Self::Sql(OracleSqlScopeShape::Aggregate)
+            }
+            RoutineInvocation::Polymorphic => Self::Unwritable {
+                reason: "it is a polymorphic table function, so it can only be called with a \
+                         table argument",
+            },
         }
     }
 }
@@ -730,12 +744,19 @@ trait ObjectBrowserDbBehavior: Sync {
     /// statement shape depends on facts an argument row cannot carry, and a
     /// builder that could be handed arguments alone is one that can be made to
     /// write a shape the routine does not support.
+    ///
+    /// Returns an OUTCOME rather than a `String` because "the definition was
+    /// read and there is still no script to write" is a real answer — Oracle's
+    /// polymorphic table functions are invoked with a TABLE, which no
+    /// generated argument list can supply. A builder that had to return a
+    /// `String` could only invent one, and the block it used to invent
+    /// "succeeded" while doing nothing the user asked for.
     fn build_routine_script(
         &self,
         qualified_name: &str,
         routine_type: &str,
         definition: &crate::db::query::RoutineDefinition,
-    ) -> String;
+    ) -> RoutineScriptOutcome;
     fn action_scope<'a>(
         &self,
         selected_scope: Option<&'a str>,
@@ -805,6 +826,13 @@ trait ObjectBrowserDbBehavior: Sync {
         selected_scope: Option<&str>,
         package_name: &str,
     ) -> Result<Vec<PackageRoutine>, String>;
+    /// The package-member half of `Execute Procedure`/`Execute Function`.
+    ///
+    /// Acquires its own session (an `UNKNOWN` kind has to be resolved against
+    /// the server's package listing before the member's arguments can even be
+    /// asked for), so it is the only one that can say which backend the work
+    /// ran on — hence `load_db_type`, which it overwrites once a session is in
+    /// hand and leaves untouched when none was ever acquired.
     fn load_package_routine_script(
         &self,
         connection: &SharedConnection,
@@ -813,6 +841,7 @@ trait ObjectBrowserDbBehavior: Sync {
         package_name: &str,
         routine_name: &str,
         routine_type: &str,
+        load_db_type: &mut crate::db::DatabaseType,
     ) -> Result<RoutineScriptData, String>;
     fn load_compilation_errors(
         &self,
@@ -951,12 +980,10 @@ enum ObjectActionResult {
     SequenceInfo(Result<SequenceInfo, String>),
     SynonymInfo(Result<SynonymInfo, String>),
     Ddl(Result<String, String>),
-    RoutineScript {
-        qualified_name: String,
-        routine_type: String,
-        db_type: crate::db::DatabaseType,
-        result: Result<RoutineScriptOutcome, String>,
-    },
+    /// Carries the whole load rather than its parts: the answer and the
+    /// backend it ran on are one fact, and splitting them is what let one
+    /// producer ship a stale backend beside a fresh answer.
+    RoutineScript(RoutineScriptLoad),
     PackageRoutines {
         package_name: String,
         result: Result<Vec<PackageRoutine>, String>,
@@ -3333,17 +3360,12 @@ impl ObjectBrowserWidget {
                                 ));
                             }
                         },
-                        ObjectActionResult::RoutineScript {
-                            qualified_name,
-                            routine_type,
-                            db_type,
-                            result,
-                        } => {
+                        ObjectActionResult::RoutineScript(load) => {
                             let delivery = ObjectBrowserWidget::routine_script_delivery(
-                                db_type,
-                                &qualified_name,
-                                &routine_type,
-                                result,
+                                load.db_type,
+                                &load.qualified_name,
+                                &load.routine_type,
+                                load.result,
                             );
                             if let Some(alert) = delivery.alert {
                                 crate::ui::alert_on_main(&alert);
@@ -5302,48 +5324,58 @@ impl ObjectBrowserWidget {
     /// harness (`verify_proc_exec_live`), which reads definitions through the
     /// same db-layer entry points the browser uses and asserts the generated
     /// script really runs on every backend.
+    ///
+    /// `Err` is the builder's REFUSAL sentence, not a failure to build: a
+    /// definition can be read in full and still name a routine no generated
+    /// script can call. The harness sees the same two answers the delivery
+    /// rule does, so a case that must refuse cannot pass by producing text.
     #[doc(hidden)]
     pub fn routine_script_for_harness(
         db_type: crate::db::DatabaseType,
         qualified_name: &str,
         routine_type: &str,
         definition: &crate::db::query::RoutineDefinition,
-    ) -> String {
-        object_browser_behavior_for(db_type).build_routine_script(
+    ) -> Result<String, String> {
+        match object_browser_behavior_for(db_type).build_routine_script(
             qualified_name,
             routine_type,
             definition,
-        )
+        ) {
+            RoutineScriptOutcome::Script(sql) => Ok(sql),
+            RoutineScriptOutcome::Refused(reason) => Err(reason),
+        }
     }
 
-    /// What `Execute Procedure`/`Execute Function`/`Execute Routine` does to
-    /// one tree item, from the click to what the user is shown: the real
-    /// loader on a real pooled session, and the real delivery rule.
+    /// Everything `Execute Procedure`/`Execute Function`/`Execute Routine`
+    /// loads for ONE item, on a real pooled session.
     ///
-    /// Returns `(qualified name, resolved kind, alert, sql opened)` — an
-    /// `alert` with no `sql` is the app refusing, which is the whole point of
-    /// the readability gate.
-    ///
-    /// `#[doc(hidden)]`, for the live verification harness
-    /// (`verify_proc_exec_live`). It composes the same three steps the context
-    /// menu's worker composes, in the same order; the menu splits them across
-    /// a thread and the action-result loop, which is why nothing could reach
-    /// this chain before — the standalone half needs a pooled session, and the
-    /// package half resolves an `UNKNOWN` kind against the server's own
-    /// package listing.
-    #[doc(hidden)]
-    pub fn routine_script_delivery_for_harness(
+    /// The single road every caller takes — both context-menu arms and the
+    /// live harness. It used to be three near-copies, which is how the two
+    /// menu arms came to answer "which backend did this work run on?"
+    /// differently: the standalone one re-read it from the session context,
+    /// the package one shipped the widget's snapshot. That fact decides which
+    /// family's syntax the could-not-ask road's fallback script is written in,
+    /// so it has to be answered once, here, by the code that acquired the
+    /// session.
+    fn load_routine_script_for_item(
         connection: &SharedConnection,
         db_type: crate::db::DatabaseType,
         selected_scope: Option<&str>,
         item: &ObjectItem,
         routine_type: &str,
-    ) -> (String, String, Option<String>, Option<String>) {
-        let activity = format!("Loading {routine_type} arguments (harness)");
-        let mut resolved_type = routine_type.to_string();
+        activity: String,
+    ) -> RoutineScriptLoad {
+        let mut resolved_routine_type = routine_type.to_string();
+        // The backend the work ACTUALLY ran on. The caller's snapshot until a
+        // session says otherwise, because until one is acquired there is
+        // nothing better to go on.
         let mut load_db_type = db_type;
         let (qualified_name, result) = match item {
             ObjectItem::Simple { object_name, .. } => {
+                // Scope-qualified UP FRONT, so the simple-script fallback a
+                // failed argument load produces still targets the browsed
+                // scope. The load's own qualification replaces this on
+                // success.
                 let mut qualified_name =
                     Self::qualify_object_name_for_scope(db_type, selected_scope, object_name);
                 let result = Self::with_pooled_object_session(
@@ -5359,6 +5391,13 @@ impl ObjectBrowserWidget {
                             object_name,
                             routine_type,
                         )?;
+                        // Every fact the load RESOLVED is taken FROM it, on
+                        // this road as on the package one. The kind cannot
+                        // differ here today — this road is handed the kind the
+                        // menu label named — but a road that drops what a
+                        // loader returns is one a later loader can be made to
+                        // answer into thin air.
+                        resolved_routine_type = data.resolved_routine_type;
                         qualified_name = data.qualified_name;
                         Ok(data.outcome)
                     },
@@ -5384,9 +5423,14 @@ impl ObjectBrowserWidget {
                         package_name,
                         routine_name,
                         routine_type,
+                        &mut load_db_type,
                     )
+                    // Both facts the load RESOLVED are taken from it: an
+                    // `UNKNOWN` kind is asked of the package listing, and that
+                    // listing answers with the member's own spelling as well
+                    // as its kind.
                     .map(|data| {
-                        resolved_type = data.resolved_routine_type;
+                        resolved_routine_type = data.resolved_routine_type;
                         qualified_name = data.qualified_name;
                         data.outcome
                     });
@@ -5396,20 +5440,152 @@ impl ObjectBrowserWidget {
             // two shapes above — and answered here rather than left to the
             // delivery rule, whose failed-load road would hand back a call
             // script naming a column.
-            ObjectItem::Column { column_name, .. } => {
-                return (
-                    column_name.clone(),
-                    resolved_type,
-                    Some("a column is not a routine".to_string()),
-                    None,
-                )
-            }
+            ObjectItem::Column { column_name, .. } => (
+                column_name.clone(),
+                Ok(RoutineScriptOutcome::Refused(
+                    "a column is not a routine".to_string(),
+                )),
+            ),
         };
-        let delivery =
-            Self::routine_script_delivery(load_db_type, &qualified_name, &resolved_type, result);
-        (
+        RoutineScriptLoad {
             qualified_name,
-            resolved_type,
+            routine_type: resolved_routine_type,
+            db_type: load_db_type,
+            result,
+        }
+    }
+
+    /// The routine kind an Execute menu label asks for.
+    ///
+    /// `Execute Routine` is the label for an item whose kind nothing has
+    /// resolved yet, and `UNKNOWN` is the value that makes the loader ask the
+    /// server for it.
+    fn execute_label_routine_type(label: &str) -> String {
+        match label {
+            "Execute Function" => "FUNCTION".to_string(),
+            "Execute Procedure" => "PROCEDURE".to_string(),
+            _ => "UNKNOWN".to_string(),
+        }
+    }
+
+    /// The name an Execute action names in what the user reads, scope-qualified
+    /// the way the generated script will name it.
+    fn routine_action_display_name(
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+        item: &ObjectItem,
+    ) -> String {
+        match item {
+            ObjectItem::Simple { object_name, .. } => {
+                Self::qualify_object_name_for_scope(db_type, selected_scope, object_name)
+            }
+            ObjectItem::PackageRoutine {
+                package_name,
+                routine_name,
+                ..
+            } => Self::qualify_package_member_name(
+                db_type,
+                selected_scope,
+                package_name,
+                routine_name,
+            ),
+            ObjectItem::Column { column_name, .. } => column_name.clone(),
+        }
+    }
+
+    /// Run [`Self::load_routine_script_for_item`] on a worker thread and post
+    /// its answer to the action loop.
+    ///
+    /// Every Execute label ends here. The menu arms differ only in the GUARD
+    /// that decides which items a label may act on; one road afterwards is what
+    /// keeps two arms of one action from answering the same questions
+    /// differently — which is exactly how the package arm came to ship the
+    /// widget's stale backend snapshot beside a fresh answer.
+    fn spawn_routine_script_load(
+        connection: &SharedConnection,
+        action_sender: &std::sync::mpsc::Sender<ObjectActionResult>,
+        status_callback: &StatusCallback,
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<String>,
+        item: ObjectItem,
+        routine_type: String,
+    ) {
+        let display_name =
+            Self::routine_action_display_name(db_type, selected_scope.as_deref(), &item);
+        // `Execute Routine` has no kind yet, so the line says what was clicked
+        // rather than a kind nobody has answered.
+        let status_routine_type = match routine_type.eq_ignore_ascii_case("UNKNOWN") {
+            true => "routine",
+            false => routine_type.as_str(),
+        };
+        let activity = format!("Loading {status_routine_type} arguments for {display_name}");
+        Self::emit_status_callback(status_callback, &activity);
+
+        let connection = connection.clone();
+        let sender = action_sender.clone();
+        thread::spawn(move || {
+            let loaded = Self::run_object_action_work("Load routine arguments", || {
+                Ok(Self::load_routine_script_for_item(
+                    &connection,
+                    db_type,
+                    selected_scope.as_deref(),
+                    &item,
+                    &routine_type,
+                    activity,
+                ))
+            });
+            // A panic leaves the action with nothing loaded, so it takes the
+            // could-not-ask road carrying the facts the click already had.
+            let load = loaded.unwrap_or_else(|err| RoutineScriptLoad {
+                qualified_name: display_name,
+                routine_type,
+                db_type,
+                result: Err(err),
+            });
+
+            let _ = sender.send(ObjectActionResult::RoutineScript(load));
+            app::awake();
+        });
+    }
+
+    /// What `Execute Procedure`/`Execute Function`/`Execute Routine` does to
+    /// one tree item, from the click to what the user is shown: the real
+    /// loader on a real pooled session, and the real delivery rule.
+    ///
+    /// Returns `(qualified name, resolved kind, alert, sql opened)` — an
+    /// `alert` with no `sql` is the app refusing, which is the whole point of
+    /// the readability gate.
+    ///
+    /// `#[doc(hidden)]`, for the live verification harness
+    /// (`verify_proc_exec_live`). It composes exactly what the context menu's
+    /// worker composes — the same loader, then the same delivery rule — which
+    /// the menu splits across a thread and the action-result loop, and that
+    /// split is why nothing could reach this chain before.
+    #[doc(hidden)]
+    pub fn routine_script_delivery_for_harness(
+        connection: &SharedConnection,
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+        item: &ObjectItem,
+        routine_type: &str,
+    ) -> (String, String, Option<String>, Option<String>) {
+        let load = Self::load_routine_script_for_item(
+            connection,
+            db_type,
+            selected_scope,
+            item,
+            routine_type,
+            format!("Loading {routine_type} arguments (harness)"),
+        );
+        let delivery = Self::routine_script_delivery(
+            load.db_type,
+            &load.qualified_name,
+            &load.routine_type,
+            load.result,
+        );
+        (
+            load.qualified_name,
+            load.routine_type,
             delivery.alert,
             delivery.open_sql,
         )
@@ -5445,7 +5621,7 @@ impl ObjectBrowserWidget {
             // The catalog ANSWERED. A parameterless call is the one script
             // that answer rules out, so the user is told and nothing is
             // opened — the same treatment an unresolved kind has always had.
-            Ok(RoutineScriptOutcome::Unreadable(reason)) => RoutineScriptDelivery {
+            Ok(RoutineScriptOutcome::Refused(reason)) => RoutineScriptDelivery {
                 alert: Some(reason),
                 open_sql: None,
             },
@@ -5477,14 +5653,10 @@ impl ObjectBrowserWidget {
     ) -> RoutineScriptOutcome {
         match lookup {
             crate::db::query::RoutineDefinitionLookup::Defined(definition) => {
-                RoutineScriptOutcome::Script(behavior.build_routine_script(
-                    qualified_name,
-                    routine_type,
-                    &definition,
-                ))
+                behavior.build_routine_script(qualified_name, routine_type, &definition)
             }
             crate::db::query::RoutineDefinitionLookup::Unreadable(reason) => {
-                RoutineScriptOutcome::Unreadable(reason)
+                RoutineScriptOutcome::Refused(reason)
             }
         }
     }
@@ -5527,13 +5699,23 @@ impl ObjectBrowserWidget {
 
     /// [`Self::listed_package_routine_identity`] for the caller that has to
     /// REFUSE when the listing does not settle it.
+    ///
+    /// The refusal comes back as [`RoutineScriptOutcome::Refused`] — a
+    /// TYPE, not an `Err(String)` — because the listing ANSWERED: no single
+    /// member carries that name. `Err` is the could-not-ask road, whose
+    /// delivery rule owns a simple-call fallback script; the only thing that
+    /// kept this refusal from opening one was the delivery's `UNKNOWN` guard
+    /// at the far end, and "the wrong road, saved by a guard somewhere else"
+    /// is exactly what the outcome type exists to rule out.
     fn resolve_listed_package_routine(
         routines: &[PackageRoutine],
         requested_name: &str,
         qualified_display_name: &str,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String), RoutineScriptOutcome> {
         Self::listed_package_routine_identity(routines, requested_name).ok_or_else(|| {
-            format!("Could not resolve package routine type for {qualified_display_name}")
+            RoutineScriptOutcome::Refused(format!(
+                "Could not resolve package routine type for {qualified_display_name}"
+            ))
         })
     }
 
@@ -5591,7 +5773,7 @@ impl ObjectBrowserWidget {
         routine_type: &str,
         definition: &crate::db::query::RoutineDefinition,
     ) -> String {
-        let selected_args = Self::select_overload_arguments(&definition.arguments, routine_type);
+        let selected_args = Self::select_overload_arguments(definition, routine_type);
         if selected_args.is_empty() {
             return Self::build_simple_mysql_routine_script(qualified_name, routine_type);
         }
@@ -5729,22 +5911,46 @@ impl ObjectBrowserWidget {
         qualified_name: &str,
         routine_type: &str,
         definition: &crate::db::query::RoutineDefinition,
-    ) -> String {
-        let selected_args = Self::select_overload_arguments(&definition.arguments, routine_type);
+    ) -> RoutineScriptOutcome {
+        let selected_args = Self::select_overload_arguments(definition, routine_type);
         if selected_args.is_empty() {
-            return Self::build_simple_oracle_routine_script(qualified_name, routine_type);
+            // No overload number to key the invocation form on — and none is
+            // needed. Every form that is not the block belongs to a FUNCTION,
+            // and a function always carries its return-value row, so an empty
+            // selection is either a parameterless PROCEDURE (which only the
+            // block can call) or an argument list that was never read (where
+            // the block is the only shape this app can choose).
+            return RoutineScriptOutcome::Script(Self::build_simple_oracle_routine_script(
+                qualified_name,
+                routine_type,
+            ));
         }
 
         // Asked BEFORE anything is written, from the overload actually
         // selected: a PL/SQL block is not a shape every routine supports, and
         // a routine that only SQL can call has no use for the block's
         // declarations, binds or seed lines.
-        let call_form = RoutineCallForm::of(
+        let shape = OracleRoutineScript::of(
             &definition.overloads,
             selected_args.first().and_then(|arg| arg.overload),
         );
-        if let Some(shape) = call_form.sql_scope_shape() {
-            return Self::build_oracle_sql_scope_script(qualified_name, &selected_args, shape);
+        match shape {
+            OracleRoutineScript::PlSqlBlock => {}
+            OracleRoutineScript::Sql(shape) => {
+                return RoutineScriptOutcome::Script(Self::build_oracle_sql_scope_script(
+                    qualified_name,
+                    &selected_args,
+                    shape,
+                ))
+            }
+            OracleRoutineScript::Unwritable { reason } => {
+                return RoutineScriptOutcome::Refused(
+                    crate::db::query::result_messages::routine_call_not_writable(
+                        qualified_name,
+                        reason,
+                    ),
+                )
+            }
         }
 
         let mut used_names: HashSet<String> = HashSet::new();
@@ -5849,7 +6055,7 @@ impl ObjectBrowserWidget {
 
         script.push_str("END;\n/\n");
 
-        script
+        RoutineScriptOutcome::Script(script)
     }
 
     /// One Oracle call expression: named association, one argument per line,
@@ -6002,13 +6208,27 @@ impl ObjectBrowserWidget {
     /// (position 0, no name). When no group agrees, or the kind is unknown,
     /// the first group keeps the long-standing behavior. Rows arrive sorted
     /// by overload, so equal overloads are contiguous.
+    ///
+    /// Takes the whole [`crate::db::query::RoutineDefinition`], not just its
+    /// argument rows, because the argument rows alone cannot answer for a
+    /// PARAMETERLESS overload: it has no `ALL_ARGUMENTS` rows at all (none on
+    /// 18c+, and the pre-18c placeholder row is dropped by the
+    /// `data_type IS NOT NULL` filter), while `ALL_PROCEDURES` — carried in
+    /// `definition.overloads` — lists one row per overload regardless. When
+    /// the wanted kind is PROCEDURE, no argument group has that shape, and the
+    /// dictionary lists an overload the rows do not cover, that overload can
+    /// only be a parameterless procedure (a function always carries its
+    /// return-value row), so the EMPTY selection is returned: the builder's
+    /// empty-list path writes the simple call, which the server resolves to
+    /// exactly that overload. Falling back to the first group instead is how
+    /// `Execute Procedure` on such a member came to run the FUNCTION.
     fn select_overload_arguments(
-        arguments: &[ProcedureArgument],
+        definition: &crate::db::query::RoutineDefinition,
         routine_type: &str,
     ) -> Vec<ProcedureArgument> {
         let mut groups: Vec<Vec<ProcedureArgument>> = Vec::new();
         let mut current_overload: Option<Option<i32>> = None;
-        for arg in arguments {
+        for arg in &definition.arguments {
             if current_overload != Some(arg.overload) {
                 current_overload = Some(arg.overload);
                 groups.push(Vec::new());
@@ -6026,8 +6246,34 @@ impl ObjectBrowserWidget {
                 is_function == wants_function
             })
         });
+        if matches!(matching, Some(None))
+            && wants_procedure
+            && Self::dictionary_lists_argumentless_overload(&definition.overloads, &groups)
+        {
+            return Vec::new();
+        }
         let index = matching.flatten().unwrap_or(0);
         groups.into_iter().nth(index).unwrap_or_default()
+    }
+
+    /// Whether the dictionary lists an overload the argument rows do not
+    /// cover — i.e. a parameterless overload.
+    ///
+    /// The dictionary's overload numbers match the argument rows' value for
+    /// value including `NULL` (live-proven, see [`RoutineCallForm::of`]), so
+    /// an overload with no matching argument group is one the argument query
+    /// genuinely returned nothing for, not a numbering mismatch. On the
+    /// MySQL family and on Oracle's fail-open road `definition.overloads` is
+    /// empty and this can never answer yes.
+    fn dictionary_lists_argumentless_overload(
+        overloads: &[crate::db::query::RoutineOverload],
+        argument_groups: &[Vec<ProcedureArgument>],
+    ) -> bool {
+        overloads.iter().any(|listed| {
+            !argument_groups
+                .iter()
+                .any(|group| group.first().map(|arg| arg.overload) == Some(listed.overload))
+        })
     }
 
     /// The row that carries a FUNCTION's return value: position 0 with no
@@ -7042,29 +7288,39 @@ impl ObjectBrowserWidget {
     /// the server itself would give.
     ///
     /// The case-insensitive pass is the convenience half: a bare `EMP` finding
-    /// a quoted-created `emp`, or a MySQL name typed in another case. It
-    /// answers only when exactly ONE candidate matches, so two names differing
-    /// only in case — `MYPROC` and `"myProc"`, two routines a schema or a
-    /// package may legally hold at once — are never separated by the order the
-    /// list happens to be in. An unsettled name resolves to nothing, and the
-    /// action then says so instead of acting on a guess.
-    fn identified_by_name<'a, T>(
+    /// a quoted-created `emp`, or a MySQL name typed in another case.
+    ///
+    /// BOTH passes are settled by the same rule — a name answers when every
+    /// candidate it matches is the SAME candidate — which is why `T: PartialEq`
+    /// is required. Counting matches instead would be wrong in both
+    /// directions: a list of plain names can legitimately hold one name twice
+    /// (two entries carrying one answer, which must still resolve), while a
+    /// package listing can hold `DUP` twice with two different KINDS, and one
+    /// of those two must not be picked by the order the list happens to be in.
+    /// Only the exact pass used to skip the question, and a wrapped package's
+    /// cross-kind duplicate is exactly the shape that reaches it.
+    fn identified_by_name<'a, T: PartialEq>(
         candidates: &'a [T],
         requested_name: &str,
         name_of: impl Fn(&T) -> &str,
     ) -> Option<&'a T> {
         let requested_name = requested_name.trim();
-        if let Some(exact) = candidates
-            .iter()
-            .find(|candidate| name_of(candidate) == requested_name)
-        {
-            return Some(exact);
+        fn settled<'a, T: PartialEq>(mut matches: impl Iterator<Item = &'a T>) -> Option<&'a T> {
+            let first = matches.next()?;
+            matches.all(|other| other == first).then_some(first)
         }
-        let mut insensitive = candidates
-            .iter()
-            .filter(|candidate| name_of(candidate).eq_ignore_ascii_case(requested_name));
-        let only = insensitive.next()?;
-        insensitive.next().is_none().then_some(only)
+        settled(
+            candidates
+                .iter()
+                .filter(|candidate| name_of(candidate) == requested_name),
+        )
+        .or_else(|| {
+            settled(
+                candidates
+                    .iter()
+                    .filter(|candidate| name_of(candidate).eq_ignore_ascii_case(requested_name)),
+            )
+        })
     }
 
     fn selection_name_match(names: &[String], candidate: &str) -> Option<String> {
@@ -7570,147 +7826,39 @@ impl ObjectBrowserWidget {
                     }
                     (
                         label @ ("Execute Procedure" | "Execute Function"),
-                        ObjectItem::Simple {
-                            object_name,
-                            object_type,
-                        },
+                        // Only the TYPE is read here: which label may act on
+                        // this item. The name travels on the item itself, to
+                        // the one loader both Execute arms share.
+                        ObjectItem::Simple { object_type, .. },
                     ) if (label == "Execute Procedure" && object_type == "PROCEDURES")
                         || (label == "Execute Function" && object_type == "FUNCTIONS") =>
                     {
-                        let connection = connection.clone();
-                        let sender = action_sender.clone();
-                        let object_name = object_name.clone();
-                        let routine_type = if label == "Execute Function" {
-                            "FUNCTION".to_string()
-                        } else {
-                            "PROCEDURE".to_string()
-                        };
-                        let selected_scope = selected_scope.clone();
-                        Self::emit_status_callback(
+                        Self::spawn_routine_script_load(
+                            connection,
+                            action_sender,
                             status_callback,
-                            &format!("Loading {} arguments for {}", routine_type, object_name),
+                            db_type,
+                            selected_scope.clone(),
+                            item_info.clone(),
+                            Self::execute_label_routine_type(label),
                         );
-                        thread::spawn(move || {
-                            let activity =
-                                format!("Loading {} arguments for {}", routine_type, object_name);
-                            // Scope-qualified UP FRONT, so the simple-script
-                            // fallback a failed argument load produces still
-                            // targets the browsed scope. The load's own
-                            // qualification replaces this on success.
-                            let mut qualified_name = Self::qualify_object_name_for_scope(
-                                db_type,
-                                selected_scope.as_deref(),
-                                &object_name,
-                            );
-                            let mut db_type = db_type;
-                            let result =
-                                Self::run_object_action_work("Load routine arguments", || {
-                                    ObjectBrowserWidget::with_pooled_object_session(
-                                        &connection,
-                                        selected_scope.as_deref(),
-                                        activity,
-                                        |context, session| {
-                                            db_type = context.connection_info.db_type;
-                                            let data = object_browser_behavior_for(db_type)
-                                                .load_routine_script(
-                                                    context,
-                                                    session,
-                                                    selected_scope.as_deref(),
-                                                    &object_name,
-                                                    &routine_type,
-                                                )?;
-                                            qualified_name = data.qualified_name;
-                                            Ok(data.outcome)
-                                        },
-                                    )
-                                });
-
-                            let _ = sender.send(ObjectActionResult::RoutineScript {
-                                qualified_name,
-                                routine_type,
-                                db_type,
-                                result,
-                            });
-                            app::awake();
-                        });
                     }
                     (
                         label @ ("Execute Procedure" | "Execute Function" | "Execute Routine"),
-                        ObjectItem::PackageRoutine {
-                            package_name,
-                            routine_name,
-                            routine_type,
-                        },
+                        ObjectItem::PackageRoutine { routine_type, .. },
                     ) if (label == "Execute Procedure" && routine_type == "PROCEDURE")
                         || (label == "Execute Function" && routine_type == "FUNCTION")
                         || (label == "Execute Routine" && routine_type == "UNKNOWN") =>
                     {
-                        let connection = connection.clone();
-                        let sender = action_sender.clone();
-                        let package_name = package_name.clone();
-                        let routine_name = routine_name.clone();
-                        let routine_type = match label {
-                            "Execute Function" => "FUNCTION".to_string(),
-                            "Execute Procedure" => "PROCEDURE".to_string(),
-                            _ => "UNKNOWN".to_string(),
-                        };
-                        let selected_scope = selected_scope.clone();
-                        let qualified_name = Self::qualify_package_member_name(
-                            db_type,
-                            selected_scope.as_deref(),
-                            &package_name,
-                            &routine_name,
-                        );
-                        let status_routine_type = if routine_type == "UNKNOWN" {
-                            "routine".to_string()
-                        } else {
-                            routine_type.clone()
-                        };
-                        Self::emit_status_callback(
+                        Self::spawn_routine_script_load(
+                            connection,
+                            action_sender,
                             status_callback,
-                            &format!(
-                                "Loading {} arguments for {}",
-                                status_routine_type, qualified_name
-                            ),
+                            db_type,
+                            selected_scope.clone(),
+                            item_info.clone(),
+                            Self::execute_label_routine_type(label),
                         );
-                        thread::spawn(move || {
-                            let activity = format!(
-                                "Loading {} arguments for {}",
-                                status_routine_type, qualified_name
-                            );
-                            let mut resolved_routine_type = routine_type.clone();
-                            // Both facts the load RESOLVED are taken from it,
-                            // for the same reason the standalone arm above
-                            // does: an `UNKNOWN` kind is asked of the package
-                            // listing, and that listing answers with the
-                            // member's own spelling as well as its kind.
-                            let mut qualified_name = qualified_name;
-                            let result =
-                                Self::run_object_action_work("Load routine arguments", || {
-                                    object_browser_behavior_for(db_type)
-                                        .load_package_routine_script(
-                                            &connection,
-                                            activity,
-                                            selected_scope.as_deref(),
-                                            &package_name,
-                                            &routine_name,
-                                            &routine_type,
-                                        )
-                                        .map(|data| {
-                                            resolved_routine_type = data.resolved_routine_type;
-                                            qualified_name = data.qualified_name;
-                                            data.outcome
-                                        })
-                                });
-
-                            let _ = sender.send(ObjectActionResult::RoutineScript {
-                                qualified_name,
-                                routine_type: resolved_routine_type,
-                                db_type,
-                                result,
-                            });
-                            app::awake();
-                        });
                     }
                     (
                         "Check Compilation",
@@ -9089,7 +9237,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         qualified_name: &str,
         routine_type: &str,
         definition: &crate::db::query::RoutineDefinition,
-    ) -> String {
+    ) -> RoutineScriptOutcome {
         ObjectBrowserWidget::build_procedure_script(qualified_name, routine_type, definition)
     }
 
@@ -9358,6 +9506,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         package_name: &str,
         routine_name: &str,
         routine_type: &str,
+        load_db_type: &mut crate::db::DatabaseType,
     ) -> Result<RoutineScriptData, String> {
         // The name the ACTION was asked about. It is the catalog's spelling
         // whenever it came from the tree or a resolved selection, and the
@@ -9374,7 +9523,8 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             connection,
             selected_scope,
             activity,
-            |_context, session| {
+            |context, session| {
+                *load_db_type = context.connection_info.db_type;
                 let (member_name, resolved_type) = if routine_type == "UNKNOWN" {
                     let routines = match session {
                         crate::db::DbPoolSession::Oracle(conn) => {
@@ -9391,11 +9541,24 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                             ))
                         }
                     };
-                    ObjectBrowserWidget::resolve_listed_package_routine(
+                    match ObjectBrowserWidget::resolve_listed_package_routine(
                         &routines,
                         routine_name,
                         &requested_display_name,
-                    )?
+                    ) {
+                        Ok(identity) => identity,
+                        // The listing ANSWERED and could not settle the
+                        // member. That refusal is delivered as the catalog's
+                        // own outcome — the `Err` road below is reserved for
+                        // reads that could not be made.
+                        Err(outcome) => {
+                            return Ok(RoutineScriptData {
+                                qualified_name: requested_display_name.clone(),
+                                resolved_routine_type: routine_type.to_string(),
+                                outcome,
+                            })
+                        }
+                    }
                 } else {
                     (routine_name.to_string(), routine_type.to_string())
                 };
@@ -10042,13 +10205,21 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         ObjectBrowserWidget::build_simple_mysql_routine_script(qualified_name, routine_type)
     }
 
+    /// Always a script: this family has exactly one invocation form, so there
+    /// is no routine it can describe and then be unable to call. That is the
+    /// same fact its loaders state by leaving `RoutineDefinition::overloads`
+    /// empty.
     fn build_routine_script(
         &self,
         qualified_name: &str,
         routine_type: &str,
         definition: &crate::db::query::RoutineDefinition,
-    ) -> String {
-        ObjectBrowserWidget::build_mysql_routine_script(qualified_name, routine_type, definition)
+    ) -> RoutineScriptOutcome {
+        RoutineScriptOutcome::Script(ObjectBrowserWidget::build_mysql_routine_script(
+            qualified_name,
+            routine_type,
+            definition,
+        ))
     }
 
     fn action_scope<'a>(
@@ -10224,6 +10395,10 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         ))
     }
 
+    /// No session is acquired, so `load_db_type` is left as the caller found
+    /// it: this family has no package routines at all
+    /// (`supports_package_routines()` is false, and the selection resolver
+    /// gates on it), so nothing constructs the item that reaches here.
     fn load_package_routine_script(
         &self,
         _connection: &SharedConnection,
@@ -10232,6 +10407,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         package_name: &str,
         routine_name: &str,
         _routine_type: &str,
+        _load_db_type: &mut crate::db::DatabaseType,
     ) -> Result<RoutineScriptData, String> {
         Err(format!(
             "Package routine execution is not supported for {}.{}",
@@ -12189,12 +12365,15 @@ mod tests {
     use super::{
         consume_owned_key_up, copy_text_for_object_item, CardWriteRefusal, DestructiveObjectAction,
         MultiObjectBrowserWidget, ObjectBrowserDbBehavior, ObjectBrowserMetadataSnapshot,
-        ObjectBrowserWidget, ObjectCache, ObjectDefaultAction, ObjectItem, OracleSqlScopeShape,
-        RoutineCallForm, ScopeSwitchPreflightCallback, MYSQL_OBJECT_BROWSER_BEHAVIOR,
-        SCOPE_SELECTOR_ROW_HEIGHT, SCOPE_SELECTOR_TABLE_VERTICAL_PADDING,
+        ObjectBrowserWidget, ObjectCache, ObjectDefaultAction, ObjectItem, OracleRoutineScript,
+        OracleSqlScopeShape, RoutineScriptOutcome, ScopeSwitchPreflightCallback,
+        MYSQL_OBJECT_BROWSER_BEHAVIOR, SCOPE_SELECTOR_ROW_HEIGHT,
+        SCOPE_SELECTOR_TABLE_VERTICAL_PADDING,
     };
     use crate::db::{DatabaseType, OracleDriverMode};
-    use crate::db::{PackageRoutine, ProcedureArgument, RoutineDefinition, RoutineOverload};
+    use crate::db::{
+        PackageRoutine, ProcedureArgument, RoutineDefinition, RoutineInvocation, RoutineOverload,
+    };
     use crate::ui::{IntellisenseData, QualifiedMemberKind};
     use fltk::enums::Key;
     use std::sync::{Arc, Mutex};
@@ -12346,20 +12525,35 @@ mod tests {
         RoutineDefinition::from_arguments(arguments.to_vec())
     }
 
-    /// The definition of a routine the dictionary marks PIPELINED or
-    /// AGGREGATE, for the one overload the tests build.
+    /// The definition of a routine the dictionary marks with a non-ordinary
+    /// invocation form, for the one overload the tests build.
     fn routine_definition_with_call_form(
         arguments: &[ProcedureArgument],
-        pipelined: bool,
-        aggregate: bool,
+        invocation: RoutineInvocation,
     ) -> RoutineDefinition {
         RoutineDefinition {
             overloads: vec![RoutineOverload {
                 overload: arguments.first().and_then(|arg| arg.overload),
-                pipelined,
-                aggregate,
+                invocation,
             }],
             arguments: arguments.to_vec(),
+        }
+    }
+
+    /// The Oracle script a builder wrote, for the tests whose subject is the
+    /// TEXT. A refusal fails the test loudly instead of being formatted into
+    /// an assertion as if it were a script.
+    fn oracle_script(
+        qualified_name: &str,
+        routine_type: &str,
+        definition: &RoutineDefinition,
+    ) -> String {
+        match ObjectBrowserWidget::build_procedure_script(qualified_name, routine_type, definition)
+        {
+            RoutineScriptOutcome::Script(sql) => sql,
+            RoutineScriptOutcome::Refused(reason) => {
+                panic!("{qualified_name}: the builder refused with {reason}")
+            }
         }
     }
 
@@ -13918,7 +14112,7 @@ mod tests {
             procedure_argument(Some("P_MIN_SAL"), 1, Some("NUMBER"), "IN"),
         ];
 
-        let sql = ObjectBrowserWidget::build_procedure_script(
+        let sql = oracle_script(
             "DEMO_PKG.GET_ROWS",
             "FUNCTION",
             &routine_definition(&arguments),
@@ -13958,11 +14152,7 @@ mod tests {
             ),
         ];
 
-        let sql = ObjectBrowserWidget::build_procedure_script(
-            "SQ_QUOTED_P",
-            "PROCEDURE",
-            &routine_definition(&arguments),
-        );
+        let sql = oracle_script("SQ_QUOTED_P", "PROCEDURE", &routine_definition(&arguments));
 
         assert!(sql.contains("\"my arg\" => v_my_arg"));
         assert!(sql.contains("\"lower\" => :v_lower"));
@@ -14010,7 +14200,7 @@ mod tests {
             procedure_argument(Some("p_n"), 4, Some("NUMBER"), "IN"),
         ];
 
-        let sql = ObjectBrowserWidget::build_procedure_script(
+        let sql = oracle_script(
             "SCOTT.SQ_PROC",
             "PROCEDURE",
             &routine_definition(&arguments),
@@ -14050,11 +14240,7 @@ mod tests {
             ),
         ];
 
-        let sql = ObjectBrowserWidget::build_procedure_script(
-            "SQ_ROW_PROC",
-            "PROCEDURE",
-            &routine_definition(&arguments),
-        );
+        let sql = oracle_script("SQ_ROW_PROC", "PROCEDURE", &routine_definition(&arguments));
 
         assert!(sql.contains("  v_p_user ALL_USERS%ROWTYPE;\n"));
         assert!(sql.contains("  v_p_emp SCOTT.EMP%ROWTYPE;\n"));
@@ -14092,11 +14278,7 @@ mod tests {
             ),
         ];
 
-        let sql = ObjectBrowserWidget::build_procedure_script(
-            "SQ_REF_PROC",
-            "PROCEDURE",
-            &routine_definition(&arguments),
-        );
+        let sql = oracle_script("SQ_REF_PROC", "PROCEDURE", &routine_definition(&arguments));
 
         assert!(sql.contains("  v_p_ref REF SCOTT.SQ_OBJ_T;\n"));
         assert!(sql.contains("  v_p_cur SYS_REFCURSOR;\n"));
@@ -14130,31 +14312,74 @@ mod tests {
             overloaded(Some("B"), 2, "VARCHAR2", "IN", 2),
         ];
 
-        let as_function = ObjectBrowserWidget::build_procedure_script(
-            "SQ_X_OVL.DUP",
-            "FUNCTION",
-            &routine_definition(&arguments),
-        );
+        let as_function =
+            oracle_script("SQ_X_OVL.DUP", "FUNCTION", &routine_definition(&arguments));
         assert!(as_function.starts_with("VAR v_result NUMBER\n"));
         assert!(as_function.contains("B => v_b"));
         assert!(!as_function.contains("A => "));
 
-        let as_procedure = ObjectBrowserWidget::build_procedure_script(
-            "SQ_X_OVL.DUP",
-            "PROCEDURE",
-            &routine_definition(&arguments),
-        );
+        let as_procedure =
+            oracle_script("SQ_X_OVL.DUP", "PROCEDURE", &routine_definition(&arguments));
         assert!(as_procedure.contains("A => v_a"));
         assert!(!as_procedure.contains("VAR "));
         assert!(!as_procedure.contains("B => "));
 
-        let unknown = ObjectBrowserWidget::build_procedure_script(
-            "SQ_X_OVL.DUP",
-            "UNKNOWN",
-            &routine_definition(&arguments),
-        );
+        let unknown = oracle_script("SQ_X_OVL.DUP", "UNKNOWN", &routine_definition(&arguments));
         assert!(unknown.contains("A => v_a"));
         assert!(!unknown.contains("B => "));
+    }
+
+    /// A PARAMETERLESS overload has no `ALL_ARGUMENTS` rows at all (none on
+    /// 18c+, and the pre-18c placeholder row is dropped by the
+    /// `data_type IS NOT NULL` filter), so the group picker cannot see it in
+    /// the argument rows — only `definition.overloads` (`ALL_PROCEDURES`, one
+    /// row per overload) can say it exists. With `PROCEDURE dup` +
+    /// `FUNCTION dup(b)` in one package, `Execute Procedure` used to fall
+    /// back to the function's group and run the routine the user did NOT
+    /// click; the empty selection — the simple call `BEGIN pkg.dup; END;` —
+    /// is what PL/SQL resolves to the parameterless procedure.
+    #[test]
+    fn build_oracle_script_calls_the_parameterless_procedure_the_dictionary_lists() {
+        // Overload 1: PROCEDURE dup — parameterless, so NO argument rows.
+        // Overload 2: FUNCTION dup(b VARCHAR2) RETURN NUMBER.
+        let arguments = vec![
+            ProcedureArgument {
+                overload: Some(2),
+                ..procedure_argument(None, 0, Some("NUMBER"), "OUT")
+            },
+            ProcedureArgument {
+                overload: Some(2),
+                ..procedure_argument(Some("B"), 1, Some("VARCHAR2"), "IN")
+            },
+        ];
+        let listed = |overload: i32| RoutineOverload {
+            overload: Some(overload),
+            invocation: RoutineInvocation::Ordinary,
+        };
+        let definition =
+            RoutineDefinition::from_dictionary(arguments.clone(), vec![listed(1), listed(2)]);
+
+        let as_procedure = oracle_script("SQ_X_PL.DUP", "PROCEDURE", &definition);
+        assert_eq!(
+            as_procedure, "BEGIN\n  SQ_X_PL.DUP;\nEND;\n/\n",
+            "the parameterless procedure the dictionary lists is the call, not the function's group"
+        );
+
+        // The function's own half is untouched: its group is visible and
+        // matches the wanted shape.
+        let as_function = oracle_script("SQ_X_PL.DUP", "FUNCTION", &definition);
+        assert!(as_function.contains("B => "));
+        assert!(as_function.starts_with("VAR v_result NUMBER\n"));
+
+        // When the dictionary's overloads are exactly the ones the argument
+        // rows already show, nothing is missing and the long-standing
+        // first-group fallback answers for a kind with no matching shape.
+        let covered = RoutineDefinition::from_dictionary(arguments, vec![listed(2)]);
+        let fallback = oracle_script("SQ_X_PL.DUP", "PROCEDURE", &covered);
+        assert!(
+            fallback.contains("B => "),
+            "no absent overload -> the pre-existing group-0 fallback stays"
+        );
     }
 
     /// Whatever the routine WRITES has to be readable once the block ends.
@@ -14170,11 +14395,7 @@ mod tests {
             procedure_argument(Some("P_BOTH"), 3, Some("NUMBER"), "IN/OUT"),
         ];
 
-        let sql = ObjectBrowserWidget::build_procedure_script(
-            "SQ_OUT_P",
-            "PROCEDURE",
-            &routine_definition(&arguments),
-        );
+        let sql = oracle_script("SQ_OUT_P", "PROCEDURE", &routine_definition(&arguments));
 
         // Written values: bound, and passed to the call as binds.
         assert!(sql.contains("VAR v_p_out VARCHAR2(32767)\n"));
@@ -14212,11 +14433,7 @@ mod tests {
             procedure_argument(Some("P_FLAG"), 2, Some("PL/SQL BOOLEAN"), "OUT"),
         ];
 
-        let sql = ObjectBrowserWidget::build_procedure_script(
-            "SQ_LOCAL_P",
-            "PROCEDURE",
-            &routine_definition(&arguments),
-        );
+        let sql = oracle_script("SQ_LOCAL_P", "PROCEDURE", &routine_definition(&arguments));
 
         assert!(!sql.contains("VAR "));
         assert!(sql.contains("  v_p_rec SCOTT.SQ_PKG.T_REC;\n"));
@@ -14232,22 +14449,14 @@ mod tests {
     #[test]
     fn build_oracle_script_binds_are_wide_enough_for_the_declared_type() {
         let unbounded = vec![procedure_argument(None, 0, Some("VARCHAR2"), "OUT")];
-        let sql = ObjectBrowserWidget::build_procedure_script(
-            "SQ_LONG_F",
-            "FUNCTION",
-            &routine_definition(&unbounded),
-        );
+        let sql = oracle_script("SQ_LONG_F", "FUNCTION", &routine_definition(&unbounded));
         assert!(sql.starts_with("VAR v_result VARCHAR2(32767)\n"));
 
         let sized = vec![ProcedureArgument {
             data_length: Some(100),
             ..procedure_argument(None, 0, Some("RAW"), "OUT")
         }];
-        let sql = ObjectBrowserWidget::build_procedure_script(
-            "SQ_RAW_F",
-            "FUNCTION",
-            &routine_definition(&sized),
-        );
+        let sql = oracle_script("SQ_RAW_F", "FUNCTION", &routine_definition(&sized));
         assert!(sql.starts_with("VAR v_result VARCHAR2(200)\n"));
     }
 
@@ -14269,7 +14478,7 @@ mod tests {
                 DatabaseType::Oracle,
                 "SCOTT.ZQ_BAD",
                 "PROCEDURE",
-                Ok(super::RoutineScriptOutcome::Unreadable(refusal.to_string())),
+                Ok(super::RoutineScriptOutcome::Refused(refusal.to_string())),
             ),
             super::RoutineScriptDelivery {
                 alert: Some(refusal.to_string()),
@@ -14284,7 +14493,7 @@ mod tests {
                 DatabaseType::MariaDB,
                 "app.zq_bad",
                 "FUNCTION",
-                Ok(super::RoutineScriptOutcome::Unreadable(refusal.to_string())),
+                Ok(super::RoutineScriptOutcome::Refused(refusal.to_string())),
             )
             .open_sql,
             None
@@ -14377,10 +14586,15 @@ mod tests {
             ObjectBrowserWidget::resolve_listed_package_routine(&routines, "MYPROC", "PKG.MYPROC"),
             Ok(("MYPROC".to_string(), "PROCEDURE".to_string()))
         );
-        // Neither spelling: two members answer, so neither is chosen.
-        assert!(
-            ObjectBrowserWidget::resolve_listed_package_routine(&routines, "myproc", "PKG.myproc")
-                .is_err(),
+        // Neither spelling: two members answer, so neither is chosen. The
+        // refusal is the catalog's ANSWER, so it must arrive as `Unreadable`
+        // (open nothing, say the sentence) — never as the `Err` a failed read
+        // travels on, whose delivery rule owns a fallback call script.
+        assert_eq!(
+            ObjectBrowserWidget::resolve_listed_package_routine(&routines, "myproc", "PKG.myproc"),
+            Err(RoutineScriptOutcome::Refused(
+                "Could not resolve package routine type for PKG.myproc".to_string()
+            )),
             "an ambiguous name must be refused, not settled by list order"
         );
         // One member answers case-insensitively: the listing's spelling wins,
@@ -14389,9 +14603,61 @@ mod tests {
             ObjectBrowserWidget::resolve_listed_package_routine(&routines, "solo", "PKG.solo"),
             Ok(("SOLO".to_string(), "PROCEDURE".to_string()))
         );
-        assert!(
-            ObjectBrowserWidget::resolve_listed_package_routine(&routines, "GONE", "PKG.GONE")
-                .is_err()
+        assert_eq!(
+            ObjectBrowserWidget::resolve_listed_package_routine(&routines, "GONE", "PKG.GONE"),
+            Err(RoutineScriptOutcome::Refused(
+                "Could not resolve package routine type for PKG.GONE".to_string()
+            ))
+        );
+
+        // The EXACT pass has to ask the same question. A listing really can
+        // hold one exact name twice with two different KINDS — the wrapped /
+        // encrypted package road reads the dictionary, whose
+        // `SELECT DISTINCT name, CASE ...` yields (DUP, PROCEDURE) and
+        // (DUP, FUNCTION) — and picking one of those by list order is a guess.
+        let cross_kind = vec![
+            PackageRoutine {
+                name: "DUP".to_string(),
+                routine_type: "PROCEDURE".to_string(),
+            },
+            PackageRoutine {
+                name: "DUP".to_string(),
+                routine_type: "FUNCTION".to_string(),
+            },
+        ];
+        assert_eq!(
+            ObjectBrowserWidget::resolve_listed_package_routine(&cross_kind, "DUP", "PKG.DUP"),
+            Err(RoutineScriptOutcome::Refused(
+                "Could not resolve package routine type for PKG.DUP".to_string()
+            )),
+            "an exact name matching two DIFFERENT routines settles nothing either"
+        );
+        // Two entries that are the same routine twice still carry one answer,
+        // so they must resolve. This is why the rule is "every match is the
+        // same candidate" rather than "exactly one match": lists of plain
+        // names (schemas, packages, tables) can repeat a name harmlessly, and
+        // counting would refuse those.
+        let repeated = vec![
+            PackageRoutine {
+                name: "DUP".to_string(),
+                routine_type: "PROCEDURE".to_string(),
+            },
+            PackageRoutine {
+                name: "DUP".to_string(),
+                routine_type: "PROCEDURE".to_string(),
+            },
+        ];
+        assert_eq!(
+            ObjectBrowserWidget::resolve_listed_package_routine(&repeated, "DUP", "PKG.DUP"),
+            Ok(("DUP".to_string(), "PROCEDURE".to_string()))
+        );
+        assert_eq!(
+            ObjectBrowserWidget::selection_name_match(
+                &["EMP".to_string(), "EMP".to_string()],
+                "emp"
+            ),
+            Some("EMP".to_string()),
+            "one name listed twice is one answer, not an ambiguity"
         );
 
         // Resolving a deferred menu item takes BOTH halves from the listed
@@ -14455,10 +14721,10 @@ mod tests {
             procedure_argument(Some("N"), 1, Some("NUMBER"), "IN"),
         ];
         assert_eq!(
-            ObjectBrowserWidget::build_procedure_script(
+            oracle_script(
                 "SCOTT.ZQ_PIPE",
                 "FUNCTION",
-                &routine_definition_with_call_form(&pipelined, true, false),
+                &routine_definition_with_call_form(&pipelined, RoutineInvocation::Pipelined),
             ),
             "SELECT *\nFROM TABLE(\n  SCOTT.ZQ_PIPE(\n    N => 0\n  )\n);\n"
         );
@@ -14468,10 +14734,10 @@ mod tests {
             procedure_argument(Some("INPUT"), 1, Some("NUMBER"), "IN"),
         ];
         assert_eq!(
-            ObjectBrowserWidget::build_procedure_script(
+            oracle_script(
                 "SCOTT.ZQ_AGG",
                 "FUNCTION",
-                &routine_definition_with_call_form(&aggregate, false, true),
+                &routine_definition_with_call_form(&aggregate, RoutineInvocation::Aggregate),
             ),
             "SELECT\n  SCOTT.ZQ_AGG(\n    INPUT => 0\n  ) AS result\nFROM dual;\n"
         );
@@ -14479,11 +14745,7 @@ mod tests {
         // The SAME argument rows, with the dictionary saying "ordinary": the
         // block shape, untouched. This is what makes the flag — and not the
         // arguments — the thing that decides.
-        let ordinary = ObjectBrowserWidget::build_procedure_script(
-            "SCOTT.ZQ_AGG",
-            "FUNCTION",
-            &routine_definition(&aggregate),
-        );
+        let ordinary = oracle_script("SCOTT.ZQ_AGG", "FUNCTION", &routine_definition(&aggregate));
         assert!(ordinary.starts_with("VAR v_result NUMBER\n"));
         assert!(ordinary.contains("  :v_result := SCOTT.ZQ_AGG(\n"));
 
@@ -14499,10 +14761,10 @@ mod tests {
             None,
         )];
         assert_eq!(
-            ObjectBrowserWidget::build_procedure_script(
+            oracle_script(
                 "SCOTT.ZQ_PIPE0",
                 "FUNCTION",
-                &routine_definition_with_call_form(&no_args, true, false),
+                &routine_definition_with_call_form(&no_args, RoutineInvocation::Pipelined),
             ),
             "SELECT *\nFROM TABLE(\n  SCOTT.ZQ_PIPE0\n);\n"
         );
@@ -14533,10 +14795,10 @@ mod tests {
             procedure_argument(Some("O"), 2, Some("VARCHAR2"), "OUT"),
         ];
 
-        let sql = ObjectBrowserWidget::build_procedure_script(
+        let sql = oracle_script(
             "SCOTT.ZQ_PIPE_OUT",
             "FUNCTION",
-            &routine_definition_with_call_form(&arguments, true, false),
+            &routine_definition_with_call_form(&arguments, RoutineInvocation::Pipelined),
         );
 
         assert_eq!(
@@ -14548,47 +14810,187 @@ mod tests {
         assert!(!sql.contains(":v_"));
     }
 
-    /// The call form is read for the overload the script is actually built
-    /// for. A package may overload one name with a pipelined and an ordinary
-    /// body, and `select_overload_arguments` may pick either.
+    /// The statement shape is read for the overload the script is actually
+    /// built for — a package may overload one name with a pipelined and an
+    /// ordinary body, and `select_overload_arguments` may pick either — and
+    /// EVERY invocation form the dictionary can report has a shape of its own
+    /// here.
+    ///
+    /// The exhaustive half is the point: reading only `PIPELINED`/`AGGREGATE`
+    /// is what let a SQL macro reach the PL/SQL block, where the call RUNS and
+    /// reports the macro's own source text as the routine's value. A form with
+    /// no arm of its own would inherit that silently.
     #[test]
-    fn oracle_call_form_follows_the_selected_overload() {
+    fn every_invocation_form_maps_to_its_own_oracle_statement() {
         let overloads = vec![
             RoutineOverload {
                 overload: Some(1),
-                pipelined: false,
-                aggregate: false,
+                invocation: RoutineInvocation::Ordinary,
             },
             RoutineOverload {
                 overload: Some(2),
-                pipelined: true,
-                aggregate: false,
+                invocation: RoutineInvocation::Pipelined,
             },
         ];
 
         assert_eq!(
-            RoutineCallForm::of(&overloads, Some(1)),
-            RoutineCallForm::Ordinary
+            OracleRoutineScript::of(&overloads, Some(1)),
+            OracleRoutineScript::PlSqlBlock
         );
         assert_eq!(
-            RoutineCallForm::of(&overloads, Some(2)),
-            RoutineCallForm::PipelinedTable
+            OracleRoutineScript::of(&overloads, Some(2)),
+            OracleRoutineScript::Sql(OracleSqlScopeShape::PipelinedTable)
         );
         // A `NULL` overload is its own key, not "the first row".
         assert_eq!(
-            RoutineCallForm::of(&overloads, None),
-            RoutineCallForm::Ordinary
+            OracleRoutineScript::of(&overloads, None),
+            OracleRoutineScript::PlSqlBlock
         );
-        // Nothing known — every MySQL-family routine — is the ordinary form.
-        assert_eq!(RoutineCallForm::of(&[], None), RoutineCallForm::Ordinary);
-        assert_eq!(RoutineCallForm::Ordinary.sql_scope_shape(), None);
+        // Nothing known — every MySQL-family routine, and Oracle's fail-open
+        // road — is the block, the only shape choosable without the facts.
         assert_eq!(
-            RoutineCallForm::PipelinedTable.sql_scope_shape(),
-            Some(OracleSqlScopeShape::PipelinedTable)
+            OracleRoutineScript::of(&[], None),
+            OracleRoutineScript::PlSqlBlock
         );
+
+        let shape_of = |invocation| {
+            OracleRoutineScript::of(
+                &[RoutineOverload {
+                    overload: None,
+                    invocation,
+                }],
+                None,
+            )
+        };
         assert_eq!(
-            RoutineCallForm::Aggregate.sql_scope_shape(),
-            Some(OracleSqlScopeShape::Aggregate)
+            shape_of(RoutineInvocation::Ordinary),
+            OracleRoutineScript::PlSqlBlock
+        );
+        // `PIPELINED` and a TABLE macro are both rows in a `FROM` clause;
+        // `AGGREGATE` and a SCALAR macro are both values in a select list.
+        // All four live-proven on 23ai/26ai, parameterless forms included.
+        for rows in [RoutineInvocation::Pipelined, RoutineInvocation::TableMacro] {
+            assert_eq!(
+                shape_of(rows),
+                OracleRoutineScript::Sql(OracleSqlScopeShape::PipelinedTable),
+                "{rows:?} is reachable only from a query's FROM clause"
+            );
+        }
+        for value in [RoutineInvocation::Aggregate, RoutineInvocation::ScalarMacro] {
+            assert_eq!(
+                shape_of(value),
+                OracleRoutineScript::Sql(OracleSqlScopeShape::Aggregate),
+                "{value:?} is reachable only from a query's select list"
+            );
+        }
+        // The one form with no statement at all: its argument is a TABLE.
+        assert!(matches!(
+            shape_of(RoutineInvocation::Polymorphic),
+            OracleRoutineScript::Unwritable { .. }
+        ));
+    }
+
+    /// A routine the dictionary describes in full can still have no script,
+    /// and that answer must travel as a REFUSAL — the road that opens nothing
+    /// — never as a call script the server accepts and quietly ignores.
+    ///
+    /// Live-proven on 26ai: the block this used to write for a polymorphic
+    /// table function reported "PL/SQL procedure successfully completed" while
+    /// doing nothing the user asked for.
+    #[test]
+    fn a_polymorphic_table_function_refuses_instead_of_writing_a_block() {
+        // As `ALL_ARGUMENTS` reports one: the return row and the table
+        // argument are both `DBMS_TF` records.
+        let arguments = vec![
+            composite_procedure_argument(
+                None,
+                0,
+                "PL/SQL RECORD",
+                "OUT",
+                Some("SYS"),
+                Some("DBMS_TF"),
+                Some("TABLE_T"),
+            ),
+            composite_procedure_argument(
+                Some("T"),
+                1,
+                "PL/SQL RECORD",
+                "IN",
+                Some("SYS"),
+                Some("DBMS_TF"),
+                Some("TABLE_T"),
+            ),
+        ];
+        let definition =
+            routine_definition_with_call_form(&arguments, RoutineInvocation::Polymorphic);
+
+        let outcome =
+            ObjectBrowserWidget::build_procedure_script("SCOTT.ZQ_PTF", "FUNCTION", &definition);
+        let RoutineScriptOutcome::Refused(reason) = outcome else {
+            panic!("a polymorphic table function must refuse, got {outcome:?}");
+        };
+        // The sentence is the shared catalog's, so all four backends read the
+        // same way when they ever have a case of their own.
+        assert_eq!(
+            reason,
+            crate::db::query::result_messages::routine_call_not_writable(
+                "SCOTT.ZQ_PTF",
+                "it is a polymorphic table function, so it can only be called with a table \
+                 argument",
+            )
+        );
+        assert!(reason.contains("SCOTT.ZQ_PTF"), "{reason}");
+    }
+
+    /// A SQL macro is spliced into the SQL that names it, so only a query sees
+    /// its value.
+    ///
+    /// This is the case that made the shape question matter: the dictionary
+    /// reports `PIPELINED = NO` and `AGGREGATE = NO` for a macro, so reading
+    /// only those two produced a PL/SQL block — which RUNS, and reports the
+    /// macro's own source text as the routine's value. No error, a wrong
+    /// answer (live-proven on 26ai, standalone and package member alike).
+    #[test]
+    fn a_sql_macro_is_called_from_sql_never_from_a_block() {
+        let scalar = vec![
+            procedure_argument(None, 0, Some("VARCHAR2"), "OUT"),
+            procedure_argument(Some("P"), 1, Some("VARCHAR2"), "IN"),
+        ];
+        assert_eq!(
+            oracle_script(
+                "SCOTT.ZQ_MACRO_S",
+                "FUNCTION",
+                &routine_definition_with_call_form(&scalar, RoutineInvocation::ScalarMacro),
+            ),
+            "SELECT\n  SCOTT.ZQ_MACRO_S(\n    P => ''\n  ) AS result\nFROM dual;\n"
+        );
+
+        let table = vec![
+            procedure_argument(None, 0, Some("VARCHAR2"), "OUT"),
+            procedure_argument(Some("N"), 1, Some("NUMBER"), "IN"),
+        ];
+        assert_eq!(
+            oracle_script(
+                "SCOTT.ZQ_MACRO_T",
+                "FUNCTION",
+                &routine_definition_with_call_form(&table, RoutineInvocation::TableMacro),
+            ),
+            "SELECT *\nFROM TABLE(\n  SCOTT.ZQ_MACRO_T(\n    N => 0\n  )\n);\n"
+        );
+
+        // A PARAMETERLESS table macro is the shape that pins why `TABLE(...)`
+        // is the spelling: Oracle takes no parentheses on an empty argument
+        // list, and `SELECT * FROM ZQ_MACRO_T0` — the bare name in a FROM
+        // clause — is ORA-04044, while `TABLE(ZQ_MACRO_T0)` runs (both
+        // live-proven).
+        let parameterless = vec![procedure_argument(None, 0, Some("VARCHAR2"), "OUT")];
+        assert_eq!(
+            oracle_script(
+                "SCOTT.ZQ_MACRO_T0",
+                "FUNCTION",
+                &routine_definition_with_call_form(&parameterless, RoutineInvocation::TableMacro),
+            ),
+            "SELECT *\nFROM TABLE(\n  SCOTT.ZQ_MACRO_T0\n);\n"
         );
     }
 
@@ -14635,11 +15037,7 @@ mod tests {
         // The builders reach the same shapes when the argument list they were
         // handed is empty, so a FUNCTION never comes back as a call statement.
         assert_eq!(
-            ObjectBrowserWidget::build_procedure_script(
-                "SCOTT.SQ_F",
-                "FUNCTION",
-                &routine_definition(&[])
-            ),
+            oracle_script("SCOTT.SQ_F", "FUNCTION", &routine_definition(&[])),
             "SELECT SCOTT.SQ_F AS result\nFROM dual;\n"
         );
         assert_eq!(
@@ -14716,7 +15114,7 @@ mod tests {
         let second = format!("{}B", &oracle_name[..127]);
         assert_eq!(oracle_name.len(), 128);
         assert_eq!(second.len(), 128);
-        let oracle = ObjectBrowserWidget::build_procedure_script(
+        let oracle = oracle_script(
             "SQ_LONG_P",
             "PROCEDURE",
             &routine_definition(&[
@@ -14773,7 +15171,7 @@ mod tests {
     /// stay unquoted.
     #[test]
     fn oracle_scripts_quote_reserved_word_object_names() {
-        let procedure = ObjectBrowserWidget::build_procedure_script(
+        let procedure = oracle_script(
             &ObjectBrowserWidget::qualify_object_name_for_scope(
                 DatabaseType::Oracle,
                 Some("SCOTT"),
@@ -14828,11 +15226,7 @@ mod tests {
             "IN",
         )];
 
-        let sql = ObjectBrowserWidget::build_procedure_script(
-            "SQ_CUR_PROC",
-            "PROCEDURE",
-            &routine_definition(&arguments),
-        );
+        let sql = oracle_script("SQ_CUR_PROC", "PROCEDURE", &routine_definition(&arguments));
 
         assert!(sql.contains("  v_p_cur SYS_REFCURSOR;\n"));
         assert!(!sql.contains(":= NULL"));

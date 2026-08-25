@@ -5263,6 +5263,120 @@ fn parenthesized_sql_macro_property_keeps_function_body_attached() {
     assert!(statements[1].starts_with("SELECT * FROM topn()"));
 }
 
+/// `SQL_MACRO` as a header PROPERTY ends nothing — in a package SPEC, where
+/// the declaration has no body at all, and standalone without parentheses.
+///
+/// Both were truncated: the keyword was read as the body-less `AS SQL_MACRO;`
+/// call spec whenever any routine frame was open, which inside a package spec
+/// is the PACKAGE's own frame. The spec then reached the server cut off at the
+/// member's `;` and Oracle created it "with errors", with a stray `END` sent
+/// after it. Only `SQL_MACRO(TABLE)` survived, because a later `(` undid the
+/// marking — which is why the parenthesised form was the only one covered.
+#[test]
+fn sql_macro_declaration_property_keeps_the_whole_create_together() {
+    for (label, lines) in [
+        (
+            "package spec, parenthesised",
+            vec![
+                "CREATE OR REPLACE PACKAGE pkg_macro AS",
+                "  FUNCTION m(p VARCHAR2) RETURN VARCHAR2 SQL_MACRO(SCALAR);",
+                "END pkg_macro;",
+            ],
+        ),
+        (
+            "package spec, bare",
+            vec![
+                "CREATE OR REPLACE PACKAGE pkg_macro AS",
+                "  FUNCTION m(p VARCHAR2) RETURN VARCHAR2 SQL_MACRO;",
+                "END pkg_macro;",
+            ],
+        ),
+        (
+            "standalone, bare, with a body",
+            vec![
+                "CREATE OR REPLACE FUNCTION f RETURN VARCHAR2 SQL_MACRO IS",
+                "BEGIN",
+                "  RETURN 'SELECT 1 FROM dual';",
+                "END f;",
+            ],
+        ),
+    ] {
+        let mut engine = SqlParserEngine::new();
+        for line in lines {
+            engine.process_line(line);
+        }
+        engine.process_line("/");
+        engine.process_line("SELECT 12 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements.len(),
+            2,
+            "{label}: unexpected statements: {statements:?}"
+        );
+        assert!(
+            statements[0].contains("SQL_MACRO"),
+            "{label}: {statements:?}"
+        );
+        assert!(
+            statements[0].contains("END "),
+            "{label}: the CREATE lost its END: {statements:?}"
+        );
+        assert!(statements[1].starts_with("SELECT 12 FROM dual"), "{label}");
+    }
+}
+
+/// `sql_macro` is a legal identifier, and a body may declare it FIRST.
+///
+/// The call spec is `AS SQL_MACRO ;` — both halves. Acting on the keyword
+/// alone read `IS sql_macro NUMBER;` as a body-less routine and cut the
+/// `CREATE` at that declaration's `;`, leaving the rest of the body to reach
+/// the server as its own statement.
+#[test]
+fn a_local_variable_named_sql_macro_is_not_a_call_spec() {
+    for (label, lines) in [
+        (
+            "standalone function, first declaration",
+            vec![
+                "CREATE OR REPLACE FUNCTION f RETURN NUMBER IS",
+                "  sql_macro NUMBER;",
+                "BEGIN",
+                "  RETURN sql_macro;",
+                "END f;",
+            ],
+        ),
+        (
+            "package body member, first declaration",
+            vec![
+                "CREATE OR REPLACE PACKAGE BODY pkg_local AS",
+                "  FUNCTION f RETURN NUMBER IS",
+                "    sql_macro NUMBER;",
+                "  BEGIN RETURN 1; END;",
+                "END pkg_local;",
+            ],
+        ),
+    ] {
+        let mut engine = SqlParserEngine::new();
+        for line in lines {
+            engine.process_line(line);
+        }
+        engine.process_line("/");
+        engine.process_line("SELECT 12 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements.len(),
+            2,
+            "{label}: unexpected statements: {statements:?}"
+        );
+        assert!(
+            statements[0].contains("END "),
+            "{label}: the CREATE was cut at the declaration: {statements:?}"
+        );
+        assert!(statements[1].starts_with("SELECT 12 FROM dual"), "{label}");
+    }
+}
+
 #[test]
 fn package_nested_sql_macro_call_spec_closes_nested_function_block_on_semicolon() {
     let mut engine = SqlParserEngine::new();

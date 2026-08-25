@@ -35,7 +35,25 @@ pub(crate) struct SplitState {
     as_is_follow_state: AsIsFollowState,
     as_is_state: AsIsState,
     pub(crate) pending_subprogram_begins: usize,
-    pending_sql_macro_call_spec: bool,
+    /// Whether the token just before this one was the `AS`/`IS` that opened a
+    /// routine's body block.
+    ///
+    /// It answers one question — is the next word standing where the routine
+    /// BODY would? — and `SQL_MACRO` is the keyword that needs it: `AS
+    /// SQL_MACRO;` is a body-less call spec, while `RETURN VARCHAR2 SQL_MACRO`
+    /// is a header PROPERTY whose real body follows. Both were previously told
+    /// apart by "is a routine frame open", which answers yes inside a package
+    /// spec for the PACKAGE's own frame — so every macro DECLARATION in a spec
+    /// was read as a call spec and its `;` ended the whole `CREATE`.
+    routine_body_block_just_opened: bool,
+    /// Whether the token just flushed was a `SQL_MACRO` standing where the
+    /// routine's body goes, with the terminator not yet seen.
+    ///
+    /// The call spec is `AS SQL_MACRO ;` — BOTH halves. Acting on the keyword
+    /// alone reads `IS sql_macro NUMBER;` — a body whose first declaration is
+    /// a variable that happens to carry that legal name — as a body-less
+    /// routine, and cuts the `CREATE` at that declaration's `;`.
+    sql_macro_call_spec_armed: bool,
     routine_is_stack: Vec<RoutineFrame>,
     timing_point_state: TimingPointState,
     saw_compound_keyword: bool,
@@ -712,9 +730,14 @@ impl SplitState {
         upper_buf.make_ascii_uppercase();
         let upper = upper_buf.as_str();
 
+        // Taken BEFORE any handler runs, so it describes the PREVIOUS token;
+        // `handle_block_openers` below sets it again for the next one.
+        let follows_routine_body_block_open =
+            std::mem::take(&mut self.routine_body_block_just_opened);
+
         self.handle_routine_is_external(upper);
         self.track_create_plsql(upper);
-        self.track_sql_macro_call_spec(upper);
+        self.track_sql_macro_call_spec(upper, follows_routine_body_block_open);
         self.track_top_level_with_plsql(upper, at_statement_start);
 
         let token_prefixed_with_dollar = self.token_prefixed_with_dollar;
@@ -1118,12 +1141,8 @@ impl SplitState {
             if needs_begin_tracking {
                 self.routine_is_stack
                     .push(RoutineFrame::new(self.block_depth()));
-                if self.pending_sql_macro_call_spec {
-                    if let Some(frame) = self.routine_is_stack.last_mut() {
-                        frame.mark_external_clause();
-                    }
-                    self.pending_sql_macro_call_spec = false;
-                }
+                // The next word stands where this routine's BODY would.
+                self.routine_body_block_just_opened = true;
                 self.pending_subprogram_begins += 1;
             }
         } else if upper == "DECLARE" {
@@ -1308,7 +1327,10 @@ impl SplitState {
     }
 
     pub(crate) fn prepare_semicolon_action(&mut self) -> SemicolonAction {
-        self.pending_sql_macro_call_spec = false;
+        // The `;` is the half of `AS SQL_MACRO;` that makes it a call spec, so
+        // it is confirmed HERE — before any of the handlers below read the
+        // routine frame's policy.
+        self.confirm_sql_macro_call_spec_on_terminator();
         // FOR/WHILE ... DO candidates cannot span statement terminators.
         // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
         self.pending_do = PendingDo::None;
@@ -1467,7 +1489,8 @@ impl SplitState {
         self.begin_state = BeginState::None;
         self.as_is_state = AsIsState::None;
         self.pending_subprogram_begins = 0;
-        self.pending_sql_macro_call_spec = false;
+        self.routine_body_block_just_opened = false;
+        self.sql_macro_call_spec_armed = false;
         self.routine_is_stack.clear();
         self.timing_point_state = TimingPointState::None;
         self.saw_compound_keyword = false;
@@ -1529,14 +1552,12 @@ impl SplitState {
 
 
     pub(crate) fn track_create_plsql_symbol(&mut self, ch: char) {
-        if self.pending_sql_macro_call_spec && ch == '(' {
-            // `SQL_MACRO(TABLE)` / `SQL_MACRO(SCALAR)` is a function
-            // declaration property. It is followed by the real `AS`/`IS`
-            // routine body and must not be treated like the body-less
-            // `AS SQL_MACRO;` call-spec form.
-            self.pending_sql_macro_call_spec = false;
-        }
-
+        // A `(` used to be what UNDID a `SQL_MACRO` wrongly read as a call
+        // spec — `SQL_MACRO(TABLE)` could only be the header property. The
+        // position test in `track_sql_macro_call_spec` never makes that
+        // reading in the first place, so there is nothing left to undo, and
+        // the bare `RETURN VARCHAR2 SQL_MACRO` form (which has no `(` to save
+        // it) is right for the same reason.
         if self.block_depth() == 0
             && self.create_plsql_kind == CreatePlsqlKind::PackageBody
             && self.awaiting_package_body_name
@@ -1684,26 +1705,41 @@ impl SplitState {
         }
     }
 
-    fn track_sql_macro_call_spec(&mut self, upper: &str) {
-        if upper != "SQL_MACRO" {
+    /// `SQL_MACRO` means two different things, and only its POSITION tells
+    /// them apart.
+    ///
+    /// Standing where the body would — `AS SQL_MACRO;` / `IS SQL_MACRO;` — it
+    /// IS the body: a call spec, so the routine has no `BEGIN ... END` and the
+    /// next `;` closes it. Anywhere else it is the header property
+    /// `RETURN <type> SQL_MACRO[(SCALAR|TABLE)]`, which is followed by a real
+    /// body (a definition) or by nothing at all (a package-spec declaration) —
+    /// and in neither case does it end anything.
+    ///
+    /// Asking "is a routine frame open?" instead answered YES for the frame
+    /// the PACKAGE's own `AS` pushed, so every `SQL_MACRO` declaration in a
+    /// package spec was read as a call spec and its `;` ended the whole
+    /// `CREATE` — the spec reached the server truncated, and Oracle created it
+    /// "with errors". The same reading truncated a standalone
+    /// `RETURN VARCHAR2 SQL_MACRO IS BEGIN ... END;`; only the parenthesised
+    /// form survived, because a later `(` undid the marking.
+    /// Both halves are required, so neither is acted on alone: the state is
+    /// only ARMED here and [`Self::confirm_sql_macro_call_spec_on_terminator`]
+    /// is what fires it. Any other token disarms it — which is what keeps a
+    /// LOCAL VARIABLE named `sql_macro` (a perfectly legal name, and the first
+    /// thing a body may declare) from being read as the routine's whole body.
+    fn track_sql_macro_call_spec(&mut self, upper: &str, follows_routine_body_block_open: bool) {
+        self.sql_macro_call_spec_armed = upper == "SQL_MACRO" && follows_routine_body_block_open;
+    }
+
+    /// `AS SQL_MACRO ;` — the keyword stood where the body goes and the
+    /// terminator came next, so the routine HAS no `BEGIN ... END` and this
+    /// `;` closes it.
+    fn confirm_sql_macro_call_spec_on_terminator(&mut self) {
+        if !std::mem::take(&mut self.sql_macro_call_spec_armed) {
             return;
         }
-
-        let top_level_function_macro =
-            self.create_plsql_kind == CreatePlsqlKind::Function && self.in_create_plsql();
-        let nested_function_macro =
-            self.block_depth() > 0 && self.as_is_state == AsIsState::AwaitingNestedSubprogram;
-        let function_call_spec_macro =
-            self.block_stack.last() == Some(&BlockKind::AsIs) && self.pending_subprogram_begins > 0;
-
-        if !(top_level_function_macro || nested_function_macro || function_call_spec_macro) {
-            return;
-        }
-
-        self.pending_sql_macro_call_spec = true;
         if let Some(frame) = self.active_routine_frame_mut() {
             frame.mark_external_clause();
-            self.pending_sql_macro_call_spec = false;
         }
     }
 
