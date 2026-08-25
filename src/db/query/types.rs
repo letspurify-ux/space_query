@@ -89,6 +89,107 @@ pub struct ProcedureArgument {
     pub default_value: Option<String>,
 }
 
+/// How ONE overload of a routine can be invoked at all.
+///
+/// Oracle's `PIPELINED` and `AGGREGATE` functions are callable only from SQL —
+/// `PLS-00653` is what a PL/SQL block gets — and an argument row cannot say
+/// so: an aggregate function's `ALL_ARGUMENTS` rows are indistinguishable from
+/// an ordinary scalar function's. The flag lives in `ALL_PROCEDURES`, per
+/// overload, which is why it is carried per overload here.
+///
+/// The MySQL family has no such distinction (a stored routine is always
+/// callable the family's ordinary way), so its loaders leave the list empty
+/// and every overload reads as [`Self::pipelined`]/[`Self::aggregate`] false.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutineOverload {
+    /// `ALL_PROCEDURES.OVERLOAD`, matching `ALL_ARGUMENTS.OVERLOAD` value for
+    /// value (`NULL` for a routine that is not overloaded).
+    pub overload: Option<i32>,
+    pub pipelined: bool,
+    pub aggregate: bool,
+}
+
+/// Everything `Execute Procedure`/`Execute Function` needs to know about ONE
+/// routine to write a script that can actually run.
+///
+/// The two facts travel together on purpose. The script's SHAPE used to be
+/// decided from the argument list alone, which cannot answer "can this routine
+/// be called this way at all?" — so a pipelined or aggregate function got a
+/// PL/SQL block the server refuses to compile. A builder that takes this value
+/// cannot be handed arguments without also being handed the answer.
+///
+/// This value says only what the catalog DESCRIBED. Whether the catalog was
+/// willing to describe the routine at all is a different question, and
+/// [`RoutineDefinitionLookup`] is where it is answered — every loader in this
+/// app hands its definition out through one, so an empty [`Self::arguments`]
+/// reaching a script builder means "this routine takes no arguments" rather
+/// than "its arguments could not be read", two facts that used to be the same
+/// value. (The constructors below are public because a caller that already has
+/// the argument rows — the live verification harness — needs them; they carry
+/// no claim about readability, which is why that claim lives on the lookup and
+/// not here.)
+///
+/// There is no `Default`: an empty definition is a claim about a routine
+/// ("takes nothing, invoked the ordinary way"), and a claim has to be made by a
+/// named constructor that says where it came from.
+#[derive(Debug, Clone)]
+pub struct RoutineDefinition {
+    pub arguments: Vec<ProcedureArgument>,
+    pub overloads: Vec<RoutineOverload>,
+}
+
+impl RoutineDefinition {
+    /// A definition whose per-overload call forms were never READ.
+    ///
+    /// Two callers, and the name is deliberately the same for both because the
+    /// consequence is: the MySQL family, which has no such facts to read, and
+    /// Oracle's fail-open path, where `ALL_OBJECTS`/`ALL_PROCEDURES` could not
+    /// be reached. Either way every overload reads as
+    /// [`RoutineOverload::pipelined`]/[`RoutineOverload::aggregate`] false —
+    /// the ordinary form, which is the only shape this app can write without
+    /// those facts.
+    pub fn from_arguments(arguments: Vec<ProcedureArgument>) -> Self {
+        Self {
+            arguments,
+            overloads: Vec::new(),
+        }
+    }
+
+    /// A definition whose call forms came from a dictionary read that
+    /// SUCCEEDED. `overloads` may still be empty — see
+    /// [`Self::from_arguments`] for what an empty list then means to the
+    /// builders.
+    pub fn from_dictionary(
+        arguments: Vec<ProcedureArgument>,
+        overloads: Vec<RoutineOverload>,
+    ) -> Self {
+        Self {
+            arguments,
+            overloads,
+        }
+    }
+}
+
+/// The catalog's answer about ONE routine — and it is an ANSWER either way.
+///
+/// Kept apart from the `Err` of the lookup, which means something else
+/// entirely: `Err` is "the app could not ASK" (a session, a driver, a dropped
+/// connection), and the app then knows nothing about the routine. The two used
+/// to arrive as the same `Err(String)`, so the UI could only treat them the
+/// same — and its long-standing answer to a failed load is to open the
+/// parameterless call script, which is precisely the script
+/// [`Self::Unreadable`] rules out.
+#[derive(Debug, Clone)]
+pub enum RoutineDefinitionLookup {
+    /// The catalog described the routine.
+    Defined(RoutineDefinition),
+    /// The catalog was read and does not describe this routine's arguments —
+    /// it holds no compiled signature for it, or does not list it at all. The
+    /// text is the user-facing sentence, from
+    /// [`result_messages::routine_arguments_unreadable`].
+    Unreadable(String),
+}
+
 /// User-facing result messages shared by every database backend so the same
 /// operation reports the same text regardless of DB type or protocol.
 pub mod result_messages {
@@ -129,6 +230,32 @@ pub mod result_messages {
     pub const OBJECT_READ_EXCLUDES_UNCOMMITTED_WORK: &str =
         "This read ran on a separate DB session, so it does not include this tab's uncommitted \
          changes. Commit them first to include them.";
+
+    /// `Execute Procedure`/`Execute Function` could not read a routine's
+    /// argument list because the catalog does not describe it.
+    ///
+    /// One sentence for all four backends. It was two — Oracle said "the data
+    /// dictionary", the MySQL family said "the catalog" and named the routine
+    /// kind — which is two spellings of one situation and the exact place a
+    /// later fix reaches only one of them. `status` is the object's compile
+    /// state where the backend has one (Oracle `ALL_OBJECTS.STATUS`); the
+    /// MySQL family has no such state, because a routine whose body does not
+    /// compile is never created there in the first place.
+    pub fn routine_arguments_unreadable(display_name: &str, status: Option<&str>) -> String {
+        match status
+            .map(str::trim)
+            .filter(|status| !status.is_empty() && !status.eq_ignore_ascii_case("VALID"))
+        {
+            Some(status) => format!(
+                "Arguments for {display_name} could not be read: the object is {status}, so the \
+                 catalog holds no compiled signature for it. Compile it and retry."
+            ),
+            None => format!(
+                "Arguments for {display_name} could not be read: the catalog does not list it. It \
+                 may have been dropped, or this connection may not be allowed to see it."
+            ),
+        }
+    }
 
     /// The connection's OWN session was left in a state the app cannot
     /// describe, so the connection was replaced.
@@ -645,5 +772,92 @@ impl QueryResult {
             is_select: false,
             success: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod routine_definition_tests {
+    use super::{result_messages, ProcedureArgument, RoutineDefinition, RoutineOverload};
+
+    /// One sentence for all four backends.
+    ///
+    /// It was two — Oracle said "the data dictionary", the MySQL family said
+    /// "the catalog" and prefixed the routine kind — which is two spellings of
+    /// one situation, and the exact shape of thing a later fix reaches only
+    /// half of. `result_messages` exists to make that impossible; these two
+    /// sentences had been written outside it.
+    #[test]
+    fn one_unreadable_routine_sentence_serves_every_backend() {
+        let missing = result_messages::routine_arguments_unreadable("SCOTT.ZQ_GONE", None);
+        assert_eq!(
+            missing,
+            "Arguments for SCOTT.ZQ_GONE could not be read: the catalog does not list it. It may \
+             have been dropped, or this connection may not be allowed to see it."
+        );
+        // The MySQL family reaches the same text through the same function —
+        // only the display name differs, because only the name differs.
+        assert_eq!(
+            result_messages::routine_arguments_unreadable("app.zq_gone", None),
+            missing.replace("SCOTT.ZQ_GONE", "app.zq_gone")
+        );
+
+        // A compile state, where the backend has one, says WHY instead.
+        assert_eq!(
+            result_messages::routine_arguments_unreadable("SCOTT.ZQ_BAD", Some("INVALID")),
+            "Arguments for SCOTT.ZQ_BAD could not be read: the object is INVALID, so the catalog \
+             holds no compiled signature for it. Compile it and retry."
+        );
+        // `VALID` and blank are not reasons: a listed, valid object that
+        // reaches here is one the dictionary simply does not hold a signature
+        // for, which is the missing-object sentence.
+        for status in ["VALID", "valid", "  ", ""] {
+            assert_eq!(
+                result_messages::routine_arguments_unreadable("SCOTT.ZQ_GONE", Some(status)),
+                missing,
+                "status {status:?} is not a reason"
+            );
+        }
+    }
+
+    /// The two roads to a definition are NAMED, because they carry different
+    /// knowledge: `from_dictionary` saw the per-overload call forms,
+    /// `from_arguments` never asked for them (the MySQL family has none, and
+    /// Oracle's fail-open path could not reach them). There is deliberately no
+    /// `Default` — an empty definition is a claim about a routine.
+    #[test]
+    fn a_definition_says_where_its_call_forms_came_from() {
+        let argument = ProcedureArgument {
+            name: Some("A".to_string()),
+            position: 1,
+            sequence: 1,
+            data_type: Some("NUMBER".to_string()),
+            in_out: Some("IN".to_string()),
+            data_length: None,
+            data_precision: None,
+            data_scale: None,
+            type_owner: None,
+            type_name: None,
+            type_subname: None,
+            pls_type: None,
+            overload: None,
+            default_value: None,
+        };
+
+        let unasked = RoutineDefinition::from_arguments(vec![argument.clone()]);
+        assert_eq!(unasked.arguments.len(), 1);
+        assert!(
+            unasked.overloads.is_empty(),
+            "no call forms were read, so none are claimed"
+        );
+
+        let read = RoutineDefinition::from_dictionary(
+            vec![argument],
+            vec![RoutineOverload {
+                overload: None,
+                pipelined: true,
+                aggregate: false,
+            }],
+        );
+        assert!(read.overloads[0].pipelined);
     }
 }

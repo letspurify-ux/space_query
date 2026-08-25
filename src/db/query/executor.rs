@@ -19,7 +19,8 @@ use crate::utils::logging;
 use super::script::MysqlDelimitedStatementState;
 use super::{
     result_messages, ColumnInfo, ProcedureArgument, QueryCell, QueryResult, ResolvedBind,
-    ScriptItem, SqlValueKind, StatementResultKind, ToolCommand,
+    RoutineDefinition, RoutineDefinitionLookup, RoutineOverload, ScriptItem, SqlValueKind,
+    StatementResultKind, ToolCommand,
 };
 
 pub struct QueryExecutor;
@@ -8600,6 +8601,33 @@ pub struct PackageRoutine {
     pub routine_type: String,
 }
 
+/// What one `ALL_OBJECTS`/`ALL_PROCEDURES` read said about a routine.
+///
+/// Only ever built from a read that SUCCEEDED. "The read failed" is carried as
+/// `Option::None` AROUND this value rather than as an empty one, because the
+/// two answers lead opposite ways: a dictionary that said nothing means the
+/// routine's arguments cannot be trusted, while a dictionary that could not be
+/// asked means nothing at all — see
+/// [`ObjectBrowser::routine_definition_or_error`].
+#[derive(Debug, Default)]
+struct RoutineDictionaryEntry {
+    /// `ALL_OBJECTS.STATUS` of the object the routine lives in — the routine
+    /// itself, or its package.
+    status: Option<String>,
+    /// One entry per overload the dictionary listed for THIS routine.
+    overloads: Vec<RoutineOverload>,
+}
+
+impl RoutineDictionaryEntry {
+    fn absorb(&mut self, row: (Option<String>, Option<RoutineOverload>)) {
+        let (status, overload) = row;
+        // Every row of one read describes the same object, so the first
+        // status is the object's status.
+        self.status = self.status.take().or(status);
+        self.overloads.extend(overload);
+    }
+}
+
 impl ObjectBrowser {
     fn normalize_generated_ddl(ddl: String) -> String {
         let normalized_newlines = ddl.replace("\r\n", "\n");
@@ -9549,6 +9577,19 @@ impl ObjectBrowser {
     /// Looks for top-level PROCEDURE/FUNCTION keywords, skipping those inside
     /// comments, string literals (q-quoted forms included), and type/cursor
     /// declarations.
+    ///
+    /// Each name is recorded as the SERVER STORES it, which is the reading
+    /// [`QueryExecutor::normalize_object_name`] gives the same text: a bare
+    /// name is upper-cased, a quoted one keeps its spelling. That is also what
+    /// the dictionary fallback ([`Self::get_package_routines_from_dict`])
+    /// returns, so the two sources of one package's member list agree.
+    ///
+    /// Upper-casing a QUOTED name was a defect with a long reach: the tree is
+    /// where every `Execute Procedure`/`Execute Function` gets its member name,
+    /// so `PROCEDURE "myProc"` reached the script as `MYPROC` — a name PL/SQL
+    /// resolves to nothing (PLS-00302) and the argument lookup finds no rows
+    /// for. It also made `"myProc"` and `MYPROC`, two routines a package may
+    /// legally declare side by side, collide into one entry.
     fn parse_package_spec_routines(source: &str) -> Vec<PackageRoutine> {
         let mut routines: Vec<PackageRoutine> = Vec::new();
         let mut seen = HashSet::new();
@@ -9643,10 +9684,14 @@ impl ObjectBrowser {
                 while j < len && bytes[j] != b'"' {
                     j += 1;
                 }
+                // A quoted name is stored exactly as written, so it is
+                // recorded exactly as written — and it is its OWN name: a
+                // package may declare `"myProc"` and `MYPROC` side by side,
+                // which a case-folded `seen` key would merge into one.
                 let name = source.get(qs..j).unwrap_or("").to_string();
-                if !name.is_empty() && seen.insert(name.to_uppercase()) {
+                if !name.is_empty() && seen.insert(name.clone()) {
                     routines.push(PackageRoutine {
-                        name: name.to_uppercase(),
+                        name,
                         routine_type: routine_type.to_string(),
                     });
                 }
@@ -9906,6 +9951,339 @@ impl ObjectBrowser {
         procedure_name: &str,
     ) -> Result<Vec<ProcedureArgument>, String> {
         Self::get_thin_procedure_arguments_inner(conn, Some(package_name), procedure_name)
+    }
+
+    /// What the dictionary says about a standalone routine — the arguments,
+    /// the rows that say how it can be invoked, or the answer that it cannot
+    /// be read at all.
+    ///
+    /// `Err` is reserved for a read that could not be MADE; the dictionary's
+    /// own "no" arrives as [`RoutineDefinitionLookup::Unreadable`], because
+    /// the caller has to act on the two differently.
+    ///
+    /// `procedure_name` is a name as this app WRITES it — optionally
+    /// `owner.`-qualified, each part quoted when the catalog's spelling needs
+    /// it — the same value the generated script names, so the lookup and the
+    /// call can never mean different routines.
+    pub fn get_procedure_definition(
+        conn: &Connection,
+        procedure_name: &str,
+    ) -> Result<RoutineDefinitionLookup, String> {
+        Self::get_procedure_definition_inner(conn, None, procedure_name)
+    }
+
+    /// The same lookup for one package member. Both names are written the
+    /// way this app writes them — see [`Self::get_procedure_definition`].
+    pub fn get_package_procedure_definition(
+        conn: &Connection,
+        package_name: &str,
+        procedure_name: &str,
+    ) -> Result<RoutineDefinitionLookup, String> {
+        Self::get_procedure_definition_inner(conn, Some(package_name), procedure_name)
+    }
+
+    pub fn get_thin_procedure_definition(
+        conn: &mut OracleThinSession,
+        procedure_name: &str,
+    ) -> Result<RoutineDefinitionLookup, String> {
+        Self::get_thin_procedure_definition_inner(conn, None, procedure_name)
+    }
+
+    pub fn get_thin_package_procedure_definition(
+        conn: &mut OracleThinSession,
+        package_name: &str,
+        procedure_name: &str,
+    ) -> Result<RoutineDefinitionLookup, String> {
+        Self::get_thin_procedure_definition_inner(conn, Some(package_name), procedure_name)
+    }
+
+    /// The `ALL_OBJECTS`/`ALL_PROCEDURES` read behind every
+    /// `get_*_definition`, column for column on both protocols.
+    ///
+    /// `ALL_PROCEDURES` is the dictionary's own answer to "is this routine's
+    /// compiled signature readable?": a routine whose body failed to compile
+    /// is in `ALL_OBJECTS` with `STATUS = 'INVALID'` and in neither
+    /// `ALL_PROCEDURES` nor `ALL_ARGUMENTS` (live-proven on 23ai, standalone
+    /// and package member alike), and an execute-only grantee sees exactly the
+    /// same rows in both views. So a routine with no `ALL_PROCEDURES` row is
+    /// one whose empty argument list means nothing.
+    ///
+    /// The `LEFT JOIN` is what lets one round trip answer both halves: the
+    /// object's STATUS says WHY the routine is unreadable, and the joined rows
+    /// (one per overload) say how each overload may be invoked.
+    /// The object is selected in an INLINE VIEW so that every placeholder
+    /// appears in the text in its own numeric order. The thin protocol pairs
+    /// binds with the placeholders in the order they APPEAR (see
+    /// `tns_thin::exec::parse_sql_bind_names`), so a `:3` written above `:1`
+    /// silently receives the first bind — which is exactly how the member name
+    /// once arrived as the owner and a pipelined package member came back
+    /// looking ordinary.
+    fn routine_dictionary_sql(package_member: bool) -> &'static str {
+        match package_member {
+            true => {
+                r#"
+                SELECT
+                    o.status,
+                    CASE WHEN p.object_name IS NULL THEN 'N' ELSE 'Y' END,
+                    p.overload,
+                    p.pipelined,
+                    p.aggregate
+                FROM (
+                    SELECT owner, object_name, status
+                    FROM all_objects
+                    WHERE owner = :1
+                      AND object_name = :2
+                      AND object_type = 'PACKAGE'
+                ) o
+                LEFT JOIN all_procedures p
+                  ON p.owner = o.owner
+                 AND p.object_name = o.object_name
+                 AND p.procedure_name = :3
+                "#
+            }
+            false => {
+                r#"
+                SELECT
+                    o.status,
+                    CASE WHEN p.object_name IS NULL THEN 'N' ELSE 'Y' END,
+                    p.overload,
+                    p.pipelined,
+                    p.aggregate
+                FROM (
+                    SELECT owner, object_name, status
+                    FROM all_objects
+                    WHERE owner = :1
+                      AND object_name = :2
+                      AND object_type IN ('PROCEDURE', 'FUNCTION')
+                ) o
+                LEFT JOIN all_procedures p
+                  ON p.owner = o.owner
+                 AND p.object_name = o.object_name
+                 AND p.procedure_name IS NULL
+                "#
+            }
+        }
+    }
+
+    /// One dictionary row as the two facts it carries: the object's status and
+    /// — when the routine itself was found — how that overload is invoked.
+    fn routine_dictionary_row(
+        status: Option<String>,
+        found: Option<String>,
+        overload: Option<String>,
+        pipelined: Option<String>,
+        aggregate: Option<String>,
+    ) -> (Option<String>, Option<RoutineOverload>) {
+        let status = status.map(|value| value.trim().to_string());
+        if !Self::dictionary_flag_is_yes(found.as_deref()) {
+            return (status, None);
+        }
+        (
+            status,
+            Some(RoutineOverload {
+                overload: overload.and_then(|value| value.trim().parse::<i32>().ok()),
+                pipelined: Self::dictionary_flag_is_yes(pipelined.as_deref()),
+                aggregate: Self::dictionary_flag_is_yes(aggregate.as_deref()),
+            }),
+        )
+    }
+
+    /// One reading for both spellings of "yes" in the row above: Oracle writes
+    /// `ALL_PROCEDURES.PIPELINED`/`AGGREGATE` as `YES`/`NO`, while the join
+    /// marker this app adds is `Y`/`N`. Two spellings and one meaning is
+    /// exactly the place a per-column test would drift, so the rule is asked
+    /// once — a value that starts with `Y`.
+    fn dictionary_flag_is_yes(value: Option<&str>) -> bool {
+        value.is_some_and(|value| {
+            value
+                .trim()
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'Y'))
+        })
+    }
+
+    fn routine_display_name(package_name: Option<&str>, procedure_name: &str) -> String {
+        match package_name {
+            Some(package_name) => format!("{package_name}.{procedure_name}"),
+            None => procedure_name.to_string(),
+        }
+    }
+
+    fn get_procedure_definition_inner(
+        conn: &Connection,
+        package_name: Option<&str>,
+        procedure_name: &str,
+    ) -> Result<RoutineDefinitionLookup, String> {
+        let display_name = Self::routine_display_name(package_name, procedure_name);
+        let arguments = Self::get_procedure_arguments_inner(conn, package_name, procedure_name)
+            .map_err(|err| err.to_string())?;
+        let dictionary = Self::read_routine_dictionary(conn, package_name, procedure_name);
+        Ok(Self::routine_definition_lookup(
+            &display_name,
+            arguments,
+            dictionary,
+        ))
+    }
+
+    /// The dictionary read, or `None` when it could not be MADE.
+    ///
+    /// `None` is not "the dictionary said nothing" — see
+    /// [`Self::routine_definition_lookup`] for why the two must stay apart.
+    fn read_routine_dictionary(
+        conn: &Connection,
+        package_name: Option<&str>,
+        procedure_name: &str,
+    ) -> Option<RoutineDictionaryEntry> {
+        let (owner, object_name, member_name) =
+            Self::routine_dictionary_key(package_name, procedure_name);
+        let owner = QueryExecutor::owner_or_current_schema(conn, owner).ok()?;
+        let sql = Self::routine_dictionary_sql(member_name.is_some());
+        let mut stmt = conn.statement(sql).build().ok()?;
+        let rows = match member_name.as_deref() {
+            Some(member_name) => stmt.query(&[&owner, &object_name, &member_name]),
+            None => stmt.query(&[&owner, &object_name]),
+        }
+        .ok()?;
+
+        let mut entry = RoutineDictionaryEntry::default();
+        for row_result in rows {
+            let row: Row = row_result.ok()?;
+            // A column that cannot be read abandons the whole READ rather than
+            // contributing a row that says nothing — the caller reads "nothing
+            // said" as "the routine is not there".
+            entry.absorb(Self::routine_dictionary_row(
+                row.get::<_, Option<String>>(0).ok()?,
+                row.get::<_, Option<String>>(1).ok()?,
+                row.get::<_, Option<String>>(2).ok()?,
+                row.get::<_, Option<String>>(3).ok()?,
+                row.get::<_, Option<String>>(4).ok()?,
+            ));
+        }
+        Some(entry)
+    }
+
+    fn get_thin_procedure_definition_inner(
+        conn: &mut OracleThinSession,
+        package_name: Option<&str>,
+        procedure_name: &str,
+    ) -> Result<RoutineDefinitionLookup, String> {
+        let display_name = Self::routine_display_name(package_name, procedure_name);
+        let arguments =
+            Self::get_thin_procedure_arguments_inner(conn, package_name, procedure_name)?;
+
+        let dictionary = Self::read_thin_routine_dictionary(conn, package_name, procedure_name);
+        Ok(Self::routine_definition_lookup(
+            &display_name,
+            arguments,
+            dictionary,
+        ))
+    }
+
+    /// The thin twin of [`Self::read_routine_dictionary`], row for row.
+    fn read_thin_routine_dictionary(
+        conn: &mut OracleThinSession,
+        package_name: Option<&str>,
+        procedure_name: &str,
+    ) -> Option<RoutineDictionaryEntry> {
+        let (owner, object_name, member_name) =
+            Self::routine_dictionary_key(package_name, procedure_name);
+        let owner = Self::thin_owner_or_current_schema(conn, owner).ok()?;
+        let sql = Self::routine_dictionary_sql(member_name.is_some());
+        let mut binds = vec![
+            OracleThinBindValue::Text(owner),
+            OracleThinBindValue::Text(object_name),
+        ];
+        if let Some(member_name) = member_name {
+            binds.push(OracleThinBindValue::Text(member_name));
+        }
+        let rows = Self::thin_query_text_rows(conn, sql, 5, binds).ok()?;
+
+        let mut entry = RoutineDictionaryEntry::default();
+        for row in rows {
+            // Same rule as the OCI twin: a row that is not the shape the
+            // SELECT asked for abandons the read instead of answering it.
+            if row.len() < 5 {
+                return None;
+            }
+            let read = |index: usize| {
+                row.get(index)
+                    .and_then(|value| Self::thin_optional_text(value))
+            };
+            entry.absorb(Self::routine_dictionary_row(
+                read(0),
+                read(1),
+                read(2),
+                read(3),
+                read(4),
+            ));
+        }
+        Some(entry)
+    }
+
+    /// The owner / object / member triple both protocols bind, from names
+    /// written the way this app writes them.
+    ///
+    /// The member name goes through the SAME reader as the object name
+    /// ([`Self::normalize_object_name`]: quoted text keeps its case, bare text
+    /// is the uppercase the server would have stored). Reading it any other
+    /// way is what made a quoted mixed-case package member resolve to a name
+    /// the dictionary does not hold.
+    fn routine_dictionary_key(
+        package_name: Option<&str>,
+        procedure_name: &str,
+    ) -> (Option<String>, String, Option<String>) {
+        match package_name {
+            Some(package_name) => {
+                let (owner, package_name) =
+                    QueryExecutor::split_normalized_owner_object_name(package_name);
+                (
+                    owner,
+                    package_name,
+                    Some(QueryExecutor::normalize_object_name(procedure_name)),
+                )
+            }
+            None => {
+                let (owner, procedure_name) =
+                    QueryExecutor::split_normalized_owner_object_name(procedure_name);
+                (owner, procedure_name, None)
+            }
+        }
+    }
+
+    /// The gate a [`RoutineDefinition`] can only be reached through: it is
+    /// built only when the dictionary confirmed the routine is readable.
+    ///
+    /// Arguments that were read are proof enough on their own — the gate is
+    /// only ever reached by a routine with none, which is exactly the case
+    /// "takes no arguments" and "cannot be read" used to share.
+    ///
+    /// A dictionary that could not be READ (`None`) is the third case and must
+    /// not be folded into the second: a connection that can reach
+    /// `ALL_ARGUMENTS` but not `ALL_OBJECTS`/`ALL_PROCEDURES` would otherwise
+    /// lose a script it can perfectly well build. It takes the
+    /// `from_arguments` road — call forms unknown, ordinary shape — which is
+    /// the answer this app gave before it ever asked.
+    fn routine_definition_lookup(
+        display_name: &str,
+        arguments: Vec<ProcedureArgument>,
+        dictionary: Option<RoutineDictionaryEntry>,
+    ) -> RoutineDefinitionLookup {
+        let Some(dictionary) = dictionary else {
+            return RoutineDefinitionLookup::Defined(RoutineDefinition::from_arguments(arguments));
+        };
+        if arguments.is_empty() && dictionary.overloads.is_empty() {
+            return RoutineDefinitionLookup::Unreadable(
+                result_messages::routine_arguments_unreadable(
+                    display_name,
+                    dictionary.status.as_deref(),
+                ),
+            );
+        }
+        RoutineDefinitionLookup::Defined(RoutineDefinition::from_dictionary(
+            arguments,
+            dictionary.overloads,
+        ))
     }
 
     fn get_thin_procedure_arguments_inner(
@@ -12065,7 +12443,7 @@ mod oracle_lazy_fetch_integration_tests {
 
 #[cfg(test)]
 mod package_spec_routine_parse_tests {
-    use super::ObjectBrowser;
+    use super::{ObjectBrowser, QueryExecutor};
 
     fn names_and_types(source: &str) -> Vec<(String, String)> {
         ObjectBrowser::parse_package_spec_routines(source)
@@ -12133,6 +12511,57 @@ mod package_spec_routine_parse_tests {
         assert_eq!(names_and_types(unterminated), Vec::new());
     }
 
+    /// A QUOTED member name is recorded the way the server stores it.
+    ///
+    /// The tree this list builds is where every `Execute Procedure` /
+    /// `Execute Function` gets its member name, so upper-casing a quoted one
+    /// reached the generated script as a name PL/SQL resolves to nothing
+    /// (PLS-00302) and the argument lookup finds no rows for — the exact case
+    /// the dictionary-side reader was taught to handle, through a UI path that
+    /// could never supply it. It also merged `"myProc"` and `MYPROC`, two
+    /// routines a package may legally declare side by side.
+    ///
+    /// A quoted name that is ALREADY the stored spelling stays byte-identical
+    /// to the bare form, so an ordinary package's list does not change.
+    #[test]
+    fn a_quoted_member_name_is_recorded_as_the_server_stores_it() {
+        let source = "PACKAGE demo AS\n\
+             PROCEDURE \"myProc\"(a IN NUMBER);\n\
+             PROCEDURE MYPROC(a IN NUMBER);\n\
+             FUNCTION \"UPPER_QUOTED\" RETURN NUMBER;\n\
+             PROCEDURE plain_one;\n\
+             END;";
+        assert_eq!(
+            names_and_types(source),
+            vec![
+                ("MYPROC".to_string(), "PROCEDURE".to_string()),
+                ("PLAIN_ONE".to_string(), "PROCEDURE".to_string()),
+                ("UPPER_QUOTED".to_string(), "FUNCTION".to_string()),
+                // Its own routine, not a duplicate of MYPROC.
+                ("myProc".to_string(), "PROCEDURE".to_string()),
+            ]
+        );
+    }
+
+    /// The name each entry carries is the one
+    /// [`QueryExecutor::normalize_object_name`] reads out of the declaration,
+    /// so the tree, the generated call and the dictionary lookup all mean the
+    /// same routine.
+    #[test]
+    fn member_names_read_the_same_way_the_dictionary_lookup_reads_them() {
+        for declared in ["\"myProc\"", "MYPROC", "my_proc", "\"UPPER_QUOTED\""] {
+            let source = format!("PACKAGE demo AS\nPROCEDURE {declared};\nEND;");
+            assert_eq!(
+                names_and_types(&source),
+                vec![(
+                    QueryExecutor::normalize_object_name(declared),
+                    "PROCEDURE".to_string()
+                )],
+                "declared as {declared}"
+            );
+        }
+    }
+
     /// An identifier ENDING in q followed by a plain literal is not a
     /// q-quote: `myq` is a name and `'x'` an ordinary string.
     #[test]
@@ -12164,6 +12593,266 @@ mod package_spec_routine_parse_tests {
                 ("REAL_FUNC".to_string(), "FUNCTION".to_string()),
                 ("REAL_PROC".to_string(), "PROCEDURE".to_string()),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod routine_definition_tests {
+    use super::{result_messages, ObjectBrowser, QueryExecutor};
+
+    /// The name the argument lookup reads is the name the generated script
+    /// writes. A `.` inside a quoted name belongs to the NAME, and a quoted
+    /// name keeps its case while a bare one becomes the uppercase the server
+    /// would have stored.
+    #[test]
+    fn split_normalized_owner_object_name_reads_a_quoted_dot_as_one_name() {
+        assert_eq!(
+            QueryExecutor::split_normalized_owner_object_name(r#"SCOTT."MY.PROC""#),
+            (Some("SCOTT".to_string()), "MY.PROC".to_string())
+        );
+        assert_eq!(
+            QueryExecutor::split_normalized_owner_object_name(r#""MY.PROC""#),
+            (None, "MY.PROC".to_string())
+        );
+        assert_eq!(
+            QueryExecutor::split_normalized_owner_object_name("SCOTT.my_proc"),
+            (Some("SCOTT".to_string()), "MY_PROC".to_string())
+        );
+    }
+
+    /// A package member's name has to reach the dictionary through the same
+    /// reader the package name does. Passing it BARE ran an uppercasing
+    /// reader over a catalog spelling, so a quoted-created `"myProc"` was
+    /// looked up as `MYPROC` — a name the dictionary does not hold — and the
+    /// empty answer became a parameterless call script (PLS-00306, live-proven
+    /// on 23ai).
+    #[test]
+    fn routine_dictionary_key_keeps_a_quoted_member_name_as_the_catalog_spells_it() {
+        assert_eq!(
+            ObjectBrowser::routine_dictionary_key(Some(r#"SYSTEM.ZQ_CASE_PKG"#), r#""myProc""#),
+            (
+                Some("SYSTEM".to_string()),
+                "ZQ_CASE_PKG".to_string(),
+                Some("myProc".to_string())
+            )
+        );
+        // An ordinary member is byte-identical either way.
+        assert_eq!(
+            ObjectBrowser::routine_dictionary_key(Some("SYSTEM.ZQ_PKG"), "SOLO"),
+            (
+                Some("SYSTEM".to_string()),
+                "ZQ_PKG".to_string(),
+                Some("SOLO".to_string())
+            )
+        );
+        // A standalone routine has no member half, and its own name is split
+        // off the owner exactly as before.
+        assert_eq!(
+            ObjectBrowser::routine_dictionary_key(None, "SYSTEM.ZQ_OK"),
+            (Some("SYSTEM".to_string()), "ZQ_OK".to_string(), None)
+        );
+    }
+
+    /// "This routine takes no arguments" and "its arguments could not be read"
+    /// must not be the same value: the script builder turns the first into a
+    /// parameterless call, and used to do the same with the second.
+    ///
+    /// `ALL_PROCEDURES` is the dictionary's own answer — live-proven on 23ai:
+    /// an INVALID routine is in `ALL_OBJECTS` and in NEITHER `ALL_PROCEDURES`
+    /// nor `ALL_ARGUMENTS`, while an argument-less VALID one is in both.
+    #[test]
+    fn a_routine_definition_exists_only_when_the_dictionary_lists_the_routine() {
+        use super::RoutineDefinitionLookup;
+
+        let listed = |status: &str, overloads: Vec<super::RoutineOverload>| {
+            Some(super::RoutineDictionaryEntry {
+                status: Some(status.to_string()),
+                overloads,
+            })
+        };
+        let defined = |lookup: RoutineDefinitionLookup, what: &str| match lookup {
+            RoutineDefinitionLookup::Defined(definition) => definition,
+            RoutineDefinitionLookup::Unreadable(reason) => panic!("{what}: refused with {reason}"),
+        };
+        let unreadable = |lookup: RoutineDefinitionLookup, what: &str| match lookup {
+            RoutineDefinitionLookup::Unreadable(reason) => reason,
+            RoutineDefinitionLookup::Defined(definition) => panic!(
+                "{what}: answered with a definition of {} arguments",
+                definition.arguments.len()
+            ),
+        };
+
+        let no_args_but_listed = defined(
+            ObjectBrowser::routine_definition_lookup(
+                "SYSTEM.ZQ_NOARGS",
+                Vec::new(),
+                listed(
+                    "VALID",
+                    vec![super::RoutineOverload {
+                        overload: None,
+                        pipelined: false,
+                        aggregate: false,
+                    }],
+                ),
+            ),
+            "a listed routine with no arguments is a definition",
+        );
+        assert!(no_args_but_listed.arguments.is_empty());
+
+        let invalid = unreadable(
+            ObjectBrowser::routine_definition_lookup(
+                "SYSTEM.ZQ_BAD",
+                Vec::new(),
+                listed("INVALID", Vec::new()),
+            ),
+            "an unlisted routine has no definition",
+        );
+        // Byte-identical to the shared sentence: this backend must not own a
+        // second spelling of it. (`result_messages` is where the four backends
+        // agree on what the user reads.)
+        assert_eq!(
+            invalid,
+            result_messages::routine_arguments_unreadable("SYSTEM.ZQ_BAD", Some("INVALID"))
+        );
+        assert!(invalid.contains("SYSTEM.ZQ_BAD"), "{invalid}");
+        assert!(invalid.contains("INVALID"), "{invalid}");
+
+        let gone = unreadable(
+            ObjectBrowser::routine_definition_lookup(
+                "SYSTEM.ZQ_GONE",
+                Vec::new(),
+                Some(super::RoutineDictionaryEntry::default()),
+            ),
+            "a routine the dictionary does not hold has no definition",
+        );
+        assert_eq!(
+            gone,
+            result_messages::routine_arguments_unreadable("SYSTEM.ZQ_GONE", None)
+        );
+        assert!(gone.contains("SYSTEM.ZQ_GONE"), "{gone}");
+        assert!(gone.contains("dropped"), "{gone}");
+
+        // A dictionary that could not be READ is not a dictionary that said
+        // "absent": a connection allowed to read ALL_ARGUMENTS but not
+        // ALL_OBJECTS/ALL_PROCEDURES must still get its script.
+        let unaskable = defined(
+            ObjectBrowser::routine_definition_lookup("SYSTEM.ZQ_NOARGS", Vec::new(), None),
+            "an unaskable dictionary is not a refusal",
+        );
+        assert!(unaskable.arguments.is_empty());
+        assert!(unaskable.overloads.is_empty());
+
+        // Arguments that WERE read are proof on their own: the gate must not
+        // second-guess a dictionary row it never needed.
+        defined(
+            ObjectBrowser::routine_definition_lookup(
+                "SYSTEM.ZQ_OK",
+                vec![super::ProcedureArgument {
+                    name: Some("A".to_string()),
+                    position: 1,
+                    sequence: 1,
+                    data_type: Some("NUMBER".to_string()),
+                    in_out: Some("IN".to_string()),
+                    data_length: None,
+                    data_precision: None,
+                    data_scale: None,
+                    type_owner: None,
+                    type_name: None,
+                    type_subname: None,
+                    pls_type: None,
+                    overload: None,
+                    default_value: None,
+                }],
+                listed("INVALID", Vec::new()),
+            ),
+            "arguments that were read are their own proof",
+        );
+    }
+
+    /// Every numbered placeholder must appear in its own numeric order.
+    ///
+    /// The thin protocol pairs the supplied binds with the placeholders in the
+    /// order they APPEAR in the text, not by the number in their names, so a
+    /// `:3` written above `:1` receives the FIRST bind. That is not a syntax
+    /// error and not a wrong-row error either — the query simply answers about
+    /// a different object, which is how a pipelined package member first came
+    /// back looking ordinary (caught by the live round trip, not by a type).
+    #[test]
+    fn routine_dictionary_sql_numbers_its_binds_in_appearance_order() {
+        for package_member in [true, false] {
+            let sql = ObjectBrowser::routine_dictionary_sql(package_member);
+            let mut seen: Vec<usize> = Vec::new();
+            let bytes = sql.as_bytes();
+            for (index, byte) in bytes.iter().enumerate() {
+                if *byte != b':' {
+                    continue;
+                }
+                let digits: String = sql[index + 1..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                if let Ok(number) = digits.parse::<usize>() {
+                    seen.push(number);
+                }
+            }
+            let expected: Vec<usize> = (1..=seen.len()).collect();
+            assert_eq!(
+                seen, expected,
+                "package_member={package_member}: placeholders must read 1, 2, 3 ... in order"
+            );
+        }
+    }
+
+    /// The dictionary row reader: a routine that did not join carries no call
+    /// form at all, and `PIPELINED`/`AGGREGATE` are read as the `Y`/`N` the
+    /// view spells them.
+    #[test]
+    fn routine_dictionary_row_reads_the_join_marker_before_the_flags() {
+        let yes = |value: &str| Some(value.to_string());
+        assert_eq!(
+            ObjectBrowser::routine_dictionary_row(
+                yes("VALID"),
+                yes("N"),
+                yes("1"),
+                yes("YES"),
+                yes("NO")
+            ),
+            (Some("VALID".to_string()), None)
+        );
+        assert_eq!(
+            ObjectBrowser::routine_dictionary_row(
+                yes("VALID"),
+                yes("Y"),
+                yes("2"),
+                yes("YES"),
+                yes("NO")
+            ),
+            (
+                Some("VALID".to_string()),
+                Some(super::RoutineOverload {
+                    overload: Some(2),
+                    pipelined: true,
+                    aggregate: false,
+                })
+            )
+        );
+        assert_eq!(
+            ObjectBrowser::routine_dictionary_row(
+                yes("VALID"),
+                yes("Y"),
+                None,
+                yes("NO"),
+                yes("YES")
+            ),
+            (
+                Some("VALID".to_string()),
+                Some(super::RoutineOverload {
+                    overload: None,
+                    pipelined: false,
+                    aggregate: true,
+                })
+            )
         );
     }
 }

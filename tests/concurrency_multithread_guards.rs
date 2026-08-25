@@ -12418,6 +12418,29 @@ fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
          the user to retry one: {watchdog_body}"
     );
 
+    // Both tiers send their graceful break through ONE function, so the slot
+    // read is asserted where it now lives — and asserting that each road CALLS
+    // that function is what keeps either of them from hand-rolling the send
+    // again and drifting apart.
+    let sender = slice_to_end_of_fn(
+        &editor,
+        editor
+            .find("fn send_and_finish_graceful_break(")
+            .expect("one sender must own the break both tiers send"),
+    );
+    assert!(
+        sender
+            .contains("QueryCancelHandle::OperationSlot(Arc::clone(current_query_cancel_handle))"),
+        "and it must hold the SLOT while it acts, so a hand-back landing while the break \
+         travels withdraws it instead of letting it act on a handle cloned a moment \
+         earlier: {sender}"
+    );
+    assert!(
+        watchdog_body
+            .contains("Self::send_and_finish_graceful_break(&current_query_cancel_handle)"),
+        "the force tier's fallback break goes through that sender: {watchdog_body}"
+    );
+
     // The graceful tier reads through the slot as well, and answers a withdraw
     // the way it answers a session that has not arrived: keep waiting.
     let road = slice_to_end_of_fn(
@@ -12427,8 +12450,8 @@ fn both_query_cancel_tiers_read_the_operation_slot_again_before_they_act() {
             .expect("the query tab's cancel road should exist"),
     );
     let graceful = road
-        .find("let cancel_handle =\n                    QueryCancelHandle::OperationSlot(Arc::clone(&current_query_cancel_handle));")
-        .expect("the graceful tier must read through the slot too");
+        .find("SqlEditorWidget::send_and_finish_graceful_break(&current_query_cancel_handle)")
+        .expect("the graceful tier must send through that sender too");
     let graceful_body = &road[graceful..];
     assert!(
         graceful_body.contains("Ok(SessionCancelDelivery::Withdrawn) => {")
@@ -14141,7 +14164,7 @@ fn the_force_tier_is_never_the_first_thing_a_session_sees() {
         .find("match SqlEditorWidget::claim_graceful_break(&current_query_cancel_handle) {")
         .expect("the cancel thread must claim the break it is about to send");
     let graceful_send = editor[graceful..]
-        .find("cancel_handle.cancel_interrupt(")
+        .find("SqlEditorWidget::send_and_finish_graceful_break(")
         .expect("the cancel thread must then send it");
     assert!(graceful_send > 0, "claimed before sent");
 

@@ -409,7 +409,7 @@ type MetadataCallback = Arc<Mutex<Option<Box<dyn FnMut(ObjectBrowserMetadataSnap
 type TabMetadataCallback =
     Arc<Mutex<Option<Box<dyn FnMut(QueryTabId, ObjectBrowserMetadataSnapshot)>>>>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObjectItem {
     Simple {
         object_type: String,
@@ -439,7 +439,73 @@ struct ResolvedObjectContext {
 struct RoutineScriptData {
     qualified_name: String,
     resolved_routine_type: String,
-    sql: String,
+    outcome: RoutineScriptOutcome,
+}
+
+/// What a routine-script load produced.
+///
+/// The two are not the same failure and must not be delivered the same way.
+/// An `Err` around this value means the app could not ASK — a session, a
+/// driver, a connection that went away — and it still knows nothing about the
+/// routine, so the long-standing simple-call fallback gives the user something
+/// to edit. [`Self::Unreadable`] is the catalog's own ANSWER: this routine's
+/// argument list cannot be read, which makes a parameterless call script
+/// precisely the thing that answer rules out.
+///
+/// They used to arrive as one `Result<String, String>`, so the delivery point
+/// could only treat them alike: it alerted, and then opened the parameterless
+/// script anyway — for a routine the catalog had just said takes two
+/// arguments, or is not there at all.
+enum RoutineScriptOutcome {
+    /// The script to open in a new tab.
+    Script(String),
+    /// Nothing is opened; the sentence is what the user is told instead.
+    Unreadable(String),
+}
+
+/// One identifier out of a selected object reference, with the fact a bare
+/// `String` loses: whether the selection wrote it QUOTED.
+///
+/// `SCOTT.EMP` and `SCOTT."EMP"` name the same object, but `pkg.myProc` and
+/// `pkg."myProc"` do not — Oracle's parser folds the first to `PKG.MYPROC`
+/// while the second is a name only a quoted declaration can create. Stripping
+/// the quotes and passing the raw text on answers neither question: it makes
+/// the two indistinguishable, so every lookup downstream has to guess, and one
+/// of them (the package-member reader) has to pick between two real routines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedObjectPart {
+    /// The identifier's text, quotes removed.
+    text: String,
+    /// Whether the selection wrote it inside `"…"`, `` `…` `` or `[…]`.
+    quoted: bool,
+}
+
+impl SelectedObjectPart {
+    /// The name this part DENOTES on `db_type` — what every lookup has to be
+    /// given.
+    ///
+    /// A quoted part denotes its text exactly. A bare one denotes whatever the
+    /// server's parser folds it to, which each backend answers for itself
+    /// ([`ObjectBrowserDbBehavior::denoted_bare_identifier`]).
+    ///
+    /// Inert for every case-insensitive matcher this feeds, which is all of
+    /// them but one: the package-member reader, which needs an EXACT spelling
+    /// precisely because a package may hold `MYPROC` and `"myProc"` at once.
+    fn denoted_name(&self, db_type: crate::db::DatabaseType) -> String {
+        match self.quoted {
+            true => self.text.clone(),
+            false => object_browser_behavior_for(db_type).denoted_bare_identifier(&self.text),
+        }
+    }
+}
+
+/// What the object browser does with a routine-script load's answer.
+#[derive(Debug, PartialEq, Eq)]
+struct RoutineScriptDelivery {
+    /// What the user is told, if anything.
+    alert: Option<String>,
+    /// What is opened in a new query tab, if anything.
+    open_sql: Option<String>,
 }
 
 /// What a routine does with ONE of its arguments.
@@ -502,6 +568,80 @@ enum OracleValueCarrier {
     Local,
 }
 
+/// The statement shape a routine can be invoked with at all.
+///
+/// Decided from what the ROUTINE IS, never from what its argument list looks
+/// like. Oracle's `PIPELINED` and `AGGREGATE` functions are callable only from
+/// SQL — a PL/SQL block naming one does not compile — and their argument rows
+/// are indistinguishable from an ordinary function's: an aggregate over
+/// `NUMBER` reads as `NUMBER f(NUMBER)` in `ALL_ARGUMENTS`. Asking the
+/// argument list is what produced a script that could never run, and asking it
+/// per BACKEND would not have helped either, because the same routine's
+/// argument-less form accidentally worked (the empty-list path already writes
+/// a `SELECT`) while its parameterised form did not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RoutineCallForm {
+    /// The family's ordinary form: a PL/SQL block on Oracle, `CALL`/`SELECT`
+    /// on the MySQL family. Everything the MySQL family has.
+    #[default]
+    Ordinary,
+    /// Oracle `PIPELINED`: rows, and only from a query's `FROM` clause.
+    PipelinedTable,
+    /// Oracle `AGGREGATE`: only from a query's select list.
+    Aggregate,
+}
+
+impl RoutineCallForm {
+    /// How the overload the script is being built for may be invoked.
+    ///
+    /// Keyed by overload because a package may legally overload one name with
+    /// a pipelined and an ordinary body, and `ALL_PROCEDURES.OVERLOAD` matches
+    /// `ALL_ARGUMENTS.OVERLOAD` value for value including `NULL` (live-proven
+    /// on 23ai for standalone routines, non-overloaded members and overloaded
+    /// members alike). An overload with no row — every MySQL-family routine,
+    /// and any Oracle routine whose dictionary row could not be matched — is
+    /// [`Self::Ordinary`], the form this app has always written.
+    fn of(overloads: &[crate::db::query::RoutineOverload], overload: Option<i32>) -> Self {
+        overloads
+            .iter()
+            .find(|candidate| candidate.overload == overload)
+            .map(
+                |candidate| match (candidate.pipelined, candidate.aggregate) {
+                    (true, _) => Self::PipelinedTable,
+                    (_, true) => Self::Aggregate,
+                    _ => Self::Ordinary,
+                },
+            )
+            .unwrap_or_default()
+    }
+
+    /// The query shape this form needs, or `None` when the family's ordinary
+    /// shape is the right one.
+    ///
+    /// Returning the shape rather than a yes/no is what lets
+    /// [`ObjectBrowserWidget::build_oracle_sql_scope_script`] take a value
+    /// that CANNOT be "ordinary": the two shapes differ in more than their
+    /// text — a query has nowhere to declare a variable, so nothing the
+    /// routine writes can be carried back — and a builder able to receive
+    /// `Ordinary` would need a branch for a case its caller already excluded.
+    fn sql_scope_shape(self) -> Option<OracleSqlScopeShape> {
+        match self {
+            Self::Ordinary => None,
+            Self::PipelinedTable => Some(OracleSqlScopeShape::PipelinedTable),
+            Self::Aggregate => Some(OracleSqlScopeShape::Aggregate),
+        }
+    }
+}
+
+/// The two statement shapes a routine only SQL can call is written with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OracleSqlScopeShape {
+    /// `SELECT * FROM TABLE(f(...))` — a `PIPELINED` function's rows.
+    PipelinedTable,
+    /// `SELECT f(...) FROM dual` — an `AGGREGATE` function's value.
+    Aggregate,
+}
+
 /// The longest variable name a generated Oracle script may declare.
 ///
 /// 128 bytes is the identifier limit of every Oracle release this app can
@@ -552,6 +692,14 @@ trait ObjectBrowserDbBehavior: Sync {
         package_name: &str,
         routine_name: &str,
     ) -> String;
+    /// The name a BARE identifier denotes on this backend.
+    ///
+    /// Oracle's parser folds an unquoted name to upper case, so `emp` names
+    /// `EMP` and only a quoted declaration can create `emp`. The MySQL family
+    /// folds nothing, so `emp` names `emp` and `Emp` really can be a second
+    /// object. Asked of the backend rather than tested in place because the
+    /// answer is a property OF the backend — a new one has to state its own.
+    fn denoted_bare_identifier(&self, identifier: &str) -> String;
     fn preview_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String;
     /// The statement `Export Data...` runs: the same relation the preview
     /// shows, with no row limit.
@@ -576,11 +724,17 @@ trait ObjectBrowserDbBehavior: Sync {
     /// family requires them) — one entry point so the kind cannot be
     /// forgotten at a call site.
     fn build_simple_routine_script(&self, qualified_name: &str, routine_type: &str) -> String;
+    /// The script for a routine whose definition was READ.
+    ///
+    /// Takes the whole [`RoutineDefinition`] rather than its argument list: the
+    /// statement shape depends on facts an argument row cannot carry, and a
+    /// builder that could be handed arguments alone is one that can be made to
+    /// write a shape the routine does not support.
     fn build_routine_script(
         &self,
         qualified_name: &str,
         routine_type: &str,
-        arguments: &[ProcedureArgument],
+        definition: &crate::db::query::RoutineDefinition,
     ) -> String;
     fn action_scope<'a>(
         &self,
@@ -801,7 +955,7 @@ enum ObjectActionResult {
         qualified_name: String,
         routine_type: String,
         db_type: crate::db::DatabaseType,
-        result: Result<String, String>,
+        result: Result<RoutineScriptOutcome, String>,
     },
     PackageRoutines {
         package_name: String,
@@ -3185,27 +3339,16 @@ impl ObjectBrowserWidget {
                             db_type,
                             result,
                         } => {
-                            let sql = match result {
-                                Ok(sql) => Some(sql),
-                                Err(err) => {
-                                    crate::ui::alert_on_main(&format!(
-                                        "Failed to load routine arguments: {}",
-                                        err
-                                    ));
-                                    if routine_type.eq_ignore_ascii_case("UNKNOWN") {
-                                        None
-                                    } else {
-                                        Some(
-                                            ObjectBrowserWidget::build_simple_routine_script_for_db(
-                                                db_type,
-                                                &qualified_name,
-                                                &routine_type,
-                                            ),
-                                        )
-                                    }
-                                }
-                            };
-                            if let Some(sql) = sql {
+                            let delivery = ObjectBrowserWidget::routine_script_delivery(
+                                db_type,
+                                &qualified_name,
+                                &routine_type,
+                                result,
+                            );
+                            if let Some(alert) = delivery.alert {
+                                crate::ui::alert_on_main(&alert);
+                            }
+                            if let Some(sql) = delivery.open_sql {
                                 ObjectBrowserWidget::emit_sql_callback(
                                     &sql_callback,
                                     SqlAction::OpenInNewTab(sql),
@@ -4355,6 +4498,23 @@ impl ObjectBrowserWidget {
             })
     }
 
+    /// One MySQL-family catalog name as a SEGMENT of a dotted path.
+    ///
+    /// Bare unless writing it bare would let
+    /// [`Self::quote_mysql_identifier_path`] read one name as two. That
+    /// splitter separates on an unquoted `.` and tracks backticks, so those
+    /// are the two characters a segment cannot carry unquoted — and both are
+    /// legal inside a MySQL/MariaDB identifier. Everything else is returned
+    /// untouched, which is what keeps every ordinary qualified name (and every
+    /// status message and completion text built from one) exactly as it was.
+    fn quote_mysql_path_segment(name: &str) -> String {
+        let name = name.trim();
+        match name.contains('.') || name.contains('`') {
+            true => format!("`{}`", name.replace('`', "``")),
+            false => name.to_string(),
+        }
+    }
+
     fn quote_mysql_identifier_path(identifier: &str) -> String {
         let mut segments = Vec::new();
         let mut start = 0usize;
@@ -4995,9 +5155,18 @@ impl ObjectBrowserWidget {
             .clone()
     }
 
+    /// `scope.object`, each part written the way Oracle has to read it.
+    ///
+    /// `object_name` is ONE object's name as the catalog spells it — the tree
+    /// and every selection resolver hand bare names — so a `.` inside it is
+    /// part of the name (a quoted-created `"MY.PROC"`, live-proven callable as
+    /// `SYSTEM."MY.PROC"`) and not a qualifier that is already there. Treating
+    /// it as one used to skip quoting entirely, which named a DIFFERENT object:
+    /// `MY.PROC` reads as schema `MY`, and the argument lookup — whose splitter
+    /// IS quote-aware — went looking in that schema too.
     fn qualify_oracle_object_name(selected_scope: Option<&str>, object_name: &str) -> String {
         let object_name = object_name.trim();
-        if object_name.is_empty() || object_name.contains('.') {
+        if object_name.is_empty() {
             return object_name.to_string();
         }
 
@@ -5128,9 +5297,9 @@ impl ObjectBrowserWidget {
     }
 
     /// The routine-call script `Execute Procedure`/`Execute Function` opens,
-    /// built from already-fetched arguments — the exact per-backend builder
+    /// built from an already-fetched definition — the exact per-backend builder
     /// the context menu uses. `#[doc(hidden)]`, for the live verification
-    /// harness (`verify_proc_exec_live`), which fetches arguments through the
+    /// harness (`verify_proc_exec_live`), which reads definitions through the
     /// same db-layer entry points the browser uses and asserts the generated
     /// script really runs on every backend.
     #[doc(hidden)]
@@ -5138,12 +5307,111 @@ impl ObjectBrowserWidget {
         db_type: crate::db::DatabaseType,
         qualified_name: &str,
         routine_type: &str,
-        arguments: &[ProcedureArgument],
+        definition: &crate::db::query::RoutineDefinition,
     ) -> String {
         object_browser_behavior_for(db_type).build_routine_script(
             qualified_name,
             routine_type,
-            arguments,
+            definition,
+        )
+    }
+
+    /// What `Execute Procedure`/`Execute Function`/`Execute Routine` does to
+    /// one tree item, from the click to what the user is shown: the real
+    /// loader on a real pooled session, and the real delivery rule.
+    ///
+    /// Returns `(qualified name, resolved kind, alert, sql opened)` — an
+    /// `alert` with no `sql` is the app refusing, which is the whole point of
+    /// the readability gate.
+    ///
+    /// `#[doc(hidden)]`, for the live verification harness
+    /// (`verify_proc_exec_live`). It composes the same three steps the context
+    /// menu's worker composes, in the same order; the menu splits them across
+    /// a thread and the action-result loop, which is why nothing could reach
+    /// this chain before — the standalone half needs a pooled session, and the
+    /// package half resolves an `UNKNOWN` kind against the server's own
+    /// package listing.
+    #[doc(hidden)]
+    pub fn routine_script_delivery_for_harness(
+        connection: &SharedConnection,
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+        item: &ObjectItem,
+        routine_type: &str,
+    ) -> (String, String, Option<String>, Option<String>) {
+        let activity = format!("Loading {routine_type} arguments (harness)");
+        let mut resolved_type = routine_type.to_string();
+        let mut load_db_type = db_type;
+        let (qualified_name, result) = match item {
+            ObjectItem::Simple { object_name, .. } => {
+                let mut qualified_name =
+                    Self::qualify_object_name_for_scope(db_type, selected_scope, object_name);
+                let result = Self::with_pooled_object_session(
+                    connection,
+                    selected_scope,
+                    activity,
+                    |context, session| {
+                        load_db_type = context.connection_info.db_type;
+                        let data = object_browser_behavior_for(load_db_type).load_routine_script(
+                            context,
+                            session,
+                            selected_scope,
+                            object_name,
+                            routine_type,
+                        )?;
+                        qualified_name = data.qualified_name;
+                        Ok(data.outcome)
+                    },
+                );
+                (qualified_name, result)
+            }
+            ObjectItem::PackageRoutine {
+                package_name,
+                routine_name,
+                ..
+            } => {
+                let mut qualified_name = Self::qualify_package_member_name(
+                    db_type,
+                    selected_scope,
+                    package_name,
+                    routine_name,
+                );
+                let result = object_browser_behavior_for(db_type)
+                    .load_package_routine_script(
+                        connection,
+                        activity,
+                        selected_scope,
+                        package_name,
+                        routine_name,
+                        routine_type,
+                    )
+                    .map(|data| {
+                        resolved_type = data.resolved_routine_type;
+                        qualified_name = data.qualified_name;
+                        data.outcome
+                    });
+                (qualified_name, result)
+            }
+            // Unreachable through the menu — its Execute arms match only the
+            // two shapes above — and answered here rather than left to the
+            // delivery rule, whose failed-load road would hand back a call
+            // script naming a column.
+            ObjectItem::Column { column_name, .. } => {
+                return (
+                    column_name.clone(),
+                    resolved_type,
+                    Some("a column is not a routine".to_string()),
+                    None,
+                )
+            }
+        };
+        let delivery =
+            Self::routine_script_delivery(load_db_type, &qualified_name, &resolved_type, result);
+        (
+            qualified_name,
+            resolved_type,
+            delivery.alert,
+            delivery.open_sql,
         )
     }
 
@@ -5154,6 +5422,119 @@ impl ObjectBrowserWidget {
     ) -> String {
         object_browser_behavior_for(db_type)
             .build_simple_routine_script(qualified_name, routine_type)
+    }
+
+    /// What `Execute Procedure`/`Execute Function` does with a load's answer:
+    /// what it SAYS, and what it OPENS.
+    ///
+    /// A value rather than a branch inside the action-result loop, because
+    /// this is the rule the whole readability gate exists to enforce and it
+    /// was previously unreachable by any test — the loop it lived in needs a
+    /// live connection, a worker thread and an FLTK event pump.
+    fn routine_script_delivery(
+        db_type: crate::db::DatabaseType,
+        qualified_name: &str,
+        routine_type: &str,
+        result: Result<RoutineScriptOutcome, String>,
+    ) -> RoutineScriptDelivery {
+        match result {
+            Ok(RoutineScriptOutcome::Script(sql)) => RoutineScriptDelivery {
+                alert: None,
+                open_sql: Some(sql),
+            },
+            // The catalog ANSWERED. A parameterless call is the one script
+            // that answer rules out, so the user is told and nothing is
+            // opened — the same treatment an unresolved kind has always had.
+            Ok(RoutineScriptOutcome::Unreadable(reason)) => RoutineScriptDelivery {
+                alert: Some(reason),
+                open_sql: None,
+            },
+            // The app could not ASK, so it knows nothing about the routine:
+            // the simple call script still gives the user something to edit.
+            Err(err) => RoutineScriptDelivery {
+                alert: Some(format!("Failed to load routine arguments: {err}")),
+                open_sql: (!routine_type.eq_ignore_ascii_case("UNKNOWN")).then(|| {
+                    Self::build_simple_routine_script_for_db(db_type, qualified_name, routine_type)
+                }),
+            },
+        }
+    }
+
+    /// One reading of the catalog's answer, for every backend: a definition
+    /// becomes that backend's script, and a refusal is carried through as a
+    /// refusal.
+    ///
+    /// Shared on purpose. The refusal used to be an `Err` each family raised
+    /// in its own words, on the same road a lost session takes — so the one
+    /// place that decides what to OPEN could not tell "the catalog says this
+    /// routine's arguments cannot be read" from "the app could not ask", and
+    /// answered both by opening a parameterless call script.
+    fn routine_script_outcome(
+        behavior: &dyn ObjectBrowserDbBehavior,
+        qualified_name: &str,
+        routine_type: &str,
+        lookup: crate::db::query::RoutineDefinitionLookup,
+    ) -> RoutineScriptOutcome {
+        match lookup {
+            crate::db::query::RoutineDefinitionLookup::Defined(definition) => {
+                RoutineScriptOutcome::Script(behavior.build_routine_script(
+                    qualified_name,
+                    routine_type,
+                    &definition,
+                ))
+            }
+            crate::db::query::RoutineDefinitionLookup::Unreadable(reason) => {
+                RoutineScriptOutcome::Unreadable(reason)
+            }
+        }
+    }
+
+    /// The listed package member whose name is the one that was asked for.
+    ///
+    /// EXACT first: `"myProc"` and `MYPROC` are two routines one package may
+    /// legally declare, and both answer a case-insensitive test. The
+    /// case-insensitive pass is still needed — an `UNKNOWN` kind can arrive
+    /// from editor-selected text the caches could not resolve, where the
+    /// spelling is the user's — but it only answers when exactly one member
+    /// matches, so an ambiguous name is refused rather than settled by the
+    /// order the listing happens to be in.
+    fn listed_package_routine<'a>(
+        routines: &'a [PackageRoutine],
+        requested_name: &str,
+    ) -> Option<&'a PackageRoutine> {
+        Self::identified_by_name(routines, requested_name, |routine| routine.name.as_str())
+    }
+
+    /// The member's STORED name and its kind, together — `None` when the
+    /// listing does not settle both.
+    ///
+    /// They are one fact from one row: the listing that says a member is a
+    /// FUNCTION is the same row that says how its name is written. Taking the
+    /// kind from it while keeping the caller's spelling is what sent
+    /// `pkg.myproc` to the dictionary under a name it does not hold — and the
+    /// generated call to a name PL/SQL resolves to nothing. Every consumer of
+    /// a package listing reads it through here so none of them can take one
+    /// half without the other.
+    fn listed_package_routine_identity(
+        routines: &[PackageRoutine],
+        requested_name: &str,
+    ) -> Option<(String, String)> {
+        Self::listed_package_routine(routines, requested_name).and_then(|routine| {
+            Self::normalize_package_routine_type(&routine.routine_type)
+                .map(|kind| (routine.name.clone(), kind))
+        })
+    }
+
+    /// [`Self::listed_package_routine_identity`] for the caller that has to
+    /// REFUSE when the listing does not settle it.
+    fn resolve_listed_package_routine(
+        routines: &[PackageRoutine],
+        requested_name: &str,
+        qualified_display_name: &str,
+    ) -> Result<(String, String), String> {
+        Self::listed_package_routine_identity(routines, requested_name).ok_or_else(|| {
+            format!("Could not resolve package routine type for {qualified_display_name}")
+        })
     }
 
     fn default_value_for_mysql_argument(arg: &ProcedureArgument, type_str: &str) -> String {
@@ -5208,9 +5589,9 @@ impl ObjectBrowserWidget {
     fn build_mysql_routine_script(
         qualified_name: &str,
         routine_type: &str,
-        arguments: &[ProcedureArgument],
+        definition: &crate::db::query::RoutineDefinition,
     ) -> String {
-        let selected_args = Self::select_overload_arguments(arguments, routine_type);
+        let selected_args = Self::select_overload_arguments(&definition.arguments, routine_type);
         if selected_args.is_empty() {
             return Self::build_simple_mysql_routine_script(qualified_name, routine_type);
         }
@@ -5347,11 +5728,23 @@ impl ObjectBrowserWidget {
     fn build_procedure_script(
         qualified_name: &str,
         routine_type: &str,
-        arguments: &[ProcedureArgument],
+        definition: &crate::db::query::RoutineDefinition,
     ) -> String {
-        let selected_args = Self::select_overload_arguments(arguments, routine_type);
+        let selected_args = Self::select_overload_arguments(&definition.arguments, routine_type);
         if selected_args.is_empty() {
             return Self::build_simple_oracle_routine_script(qualified_name, routine_type);
+        }
+
+        // Asked BEFORE anything is written, from the overload actually
+        // selected: a PL/SQL block is not a shape every routine supports, and
+        // a routine that only SQL can call has no use for the block's
+        // declarations, binds or seed lines.
+        let call_form = RoutineCallForm::of(
+            &definition.overloads,
+            selected_args.first().and_then(|arg| arg.overload),
+        );
+        if let Some(shape) = call_form.sql_scope_shape() {
+            return Self::build_oracle_sql_scope_script(qualified_name, &selected_args, shape);
         }
 
         let mut used_names: HashSet<String> = HashSet::new();
@@ -5444,18 +5837,7 @@ impl ObjectBrowserWidget {
             script.push('\n');
         }
 
-        // Build the call expression (with or without arguments)
-        let call_str = if call_args.is_empty() {
-            qualified_name.to_string()
-        } else {
-            let mut s = format!("{}(\n", qualified_name);
-            for (idx, arg) in call_args.iter().enumerate() {
-                let suffix = if idx + 1 == call_args.len() { "" } else { "," };
-                s.push_str(&format!("    {}{}\n", arg, suffix));
-            }
-            s.push_str("  )");
-            s
-        };
+        let call_str = Self::oracle_call_expression(qualified_name, &call_args);
 
         if let Some(ref return_target) = return_target {
             // Function: assign return value via ':='
@@ -5468,6 +5850,68 @@ impl ObjectBrowserWidget {
         script.push_str("END;\n/\n");
 
         script
+    }
+
+    /// One Oracle call expression: named association, one argument per line,
+    /// or the bare name when there are none — Oracle takes NO parentheses on
+    /// an empty argument list.
+    ///
+    /// Shared by both Oracle shapes so a routine's call reads the same however
+    /// the statement around it is written.
+    fn oracle_call_expression(qualified_name: &str, call_args: &[String]) -> String {
+        if call_args.is_empty() {
+            return qualified_name.to_string();
+        }
+        let mut sql = format!("{}(\n", qualified_name);
+        for (idx, arg) in call_args.iter().enumerate() {
+            let suffix = if idx + 1 == call_args.len() { "" } else { "," };
+            sql.push_str(&format!("    {}{}\n", arg, suffix));
+        }
+        sql.push_str("  )");
+        sql
+    }
+
+    /// The script for a routine only SQL can call.
+    ///
+    /// A `PIPELINED` function produces ROWS and is reachable only through a
+    /// query's `FROM` clause; an `AGGREGATE` function is reachable only from a
+    /// select list. Both are `PLS-00653` inside a PL/SQL block, which is what
+    /// the block builder used to write for them.
+    ///
+    /// A query has no declarations, so every argument is written as its
+    /// neutral literal — the same value [`Self::default_value_for_argument`]
+    /// gives a local. That includes an OUT/IN OUT argument, which SQL has no
+    /// way to carry at all: writing it keeps the argument list complete, and
+    /// the server then refuses the call for the true reason (the function has
+    /// OUT arguments) instead of the block's misleading one.
+    fn build_oracle_sql_scope_script(
+        qualified_name: &str,
+        arguments: &[ProcedureArgument],
+        shape: OracleSqlScopeShape,
+    ) -> String {
+        let call_args: Vec<String> = arguments
+            .iter()
+            .filter(|arg| !Self::is_function_return_row(arg))
+            .map(|arg| {
+                let type_str = Self::format_argument_type(arg);
+                Self::oracle_call_argument_expr(
+                    arg.name.as_deref(),
+                    &Self::default_value_for_argument(&type_str),
+                )
+            })
+            .collect();
+        let call = Self::oracle_call_expression(qualified_name, &call_args);
+
+        // Every variant is named on purpose: a shape added later must not be
+        // able to inherit another one's text by falling into a wildcard.
+        match shape {
+            OracleSqlScopeShape::PipelinedTable => {
+                format!("SELECT *\nFROM TABLE(\n  {}\n);\n", call)
+            }
+            OracleSqlScopeShape::Aggregate => {
+                format!("SELECT\n  {} AS result\nFROM dual;\n", call)
+            }
+        }
     }
 
     /// The `VAR` type a bind needs to carry this argument, `None` when no
@@ -6139,22 +6583,36 @@ impl ObjectBrowserWidget {
         true
     }
 
+    /// Turn an `UNKNOWN` package-routine item into a resolved one, from the
+    /// listing the server just answered with.
+    ///
+    /// Both halves come from the SAME listed row: the kind, and the member's
+    /// own spelling. Taking only the kind left the item naming the routine the
+    /// way it was ASKED about — the user's typing, or a tree that once
+    /// upper-cased quoted names — and every action that follows writes the
+    /// name it finds here. `listed_package_routine` is what decides which row
+    /// that is, so an exact spelling wins and two members differing only in
+    /// case leave the item unresolved rather than resolved to a coin flip.
     fn apply_package_routine_type_from_routines(
         item: &mut ObjectItem,
         routines: &[PackageRoutine],
     ) {
-        let routine_name = match item {
+        let requested_name = match item {
             ObjectItem::PackageRoutine { routine_name, .. } => routine_name.clone(),
             _ => return,
         };
-        let Some(resolved_type) = routines
-            .iter()
-            .find(|routine| routine.name.eq_ignore_ascii_case(&routine_name))
-            .and_then(|routine| Self::normalize_package_routine_type(&routine.routine_type))
+        let Some((resolved_name, resolved_type)) =
+            Self::listed_package_routine_identity(routines, &requested_name)
         else {
             return;
         };
-        if let ObjectItem::PackageRoutine { routine_type, .. } = item {
+        if let ObjectItem::PackageRoutine {
+            routine_name,
+            routine_type,
+            ..
+        } = item
+        {
+            *routine_name = resolved_name;
             *routine_type = resolved_type;
         }
     }
@@ -6175,7 +6633,15 @@ impl ObjectBrowserWidget {
         db_type: crate::db::DatabaseType,
         current_scope: Option<&str>,
     ) -> Option<ResolvedObjectContext> {
-        let parts = Self::selected_object_reference_parts(selected_text)?;
+        // Each part becomes the name it DENOTES on this backend before any
+        // lookup sees it. The lexer above can only report the text and whether
+        // it was quoted; folding those two into one string is what made
+        // `pkg.myProc` and `pkg."myProc"` the same value, and they are two
+        // different routines.
+        let parts: Vec<String> = Self::selected_object_reference_parts(selected_text)?
+            .iter()
+            .map(|part| part.denoted_name(db_type))
+            .collect();
         match parts.as_slice() {
             [name] => Self::resolve_simple_selection_object(name, data, cache),
             [qualifier, name] => {
@@ -6291,7 +6757,7 @@ impl ObjectBrowserWidget {
             .then(|| Self::package_routine_context(None, &package_name, routine_name, data, cache))
     }
 
-    fn selected_object_reference_parts(selected_text: &str) -> Option<Vec<String>> {
+    fn selected_object_reference_parts(selected_text: &str) -> Option<Vec<SelectedObjectPart>> {
         let trimmed = selected_text
             .trim()
             .trim_matches(|ch| matches!(ch, ';' | ',' | '(' | ')'))
@@ -6300,7 +6766,7 @@ impl ObjectBrowserWidget {
             return None;
         }
 
-        let mut parts = Vec::new();
+        let mut parts: Vec<SelectedObjectPart> = Vec::new();
         for part in Self::split_selected_object_reference_parts(trimmed)? {
             parts.push(Self::normalize_selected_object_part(part)?);
         }
@@ -6348,7 +6814,7 @@ impl ObjectBrowserWidget {
         Some(parts)
     }
 
-    fn normalize_selected_object_part(part: &str) -> Option<String> {
+    fn normalize_selected_object_part(part: &str) -> Option<SelectedObjectPart> {
         let part = part
             .trim()
             .trim_matches(|ch| matches!(ch, ';' | ',' | '(' | ')'))
@@ -6384,7 +6850,10 @@ impl ObjectBrowserWidget {
         if !is_quoted && unquoted.chars().any(char::is_whitespace) {
             return None;
         }
-        Some(unquoted)
+        Some(SelectedObjectPart {
+            text: unquoted,
+            quoted: is_quoted,
+        })
     }
 
     fn resolve_simple_selection_object(
@@ -6564,12 +7033,42 @@ impl ObjectBrowserWidget {
         }
     }
 
-    fn selection_name_match(names: &[String], candidate: &str) -> Option<String> {
-        let candidate = candidate.trim();
-        names
+    /// The ONE candidate a requested name identifies, or `None` when the
+    /// candidates cannot settle it.
+    ///
+    /// EXACT first, because the requested name is already the one the
+    /// selection DENOTES ([`SelectedObjectPart::denoted_name`]) or a catalog
+    /// spelling the tree handed over — either way an exact hit is the answer
+    /// the server itself would give.
+    ///
+    /// The case-insensitive pass is the convenience half: a bare `EMP` finding
+    /// a quoted-created `emp`, or a MySQL name typed in another case. It
+    /// answers only when exactly ONE candidate matches, so two names differing
+    /// only in case — `MYPROC` and `"myProc"`, two routines a schema or a
+    /// package may legally hold at once — are never separated by the order the
+    /// list happens to be in. An unsettled name resolves to nothing, and the
+    /// action then says so instead of acting on a guess.
+    fn identified_by_name<'a, T>(
+        candidates: &'a [T],
+        requested_name: &str,
+        name_of: impl Fn(&T) -> &str,
+    ) -> Option<&'a T> {
+        let requested_name = requested_name.trim();
+        if let Some(exact) = candidates
             .iter()
-            .find(|name| name.eq_ignore_ascii_case(candidate))
-            .cloned()
+            .find(|candidate| name_of(candidate) == requested_name)
+        {
+            return Some(exact);
+        }
+        let mut insensitive = candidates
+            .iter()
+            .filter(|candidate| name_of(candidate).eq_ignore_ascii_case(requested_name));
+        let only = insensitive.next()?;
+        insensitive.next().is_none().then_some(only)
+    }
+
+    fn selection_name_match(names: &[String], candidate: &str) -> Option<String> {
+        Self::identified_by_name(names, candidate, String::as_str).cloned()
     }
 
     fn package_name_match(
@@ -6651,23 +7150,35 @@ impl ObjectBrowserWidget {
                             }))
                 }
             })
-            .and_then(|(_, routines)| {
-                routines
-                    .iter()
-                    .find(|routine| routine.name.eq_ignore_ascii_case(routine_name))
-            })
-            .and_then(|routine| {
-                Self::normalize_package_routine_type(&routine.routine_type)
-                    .map(|routine_type| (routine.name.clone(), routine_type))
-            })
+            // The same reader the server-side resolution uses: exact spelling
+            // first, and no answer at all when two members differ only in
+            // case. `"myProc"` and `MYPROC` are two routines a package may
+            // declare side by side, and this cache is now able to hold both —
+            // an unresolved name falls through to `UNKNOWN`, which asks the
+            // server and gets the same refusal in words.
+            .and_then(|(_, routines)| Self::listed_package_routine_identity(routines, routine_name))
     }
 
-    fn normalize_package_routine_type(routine_type: &str) -> Option<String> {
+    /// The catalog's routine type as one of the two values every consumer
+    /// understands, or `None` for anything else.
+    pub(crate) fn normalize_package_routine_type(routine_type: &str) -> Option<String> {
         match routine_type.trim().to_ascii_uppercase().as_str() {
             "FUNCTION" => Some("FUNCTION".to_string()),
             "PROCEDURE" => Some("PROCEDURE".to_string()),
             _ => None,
         }
+    }
+
+    /// A catalog routine type as the `routine_type` an
+    /// [`ObjectItem::PackageRoutine`] may carry.
+    ///
+    /// Exactly three values mean something downstream: `PROCEDURE` and
+    /// `FUNCTION` name an action arm, and `UNKNOWN` is the one that makes the
+    /// menu ask the server. Anything else reaches a menu whose single entry
+    /// matches no arm — a dead item — so it is folded into `UNKNOWN` HERE,
+    /// where the item is built, rather than left for each consumer to notice.
+    pub(crate) fn package_routine_item_type(routine_type: &str) -> String {
+        Self::normalize_package_routine_type(routine_type).unwrap_or_else(|| "UNKNOWN".to_string())
     }
 
     fn qualified_member_matches_kind(
@@ -7109,7 +7620,7 @@ impl ObjectBrowserWidget {
                                                     &routine_type,
                                                 )?;
                                             qualified_name = data.qualified_name;
-                                            Ok(data.sql)
+                                            Ok(data.outcome)
                                         },
                                     )
                                 });
@@ -7168,6 +7679,12 @@ impl ObjectBrowserWidget {
                                 status_routine_type, qualified_name
                             );
                             let mut resolved_routine_type = routine_type.clone();
+                            // Both facts the load RESOLVED are taken from it,
+                            // for the same reason the standalone arm above
+                            // does: an `UNKNOWN` kind is asked of the package
+                            // listing, and that listing answers with the
+                            // member's own spelling as well as its kind.
+                            let mut qualified_name = qualified_name;
                             let result =
                                 Self::run_object_action_work("Load routine arguments", || {
                                     object_browser_behavior_for(db_type)
@@ -7181,7 +7698,8 @@ impl ObjectBrowserWidget {
                                         )
                                         .map(|data| {
                                             resolved_routine_type = data.resolved_routine_type;
-                                            data.sql
+                                            qualified_name = data.qualified_name;
+                                            data.outcome
                                         })
                                 });
 
@@ -8509,6 +9027,12 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         )
     }
 
+    /// Oracle folds an unquoted identifier to upper case — the same reading
+    /// `QueryExecutor::normalize_object_name` gives a catalog name.
+    fn denoted_bare_identifier(&self, identifier: &str) -> String {
+        identifier.to_uppercase()
+    }
+
     fn preview_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String {
         let qualified_name = self.qualify_object_name(selected_scope, object_name);
         format!("SELECT * FROM {} WHERE ROWNUM <= 100", qualified_name)
@@ -8564,9 +9088,9 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         &self,
         qualified_name: &str,
         routine_type: &str,
-        arguments: &[ProcedureArgument],
+        definition: &crate::db::query::RoutineDefinition,
     ) -> String {
-        ObjectBrowserWidget::build_procedure_script(qualified_name, routine_type, arguments)
+        ObjectBrowserWidget::build_procedure_script(qualified_name, routine_type, definition)
     }
 
     fn action_scope<'a>(
@@ -8586,13 +9110,12 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         routine_type: &str,
     ) -> Result<RoutineScriptData, String> {
         let qualified_name = self.qualify_object_name(selected_scope, object_name);
-        let arguments = match session {
+        let lookup = match session {
             crate::db::DbPoolSession::Oracle(conn) => {
-                ObjectBrowser::get_procedure_arguments(conn, &qualified_name)
-                    .map_err(|err| err.to_string())?
+                ObjectBrowser::get_procedure_definition(conn, &qualified_name)?
             }
             crate::db::DbPoolSession::OracleThin(conn) => {
-                ObjectBrowser::get_thin_procedure_arguments(conn, &qualified_name)?
+                ObjectBrowser::get_thin_procedure_definition(conn, &qualified_name)?
             }
             unexpected @ crate::db::DbPoolSession::MySQL { .. } => {
                 return Err(format!(
@@ -8604,7 +9127,12 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         Ok(RoutineScriptData {
             qualified_name: qualified_name.clone(),
             resolved_routine_type: routine_type.to_string(),
-            sql: self.build_routine_script(&qualified_name, routine_type, &arguments),
+            outcome: ObjectBrowserWidget::routine_script_outcome(
+                self,
+                &qualified_name,
+                routine_type,
+                lookup,
+            ),
         })
     }
 
@@ -8831,88 +9359,95 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         routine_name: &str,
         routine_type: &str,
     ) -> Result<RoutineScriptData, String> {
-        let qualified_name =
-            self.qualify_package_member_name(selected_scope, package_name, routine_name);
+        // The name the ACTION was asked about. It is the catalog's spelling
+        // whenever it came from the tree or a resolved selection, and the
+        // user's own whenever the kind arrived UNKNOWN from unresolved editor
+        // text — which is why the UNKNOWN road below replaces it with the
+        // spelling the package listing carries.
+        let requested_display_name = self.qualify_package_member_name(
+            selected_scope,
+            package_name,
+            &crate::db::DatabaseConnection::quote_oracle_identifier(routine_name),
+        );
         let package_qualified_name = self.qualify_object_name(selected_scope, package_name);
         ObjectBrowserWidget::with_pooled_object_session(
             connection,
             selected_scope,
             activity,
-            |_context, session| match session {
-                crate::db::DbPoolSession::Oracle(conn) => {
-                    let resolved_type = if routine_type == "UNKNOWN" {
-                        let routines =
+            |_context, session| {
+                let (member_name, resolved_type) = if routine_type == "UNKNOWN" {
+                    let routines = match session {
+                        crate::db::DbPoolSession::Oracle(conn) => {
                             ObjectBrowser::get_package_routines(conn, &package_qualified_name)
-                                .map_err(|err| err.to_string())?;
-                        routines
-                            .iter()
-                            .find(|routine| routine.name.eq_ignore_ascii_case(routine_name))
-                            .and_then(|routine| {
-                                ObjectBrowserWidget::normalize_package_routine_type(
-                                    &routine.routine_type,
-                                )
-                            })
-                            .ok_or_else(|| {
-                                format!(
-                                    "Could not resolve package routine type for {}",
-                                    qualified_name
-                                )
-                            })
-                    } else {
-                        Ok(routine_type.to_string())
-                    }?;
-
-                    let arguments = ObjectBrowser::get_package_procedure_arguments(
-                        conn,
-                        &package_qualified_name,
+                                .map_err(|err| err.to_string())?
+                        }
+                        crate::db::DbPoolSession::OracleThin(conn) => {
+                            ObjectBrowser::get_thin_package_routines(conn, &package_qualified_name)?
+                        }
+                        unexpected @ crate::db::DbPoolSession::MySQL { .. } => {
+                            return Err(format!(
+                                "Expected Oracle object action session but acquired {}",
+                                unexpected.db_type()
+                            ))
+                        }
+                    };
+                    ObjectBrowserWidget::resolve_listed_package_routine(
+                        &routines,
                         routine_name,
-                    )
-                    .map_err(|err| err.to_string())?;
-                    Ok(RoutineScriptData {
-                        qualified_name: qualified_name.clone(),
-                        resolved_routine_type: resolved_type.clone(),
-                        sql: self.build_routine_script(&qualified_name, &resolved_type, &arguments),
-                    })
-                }
-                crate::db::DbPoolSession::OracleThin(conn) => {
-                    let resolved_type = if routine_type == "UNKNOWN" {
-                        let routines = ObjectBrowser::get_thin_package_routines(
+                        &requested_display_name,
+                    )?
+                } else {
+                    (routine_name.to_string(), routine_type.to_string())
+                };
+
+                // ONE spelling of the member's name, used by the script AND by
+                // the lookup. They used to be written differently — the script
+                // quoted the catalog's name, the lookup passed it bare into a
+                // reader that uppercases anything unquoted — so a quoted
+                // mixed-case member was looked up under a name the dictionary
+                // does not hold and came back with no arguments at all.
+                // `quote_oracle_identifier` passes an already-quoted name
+                // through unchanged, so composing it once here and again inside
+                // `qualify_package_member_name` is the same text.
+                let member_sql_name =
+                    crate::db::DatabaseConnection::quote_oracle_identifier(&member_name);
+                let qualified_name = self.qualify_package_member_name(
+                    selected_scope,
+                    package_name,
+                    &member_sql_name,
+                );
+                let lookup = match session {
+                    crate::db::DbPoolSession::Oracle(conn) => {
+                        ObjectBrowser::get_package_procedure_definition(
                             conn,
                             &package_qualified_name,
-                        )?;
-                        routines
-                            .iter()
-                            .find(|routine| routine.name.eq_ignore_ascii_case(routine_name))
-                            .and_then(|routine| {
-                                ObjectBrowserWidget::normalize_package_routine_type(
-                                    &routine.routine_type,
-                                )
-                            })
-                            .ok_or_else(|| {
-                                format!(
-                                    "Could not resolve package routine type for {}",
-                                    qualified_name
-                                )
-                            })
-                    } else {
-                        Ok(routine_type.to_string())
-                    }?;
-
-                    let arguments = ObjectBrowser::get_thin_package_procedure_arguments(
-                        conn,
-                        &package_qualified_name,
-                        routine_name,
-                    )?;
-                    Ok(RoutineScriptData {
-                        qualified_name: qualified_name.clone(),
-                        resolved_routine_type: resolved_type.clone(),
-                        sql: self.build_routine_script(&qualified_name, &resolved_type, &arguments),
-                    })
-                }
-                unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
-                    "Expected Oracle object action session but acquired {}",
-                    unexpected.db_type()
-                )),
+                            &member_sql_name,
+                        )?
+                    }
+                    crate::db::DbPoolSession::OracleThin(conn) => {
+                        ObjectBrowser::get_thin_package_procedure_definition(
+                            conn,
+                            &package_qualified_name,
+                            &member_sql_name,
+                        )?
+                    }
+                    unexpected @ crate::db::DbPoolSession::MySQL { .. } => {
+                        return Err(format!(
+                            "Expected Oracle object action session but acquired {}",
+                            unexpected.db_type()
+                        ))
+                    }
+                };
+                Ok(RoutineScriptData {
+                    qualified_name: qualified_name.clone(),
+                    resolved_routine_type: resolved_type.clone(),
+                    outcome: ObjectBrowserWidget::routine_script_outcome(
+                        self,
+                        &qualified_name,
+                        &resolved_type,
+                        lookup,
+                    ),
+                })
             },
         )
     }
@@ -9403,16 +9938,36 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
 }
 
 impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
+    /// `scope.object` as a PATH — a value
+    /// [`ObjectBrowserWidget::quote_mysql_identifier_path`] later splits back
+    /// into its segments.
+    ///
+    /// `object_name` is one object's own catalog name, so a `.` inside it
+    /// belongs to the name (`CREATE PROCEDURE `my.proc`` is accepted by both
+    /// engines and the catalog reports ROUTINE_NAME `my.proc`). Written bare
+    /// into the path it becomes a separator, and the split then names schema
+    /// `my`, object `proc` — a DIFFERENT object, while the argument lookup,
+    /// which takes the scope and the name as two values, kept finding the
+    /// right one. Backticking the segment is what keeps one name one segment;
+    /// the splitter strips and re-adds the quotes, so a name that needs none
+    /// comes out byte-identical.
     fn qualify_object_name(&self, selected_scope: Option<&str>, object_name: &str) -> String {
         let object_name = object_name.trim();
-        if object_name.is_empty() || object_name.contains('.') {
+        if object_name.is_empty() {
             return object_name.to_string();
         }
+        let object_name = ObjectBrowserWidget::quote_mysql_path_segment(object_name);
 
         selected_scope
             .filter(|scope| !scope.trim().is_empty())
-            .map(|scope| format!("{}.{}", scope.trim(), object_name))
-            .unwrap_or_else(|| object_name.to_string())
+            .map(|scope| {
+                format!(
+                    "{}.{}",
+                    ObjectBrowserWidget::quote_mysql_path_segment(scope.trim()),
+                    object_name
+                )
+            })
+            .unwrap_or(object_name)
     }
 
     fn qualify_package_member_name(
@@ -9423,6 +9978,14 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     ) -> String {
         let package_name = self.qualify_object_name(selected_scope, package_name);
         format!("{}.{}", package_name, routine_name.trim())
+    }
+
+    /// Neither engine folds an identifier's case, so a bare name denotes
+    /// itself. Upper-casing here would invent a name the server never
+    /// resolves — `Emp` and `emp` can be two tables on a case-sensitive file
+    /// system.
+    fn denoted_bare_identifier(&self, identifier: &str) -> String {
+        identifier.to_string()
     }
 
     fn preview_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String {
@@ -9483,9 +10046,9 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         &self,
         qualified_name: &str,
         routine_type: &str,
-        arguments: &[ProcedureArgument],
+        definition: &crate::db::query::RoutineDefinition,
     ) -> String {
-        ObjectBrowserWidget::build_mysql_routine_script(qualified_name, routine_type, arguments)
+        ObjectBrowserWidget::build_mysql_routine_script(qualified_name, routine_type, definition)
     }
 
     fn action_scope<'a>(
@@ -9513,18 +10076,22 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         let conn = self.take_object_action_session(context, session)?;
         let action_scope = self.action_scope(selected_scope, context);
         let qualified_name = self.qualify_object_name(action_scope, object_name);
-        crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_arguments_in_schema(
+        crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_definition_in_schema(
             conn.as_mut(),
             action_scope,
             object_name,
             kind,
         )
-        .map(|arguments| RoutineScriptData {
+        .map(|lookup| RoutineScriptData {
             qualified_name: qualified_name.clone(),
             resolved_routine_type: routine_type.to_string(),
-            sql: self.build_routine_script(&qualified_name, routine_type, &arguments),
+            outcome: ObjectBrowserWidget::routine_script_outcome(
+                self,
+                &qualified_name,
+                routine_type,
+                lookup,
+            ),
         })
-        .map_err(|err| err.to_string())
     }
 
     fn load_table_structure(
@@ -11621,12 +12188,13 @@ fn read_import_file(path: &std::path::Path) -> Result<String, String> {
 mod tests {
     use super::{
         consume_owned_key_up, copy_text_for_object_item, CardWriteRefusal, DestructiveObjectAction,
-        MultiObjectBrowserWidget, ObjectBrowserMetadataSnapshot, ObjectBrowserWidget, ObjectCache,
-        ObjectDefaultAction, ObjectItem, ScopeSwitchPreflightCallback, SCOPE_SELECTOR_ROW_HEIGHT,
-        SCOPE_SELECTOR_TABLE_VERTICAL_PADDING,
+        MultiObjectBrowserWidget, ObjectBrowserDbBehavior, ObjectBrowserMetadataSnapshot,
+        ObjectBrowserWidget, ObjectCache, ObjectDefaultAction, ObjectItem, OracleSqlScopeShape,
+        RoutineCallForm, ScopeSwitchPreflightCallback, MYSQL_OBJECT_BROWSER_BEHAVIOR,
+        SCOPE_SELECTOR_ROW_HEIGHT, SCOPE_SELECTOR_TABLE_VERTICAL_PADDING,
     };
     use crate::db::{DatabaseType, OracleDriverMode};
-    use crate::db::{PackageRoutine, ProcedureArgument};
+    use crate::db::{PackageRoutine, ProcedureArgument, RoutineDefinition, RoutineOverload};
     use crate::ui::{IntellisenseData, QualifiedMemberKind};
     use fltk::enums::Key;
     use std::sync::{Arc, Mutex};
@@ -11764,6 +12332,34 @@ mod tests {
             pls_type: None,
             overload: None,
             default_value: None,
+        }
+    }
+
+    /// The definition of an ORDINARY routine: these arguments, and no
+    /// dictionary row claiming a call form other than the family's usual one.
+    ///
+    /// That is what every script-shape test below is about, and what
+    /// `RoutineCallForm::of` reads out of an empty overload list — so wrapping
+    /// an argument list in this leaves the generated script byte for byte what
+    /// it was before the builders started taking a whole definition.
+    fn routine_definition(arguments: &[ProcedureArgument]) -> RoutineDefinition {
+        RoutineDefinition::from_arguments(arguments.to_vec())
+    }
+
+    /// The definition of a routine the dictionary marks PIPELINED or
+    /// AGGREGATE, for the one overload the tests build.
+    fn routine_definition_with_call_form(
+        arguments: &[ProcedureArgument],
+        pipelined: bool,
+        aggregate: bool,
+    ) -> RoutineDefinition {
+        RoutineDefinition {
+            overloads: vec![RoutineOverload {
+                overload: arguments.first().and_then(|arg| arg.overload),
+                pipelined,
+                aggregate,
+            }],
+            arguments: arguments.to_vec(),
         }
     }
 
@@ -12162,24 +12758,76 @@ mod tests {
 
     #[test]
     fn preview_select_sql_uses_mysql_limit_and_identifier_quotes() {
+        let sql =
+            ObjectBrowserWidget::preview_select_sql(crate::db::DatabaseType::MySQL, None, "items");
+        assert_eq!(sql, "SELECT * FROM `items` LIMIT 100");
+
         let sql = ObjectBrowserWidget::preview_select_sql(
             crate::db::DatabaseType::MySQL,
-            None,
-            "order.items",
+            Some("order"),
+            "items",
         );
-
         assert_eq!(sql, "SELECT * FROM `order`.`items` LIMIT 100");
     }
 
+    /// The SCOPE is what says which schema, and it arrives as its own value —
+    /// the editor-selection resolver splits `sales.orders` into
+    /// `selected_scope = sales` + `object_name = orders` before any action
+    /// runs, and the tree only ever holds one object's catalog name.
+    ///
+    /// So a `.` inside `object_name` is part of that name. This assertion used
+    /// to read the other way (`order.items` becoming `` `order`.`items` ``),
+    /// which is the premise that made `Select Data (Top 100)` on a table named
+    /// `order.items` read a table called `items` in a schema called `order`.
+    /// Both engines accept such a name — live-proven on MySQL 8:
+    /// ``CREATE PROCEDURE `zq.dot`(IN a INT)`` is created and
+    /// `INFORMATION_SCHEMA.ROUTINES` reports ROUTINE_NAME `zq.dot`.
     #[test]
-    fn preview_select_sql_preserves_mysql_quoted_dotted_identifier_segments() {
+    fn preview_select_sql_keeps_a_dotted_mysql_catalog_name_as_one_object() {
         let sql = ObjectBrowserWidget::preview_select_sql(
             crate::db::DatabaseType::MySQL,
-            None,
-            "`sales.ops`.`order.items`",
+            Some("sales"),
+            "order.items",
         );
 
-        assert_eq!(sql, "SELECT * FROM `sales.ops`.`order.items` LIMIT 100");
+        assert_eq!(sql, "SELECT * FROM `sales`.`order.items` LIMIT 100");
+    }
+
+    /// A dot INSIDE a quoted segment is not a separator. This is the path
+    /// splitter's own rule — it is what lets a segment carry a dot at all —
+    /// so it is asserted on the splitter rather than through a caller whose
+    /// input is a single object name.
+    #[test]
+    fn quote_mysql_identifier_path_preserves_quoted_dotted_segments() {
+        assert_eq!(
+            ObjectBrowserWidget::quote_mysql_identifier_path("`sales.ops`.`order.items`"),
+            "`sales.ops`.`order.items`"
+        );
+        // The OTHER character the splitter tracks. A backtick is legal inside
+        // a MySQL-family name and the catalog reports it raw; doubled once, it
+        // is the spelling the server accepts — live-proven on MariaDB
+        // (``CREATE PROCEDURE `zr``tick` `` is created and reported as
+        // ``zr`tick``, and the doubled call runs).
+        assert_eq!(
+            MYSQL_OBJECT_BROWSER_BEHAVIOR.qualify_object_name(Some("app"), "zr`tick"),
+            "app.`zr``tick`"
+        );
+        assert_eq!(
+            ObjectBrowserWidget::quote_mysql_identifier_path(
+                &MYSQL_OBJECT_BROWSER_BEHAVIOR.qualify_object_name(Some("app"), "zr`tick")
+            ),
+            "`app`.`zr``tick`"
+        );
+        // And re-quoting what `qualify_object_name` produced is inert, which
+        // is what lets the qualifier quote a segment without the splitter
+        // quoting it a second time.
+        assert_eq!(
+            ObjectBrowserWidget::quote_mysql_identifier_path(
+                &MYSQL_OBJECT_BROWSER_BEHAVIOR
+                    .qualify_object_name(Some("sales.ops"), "order.items")
+            ),
+            "`sales.ops`.`order.items`"
+        );
     }
 
     #[test]
@@ -12839,6 +13487,27 @@ mod tests {
         );
     }
 
+    /// A `.` inside a catalog name is part of the NAME. Every caller hands one
+    /// object's own name, so treating the dot as a qualifier that is already
+    /// there skipped quoting and named a different object: `MY.PROC` reads as
+    /// schema `MY`, and the browsed scope was dropped on top of that.
+    /// Live-proven on 23ai: `"ZQ.DOT"` is creatable and `SYSTEM."ZQ.DOT"(A =>
+    /// 1)` runs, while the dictionary holds it under object_name `ZQ.DOT`.
+    #[test]
+    fn oracle_object_names_quote_a_dot_that_belongs_to_the_name() {
+        assert_eq!(
+            ObjectBrowserWidget::qualify_oracle_object_name(Some("SCOTT"), "MY.PROC"),
+            r#"SCOTT."MY.PROC""#
+        );
+        assert_eq!(
+            ObjectBrowserWidget::qualify_oracle_object_name(None, "MY.PROC"),
+            r#""MY.PROC""#
+        );
+        // The lookup reads that back as one object in one schema — pinned on
+        // the db side by
+        // `split_normalized_owner_object_name_reads_a_quoted_dot_as_one_name`.
+    }
+
     #[test]
     fn oracle_package_member_names_quote_case_sensitive_routines() {
         assert_eq!(
@@ -13225,8 +13894,11 @@ mod tests {
             },
         ];
 
-        let sql =
-            ObjectBrowserWidget::build_mysql_routine_script("demo_proc", "PROCEDURE", &arguments);
+        let sql = ObjectBrowserWidget::build_mysql_routine_script(
+            "demo_proc",
+            "PROCEDURE",
+            &routine_definition(&arguments),
+        );
 
         assert!(sql.contains("CALL `demo_proc`("));
         assert!(sql.contains("0,"));
@@ -13249,7 +13921,7 @@ mod tests {
         let sql = ObjectBrowserWidget::build_procedure_script(
             "DEMO_PKG.GET_ROWS",
             "FUNCTION",
-            &arguments,
+            &routine_definition(&arguments),
         );
 
         assert!(sql.starts_with("VAR v_result REFCURSOR\n"));
@@ -13286,8 +13958,11 @@ mod tests {
             ),
         ];
 
-        let sql =
-            ObjectBrowserWidget::build_procedure_script("SQ_QUOTED_P", "PROCEDURE", &arguments);
+        let sql = ObjectBrowserWidget::build_procedure_script(
+            "SQ_QUOTED_P",
+            "PROCEDURE",
+            &routine_definition(&arguments),
+        );
 
         assert!(sql.contains("\"my arg\" => v_my_arg"));
         assert!(sql.contains("\"lower\" => :v_lower"));
@@ -13335,8 +14010,11 @@ mod tests {
             procedure_argument(Some("p_n"), 4, Some("NUMBER"), "IN"),
         ];
 
-        let sql =
-            ObjectBrowserWidget::build_procedure_script("SCOTT.SQ_PROC", "PROCEDURE", &arguments);
+        let sql = ObjectBrowserWidget::build_procedure_script(
+            "SCOTT.SQ_PROC",
+            "PROCEDURE",
+            &routine_definition(&arguments),
+        );
 
         assert!(sql.contains("  v_p_rec SCOTT.SQ_PKG.T_REC;\n"));
         assert!(sql.contains("  v_p_tab SCOTT.SQ_PKG.T_TAB;\n"));
@@ -13372,8 +14050,11 @@ mod tests {
             ),
         ];
 
-        let sql =
-            ObjectBrowserWidget::build_procedure_script("SQ_ROW_PROC", "PROCEDURE", &arguments);
+        let sql = ObjectBrowserWidget::build_procedure_script(
+            "SQ_ROW_PROC",
+            "PROCEDURE",
+            &routine_definition(&arguments),
+        );
 
         assert!(sql.contains("  v_p_user ALL_USERS%ROWTYPE;\n"));
         assert!(sql.contains("  v_p_emp SCOTT.EMP%ROWTYPE;\n"));
@@ -13411,8 +14092,11 @@ mod tests {
             ),
         ];
 
-        let sql =
-            ObjectBrowserWidget::build_procedure_script("SQ_REF_PROC", "PROCEDURE", &arguments);
+        let sql = ObjectBrowserWidget::build_procedure_script(
+            "SQ_REF_PROC",
+            "PROCEDURE",
+            &routine_definition(&arguments),
+        );
 
         assert!(sql.contains("  v_p_ref REF SCOTT.SQ_OBJ_T;\n"));
         assert!(sql.contains("  v_p_cur SYS_REFCURSOR;\n"));
@@ -13446,20 +14130,29 @@ mod tests {
             overloaded(Some("B"), 2, "VARCHAR2", "IN", 2),
         ];
 
-        let as_function =
-            ObjectBrowserWidget::build_procedure_script("SQ_X_OVL.DUP", "FUNCTION", &arguments);
+        let as_function = ObjectBrowserWidget::build_procedure_script(
+            "SQ_X_OVL.DUP",
+            "FUNCTION",
+            &routine_definition(&arguments),
+        );
         assert!(as_function.starts_with("VAR v_result NUMBER\n"));
         assert!(as_function.contains("B => v_b"));
         assert!(!as_function.contains("A => "));
 
-        let as_procedure =
-            ObjectBrowserWidget::build_procedure_script("SQ_X_OVL.DUP", "PROCEDURE", &arguments);
+        let as_procedure = ObjectBrowserWidget::build_procedure_script(
+            "SQ_X_OVL.DUP",
+            "PROCEDURE",
+            &routine_definition(&arguments),
+        );
         assert!(as_procedure.contains("A => v_a"));
         assert!(!as_procedure.contains("VAR "));
         assert!(!as_procedure.contains("B => "));
 
-        let unknown =
-            ObjectBrowserWidget::build_procedure_script("SQ_X_OVL.DUP", "UNKNOWN", &arguments);
+        let unknown = ObjectBrowserWidget::build_procedure_script(
+            "SQ_X_OVL.DUP",
+            "UNKNOWN",
+            &routine_definition(&arguments),
+        );
         assert!(unknown.contains("A => v_a"));
         assert!(!unknown.contains("B => "));
     }
@@ -13477,7 +14170,11 @@ mod tests {
             procedure_argument(Some("P_BOTH"), 3, Some("NUMBER"), "IN/OUT"),
         ];
 
-        let sql = ObjectBrowserWidget::build_procedure_script("SQ_OUT_P", "PROCEDURE", &arguments);
+        let sql = ObjectBrowserWidget::build_procedure_script(
+            "SQ_OUT_P",
+            "PROCEDURE",
+            &routine_definition(&arguments),
+        );
 
         // Written values: bound, and passed to the call as binds.
         assert!(sql.contains("VAR v_p_out VARCHAR2(32767)\n"));
@@ -13515,8 +14212,11 @@ mod tests {
             procedure_argument(Some("P_FLAG"), 2, Some("PL/SQL BOOLEAN"), "OUT"),
         ];
 
-        let sql =
-            ObjectBrowserWidget::build_procedure_script("SQ_LOCAL_P", "PROCEDURE", &arguments);
+        let sql = ObjectBrowserWidget::build_procedure_script(
+            "SQ_LOCAL_P",
+            "PROCEDURE",
+            &routine_definition(&arguments),
+        );
 
         assert!(!sql.contains("VAR "));
         assert!(sql.contains("  v_p_rec SCOTT.SQ_PKG.T_REC;\n"));
@@ -13532,15 +14232,364 @@ mod tests {
     #[test]
     fn build_oracle_script_binds_are_wide_enough_for_the_declared_type() {
         let unbounded = vec![procedure_argument(None, 0, Some("VARCHAR2"), "OUT")];
-        let sql = ObjectBrowserWidget::build_procedure_script("SQ_LONG_F", "FUNCTION", &unbounded);
+        let sql = ObjectBrowserWidget::build_procedure_script(
+            "SQ_LONG_F",
+            "FUNCTION",
+            &routine_definition(&unbounded),
+        );
         assert!(sql.starts_with("VAR v_result VARCHAR2(32767)\n"));
 
         let sized = vec![ProcedureArgument {
             data_length: Some(100),
             ..procedure_argument(None, 0, Some("RAW"), "OUT")
         }];
-        let sql = ObjectBrowserWidget::build_procedure_script("SQ_RAW_F", "FUNCTION", &sized);
+        let sql = ObjectBrowserWidget::build_procedure_script(
+            "SQ_RAW_F",
+            "FUNCTION",
+            &routine_definition(&sized),
+        );
         assert!(sql.starts_with("VAR v_result VARCHAR2(200)\n"));
+    }
+
+    /// The catalog's REFUSAL must not be answered with a script.
+    ///
+    /// A parameterless call is exactly what "this routine's arguments cannot
+    /// be read" rules out — the routine may take two, or not be there at all —
+    /// and the delivery point used to open one anyway, because the refusal
+    /// reached it on the same `Err` road a lost session takes. Only a load
+    /// that could not ASK still gets the fallback, because only then does the
+    /// app know nothing.
+    #[test]
+    fn a_refused_routine_opens_nothing_while_a_failed_load_still_falls_back() {
+        let refusal = "Arguments for SCOTT.ZQ_BAD could not be read: the object is INVALID, so \
+                       the catalog holds no compiled signature for it. Compile it and retry.";
+
+        assert_eq!(
+            ObjectBrowserWidget::routine_script_delivery(
+                DatabaseType::Oracle,
+                "SCOTT.ZQ_BAD",
+                "PROCEDURE",
+                Ok(super::RoutineScriptOutcome::Unreadable(refusal.to_string())),
+            ),
+            super::RoutineScriptDelivery {
+                alert: Some(refusal.to_string()),
+                open_sql: None,
+            },
+            "the catalog's answer is said, and nothing is opened"
+        );
+
+        // Same refusal, MySQL family: one rule, not one per backend.
+        assert_eq!(
+            ObjectBrowserWidget::routine_script_delivery(
+                DatabaseType::MariaDB,
+                "app.zq_bad",
+                "FUNCTION",
+                Ok(super::RoutineScriptOutcome::Unreadable(refusal.to_string())),
+            )
+            .open_sql,
+            None
+        );
+
+        // A load that could not ASK knows nothing about the routine, so the
+        // long-standing simple-call fallback stands — per family shape.
+        assert_eq!(
+            ObjectBrowserWidget::routine_script_delivery(
+                DatabaseType::Oracle,
+                "SCOTT.ZQ_P",
+                "PROCEDURE",
+                Err("connection lost".to_string()),
+            ),
+            super::RoutineScriptDelivery {
+                alert: Some("Failed to load routine arguments: connection lost".to_string()),
+                open_sql: Some("BEGIN\n  SCOTT.ZQ_P;\nEND;\n/\n".to_string()),
+            }
+        );
+        assert_eq!(
+            ObjectBrowserWidget::routine_script_delivery(
+                DatabaseType::MySQL,
+                "app.zq_p",
+                "PROCEDURE",
+                Err("connection lost".to_string()),
+            )
+            .open_sql,
+            Some("CALL `app`.`zq_p`();\n".to_string())
+        );
+        // An unresolved KIND has no shape to fall back to, as before.
+        assert_eq!(
+            ObjectBrowserWidget::routine_script_delivery(
+                DatabaseType::Oracle,
+                "SCOTT.PKG.R",
+                "UNKNOWN",
+                Err("connection lost".to_string()),
+            )
+            .open_sql,
+            None
+        );
+
+        // And a definition that WAS read opens its script and says nothing.
+        assert_eq!(
+            ObjectBrowserWidget::routine_script_delivery(
+                DatabaseType::Oracle,
+                "SCOTT.ZQ_P",
+                "PROCEDURE",
+                Ok(super::RoutineScriptOutcome::Script(
+                    "BEGIN NULL; END;\n".to_string()
+                )),
+            ),
+            super::RoutineScriptDelivery {
+                alert: None,
+                open_sql: Some("BEGIN NULL; END;\n".to_string()),
+            }
+        );
+    }
+
+    /// A package member is found by the name the listing SPELLS.
+    ///
+    /// `"myProc"` and `MYPROC` are two routines one package may declare side
+    /// by side, and both answer a case-insensitive test — so the exact match
+    /// has to come first. The case-insensitive pass still has a job (an
+    /// `UNKNOWN` kind can arrive from editor text the caches could not
+    /// resolve, spelled as the user typed it) but must refuse when more than
+    /// one member answers it, rather than settle it by listing order.
+    #[test]
+    fn a_package_member_resolves_by_exact_name_before_case_is_ignored() {
+        let routines = vec![
+            PackageRoutine {
+                name: "MYPROC".to_string(),
+                routine_type: "PROCEDURE".to_string(),
+            },
+            PackageRoutine {
+                name: "myProc".to_string(),
+                routine_type: "FUNCTION".to_string(),
+            },
+            PackageRoutine {
+                name: "SOLO".to_string(),
+                routine_type: "PROCEDURE".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            ObjectBrowserWidget::resolve_listed_package_routine(&routines, "myProc", "PKG.myProc"),
+            Ok(("myProc".to_string(), "FUNCTION".to_string())),
+            "the quoted member is its own routine, not the upper-cased one"
+        );
+        assert_eq!(
+            ObjectBrowserWidget::resolve_listed_package_routine(&routines, "MYPROC", "PKG.MYPROC"),
+            Ok(("MYPROC".to_string(), "PROCEDURE".to_string()))
+        );
+        // Neither spelling: two members answer, so neither is chosen.
+        assert!(
+            ObjectBrowserWidget::resolve_listed_package_routine(&routines, "myproc", "PKG.myproc")
+                .is_err(),
+            "an ambiguous name must be refused, not settled by list order"
+        );
+        // One member answers case-insensitively: the listing's spelling wins,
+        // which is what the dictionary lookup and the generated call need.
+        assert_eq!(
+            ObjectBrowserWidget::resolve_listed_package_routine(&routines, "solo", "PKG.solo"),
+            Ok(("SOLO".to_string(), "PROCEDURE".to_string()))
+        );
+        assert!(
+            ObjectBrowserWidget::resolve_listed_package_routine(&routines, "GONE", "PKG.GONE")
+                .is_err()
+        );
+
+        // Resolving a deferred menu item takes BOTH halves from the listed
+        // row. Taking only the kind left the item naming the routine the way
+        // it was asked about, and every action that follows writes the name it
+        // finds on the item.
+        let mut item = ObjectItem::PackageRoutine {
+            package_name: "PKG".to_string(),
+            routine_name: "solo".to_string(),
+            routine_type: "UNKNOWN".to_string(),
+        };
+        ObjectBrowserWidget::apply_package_routine_type_from_routines(&mut item, &routines);
+        assert_eq!(
+            item,
+            ObjectItem::PackageRoutine {
+                package_name: "PKG".to_string(),
+                routine_name: "SOLO".to_string(),
+                routine_type: "PROCEDURE".to_string(),
+            }
+        );
+
+        // Ambiguous: left UNKNOWN, so the action asks the server and gets the
+        // refusal in words rather than acting on a guess.
+        let mut ambiguous = ObjectItem::PackageRoutine {
+            package_name: "PKG".to_string(),
+            routine_name: "myproc".to_string(),
+            routine_type: "UNKNOWN".to_string(),
+        };
+        ObjectBrowserWidget::apply_package_routine_type_from_routines(&mut ambiguous, &routines);
+        assert_eq!(
+            ambiguous,
+            ObjectItem::PackageRoutine {
+                package_name: "PKG".to_string(),
+                routine_name: "myproc".to_string(),
+                routine_type: "UNKNOWN".to_string(),
+            }
+        );
+    }
+
+    /// A routine only SQL can call gets a QUERY, never a PL/SQL block.
+    ///
+    /// A `PIPELINED` function is reachable through `TABLE(...)` in a `FROM`
+    /// clause and an `AGGREGATE` function through a select list; both are
+    /// PLS-00653 inside a block, which is what the builder wrote for them
+    /// while it decided the shape from the argument list alone. The aggregate
+    /// case is the one that proves the argument list cannot answer this: its
+    /// rows are a plain `NUMBER` return and a plain `NUMBER` argument,
+    /// identical to an ordinary scalar function's.
+    #[test]
+    fn build_oracle_script_uses_a_query_for_routines_only_sql_can_call() {
+        let pipelined = vec![
+            composite_procedure_argument(
+                None,
+                0,
+                "TABLE",
+                "OUT",
+                Some("SCOTT"),
+                Some("T_NUMS"),
+                None,
+            ),
+            procedure_argument(Some("N"), 1, Some("NUMBER"), "IN"),
+        ];
+        assert_eq!(
+            ObjectBrowserWidget::build_procedure_script(
+                "SCOTT.ZQ_PIPE",
+                "FUNCTION",
+                &routine_definition_with_call_form(&pipelined, true, false),
+            ),
+            "SELECT *\nFROM TABLE(\n  SCOTT.ZQ_PIPE(\n    N => 0\n  )\n);\n"
+        );
+
+        let aggregate = vec![
+            procedure_argument(None, 0, Some("NUMBER"), "OUT"),
+            procedure_argument(Some("INPUT"), 1, Some("NUMBER"), "IN"),
+        ];
+        assert_eq!(
+            ObjectBrowserWidget::build_procedure_script(
+                "SCOTT.ZQ_AGG",
+                "FUNCTION",
+                &routine_definition_with_call_form(&aggregate, false, true),
+            ),
+            "SELECT\n  SCOTT.ZQ_AGG(\n    INPUT => 0\n  ) AS result\nFROM dual;\n"
+        );
+
+        // The SAME argument rows, with the dictionary saying "ordinary": the
+        // block shape, untouched. This is what makes the flag — and not the
+        // arguments — the thing that decides.
+        let ordinary = ObjectBrowserWidget::build_procedure_script(
+            "SCOTT.ZQ_AGG",
+            "FUNCTION",
+            &routine_definition(&aggregate),
+        );
+        assert!(ordinary.starts_with("VAR v_result NUMBER\n"));
+        assert!(ordinary.contains("  :v_result := SCOTT.ZQ_AGG(\n"));
+
+        // Oracle takes no parentheses on an empty argument list, in a query
+        // exactly as in a block.
+        let no_args = vec![composite_procedure_argument(
+            None,
+            0,
+            "TABLE",
+            "OUT",
+            Some("SCOTT"),
+            Some("T_NUMS"),
+            None,
+        )];
+        assert_eq!(
+            ObjectBrowserWidget::build_procedure_script(
+                "SCOTT.ZQ_PIPE0",
+                "FUNCTION",
+                &routine_definition_with_call_form(&no_args, true, false),
+            ),
+            "SELECT *\nFROM TABLE(\n  SCOTT.ZQ_PIPE0\n);\n"
+        );
+    }
+
+    /// A query has nowhere to put a variable, so an OUT argument is written as
+    /// a literal like every other one.
+    ///
+    /// PL/SQL lets a pipelined function declare an OUT parameter, and SQL
+    /// cannot carry one at all — such a routine is callable from nowhere.
+    /// Dropping the argument would make the list the wrong LENGTH and the
+    /// server would complain about the count; writing it keeps the call
+    /// complete, so the refusal names the real problem (the function has OUT
+    /// arguments) instead of a made-up one.
+    #[test]
+    fn build_oracle_sql_scope_script_writes_every_argument_as_a_literal() {
+        let arguments = vec![
+            composite_procedure_argument(
+                None,
+                0,
+                "TABLE",
+                "OUT",
+                Some("SCOTT"),
+                Some("T_NUMS"),
+                None,
+            ),
+            procedure_argument(Some("N"), 1, Some("NUMBER"), "IN"),
+            procedure_argument(Some("O"), 2, Some("VARCHAR2"), "OUT"),
+        ];
+
+        let sql = ObjectBrowserWidget::build_procedure_script(
+            "SCOTT.ZQ_PIPE_OUT",
+            "FUNCTION",
+            &routine_definition_with_call_form(&arguments, true, false),
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT *\nFROM TABLE(\n  SCOTT.ZQ_PIPE_OUT(\n    N => 0,\n    O => ''\n  )\n);\n"
+        );
+        // No declarations, no binds: a query has neither.
+        assert!(!sql.contains("VAR "));
+        assert!(!sql.contains(":v_"));
+    }
+
+    /// The call form is read for the overload the script is actually built
+    /// for. A package may overload one name with a pipelined and an ordinary
+    /// body, and `select_overload_arguments` may pick either.
+    #[test]
+    fn oracle_call_form_follows_the_selected_overload() {
+        let overloads = vec![
+            RoutineOverload {
+                overload: Some(1),
+                pipelined: false,
+                aggregate: false,
+            },
+            RoutineOverload {
+                overload: Some(2),
+                pipelined: true,
+                aggregate: false,
+            },
+        ];
+
+        assert_eq!(
+            RoutineCallForm::of(&overloads, Some(1)),
+            RoutineCallForm::Ordinary
+        );
+        assert_eq!(
+            RoutineCallForm::of(&overloads, Some(2)),
+            RoutineCallForm::PipelinedTable
+        );
+        // A `NULL` overload is its own key, not "the first row".
+        assert_eq!(
+            RoutineCallForm::of(&overloads, None),
+            RoutineCallForm::Ordinary
+        );
+        // Nothing known — every MySQL-family routine — is the ordinary form.
+        assert_eq!(RoutineCallForm::of(&[], None), RoutineCallForm::Ordinary);
+        assert_eq!(RoutineCallForm::Ordinary.sql_scope_shape(), None);
+        assert_eq!(
+            RoutineCallForm::PipelinedTable.sql_scope_shape(),
+            Some(OracleSqlScopeShape::PipelinedTable)
+        );
+        assert_eq!(
+            RoutineCallForm::Aggregate.sql_scope_shape(),
+            Some(OracleSqlScopeShape::Aggregate)
+        );
     }
 
     /// The routine KIND picks the shape when there are no argument rows to
@@ -13586,11 +14635,19 @@ mod tests {
         // The builders reach the same shapes when the argument list they were
         // handed is empty, so a FUNCTION never comes back as a call statement.
         assert_eq!(
-            ObjectBrowserWidget::build_procedure_script("SCOTT.SQ_F", "FUNCTION", &[]),
+            ObjectBrowserWidget::build_procedure_script(
+                "SCOTT.SQ_F",
+                "FUNCTION",
+                &routine_definition(&[])
+            ),
             "SELECT SCOTT.SQ_F AS result\nFROM dual;\n"
         );
         assert_eq!(
-            ObjectBrowserWidget::build_mysql_routine_script("app.fn", "FUNCTION", &[]),
+            ObjectBrowserWidget::build_mysql_routine_script(
+                "app.fn",
+                "FUNCTION",
+                &routine_definition(&[])
+            ),
             "SELECT `app`.`fn`() AS result;\n"
         );
     }
@@ -13610,7 +14667,11 @@ mod tests {
             procedure_argument(Some("p_qty"), 6, Some("int"), "IN"),
         ];
 
-        let sql = ObjectBrowserWidget::build_mysql_routine_script("app.p", "PROCEDURE", &arguments);
+        let sql = ObjectBrowserWidget::build_mysql_routine_script(
+            "app.p",
+            "PROCEDURE",
+            &routine_definition(&arguments),
+        );
 
         assert_eq!(
             sql,
@@ -13633,7 +14694,7 @@ mod tests {
         let mysql = ObjectBrowserWidget::build_mysql_routine_script(
             "app.p",
             "PROCEDURE",
-            &[procedure_argument(Some(&long_name), 1, Some("int"), "OUT")],
+            &routine_definition(&[procedure_argument(Some(&long_name), 1, Some("int"), "OUT")]),
         );
         let session_var = mysql
             .lines()
@@ -13658,10 +14719,10 @@ mod tests {
         let oracle = ObjectBrowserWidget::build_procedure_script(
             "SQ_LONG_P",
             "PROCEDURE",
-            &[
+            &routine_definition(&[
                 procedure_argument(Some(&oracle_name), 1, Some("NUMBER"), "IN"),
                 procedure_argument(Some(&second), 2, Some("NUMBER"), "IN"),
-            ],
+            ]),
         );
         let declared: Vec<&str> = oracle
             .lines()
@@ -13691,11 +14752,11 @@ mod tests {
         let sql = ObjectBrowserWidget::build_mysql_routine_script(
             "app.p",
             "PROCEDURE",
-            &[
+            &routine_definition(&[
                 procedure_argument(Some("p_plain"), 1, Some("int"), "OUT"),
                 procedure_argument(Some("`b"), 2, Some("int"), "OUT"),
                 procedure_argument(Some("a`b"), 3, Some("int"), "OUT"),
-            ],
+            ]),
         );
 
         assert!(sql.contains("SELECT @v_p_plain AS `p_plain`;"));
@@ -13719,7 +14780,7 @@ mod tests {
                 "SELECT",
             ),
             "PROCEDURE",
-            &[],
+            &routine_definition(&[]),
         );
         assert_eq!(procedure, "BEGIN\n  SCOTT.\"SELECT\";\nEND;\n/\n");
 
@@ -13767,8 +14828,11 @@ mod tests {
             "IN",
         )];
 
-        let sql =
-            ObjectBrowserWidget::build_procedure_script("SQ_CUR_PROC", "PROCEDURE", &arguments);
+        let sql = ObjectBrowserWidget::build_procedure_script(
+            "SQ_CUR_PROC",
+            "PROCEDURE",
+            &routine_definition(&arguments),
+        );
 
         assert!(sql.contains("  v_p_cur SYS_REFCURSOR;\n"));
         assert!(!sql.contains(":= NULL"));
@@ -13785,8 +14849,11 @@ mod tests {
             procedure_argument(Some("p_out"), 2, Some("INT"), "OUT"),
         ];
 
-        let sql =
-            ObjectBrowserWidget::build_mysql_routine_script("demo_fn", "FUNCTION", &arguments);
+        let sql = ObjectBrowserWidget::build_mysql_routine_script(
+            "demo_fn",
+            "FUNCTION",
+            &routine_definition(&arguments),
+        );
 
         assert!(sql.contains("SET @v_result = `demo_fn`(\n"));
         assert!(sql.contains("    @v_p_out\n"));
@@ -13802,51 +14869,70 @@ mod tests {
             procedure_argument(Some("p_in"), 1, Some("INT"), "IN"),
         ];
 
-        let sql =
-            ObjectBrowserWidget::build_mysql_routine_script("demo_fn", "FUNCTION", &arguments);
+        let sql = ObjectBrowserWidget::build_mysql_routine_script(
+            "demo_fn",
+            "FUNCTION",
+            &routine_definition(&arguments),
+        );
 
         assert!(sql.contains("SELECT `demo_fn`(\n"));
         assert!(sql.contains(") AS result;\n"));
         assert!(!sql.contains("SET @"));
     }
 
+    /// The TEXT each part carries, unchanged from when this test was written:
+    /// punctuation trimmed, every quoting form unwrapped, a doubled delimiter
+    /// read as one character, and malformed quoting refused outright.
+    ///
+    /// Each expectation now also states whether the part was QUOTED, which the
+    /// lexer always knew and used to discard. Same texts, one more fact — the
+    /// one that says whether `myProc` names `MYPROC` or `"myProc"`.
     #[test]
     fn selected_object_reference_parts_trim_sql_punctuation() {
+        let bare = |text: &str| super::SelectedObjectPart {
+            text: text.to_string(),
+            quoted: false,
+        };
+        let quoted = |text: &str| super::SelectedObjectPart {
+            text: text.to_string(),
+            quoted: true,
+        };
+
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts(" (SCOTT.EMP); "),
-            Some(vec!["SCOTT".to_string(), "EMP".to_string()])
+            Some(vec![bare("SCOTT"), bare("EMP")])
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts("demo_pkg.run_job()"),
-            Some(vec!["demo_pkg".to_string(), "run_job".to_string()])
+            Some(vec![bare("demo_pkg"), bare("run_job")])
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts("\"MixedCase\""),
-            Some(vec!["MixedCase".to_string()])
+            Some(vec![quoted("MixedCase")])
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts(r#""Demo.Pkg""#),
-            Some(vec!["Demo.Pkg".to_string()])
+            Some(vec![quoted("Demo.Pkg")])
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts(r#""Sales.Ops"."Emp.Table""#),
-            Some(vec!["Sales.Ops".to_string(), "Emp.Table".to_string()])
+            Some(vec![quoted("Sales.Ops"), quoted("Emp.Table")])
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts("[Sales.Ops].[Emp.Table]"),
-            Some(vec!["Sales.Ops".to_string(), "Emp.Table".to_string()])
+            Some(vec![quoted("Sales.Ops"), quoted("Emp.Table")])
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts(r#""Emp""Name""#),
-            Some(vec!["Emp\"Name".to_string()])
+            Some(vec![quoted("Emp\"Name")])
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts("`emp``name`"),
-            Some(vec!["emp`name".to_string()])
+            Some(vec![quoted("emp`name")])
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts("[Emp]]Name]"),
-            Some(vec!["Emp]Name".to_string()])
+            Some(vec![quoted("Emp]Name")])
         );
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts(r#""Bad"Name""#),
@@ -13867,6 +14953,142 @@ mod tests {
         assert_eq!(
             ObjectBrowserWidget::selected_object_reference_parts("SELECT EMP"),
             None
+        );
+    }
+
+    /// A selection denotes the name the SERVER would resolve it to.
+    ///
+    /// This is the fact `pkg.myProc` and `pkg."myProc"` disagree on, and the
+    /// reason a lookup cannot be handed the raw text: Oracle folds a bare
+    /// identifier to upper case, so the first names `PKG.MYPROC` and only the
+    /// second names the routine a quoted declaration created. The MySQL family
+    /// folds nothing, so upper-casing there would invent a name the server
+    /// never resolves — `Emp` and `emp` really can be two tables.
+    #[test]
+    fn a_selected_part_denotes_the_name_the_server_resolves() {
+        let bare = super::SelectedObjectPart {
+            text: "myProc".to_string(),
+            quoted: false,
+        };
+        let quoted = super::SelectedObjectPart {
+            text: "myProc".to_string(),
+            quoted: true,
+        };
+
+        assert_eq!(bare.denoted_name(DatabaseType::Oracle), "MYPROC");
+        assert_eq!(quoted.denoted_name(DatabaseType::Oracle), "myProc");
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(bare.denoted_name(db_type), "myProc", "{db_type:?}");
+            assert_eq!(quoted.denoted_name(db_type), "myProc", "{db_type:?}");
+        }
+    }
+
+    /// The STANDALONE half of the same rule: `Execute Procedure` on an editor
+    /// selection resolves through `selection_name_match`, which used to take
+    /// the first case-insensitive hit — so a schema holding `MYPROC` and
+    /// `"myProc"` (two real routines) was separated by list order.
+    #[test]
+    fn a_standalone_routine_selection_picks_by_denoted_name_and_refuses_a_tie() {
+        let names = vec!["MYPROC".to_string(), "myProc".to_string()];
+
+        // Each spelling identifies its own routine.
+        assert_eq!(
+            ObjectBrowserWidget::selection_name_match(&names, "MYPROC"),
+            Some("MYPROC".to_string())
+        );
+        assert_eq!(
+            ObjectBrowserWidget::selection_name_match(&names, "myProc"),
+            Some("myProc".to_string())
+        );
+        // A spelling that is neither is a tie, and a tie is not an answer.
+        assert_eq!(
+            ObjectBrowserWidget::selection_name_match(&names, "myproc"),
+            None,
+            "two routines answer this name; list order must not choose"
+        );
+        // The convenience half is untouched: one candidate, any case.
+        assert_eq!(
+            ObjectBrowserWidget::selection_name_match(&["EMP".to_string()], "emp"),
+            Some("EMP".to_string())
+        );
+        assert_eq!(
+            ObjectBrowserWidget::selection_name_match(&["emp".to_string()], "EMP"),
+            Some("emp".to_string())
+        );
+    }
+
+    /// The whole point of carrying the quoting: a package may hold `MYPROC`
+    /// and `"myProc"` at once, and only the selection's own quoting says which
+    /// one `pkg.myProc` meant.
+    ///
+    /// Reading the raw text made both selections the same value, so the
+    /// package-member reader — which needs an exact spelling precisely because
+    /// both names are real — had to pick one for both.
+    #[test]
+    fn a_selection_picks_the_package_member_its_quoting_names() {
+        let mut cache = ObjectCache::default();
+        cache.packages.push("PKG".to_string());
+        cache.package_routines.insert(
+            "PKG".to_string(),
+            vec![
+                PackageRoutine {
+                    name: "MYPROC".to_string(),
+                    routine_type: "PROCEDURE".to_string(),
+                },
+                PackageRoutine {
+                    name: "myProc".to_string(),
+                    routine_type: "FUNCTION".to_string(),
+                },
+            ],
+        );
+        let data = IntellisenseData::new();
+
+        let resolved = |selected: &str| {
+            ObjectBrowserWidget::resolve_selected_object_context(
+                selected,
+                &data,
+                Some(&cache),
+                DatabaseType::Oracle,
+                None,
+            )
+            .map(|context| context.item)
+        };
+
+        // Bare: Oracle folds it, so it names the upper-case routine.
+        assert_eq!(
+            resolved("PKG.myProc"),
+            Some(ObjectItem::PackageRoutine {
+                package_name: "PKG".to_string(),
+                routine_name: "MYPROC".to_string(),
+                routine_type: "PROCEDURE".to_string(),
+            })
+        );
+        // Quoted: it names the routine only a quoted declaration can create.
+        assert_eq!(
+            resolved("PKG.\"myProc\""),
+            Some(ObjectItem::PackageRoutine {
+                package_name: "PKG".to_string(),
+                routine_name: "myProc".to_string(),
+                routine_type: "FUNCTION".to_string(),
+            })
+        );
+        // A spelling neither denotes stays UNKNOWN rather than picking one:
+        // `PKG.MYPROC` is what a bare `myproc` folds to, and it is exact.
+        assert_eq!(
+            resolved("PKG.myproc"),
+            Some(ObjectItem::PackageRoutine {
+                package_name: "PKG".to_string(),
+                routine_name: "MYPROC".to_string(),
+                routine_type: "PROCEDURE".to_string(),
+            })
+        );
+        assert_eq!(
+            resolved("PKG.\"nosuch\""),
+            Some(ObjectItem::PackageRoutine {
+                package_name: "PKG".to_string(),
+                routine_name: "nosuch".to_string(),
+                routine_type: "UNKNOWN".to_string(),
+            })
         );
     }
 
@@ -14107,7 +15329,14 @@ mod tests {
             }
             _ => panic!("expected simple object"),
         }
-        assert_eq!(resolved.selected_scope.as_deref(), Some("scott"));
+        // The scope is the name the selection DENOTES, not the text it was
+        // typed in: `data.users` does not hold SCOTT here, so this is the
+        // fall-through, and it used to hand back the raw `scott`. That is a
+        // schema Oracle does not have — `qualify_oracle_object_name` sees a
+        // lowercase byte and writes `"scott".EMP`, which resolves to nothing.
+        // The metadata-case path one test below is unaffected: it matches
+        // case-insensitively and answers with the catalog's own spelling.
+        assert_eq!(resolved.selected_scope.as_deref(), Some("SCOTT"));
     }
 
     #[test]
@@ -14229,6 +15458,12 @@ mod tests {
         );
     }
 
+    /// The expected SCOPE is the name `scott` denotes on Oracle. It read
+    /// `scott` before, which is the un-normalised fall-through the selection
+    /// resolver used to take — see
+    /// `resolve_sql_selection_uses_qualified_schema_metadata`. What this test
+    /// is about, the object TYPE each qualified name resolves to, is
+    /// unchanged.
     #[test]
     fn resolve_sql_selection_uses_qualified_metadata_for_supported_object_types() {
         let mut data = IntellisenseData::new();
@@ -14258,7 +15493,7 @@ mod tests {
             DatabaseType::Oracle,
             None,
             "MATERIALIZED VIEWS",
-            Some("scott"),
+            Some("SCOTT"),
         );
         assert_resolves_simple_object(
             "scott.address_t",
@@ -14267,7 +15502,7 @@ mod tests {
             DatabaseType::Oracle,
             None,
             "TYPES",
-            Some("scott"),
+            Some("SCOTT"),
         );
         assert_resolves_simple_object(
             "scott.order_seq",
@@ -14276,7 +15511,7 @@ mod tests {
             DatabaseType::Oracle,
             None,
             "SEQUENCES",
-            Some("scott"),
+            Some("SCOTT"),
         );
         assert_resolves_simple_object(
             "scott.emp_biu",
@@ -14285,7 +15520,7 @@ mod tests {
             DatabaseType::Oracle,
             None,
             "TRIGGERS",
-            Some("scott"),
+            Some("SCOTT"),
         );
         assert_resolves_simple_object(
             "scott.emp_pk",
@@ -14294,7 +15529,7 @@ mod tests {
             DatabaseType::Oracle,
             None,
             "INDEXES",
-            Some("scott"),
+            Some("SCOTT"),
         );
         assert_resolves_simple_object(
             "scott.emp_syn",
@@ -14303,8 +15538,12 @@ mod tests {
             DatabaseType::Oracle,
             None,
             "SYNONYMS",
-            Some("scott"),
+            Some("SCOTT"),
         );
+        // MySQL, and the expectation stays as typed on purpose: this family
+        // folds no identifier, so `scott` denotes `scott` — `Scott` and
+        // `scott` really can be two schemas. Only the Oracle rows above are
+        // upper-cased, which is the whole per-family point.
         assert_resolves_simple_object(
             "scott.nightly_event",
             &data,
@@ -14425,7 +15664,13 @@ mod tests {
                 routine_type,
             } => {
                 assert_eq!(package_name, "PKG");
-                assert_eq!(routine_name, "calc");
+                // The member name is what `calc` DENOTES on Oracle. Nothing
+                // resolved it — which is this test's point, the dotted
+                // literal's type must not be reused — so the name falls
+                // through, and it used to fall through as the raw `calc`.
+                // `quote_oracle_identifier` then wrote `PKG."calc"`, a member
+                // no unquoted declaration can create.
+                assert_eq!(routine_name, "CALC");
                 assert_eq!(routine_type, "UNKNOWN");
             }
             _ => panic!("expected package routine"),
@@ -14656,12 +15901,14 @@ mod tests {
                 routine_type,
             } => {
                 assert_eq!(package_name, "DEMO_PKG");
-                assert_eq!(routine_name, "calc");
+                // Denoted, not typed — the same fall-through as the test
+                // above. The type staying UNKNOWN is what this test is for.
+                assert_eq!(routine_name, "CALC");
                 assert_eq!(routine_type, "UNKNOWN");
             }
             _ => panic!("expected package routine"),
         }
-        assert_eq!(resolved.selected_scope.as_deref(), Some("scott"));
+        assert_eq!(resolved.selected_scope.as_deref(), Some("SCOTT"));
     }
 
     #[test]

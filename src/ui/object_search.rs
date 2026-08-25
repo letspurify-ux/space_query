@@ -6,7 +6,8 @@
 //! the tree's filter box is a flat, ranked list that can be driven entirely from
 //! the keyboard: type a few letters, press Enter, land in the source.
 
-use crate::ui::object_browser::{ObjectCache, ObjectItem};
+use crate::db::PackageRoutine;
+use crate::ui::object_browser::{ObjectBrowserWidget, ObjectCache, ObjectItem};
 
 /// Upper bound on returned hits. A scope with tens of thousands of objects
 /// would otherwise build a browser list nobody scrolls through.
@@ -26,11 +27,23 @@ const CATEGORY_ORDER: [&str; 9] = [
     "SYNONYMS",
 ];
 
+/// One search result: what the user reads, and WHAT IT IS.
+///
+/// The two are separate fields on purpose. `display_name` is presentation —
+/// a package member is shown as `PKG.ROUTINE` so the user can tell which
+/// package they picked — and [`Self::item`] is identity. This used to hold
+/// only the text and recover the identity from it by splitting on the first
+/// `.`, which is a guess: a `.` is legal INSIDE an Oracle or MySQL catalog
+/// name (`"MY.PKG"`), so a package whose own name carries one came back as a
+/// member of a package that does not exist, and a member of such a package
+/// lost both halves. Nothing parses the display text any more; the identity is
+/// built from the parts the cache already keeps apart.
+///
+/// The `item` field is private and the constructors below are the only way to
+/// make one, so a hit cannot exist whose text and identity disagree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectSearchHit {
-    /// Tree category in upper case, e.g. `TABLES` — the same string
-    /// `ObjectItem::Simple::object_type` carries.
-    pub category: String,
+    item: ObjectItem,
     /// Name as the user should read it: `PKG.ROUTINE` for a package member.
     pub display_name: String,
     /// Single-word kind shown next to the name (`Table`, `Procedure`, …).
@@ -38,20 +51,42 @@ pub struct ObjectSearchHit {
 }
 
 impl ObjectSearchHit {
-    pub fn to_object_item(&self) -> ObjectItem {
-        match self.display_name.split_once('.') {
-            Some((package_name, routine_name)) if self.category == "PACKAGES" => {
-                ObjectItem::PackageRoutine {
-                    package_name: package_name.to_string(),
-                    routine_name: routine_name.to_string(),
-                    routine_type: self.kind_label.to_uppercase(),
-                }
-            }
-            _ => ObjectItem::Simple {
-                object_type: self.category.clone(),
-                object_name: self.display_name.clone(),
+    /// A hit for one object listed under `category`.
+    fn simple(category: &str, object_name: String) -> Self {
+        Self {
+            display_name: object_name.clone(),
+            kind_label: kind_label(category).to_string(),
+            item: ObjectItem::Simple {
+                object_type: category.to_string(),
+                object_name,
             },
         }
+    }
+
+    /// A hit for one member of `package_name`.
+    ///
+    /// The routine KIND comes from the catalog row through the browser's own
+    /// normaliser, not from [`Self::kind_label`]: the label is title-cased for
+    /// display, and reading the kind back out of it produced a value no
+    /// consumer knows — `title_case("")` answers `Object`, which uppercases to
+    /// `OBJECT` and matches neither an action arm nor the `UNKNOWN` that asks
+    /// the server.
+    fn package_member(package_name: &str, routine: &PackageRoutine) -> Self {
+        Self {
+            display_name: qualified_member_name(package_name, &routine.name),
+            kind_label: title_case(&routine.routine_type),
+            item: ObjectItem::PackageRoutine {
+                package_name: package_name.to_string(),
+                routine_name: routine.name.clone(),
+                routine_type: ObjectBrowserWidget::package_routine_item_type(&routine.routine_type),
+            },
+        }
+    }
+
+    /// What the browser should act on — the same value its own tree hands to
+    /// the context menu and the default action.
+    pub fn to_object_item(&self) -> ObjectItem {
+        self.item.clone()
     }
 
     /// One row of the results list.
@@ -66,6 +101,13 @@ impl ObjectSearchHit {
             escape_browser_field(&self.kind_label)
         )
     }
+}
+
+/// How a package member is spelled in the list — the ONE place the two names
+/// are joined, so what the matcher searches and what the hit shows cannot
+/// drift apart.
+fn qualified_member_name(package_name: &str, routine_name: &str) -> String {
+    format!("{package_name}.{routine_name}")
 }
 
 /// FLTK only parses format codes at the start of a field, so only a leading
@@ -130,24 +172,20 @@ pub fn search(cache: &ObjectCache, query: &str, limit: usize) -> Vec<ObjectSearc
     let query = query.trim().to_lowercase();
     let mut scored: Vec<(MatchRank, usize, usize, ObjectSearchHit)> = Vec::new();
 
-    let mut consider = |category: &str, display_name: String, matched_on: &str| {
+    let mut consider = |category: &str, object_name: &str| {
         let rank = if query.is_empty() {
             MatchRank::Prefix
         } else {
-            match match_rank(matched_on, &query) {
+            match match_rank(object_name, &query) {
                 Some(rank) => rank,
                 None => return,
             }
         };
         scored.push((
             rank,
-            display_name.chars().count(),
+            object_name.chars().count(),
             category_position(category),
-            ObjectSearchHit {
-                category: category.to_string(),
-                display_name,
-                kind_label: kind_label(category).to_string(),
-            },
+            ObjectSearchHit::simple(category, object_name.to_string()),
         ));
     };
 
@@ -163,7 +201,7 @@ pub fn search(cache: &ObjectCache, query: &str, limit: usize) -> Vec<ObjectSearc
         ("SYNONYMS", &cache.synonyms),
     ] {
         for name in names.iter() {
-            consider(category, name.clone(), name);
+            consider(category, name);
         }
     }
 
@@ -177,7 +215,7 @@ pub fn search(cache: &ObjectCache, query: &str, limit: usize) -> Vec<ObjectSearc
             continue;
         };
         for routine in routines {
-            let qualified = format!("{}.{}", package_name, routine.name);
+            let qualified = qualified_member_name(package_name, &routine.name);
             let rank = if query.is_empty() {
                 Some(MatchRank::Prefix)
             } else {
@@ -190,11 +228,7 @@ pub fn search(cache: &ObjectCache, query: &str, limit: usize) -> Vec<ObjectSearc
                 rank,
                 qualified.chars().count(),
                 category_position("PACKAGES"),
-                ObjectSearchHit {
-                    category: "PACKAGES".to_string(),
-                    display_name: qualified,
-                    kind_label: title_case(&routine.routine_type),
-                },
+                ObjectSearchHit::package_member(package_name, routine),
             ));
         }
     }
@@ -396,11 +430,7 @@ mod tests {
 
     #[test]
     fn a_name_starting_with_the_format_character_is_escaped() {
-        let hit = ObjectSearchHit {
-            category: "TABLES".to_string(),
-            display_name: "@RATE".to_string(),
-            kind_label: "Table".to_string(),
-        };
+        let hit = ObjectSearchHit::simple("TABLES", "@RATE".to_string());
         assert_eq!(hit.browser_line(), "@@RATE\tTable");
     }
 
@@ -408,12 +438,94 @@ mod tests {
     fn a_format_character_inside_a_name_is_left_alone() {
         // FLTK stops parsing at the first non-format character, so an interior
         // `@` is already literal — doubling it would show two.
-        let hit = ObjectSearchHit {
-            category: "TABLES".to_string(),
-            display_name: "DB@LINK".to_string(),
-            kind_label: "Table".to_string(),
-        };
+        let hit = ObjectSearchHit::simple("TABLES", "DB@LINK".to_string());
         assert_eq!(hit.browser_line(), "DB@LINK\tTable");
+    }
+
+    /// A `.` is legal INSIDE a catalog name, so it cannot be read as the
+    /// separator between a package and its member. Splitting the display text
+    /// on the first one turned a package called `MY.PKG` into a member `PKG`
+    /// of a package `MY` — an object that does not exist — and the action that
+    /// followed opened whatever `MY` happened to be.
+    #[test]
+    fn a_dot_inside_a_package_name_does_not_make_it_a_member() {
+        let mut cache = cache();
+        cache.packages.push("MY.PKG".to_string());
+
+        let hit = search(&cache, "my.pkg", MAX_OBJECT_SEARCH_HITS)
+            .into_iter()
+            .find(|hit| hit.display_name == "MY.PKG")
+            .expect("the dotted package is searchable");
+
+        assert_eq!(
+            hit.to_object_item(),
+            ObjectItem::Simple {
+                object_type: "PACKAGES".to_string(),
+                object_name: "MY.PKG".to_string(),
+            }
+        );
+    }
+
+    /// The member of such a package keeps BOTH names whole — the identity is
+    /// built from the two the cache already holds apart, never re-split out of
+    /// the `MY.PKG.RUN` the list shows.
+    #[test]
+    fn a_member_of_a_dotted_package_keeps_both_names_whole() {
+        let mut cache = cache();
+        cache.packages.push("MY.PKG".to_string());
+        cache.package_routines.insert(
+            "MY.PKG".to_string(),
+            vec![PackageRoutine {
+                name: "RUN".to_string(),
+                routine_type: "PROCEDURE".to_string(),
+            }],
+        );
+
+        let hit = search(&cache, "my.pkg.run", MAX_OBJECT_SEARCH_HITS)
+            .into_iter()
+            .find(|hit| hit.display_name == "MY.PKG.RUN")
+            .expect("the dotted package's member is searchable");
+
+        assert_eq!(
+            hit.to_object_item(),
+            ObjectItem::PackageRoutine {
+                package_name: "MY.PKG".to_string(),
+                routine_name: "RUN".to_string(),
+                routine_type: "PROCEDURE".to_string(),
+            }
+        );
+    }
+
+    /// The routine kind travels from the catalog row, not back out of the
+    /// title-cased label the list shows. A catalog value the label mapper does
+    /// not know (`title_case("")` answers `Object`) used to become the item's
+    /// routine type.
+    #[test]
+    fn the_routine_kind_comes_from_the_catalog_not_from_the_label() {
+        let mut cache = cache();
+        cache.package_routines.insert(
+            "PKG_ODD".to_string(),
+            vec![PackageRoutine {
+                name: "MYSTERY".to_string(),
+                routine_type: String::new(),
+            }],
+        );
+
+        let hit = search(&cache, "mystery", MAX_OBJECT_SEARCH_HITS)
+            .into_iter()
+            .find(|hit| hit.display_name == "PKG_ODD.MYSTERY")
+            .expect("the member is searchable");
+
+        assert_eq!(hit.kind_label, "Object");
+        match hit.to_object_item() {
+            // `UNKNOWN` is the one value that means "ask the server which kind
+            // this is"; `OBJECT` — what the label round trip produced — means
+            // nothing to any consumer, so its menu entry matched no action.
+            ObjectItem::PackageRoutine { routine_type, .. } => {
+                assert_eq!(routine_type, "UNKNOWN")
+            }
+            other => panic!("expected a package routine, got {other:?}"),
+        }
     }
 
     #[test]

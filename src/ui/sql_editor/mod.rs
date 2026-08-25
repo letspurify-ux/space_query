@@ -9178,13 +9178,6 @@ impl SqlEditorWidget {
                     send_outcome(QueryCancelOutcome::PendingInitialization);
                     return;
                 }
-                // Read through the SLOT for the same reason the force tier does:
-                // a hand-back landing between the check above and the break
-                // below withdraws first, and the break must see that rather than
-                // act on a handle cloned a moment earlier.
-                let cancel_handle =
-                    QueryCancelHandle::OperationSlot(Arc::clone(&current_query_cancel_handle));
-
                 // Claimed, not just sent: the watchdog asks the same question
                 // and sends the break itself for a session that arrives after
                 // this thread has given up waiting. Whoever claims first sends.
@@ -9207,21 +9200,14 @@ impl SqlEditorWidget {
                         return;
                     }
                 }
-                let interrupt_result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    cancel_handle.cancel_interrupt(&SessionCancelClaim::owned_outright())
-                }))
-                .unwrap_or_else(|payload| {
-                    Err(format!(
-                        "Graceful cancel panicked: {}",
-                        SqlEditorWidget::panic_payload_to_string(payload.as_ref())
-                    ))
-                });
-                // The break has stopped travelling, whatever it answered. Until
-                // this lands the watchdog holds its force deadline open: on the
-                // MySQL family everything above is a control connection being
-                // opened, and escalating during it destroys the session a KILL
-                // QUERY was still on its way to spare.
-                SqlEditorWidget::finish_graceful_break(&current_query_cancel_handle);
+                // The break travels and its answer is recorded as one step.
+                // Until the recording lands the watchdog holds its force
+                // deadline open: on the MySQL family the send above is a
+                // control connection being opened, and escalating during it
+                // destroys the session a KILL QUERY was still on its way to
+                // spare.
+                let interrupt_result =
+                    SqlEditorWidget::send_and_finish_graceful_break(&current_query_cancel_handle);
                 if interrupt_result.is_err()
                     && (!load_mutex_bool(&cancel_flag)
                         || !SqlEditorWidget::is_query_running_flag(&query_running)
@@ -9415,21 +9401,12 @@ impl SqlEditorWidget {
                     // on the same connection is the ordinary way) used to meet
                     // the tear-down as the first thing that ever reached it.
                     if decision == ForcePassDecision::SendGracefulBreak {
-                        // Through the SLOT, like the tear-down below: the break
-                        // must see a hand-back that lands while it is on its
-                        // way to the server.
-                        let handle = QueryCancelHandle::OperationSlot(Arc::clone(
-                            &current_query_cancel_handle,
-                        ));
-                        let interrupt_result = panic::catch_unwind(AssertUnwindSafe(|| {
-                            handle.cancel_interrupt(&SessionCancelClaim::owned_outright())
-                        }))
-                        .unwrap_or_else(|payload| {
-                            Err(format!(
-                                "Graceful cancel panicked: {}",
-                                Self::panic_payload_to_string(payload.as_ref())
-                            ))
-                        });
+                        // Sent and recorded as one step, exactly as the cancel
+                        // thread does it: the outcome announced below must not
+                        // be able to reach a reader while the publication still
+                        // says a break is travelling.
+                        let interrupt_result =
+                            Self::send_and_finish_graceful_break(&current_query_cancel_handle);
                         match interrupt_result {
                             Ok(SessionCancelDelivery::Delivered) => {
                                 let _ = progress_sender.send(QueryProgress::CancelOutcome {
@@ -9448,9 +9425,6 @@ impl SqlEditorWidget {
                                 &format!("Graceful cancel failed from the watchdog: {message}"),
                             ),
                         }
-                        // This break has stopped travelling, exactly as the
-                        // cancel thread records its own.
-                        Self::finish_graceful_break(&current_query_cancel_handle);
                         // This session has now been asked. Give it the same
                         // grace every other session gets before the tier that
                         // cannot be taken back.
@@ -9893,6 +9867,41 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .force_pass_decision()
+    }
+
+    /// Send the break this caller claimed, and record that it ANSWERED — in
+    /// that order, as ONE step.
+    ///
+    /// The order is the whole point, and it is why the two are fused here
+    /// rather than left as two calls at each sender. `Sending` means "a break
+    /// is travelling, do not escalate yet", so a publication still reading
+    /// `Sending` after its break has landed tells the force tier to hold its
+    /// one deadline open for a break that is already done — the grace starts
+    /// late, on a fact that stopped being true. Anything the app says about
+    /// the break (its `CancelOutcome`) must therefore follow the recording,
+    /// which it cannot do if the recording follows the announcement.
+    ///
+    /// Both tiers reach the session the same way — through the SLOT, so a
+    /// hand-back landing while the break travels withdraws it rather than
+    /// letting it act on a handle cloned a moment earlier — so both get the
+    /// same handle from here.
+    /// [`OperationCancelTarget::send_claimed_graceful_break`] is the
+    /// withdrawable twin, fused the same way for the same reason.
+    fn send_and_finish_graceful_break(
+        current_query_cancel_handle: &Arc<Mutex<OperationCancelTarget>>,
+    ) -> Result<crate::db::SessionCancelDelivery, String> {
+        let handle = QueryCancelHandle::OperationSlot(Arc::clone(current_query_cancel_handle));
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            handle.cancel_interrupt(&SessionCancelClaim::owned_outright())
+        }))
+        .unwrap_or_else(|payload| {
+            Err(format!(
+                "Graceful cancel panicked: {}",
+                Self::panic_payload_to_string(payload.as_ref())
+            ))
+        });
+        Self::finish_graceful_break(current_query_cancel_handle);
+        result
     }
 
     /// Record that the break this thread claimed has ANSWERED — delivered,
@@ -12492,6 +12501,49 @@ mod cancel_watchdog_tests {
     use crate::db::create_shared_connection;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
+
+    /// The fused sender's whole reason: when it RETURNS, no break is
+    /// travelling any more.
+    ///
+    /// Both tiers announce their outcome after this call, so a sender that
+    /// recorded the answer afterwards could let a reader see `InterruptSent`
+    /// while the publication still said `Sending` — and `Sending` is what
+    /// makes the force tier hold its one deadline open, so the grace would
+    /// start over for a break that had already landed. The watchdog road did
+    /// exactly that; the assertion lives on the shared step so neither road
+    /// can drift back.
+    #[test]
+    fn a_sent_graceful_break_is_recorded_before_the_sender_returns() {
+        let broken = Arc::new(AtomicBool::new(false));
+        let slot = Arc::new(Mutex::new(OperationCancelTarget::newly_published(
+            QueryCancelHandle::Test(broken.clone()),
+        )));
+        assert!(matches!(
+            SqlEditorWidget::claim_graceful_break(&slot),
+            GracefulBreakClaim::Claimed
+        ));
+
+        let delivery = SqlEditorWidget::send_and_finish_graceful_break(&slot);
+
+        assert!(
+            matches!(delivery, Ok(crate::db::SessionCancelDelivery::Delivered)),
+            "the break reached the published session: {delivery:?}"
+        );
+        assert!(
+            broken.load(Ordering::Relaxed),
+            "and the session really was broken"
+        );
+        assert!(
+            matches!(
+                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                OperationCancelTarget::Published {
+                    graceful_break: GracefulBreakProgress::Answered,
+                    ..
+                }
+            ),
+            "the answer is recorded by the time the caller has the result to announce"
+        );
+    }
 
     fn wait_for_flag(flag: &AtomicBool) -> bool {
         for _ in 0..100 {

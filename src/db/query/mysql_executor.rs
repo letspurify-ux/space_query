@@ -11,7 +11,8 @@ use super::executor::{
     ConstraintInfo, ForeignKeyInfo, IndexInfo, QueryExecutor, TableColumnDetail,
 };
 use super::types::{
-    result_messages, ColumnInfo, ProcedureArgument, QueryCell, QueryResult, SqlValueKind,
+    result_messages, ColumnInfo, ProcedureArgument, QueryCell, QueryResult, RoutineDefinition,
+    RoutineDefinitionLookup, SqlValueKind,
 };
 
 pub struct MysqlExecutor;
@@ -2908,6 +2909,86 @@ impl MysqlObjectBrowser {
         routine_name: &str,
         kind: MysqlRoutineKind,
     ) -> Result<Vec<ProcedureArgument>, MysqlError> {
+        Ok(
+            Self::routine_arguments_or_missing(conn, schema_name, routine_name, kind)?
+                .unwrap_or_default(),
+        )
+    }
+
+    /// What the catalog says about the routine — its definition, or the
+    /// answer that it does not describe one.
+    ///
+    /// The distinction is the whole point: an empty argument list has to mean
+    /// "this routine takes no arguments" and nothing else, because the script
+    /// builder turns it into a parameterless call. Handing back an empty list
+    /// for a routine the catalog does not hold is how a dropped or invisible
+    /// routine came to be offered a call script with nothing said.
+    ///
+    /// `Err` stays reserved for a read that could not be MADE — the same
+    /// division the Oracle loaders use, so the object browser can act on the
+    /// two differently without asking which backend it is on.
+    ///
+    /// `overloads` is always empty: the MySQL family has no per-overload call
+    /// form (and no overloading at all) — a stored routine is always invoked
+    /// the family's ordinary way.
+    pub fn get_routine_definition_in_schema(
+        conn: &mut Conn,
+        schema_name: Option<&str>,
+        routine_name: &str,
+        kind: MysqlRoutineKind,
+    ) -> Result<RoutineDefinitionLookup, String> {
+        if let Some(arguments) =
+            Self::routine_arguments_or_missing(conn, schema_name, routine_name, kind)
+                .map_err(|err| err.to_string())?
+        {
+            return Ok(RoutineDefinitionLookup::Defined(
+                RoutineDefinition::from_arguments(arguments),
+            ));
+        }
+        // `SHOW CREATE` could not settle it — but it needs SHOW_ROUTINE, which
+        // a user who may EXECUTE the routine need not have, so its silence is
+        // not proof of absence. The catalog is asked before refusing, and only
+        // HERE: the arguments-only entry point above discards the distinction,
+        // and must not pay a round trip for an answer it throws away.
+        if Self::routine_exists_in_schema(conn, schema_name, routine_name, kind) {
+            return Ok(RoutineDefinitionLookup::Defined(
+                RoutineDefinition::from_arguments(Vec::new()),
+            ));
+        }
+        // No compile state to report: a routine whose body does not compile is
+        // never created on this family in the first place.
+        Ok(RoutineDefinitionLookup::Unreadable(
+            result_messages::routine_arguments_unreadable(
+                &Self::qualified_routine_display_name(schema_name, routine_name),
+                None,
+            ),
+        ))
+    }
+
+    fn qualified_routine_display_name(schema_name: Option<&str>, routine_name: &str) -> String {
+        match schema_name.map(str::trim).filter(|name| !name.is_empty()) {
+            Some(schema_name) => format!("{schema_name}.{routine_name}"),
+            None => routine_name.to_string(),
+        }
+    }
+
+    /// `Ok(Some(args))` when the routine's parameter list was READ (it may be
+    /// empty), `Ok(None)` when nothing could settle whether the routine is
+    /// there at all.
+    ///
+    /// `None` is deliberately weaker than "it does not exist": it means
+    /// `INFORMATION_SCHEMA.PARAMETERS` held no row for this namespace AND
+    /// `SHOW CREATE` could not be read. Only a caller that needs the
+    /// distinction pays for settling it (see
+    /// [`Self::get_routine_definition_in_schema`]); this preserves
+    /// [`Self::get_routine_arguments_in_schema`]'s long-standing answer and
+    /// its exact round-trip count.
+    fn routine_arguments_or_missing(
+        conn: &mut Conn,
+        schema_name: Option<&str>,
+        routine_name: &str,
+        kind: MysqlRoutineKind,
+    ) -> Result<Option<Vec<ProcedureArgument>>, MysqlError> {
         let schema_name = Self::optional_schema_param(schema_name);
         let rows_result =
             Self::fetch_routine_parameter_rows(conn, schema_name.clone(), routine_name);
@@ -2930,23 +3011,47 @@ impl MysqlObjectBrowser {
                 if rows.is_empty() {
                     // No rows for THIS kind covers both "no such routine" and
                     // "routine with no parameters" — the DDL fallback settles
-                    // it (`SHOW CREATE` fails on a missing routine).
-                    return Ok(fallback_arguments(conn).unwrap_or_default());
+                    // it when it can be read.
+                    return Ok(fallback_arguments(conn));
                 }
                 rows
             }
             Err(err) => {
                 if let Some(arguments) = fallback_arguments(conn) {
-                    return Ok(arguments);
+                    return Ok(Some(arguments));
                 }
                 return Err(err);
             }
         };
 
-        Ok(rows
-            .into_iter()
-            .map(Self::routine_parameter_row_to_argument)
-            .collect())
+        Ok(Some(
+            rows.into_iter()
+                .map(Self::routine_parameter_row_to_argument)
+                .collect(),
+        ))
+    }
+
+    /// Whether the catalog holds `routine_name` in `kind`'s namespace.
+    ///
+    /// A read failure answers "yes": this only ever decides whether to REFUSE,
+    /// and a refusal has to be something the catalog said, never something a
+    /// broken read implied.
+    fn routine_exists_in_schema(
+        conn: &mut Conn,
+        schema_name: Option<&str>,
+        routine_name: &str,
+        kind: MysqlRoutineKind,
+    ) -> bool {
+        let schema_name = Self::effective_schema_param(conn, schema_name);
+        let found: Result<Option<u8>, MysqlError> = conn.exec_first(
+            "SELECT 1 FROM INFORMATION_SCHEMA.ROUTINES \
+             WHERE ROUTINE_SCHEMA = ? AND ROUTINE_NAME = ? AND ROUTINE_TYPE = ?",
+            (schema_name, routine_name, kind.as_routine_type()),
+        );
+        match found {
+            Ok(found) => found.is_some(),
+            Err(_) => true,
+        }
     }
 
     /// Arguments for whichever routine carries `routine_name`, for callers
