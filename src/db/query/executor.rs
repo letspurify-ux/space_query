@@ -10149,9 +10149,28 @@ impl ObjectBrowser {
     /// (23ai/26ai report `PIPELINED = NO` there — live-checked — so today the
     /// order is belt and braces.)
     ///
-    /// An unrecognised `SQL_MACRO` value is the ordinary form: a spelling this
-    /// app has never seen must degrade to the shape it has always written, not
-    /// to a guess.
+    /// `POLYMORPHIC` is read as a BOOLEAN — any value it STATES means "this is
+    /// a polymorphic table function" — and deliberately not as a list of known
+    /// kinds.
+    ///
+    /// The column's meaning is "NULL when this is not a PTF, otherwise which
+    /// kind it is" (`ROW` / `TABLE` today), so a value this app does not
+    /// recognise can only be a PTF kind it has not met. Matching `ROW`/`TABLE`
+    /// by NAME and letting anything else fall through to the shapes below is
+    /// therefore the dangerous reading: a future kind would get the PL/SQL
+    /// block, which for a PTF "succeeds" while doing nothing — the silent wrong
+    /// answer this whole call-form design exists to prevent, and strictly worse
+    /// than a refusal the user can see and act on.
+    ///
+    /// The one anomaly this column really has — it holds the four-character
+    /// STRING `NULL` rather than SQL NULL when it does not apply — is handled
+    /// ONCE, in [`Self::dictionary_stated_value`]. Reading "not null" as "not a
+    /// PTF" would otherwise call every ordinary routine polymorphic.
+    ///
+    /// `SQL_MACRO`'s unrecognised value takes the opposite road (the ordinary
+    /// form) because that is the shape this app has always written; the two
+    /// columns are read differently ON PURPOSE and the difference is argued at
+    /// the test that pins both.
     fn routine_invocation(
         pipelined: Option<&str>,
         aggregate: Option<&str>,
@@ -13060,7 +13079,8 @@ mod routine_definition_tests {
     ///
     /// The values are the ones the view really produces (live-checked on
     /// 23ai/26ai): `PIPELINED`/`AGGREGATE` spell `YES`/`NO`, `SQL_MACRO`
-    /// spells `SCALAR`/`TABLE`/NULL, `POLYMORPHIC` spells `ROW`/NULL. A SQL
+    /// spells `SCALAR`/`TABLE`/NULL, `POLYMORPHIC` spells `ROW`/NULL (`TABLE`
+    /// is the other kind the view documents; only `ROW` was seen live here). A SQL
     /// macro reports `NO`/`NO` for the first two, which is exactly why reading
     /// only those two made a macro indistinguishable from an ordinary function
     /// — and a PL/SQL block naming one RUNS and hands back the macro's source
@@ -13131,6 +13151,47 @@ mod routine_definition_tests {
         // always written, never to a guess.
         assert_eq!(
             read("NO", "NO", Some("SOMETHING_NEW"), None),
+            super::RoutineInvocation::Ordinary
+        );
+        // `POLYMORPHIC` takes the OPPOSITE road, and the asymmetry is the whole
+        // point rather than an oversight — round 21 "fixed" it to match
+        // `SQL_MACRO` and that was a regression, so the reasoning is pinned
+        // here.
+        //
+        // The two columns say different KINDS of thing. `SQL_MACRO` names a SQL
+        // scope, and not knowing which scope leaves the shape this app has
+        // always written as a sane floor. `POLYMORPHIC` means "this routine is
+        // a PTF" — the column is NULL for everything else — so a value that is
+        // not `ROW` or `TABLE` can only be a PTF kind this app has not met. Let
+        // that fall through and it gets the PL/SQL block, which for a PTF
+        // SUCCEEDS while doing nothing: the silent wrong answer, strictly worse
+        // than a refusal the user can see. So any STATED value refuses.
+        assert_eq!(
+            read("NO", "NO", None, Some("SOMETHING_NEW")),
+            super::RoutineInvocation::Polymorphic,
+            "an unknown POLYMORPHIC value can only be a PTF kind; the block would lie quietly"
+        );
+        assert_eq!(
+            read("NO", "NO", Some("SCALAR"), Some("SOMETHING_NEW")),
+            super::RoutineInvocation::Polymorphic,
+            "and it still outranks every shape below it"
+        );
+        // `TABLE` is the other kind the view documents. It answers the same way
+        // `ROW` does — through "the column stated something", not a name list.
+        assert_eq!(
+            read("NO", "NO", None, Some("TABLE")),
+            super::RoutineInvocation::Polymorphic
+        );
+        // The catastrophic reading this rule invites — "every ordinary routine
+        // is polymorphic" — is ruled out by `dictionary_stated_value` alone,
+        // which is why the boolean reading is safe. Both null spellings, once
+        // more, right beside the rule that depends on them.
+        assert_eq!(
+            read("NO", "NO", None, Some("NULL")),
+            super::RoutineInvocation::Ordinary
+        );
+        assert_eq!(
+            read("NO", "NO", None, None),
             super::RoutineInvocation::Ordinary
         );
     }

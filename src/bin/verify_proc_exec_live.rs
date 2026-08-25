@@ -1806,6 +1806,25 @@ fn routine_action_round_trip(h: &mut Harness, target: Target) -> Result<(), Stri
     script_success(ACT_PROC, &events)?;
     println!("    OK: an ordinary routine's action opens a script that runs");
 
+    // The name the action TARGETS is composed from the session's own context
+    // (`ObjectBrowserWidget::action_object_name`), which is the only thing that
+    // can fill in a schema the card never picked - this call passes no scope at
+    // all. Asserted rather than left to the script running, because an
+    // UNqualified `CALL p()` also runs, against whatever database the session
+    // happens to be on. It is the same name the failure road writes, so proving
+    // it here proves it for both.
+    if !target.is_oracle() {
+        let schema = target.connection_info().service_name;
+        let expected = format!("{schema}.{ACT_PROC}");
+        if name != expected {
+            return Err(format!(
+                "a scope-less action must still name the session's own database: got {name:?}, \
+                 want {expected:?}"
+            ));
+        }
+        println!("    OK: a scope-less action names {name}");
+    }
+
     // 2. A routine the catalog does not describe: the app must say so and open
     //    NOTHING. Opening the parameterless call anyway is what this asserts
     //    against - it is a script the answer rules out.
@@ -1818,8 +1837,18 @@ fn routine_action_round_trip(h: &mut Harness, target: Target) -> Result<(), Stri
     );
     match (alert, sql) {
         (Some(alert), None) => {
-            if !alert.contains(ACT_MISSING) {
-                return Err(format!("the refusal for {name} does not name it: {alert}"));
+            // The EXACT shared sentence, not merely one naming the routine.
+            // Three roads now end in "an alert and no tab" - the catalog's
+            // refusal, a routine no script can call, and a load that was
+            // STOPPED - and all three would satisfy a `contains` test, so this
+            // case could pass without the refusal it exists to prove ever
+            // happening.
+            let want = space_query::db::result_messages::routine_arguments_unreadable(&name, None);
+            if alert != want {
+                return Err(format!(
+                    "{name}: the refusal is not the shared unreadable sentence.\n  got:  \
+                     {alert}\n  want: {want}"
+                ));
             }
             println!("    OK: an unreadable routine opens nothing - {alert}");
         }

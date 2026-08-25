@@ -322,10 +322,33 @@ pub mod result_messages {
     /// argument is a TABLE, and their `ALL_ARGUMENTS` rows describe the
     /// `DBMS_TF` records the implementation package receives, not anything a
     /// caller writes.
+    ///
+    /// `reason` carries the remedy as well as the cause, because the two belong
+    /// to the invocation FORM: this sentence used to end with "Write the call by
+    /// hand against the table it reads", which is advice only a polymorphic
+    /// table function can act on. A second form reaching here would have
+    /// inherited it and told the user something untrue.
     pub fn routine_call_not_writable(display_name: &str, reason: &str) -> String {
+        format!("No call script can be generated for {display_name}: {reason}")
+    }
+
+    /// `Execute Procedure`/`Execute Function` was STOPPED before the catalog
+    /// answered — cancelled from the activity view, or its cancel timeout
+    /// fired.
+    ///
+    /// Kept apart from a load that FAILED, which is the one road that still
+    /// opens the simple-call fallback script. The app knows nothing about the
+    /// routine either way, but a stop is something that was ASKED for, and
+    /// handing back a parameterless call for a routine that takes three
+    /// arguments is acting after being told to stop — the very script
+    /// [`routine_arguments_unreadable`]'s gate exists to prevent.
+    ///
+    /// One sentence for all four backends, for the same reason as its
+    /// neighbours: the situation is the same on all four.
+    pub fn routine_script_load_stopped(display_name: &str, reason: &str) -> String {
         format!(
-            "No call script can be generated for {display_name}: {reason}. Write the call by hand \
-             against the table it reads."
+            "Loading arguments for {display_name} was stopped, so no call script was generated: \
+             {reason}"
         )
     }
 

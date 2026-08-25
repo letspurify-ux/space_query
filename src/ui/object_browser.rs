@@ -455,7 +455,54 @@ struct RoutineScriptLoad {
     /// as the kind the server's own listing gave it.
     routine_type: String,
     db_type: crate::db::DatabaseType,
-    result: Result<RoutineScriptOutcome, String>,
+    result: RoutineScriptLoadResult,
+}
+
+/// Why a routine-script load ended, in the three ways it can.
+///
+/// The two failures are NOT the same failure. A load that FAILED leaves the app
+/// knowing nothing about the routine, so the long-standing simple-call fallback
+/// still gives the user something to edit. A load that was STOPPED — cancelled
+/// from the activity view, or its cancel timeout fired — leaves the app knowing
+/// nothing EITHER, but it was asked to stop: writing a parameterless call for a
+/// routine that takes three arguments is acting after being told not to, and it
+/// is the very script [`RoutineScriptOutcome::Refused`]'s gate exists to
+/// prevent.
+///
+/// They used to arrive as one `Result<_, String>`, so the delivery point could
+/// only treat them alike — and every stop ended with an alert AND a wrong tab.
+/// The scope-race message even reads "Retry the action" while the tab it opened
+/// says the routine takes nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum RoutineScriptLoadResult {
+    /// The catalog answered: a script, or a refusal.
+    Answered(RoutineScriptOutcome),
+    /// The app could not ASK — a driver, a session, a connection that went
+    /// away, or a worker that panicked.
+    Failed(String),
+    /// The work was stopped before the catalog answered.
+    Stopped(String),
+}
+
+impl RoutineScriptLoadResult {
+    /// The ONE place a load's failure is read as one of the two things it can
+    /// be, so no caller can decide it for itself — or forget to.
+    ///
+    /// The question is asked of
+    /// [`crate::db::session_policy::message_indicates_query_cancel`], the same
+    /// DB-agnostic reader the result tabs use, so all four backends answer it
+    /// the same way and a new cancel marker is added in one place. Every
+    /// producer of this value goes through here: the loader, and the worker's
+    /// panic road.
+    fn of(result: Result<RoutineScriptOutcome, String>) -> Self {
+        match result {
+            Ok(outcome) => Self::Answered(outcome),
+            Err(err) => match crate::db::session_policy::message_indicates_query_cancel(&err) {
+                true => Self::Stopped(err),
+                false => Self::Failed(err),
+            },
+        }
+    }
 }
 
 /// What a routine-script load produced.
@@ -530,6 +577,17 @@ struct RoutineScriptDelivery {
     alert: Option<String>,
     /// What is opened in a new query tab, if anything.
     open_sql: Option<String>,
+    /// What the status line reads once the action is over.
+    ///
+    /// NOT optional, because "say nothing" is the answer that was wrong: the
+    /// action announces `Loading … arguments for X` when it starts and nothing
+    /// when it ends, so every road that ends WITHOUT opening a tab — the
+    /// catalog's refusal, a routine no script can call, a stopped load — left
+    /// the status line claiming a load was still running, with no later event
+    /// to correct it (the label has no timer and 17 unrelated writers). A
+    /// mandatory field is what makes that unrepresentable: a road added later
+    /// cannot end in silence without the compiler asking what it says.
+    status: String,
 }
 
 /// What a routine does with ONE of its arguments.
@@ -614,7 +672,9 @@ enum OracleRoutineScript {
     Sql(OracleSqlScopeShape),
     /// No script exists. The routine is reachable only with something a
     /// generated argument list cannot supply, so the action says so and opens
-    /// nothing; `reason` is the half of the sentence that names why.
+    /// nothing; `reason` is the half of the sentence that names why AND what
+    /// the user can do instead — both belong to the FORM, so a form added later
+    /// cannot inherit another one's remedy.
     Unwritable { reason: &'static str },
 }
 
@@ -640,9 +700,55 @@ impl OracleRoutineScript {
                 Self::Sql(OracleSqlScopeShape::Aggregate)
             }
             RoutineInvocation::Polymorphic => Self::Unwritable {
+                // The REMEDY belongs to the form, not to the shared sentence:
+                // "write the call by hand against the table it reads" is advice
+                // only a polymorphic table function can act on, and a second
+                // form reaching here would have inherited it from
+                // `routine_call_not_writable` and told the user something
+                // untrue. The text the user sees is unchanged.
                 reason: "it is a polymorphic table function, so it can only be called with a \
-                         table argument",
+                         table argument. Write the call by hand against the table it reads.",
             },
+        }
+    }
+}
+
+/// One of the two stored-routine groups a selected name can land in.
+///
+/// A named value rather than the `"PROCEDURES"` / `"FUNCTIONS"` string literals
+/// the selection resolvers scan, because the ORDER of these two is now a
+/// per-backend answer ([`ObjectBrowserWidget::routine_selection_order`]) and
+/// every mapping off it — the catalog label, the intellisense list, the
+/// qualified-member kind — has to be TOTAL. Read off a string, each of those
+/// mappings needs a wildcard, and a wildcard is what would quietly send one
+/// group's name to the other group's list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoutineSelectionGroup {
+    Procedures,
+    Functions,
+}
+
+impl RoutineSelectionGroup {
+    /// The `ObjectItem::Simple` object type, which is also the key
+    /// [`ObjectBrowserWidget::cache_name_match`] reads.
+    fn object_type(self) -> &'static str {
+        match self {
+            Self::Procedures => "PROCEDURES",
+            Self::Functions => "FUNCTIONS",
+        }
+    }
+
+    fn qualified_member_kind(self) -> QualifiedMemberKind {
+        match self {
+            Self::Procedures => QualifiedMemberKind::Procedure,
+            Self::Functions => QualifiedMemberKind::Function,
+        }
+    }
+
+    fn names(self, data: &IntellisenseData) -> &[String] {
+        match self {
+            Self::Procedures => &data.procedures,
+            Self::Functions => &data.functions,
         }
     }
 }
@@ -714,6 +820,25 @@ trait ObjectBrowserDbBehavior: Sync {
     /// object. Asked of the backend rather than tested in place because the
     /// answer is a property OF the backend — a new one has to state its own.
     fn denoted_bare_identifier(&self, identifier: &str) -> String;
+    /// Whether stored PROCEDURES and FUNCTIONS live in SEPARATE namespaces
+    /// here, so one name can legitimately be both.
+    ///
+    /// Oracle keeps procedures, functions, packages and types in ONE namespace
+    /// — `CREATE FUNCTION calc` beside `CREATE PROCEDURE calc` is refused — so
+    /// at most one of the two lists can hold a given name and the order they
+    /// are consulted in cannot change an answer. The MySQL family keeps TWO,
+    /// where that pair is ordinary, so a bare `calc` in editor text really does
+    /// name two objects.
+    ///
+    /// A backend that says yes gets the FUNCTION, which is not a new
+    /// preference: it is the one this app already gives the signature popup and
+    /// the bind prompt for the same ambiguity
+    /// (`MysqlObjectBrowser::get_routine_arguments_in_schema_any_kind`,
+    /// `discovered_kind_for_routine`), because a name written in an expression
+    /// is a function call far more often than a `CALL` target. Answering it
+    /// here rather than by the order of a candidate array is what stops the two
+    /// halves of this app from disagreeing about one question.
+    fn routine_namespaces_can_collide(&self) -> bool;
     fn preview_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String;
     /// The statement `Export Data...` runs: the same relation the preview
     /// shows, with no row limit.
@@ -3361,16 +3486,33 @@ impl ObjectBrowserWidget {
                             }
                         },
                         ObjectActionResult::RoutineScript(load) => {
-                            let delivery = ObjectBrowserWidget::routine_script_delivery(
+                            // DESTRUCTURED on purpose: every part of the
+                            // delivery has to be acted on, and a part dropped
+                            // here is what left the status line claiming a load
+                            // was still running. Read field by field, dropping
+                            // one is an unused binding — a warning this build
+                            // denies — instead of a silence nothing notices.
+                            let RoutineScriptDelivery {
+                                alert,
+                                open_sql,
+                                status,
+                            } = ObjectBrowserWidget::routine_script_delivery(
                                 load.db_type,
                                 &load.qualified_name,
                                 &load.routine_type,
                                 load.result,
                             );
-                            if let Some(alert) = delivery.alert {
+                            // FIRST, and unconditionally: the action announced
+                            // `Loading … arguments for X` when it started, and
+                            // the status line has no timer and no other writer
+                            // that would ever correct it. Emitting before the
+                            // alert also means the line is already true behind
+                            // the modal the user is about to dismiss.
+                            ObjectBrowserWidget::emit_status_callback(&status_callback, &status);
+                            if let Some(alert) = alert {
                                 crate::ui::alert_on_main(&alert);
                             }
-                            if let Some(sql) = delivery.open_sql {
+                            if let Some(sql) = open_sql {
                                 ObjectBrowserWidget::emit_sql_callback(
                                     &sql_callback,
                                     SqlAction::OpenInNewTab(sql),
@@ -3495,12 +3637,21 @@ impl ObjectBrowserWidget {
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                                     cache.package_routines.insert(package_name, routines);
-                                    if !show_menu {
-                                        ObjectBrowserWidget::emit_status_callback(
-                                            &status_callback,
-                                            "Could not resolve package routine type",
-                                        );
-                                    }
+                                    // Both halves say so. This road announces
+                                    // `Resolving package routine type for X`
+                                    // before it starts, and the RESOLVED half
+                                    // used to say nothing back — so a user who
+                                    // dismissed the menu without picking an
+                                    // entry was left with a status line
+                                    // claiming the lookup was still running.
+                                    // (The status label has no timer; see
+                                    // `RoutineScriptDelivery::status`.)
+                                    ObjectBrowserWidget::emit_status_callback(
+                                        &status_callback,
+                                        &ObjectBrowserWidget::package_routine_resolution_status(
+                                            &item, show_menu,
+                                        ),
+                                    );
                                 }
                                 Err(err) => {
                                     ObjectBrowserWidget::emit_status_callback(
@@ -5374,8 +5525,10 @@ impl ObjectBrowserWidget {
             ObjectItem::Simple { object_name, .. } => {
                 // Scope-qualified UP FRONT, so the simple-script fallback a
                 // failed argument load produces still targets the browsed
-                // scope. The load's own qualification replaces this on
-                // success.
+                // scope. This is the best answer available before a session
+                // exists; the closure below replaces it with the action's own
+                // as soon as one does, and the load's qualification replaces
+                // that on success.
                 let mut qualified_name =
                     Self::qualify_object_name_for_scope(db_type, selected_scope, object_name);
                 let result = Self::with_pooled_object_session(
@@ -5384,7 +5537,19 @@ impl ObjectBrowserWidget {
                     activity,
                     |context, session| {
                         load_db_type = context.connection_info.db_type;
-                        let data = object_browser_behavior_for(load_db_type).load_routine_script(
+                        let behavior = object_browser_behavior_for(load_db_type);
+                        // Re-answered from the SESSION's own context before any
+                        // work is done, so a load that fails half way still
+                        // names the object the way the load itself would have.
+                        // On the MySQL family that is what fills in a schema the
+                        // card never picked.
+                        qualified_name = Self::action_object_name(
+                            behavior,
+                            context,
+                            selected_scope,
+                            object_name,
+                        );
+                        let data = behavior.load_routine_script(
                             context,
                             session,
                             selected_scope,
@@ -5451,7 +5616,9 @@ impl ObjectBrowserWidget {
             qualified_name,
             routine_type: resolved_routine_type,
             db_type: load_db_type,
-            result,
+            // Every road above hands its failure to the ONE reader that tells a
+            // load that could not ASK from one that was told to STOP.
+            result: RoutineScriptLoadResult::of(result),
         }
     }
 
@@ -5535,12 +5702,14 @@ impl ObjectBrowserWidget {
                 ))
             });
             // A panic leaves the action with nothing loaded, so it takes the
-            // could-not-ask road carrying the facts the click already had.
+            // could-not-ask road carrying the facts the click already had —
+            // through the SAME reader the loader's own failures take, so this
+            // road cannot be given a second answer to "was this a stop?".
             let load = loaded.unwrap_or_else(|err| RoutineScriptLoad {
                 qualified_name: display_name,
                 routine_type,
                 db_type,
-                result: Err(err),
+                result: RoutineScriptLoadResult::of(Err(err)),
             });
 
             let _ = sender.send(ObjectActionResult::RoutineScript(load));
@@ -5607,31 +5776,64 @@ impl ObjectBrowserWidget {
     /// this is the rule the whole readability gate exists to enforce and it
     /// was previously unreachable by any test — the loop it lived in needs a
     /// live connection, a worker thread and an FLTK event pump.
+    ///
+    /// Exactly ONE of the four roads opens a fallback script, and the match
+    /// below names all four with no wildcard on purpose: the fallback belongs
+    /// to "the app could not ask" alone, and every time another road was let
+    /// into it the user got a parameterless call for a routine that takes
+    /// arguments ([`RoutineScriptLoadResult`], [`RoutineScriptOutcome`]).
     fn routine_script_delivery(
         db_type: crate::db::DatabaseType,
         qualified_name: &str,
         routine_type: &str,
-        result: Result<RoutineScriptOutcome, String>,
+        result: RoutineScriptLoadResult,
     ) -> RoutineScriptDelivery {
         match result {
-            Ok(RoutineScriptOutcome::Script(sql)) => RoutineScriptDelivery {
-                alert: None,
-                open_sql: Some(sql),
-            },
+            RoutineScriptLoadResult::Answered(RoutineScriptOutcome::Script(sql)) => {
+                RoutineScriptDelivery {
+                    alert: None,
+                    open_sql: Some(sql),
+                    status: format!("Opened a call script for {qualified_name}"),
+                }
+            }
             // The catalog ANSWERED. A parameterless call is the one script
             // that answer rules out, so the user is told and nothing is
             // opened — the same treatment an unresolved kind has always had.
-            Ok(RoutineScriptOutcome::Refused(reason)) => RoutineScriptDelivery {
-                alert: Some(reason),
+            RoutineScriptLoadResult::Answered(RoutineScriptOutcome::Refused(reason)) => {
+                RoutineScriptDelivery {
+                    alert: Some(reason),
+                    open_sql: None,
+                    status: format!("No call script was generated for {qualified_name}"),
+                }
+            }
+            // The work was STOPPED. The app knows nothing about the routine,
+            // exactly as on the road below — but it was told to stop, and
+            // opening a call script anyway is acting after that. Said out loud
+            // rather than left silent, because the stop can be a cancel TIMEOUT
+            // the user never asked for and would otherwise see no reason for
+            // the missing tab.
+            RoutineScriptLoadResult::Stopped(reason) => RoutineScriptDelivery {
+                alert: Some(
+                    crate::db::query::result_messages::routine_script_load_stopped(
+                        qualified_name,
+                        &reason,
+                    ),
+                ),
                 open_sql: None,
+                // Deliberately NOT "Loading arguments for X was stopped": the
+                // status line is one truncatable label, and a terminal line
+                // that OPENS with the words the in-progress line opens with
+                // reads as still running. The alert says the full sentence.
+                status: format!("Stopped loading arguments for {qualified_name}"),
             },
             // The app could not ASK, so it knows nothing about the routine:
             // the simple call script still gives the user something to edit.
-            Err(err) => RoutineScriptDelivery {
+            RoutineScriptLoadResult::Failed(err) => RoutineScriptDelivery {
                 alert: Some(format!("Failed to load routine arguments: {err}")),
                 open_sql: (!routine_type.eq_ignore_ascii_case("UNKNOWN")).then(|| {
                     Self::build_simple_routine_script_for_db(db_type, qualified_name, routine_type)
                 }),
+                status: format!("Failed to load arguments for {qualified_name}"),
             },
         }
     }
@@ -6872,6 +7074,34 @@ impl ObjectBrowserWidget {
         )
     }
 
+    /// What the status line reads once `Execute Routine`'s kind lookup is over.
+    ///
+    /// Both answers, in one place, because the road ANNOUNCES itself when it
+    /// starts (`Resolving package routine type for X`) and the status label has
+    /// no timer: the resolved half used to say nothing back, so a user who
+    /// dismissed the menu without picking an entry kept a line claiming the
+    /// lookup was still running. Same rule as
+    /// [`RoutineScriptDelivery::status`], for the same reason, on the other
+    /// half of the same feature.
+    ///
+    /// `resolved` is the caller's own answer
+    /// ([`Self::package_routine_type_is_resolved`]) rather than re-asked here,
+    /// so the sentence cannot disagree with the menu that is or is not shown.
+    fn package_routine_resolution_status(item: &ObjectItem, resolved: bool) -> String {
+        let ObjectItem::PackageRoutine {
+            package_name,
+            routine_name,
+            routine_type,
+        } = item
+        else {
+            return "Could not resolve package routine type".to_string();
+        };
+        match resolved {
+            true => format!("Resolved {package_name}.{routine_name} as {routine_type}"),
+            false => "Could not resolve package routine type".to_string(),
+        }
+    }
+
     fn resolve_selected_object_context(
         selected_text: &str,
         data: &IntellisenseData,
@@ -6889,18 +7119,20 @@ impl ObjectBrowserWidget {
             .map(|part| part.denoted_name(db_type))
             .collect();
         match parts.as_slice() {
-            [name] => Self::resolve_simple_selection_object(name, data, cache),
+            [name] => Self::resolve_simple_selection_object(name, data, cache, db_type),
             [qualifier, name] => {
                 Self::resolve_known_package_routine(qualifier, name, data, cache, db_type)
-                    .or_else(|| Self::resolve_qualified_schema_object(qualifier, name, data))
+                    .or_else(|| {
+                        Self::resolve_qualified_schema_object(qualifier, name, data, db_type)
+                    })
                     .or_else(|| {
                         if Self::scope_matches_current_or_default(
                             qualifier,
                             current_scope,
                             data.default_qualifier(),
                         ) {
-                            Self::resolve_simple_selection_object(name, data, cache).and_then(
-                                |mut context| {
+                            Self::resolve_simple_selection_object(name, data, cache, db_type)
+                                .and_then(|mut context| {
                                     if context
                                         .selected_scope
                                         .as_deref()
@@ -6916,8 +7148,7 @@ impl ObjectBrowserWidget {
                                         ));
                                     }
                                     Some(context)
-                                },
-                            )
+                                })
                         } else {
                             None
                         }
@@ -7102,12 +7333,62 @@ impl ObjectBrowserWidget {
         })
     }
 
+    /// The name an object action TARGETS, from the session it actually runs on.
+    ///
+    /// Composed HERE — not as a trait method — because the composition is not
+    /// backend policy: both halves already are. The scope half is
+    /// [`ObjectBrowserDbBehavior::action_scope`] (Oracle's browsed scope IS the
+    /// scope; the MySQL family fills a missing one from the connection's
+    /// current database) and the spelling half is
+    /// [`ObjectBrowserDbBehavior::qualify_object_name`].
+    ///
+    /// One composition because a caller that pre-computes a name for the
+    /// FAILURE road used to skip the scope half entirely, so one action
+    /// answered "which scope is this on?" two ways: the script said
+    /// ``CALL `app`.`p`(...)`` and the fallback said ``CALL `p`()``.
+    fn action_object_name(
+        behavior: &dyn ObjectBrowserDbBehavior,
+        context: &crate::db::DbPoolSessionContext,
+        selected_scope: Option<&str>,
+        object_name: &str,
+    ) -> String {
+        behavior.qualify_object_name(behavior.action_scope(selected_scope, context), object_name)
+    }
+
+    /// The two stored-routine groups, in the order a selected name that matches
+    /// BOTH of them is read.
+    ///
+    /// Only the MySQL family can produce that name at all
+    /// ([`ObjectBrowserDbBehavior::routine_namespaces_can_collide`]), and there
+    /// the FUNCTION answers. On Oracle the order is unobservable — the two
+    /// lists cannot both hold one name — so the long-standing spelling stays.
+    fn routine_selection_order(db_type: crate::db::DatabaseType) -> [RoutineSelectionGroup; 2] {
+        match object_browser_behavior_for(db_type).routine_namespaces_can_collide() {
+            true => [
+                RoutineSelectionGroup::Functions,
+                RoutineSelectionGroup::Procedures,
+            ],
+            false => [
+                RoutineSelectionGroup::Procedures,
+                RoutineSelectionGroup::Functions,
+            ],
+        }
+    }
+
     fn resolve_simple_selection_object(
         name: &str,
         data: &IntellisenseData,
         cache: Option<&ObjectCache>,
+        db_type: crate::db::DatabaseType,
     ) -> Option<ResolvedObjectContext> {
-        let candidates = [
+        let routines = Self::routine_selection_order(db_type).map(|group| {
+            (
+                group.object_type(),
+                Self::selection_name_match(group.names(data), name)
+                    .or_else(|| Self::cache_name_match(cache, group.object_type(), name)),
+            )
+        });
+        let leading = [
             (
                 "TABLES",
                 Self::selection_name_match(&data.tables, name)
@@ -7123,16 +7404,8 @@ impl ObjectBrowserWidget {
                 Self::selection_name_match(&data.materialized_views, name),
             ),
             ("TYPES", Self::selection_name_match(&data.types, name)),
-            (
-                "PROCEDURES",
-                Self::selection_name_match(&data.procedures, name)
-                    .or_else(|| Self::cache_name_match(cache, "PROCEDURES", name)),
-            ),
-            (
-                "FUNCTIONS",
-                Self::selection_name_match(&data.functions, name)
-                    .or_else(|| Self::cache_name_match(cache, "FUNCTIONS", name)),
-            ),
+        ];
+        let trailing = [
             (
                 "PACKAGES",
                 Self::selection_name_match(&data.packages, name)
@@ -7161,7 +7434,7 @@ impl ObjectBrowserWidget {
             ),
         ];
 
-        for (object_type, object_name) in candidates {
+        for (object_type, object_name) in leading.into_iter().chain(routines).chain(trailing) {
             if let Some(object_name) = object_name {
                 return Some(ResolvedObjectContext {
                     item: ObjectItem::Simple {
@@ -7190,14 +7463,19 @@ impl ObjectBrowserWidget {
         qualifier: &str,
         name: &str,
         data: &IntellisenseData,
+        db_type: crate::db::DatabaseType,
     ) -> Option<ResolvedObjectContext> {
-        let object_kinds = [
+        // `schema.calc` reaches here on the MySQL family too, so the routine
+        // pair takes the same backend-decided order the bare-name road takes.
+        let routines = Self::routine_selection_order(db_type)
+            .map(|group| (group.object_type(), group.qualified_member_kind()));
+        let leading = [
             ("TABLES", QualifiedMemberKind::Table),
             ("VIEWS", QualifiedMemberKind::View),
             ("MATERIALIZED VIEWS", QualifiedMemberKind::MaterializedView),
             ("TYPES", QualifiedMemberKind::Type),
-            ("PROCEDURES", QualifiedMemberKind::Procedure),
-            ("FUNCTIONS", QualifiedMemberKind::Function),
+        ];
+        let trailing = [
             ("PACKAGES", QualifiedMemberKind::Package),
             ("SEQUENCES", QualifiedMemberKind::Sequence),
             ("TRIGGERS", QualifiedMemberKind::Trigger),
@@ -7205,7 +7483,7 @@ impl ObjectBrowserWidget {
             ("EVENTS", QualifiedMemberKind::Event),
         ];
 
-        for (object_type, kind) in object_kinds {
+        for (object_type, kind) in leading.into_iter().chain(routines).chain(trailing) {
             if let Some(object_name) =
                 data.qualifier_member_name_matching_kinds(qualifier, name, &[kind])
             {
@@ -9181,6 +9459,13 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         identifier.to_uppercase()
     }
 
+    /// One namespace: a schema holds `calc` as a procedure or as a function,
+    /// never both — the second `CREATE` is refused as a name already used — so
+    /// the two lists can never both answer.
+    fn routine_namespaces_can_collide(&self) -> bool {
+        false
+    }
+
     fn preview_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String {
         let qualified_name = self.qualify_object_name(selected_scope, object_name);
         format!("SELECT * FROM {} WHERE ROWNUM <= 100", qualified_name)
@@ -9251,13 +9536,18 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
 
     fn load_routine_script(
         &self,
-        _context: &crate::db::DbPoolSessionContext,
+        context: &crate::db::DbPoolSessionContext,
         session: &mut crate::db::DbPoolSession,
         selected_scope: Option<&str>,
         object_name: &str,
         routine_type: &str,
     ) -> Result<RoutineScriptData, String> {
-        let qualified_name = self.qualify_object_name(selected_scope, object_name);
+        // The same reader the action's own pre-computed name goes through, so
+        // the script and the failure road cannot name the object differently.
+        // Inert here — this family's `action_scope` returns the browsed scope
+        // unchanged — and stated anyway so the two families take one road.
+        let qualified_name =
+            ObjectBrowserWidget::action_object_name(self, context, selected_scope, object_name);
         let lookup = match session {
             crate::db::DbPoolSession::Oracle(conn) => {
                 ObjectBrowser::get_procedure_definition(conn, &qualified_name)?
@@ -10151,6 +10441,13 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         identifier.to_string()
     }
 
+    /// Two namespaces: `CREATE PROCEDURE calc` and `CREATE FUNCTION calc` can
+    /// both exist in one database, so a bare `calc` really does name two
+    /// objects.
+    fn routine_namespaces_can_collide(&self) -> bool {
+        true
+    }
+
     fn preview_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String {
         let qualified_name = self.qualify_object_name(selected_scope, object_name);
         format!(
@@ -10246,7 +10543,11 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
                 .ok_or_else(|| format!("Unsupported MySQL/MariaDB routine type: {routine_type}"))?;
         let conn = self.take_object_action_session(context, session)?;
         let action_scope = self.action_scope(selected_scope, context);
-        let qualified_name = self.qualify_object_name(action_scope, object_name);
+        // Through the shared reader, not a second spelling of it: this is the
+        // name the action's failure road also has to produce, and a card with
+        // no schema picked used to make the two disagree.
+        let qualified_name =
+            ObjectBrowserWidget::action_object_name(self, context, selected_scope, object_name);
         crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_definition_in_schema(
             conn.as_mut(),
             action_scope,
@@ -14465,9 +14766,9 @@ mod tests {
     /// A parameterless call is exactly what "this routine's arguments cannot
     /// be read" rules out — the routine may take two, or not be there at all —
     /// and the delivery point used to open one anyway, because the refusal
-    /// reached it on the same `Err` road a lost session takes. Only a load
-    /// that could not ASK still gets the fallback, because only then does the
-    /// app know nothing.
+    /// reached it on the same `Err` road a lost session takes. Of the three
+    /// roads only a load that FAILED still gets the fallback; the stop road has
+    /// its own test below.
     #[test]
     fn a_refused_routine_opens_nothing_while_a_failed_load_still_falls_back() {
         let refusal = "Arguments for SCOTT.ZQ_BAD could not be read: the object is INVALID, so \
@@ -14478,11 +14779,14 @@ mod tests {
                 DatabaseType::Oracle,
                 "SCOTT.ZQ_BAD",
                 "PROCEDURE",
-                Ok(super::RoutineScriptOutcome::Refused(refusal.to_string())),
+                super::RoutineScriptLoadResult::Answered(super::RoutineScriptOutcome::Refused(
+                    refusal.to_string()
+                )),
             ),
             super::RoutineScriptDelivery {
                 alert: Some(refusal.to_string()),
                 open_sql: None,
+                status: "No call script was generated for SCOTT.ZQ_BAD".to_string(),
             },
             "the catalog's answer is said, and nothing is opened"
         );
@@ -14493,7 +14797,9 @@ mod tests {
                 DatabaseType::MariaDB,
                 "app.zq_bad",
                 "FUNCTION",
-                Ok(super::RoutineScriptOutcome::Refused(refusal.to_string())),
+                super::RoutineScriptLoadResult::Answered(super::RoutineScriptOutcome::Refused(
+                    refusal.to_string()
+                )),
             )
             .open_sql,
             None
@@ -14506,11 +14812,12 @@ mod tests {
                 DatabaseType::Oracle,
                 "SCOTT.ZQ_P",
                 "PROCEDURE",
-                Err("connection lost".to_string()),
+                super::RoutineScriptLoadResult::of(Err("connection lost".to_string())),
             ),
             super::RoutineScriptDelivery {
                 alert: Some("Failed to load routine arguments: connection lost".to_string()),
                 open_sql: Some("BEGIN\n  SCOTT.ZQ_P;\nEND;\n/\n".to_string()),
+                status: "Failed to load arguments for SCOTT.ZQ_P".to_string(),
             }
         );
         assert_eq!(
@@ -14518,7 +14825,7 @@ mod tests {
                 DatabaseType::MySQL,
                 "app.zq_p",
                 "PROCEDURE",
-                Err("connection lost".to_string()),
+                super::RoutineScriptLoadResult::of(Err("connection lost".to_string())),
             )
             .open_sql,
             Some("CALL `app`.`zq_p`();\n".to_string())
@@ -14529,7 +14836,7 @@ mod tests {
                 DatabaseType::Oracle,
                 "SCOTT.PKG.R",
                 "UNKNOWN",
-                Err("connection lost".to_string()),
+                super::RoutineScriptLoadResult::of(Err("connection lost".to_string())),
             )
             .open_sql,
             None
@@ -14541,14 +14848,200 @@ mod tests {
                 DatabaseType::Oracle,
                 "SCOTT.ZQ_P",
                 "PROCEDURE",
-                Ok(super::RoutineScriptOutcome::Script(
+                super::RoutineScriptLoadResult::Answered(super::RoutineScriptOutcome::Script(
                     "BEGIN NULL; END;\n".to_string()
                 )),
             ),
             super::RoutineScriptDelivery {
                 alert: None,
                 open_sql: Some("BEGIN NULL; END;\n".to_string()),
+                status: "Opened a call script for SCOTT.ZQ_P".to_string(),
             }
+        );
+    }
+
+    /// Every road ENDS the status line the action started.
+    ///
+    /// `spawn_routine_script_load` announces `Loading … arguments for X`, the
+    /// status label has no timer, and 17 unrelated writers is not a plan — so a
+    /// road that says nothing at the end leaves the app claiming a load is
+    /// still running. The three roads that open no tab are where it showed:
+    /// the user dismissed the alert and the line still read "Loading".
+    ///
+    /// Asserted as a PROPERTY over all four roads rather than four literals,
+    /// because the thing that must hold is "no road is silent", and a literal
+    /// per road is exactly what a fifth road would not have to satisfy.
+    #[test]
+    fn every_routine_script_road_ends_the_status_line_it_started() {
+        let roads = [
+            super::RoutineScriptLoadResult::Answered(super::RoutineScriptOutcome::Script(
+                "BEGIN NULL; END;\n".to_string(),
+            )),
+            super::RoutineScriptLoadResult::Answered(super::RoutineScriptOutcome::Refused(
+                "nope".to_string(),
+            )),
+            super::RoutineScriptLoadResult::of(Err("ORA-01013".to_string())),
+            super::RoutineScriptLoadResult::of(Err("connection lost".to_string())),
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for road in roads {
+            let delivery = ObjectBrowserWidget::routine_script_delivery(
+                DatabaseType::Oracle,
+                "SCOTT.ZQ_P",
+                "PROCEDURE",
+                road,
+            );
+            assert!(
+                !delivery.status.trim().is_empty(),
+                "a road ended without saying so: {delivery:?}"
+            );
+            assert!(
+                delivery.status.contains("SCOTT.ZQ_P"),
+                "the status must name the routine the action was about: {}",
+                delivery.status
+            );
+            assert!(
+                !delivery
+                    .status
+                    .to_ascii_lowercase()
+                    .starts_with("loading arguments for"),
+                "a terminal status must not repeat the line that says work is STILL running: {}",
+                delivery.status
+            );
+            seen.push(delivery.status);
+        }
+        // Four roads, four distinct endings: a shared one would hide which
+        // happened from the only line the user is left looking at.
+        let mut distinct = seen.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            seen.len(),
+            "roads share a status line: {seen:?}"
+        );
+    }
+
+    /// The other half of the same feature ends its status line too.
+    ///
+    /// `Execute Routine` on an UNKNOWN package member announces `Resolving
+    /// package routine type for X` and then asks the server. The UNRESOLVED
+    /// half always answered; the RESOLVED half said nothing, so dismissing the
+    /// menu without picking an entry left the line claiming the lookup was
+    /// still running.
+    #[test]
+    fn the_deferred_kind_lookup_ends_its_status_line_either_way() {
+        let member = |routine_type: &str| ObjectItem::PackageRoutine {
+            package_name: "PKG".to_string(),
+            routine_name: "myProc".to_string(),
+            routine_type: routine_type.to_string(),
+        };
+
+        let resolved = member("PROCEDURE");
+        assert!(ObjectBrowserWidget::package_routine_type_is_resolved(
+            &resolved
+        ));
+        assert_eq!(
+            ObjectBrowserWidget::package_routine_resolution_status(&resolved, true),
+            "Resolved PKG.myProc as PROCEDURE",
+            "the resolved half names the member AND the kind the menu is about to offer"
+        );
+
+        // Unresolved keeps the sentence it always had, so the failure road's
+        // wording is untouched by this fix.
+        let unknown = member("UNKNOWN");
+        assert!(!ObjectBrowserWidget::package_routine_type_is_resolved(
+            &unknown
+        ));
+        assert_eq!(
+            ObjectBrowserWidget::package_routine_resolution_status(&unknown, false),
+            "Could not resolve package routine type"
+        );
+
+        // An item shape this road cannot produce still ends the line rather
+        // than claiming a resolution it did not make.
+        assert_eq!(
+            ObjectBrowserWidget::package_routine_resolution_status(
+                &ObjectItem::Simple {
+                    object_type: "PROCEDURES".to_string(),
+                    object_name: "P".to_string(),
+                },
+                true,
+            ),
+            "Could not resolve package routine type"
+        );
+    }
+
+    /// A load that was STOPPED opens nothing, on every backend.
+    ///
+    /// The app knows nothing about the routine here, exactly as on the failed
+    /// road — but it was told to stop, and the parameterless call it used to
+    /// hand back is the one script the readability gate exists to prevent. It
+    /// was reachable two ways a user meets in practice: cancelling the activity,
+    /// and a cancel TIMEOUT firing on a slow `ALL_ARGUMENTS` read. The
+    /// scope-race message is the sharpest case — it says "Retry the action"
+    /// while the tab it opened claimed the routine takes nothing.
+    #[test]
+    fn a_stopped_routine_load_opens_nothing_on_every_backend() {
+        // One cancel spelling per backend, as its own driver reports it, plus
+        // the app's own text. Each must reach the SAME road on the SAME rule.
+        // (`DatabaseType` has no thin/OCI split — both Oracle protocols report
+        // the same `ORA-` code, which is why one entry covers both.)
+        let stops = [
+            (
+                DatabaseType::Oracle,
+                "ORA-01013: user requested cancel of current operation",
+            ),
+            (DatabaseType::MySQL, "Query execution was interrupted"),
+            (DatabaseType::MariaDB, "Query was killed"),
+            (DatabaseType::Oracle, "Query cancelled by user"),
+        ];
+        for (db_type, reason) in stops {
+            let delivery = ObjectBrowserWidget::routine_script_delivery(
+                db_type,
+                "SCOTT.ZQ_P",
+                "PROCEDURE",
+                super::RoutineScriptLoadResult::of(Err(reason.to_string())),
+            );
+            assert_eq!(
+                delivery.open_sql, None,
+                "{db_type:?} opened a script after the load was stopped: {reason}"
+            );
+            assert_eq!(
+                delivery.alert,
+                Some(
+                    crate::db::query::result_messages::routine_script_load_stopped(
+                        "SCOTT.ZQ_P",
+                        reason
+                    )
+                ),
+                "every backend says the one shared sentence"
+            );
+        }
+
+        // An UNKNOWN kind takes the same road: there was nothing to fall back
+        // to before, and there is nothing to open now either.
+        assert_eq!(
+            ObjectBrowserWidget::routine_script_delivery(
+                DatabaseType::Oracle,
+                "SCOTT.PKG.R",
+                "UNKNOWN",
+                super::RoutineScriptLoadResult::of(Err("ORA-01013".to_string())),
+            )
+            .open_sql,
+            None
+        );
+
+        // The classifier is what separates the two failures, and it must not
+        // swallow an ordinary one: a lost connection still reaches the
+        // fallback road (asserted in full by the test above).
+        assert_eq!(
+            super::RoutineScriptLoadResult::of(Err("connection lost".to_string())),
+            super::RoutineScriptLoadResult::Failed("connection lost".to_string())
+        );
+        assert_eq!(
+            super::RoutineScriptLoadResult::of(Err("ORA-01013".to_string())),
+            super::RoutineScriptLoadResult::Stopped("ORA-01013".to_string())
         );
     }
 
@@ -14930,16 +15423,26 @@ mod tests {
             panic!("a polymorphic table function must refuse, got {outcome:?}");
         };
         // The sentence is the shared catalog's, so all four backends read the
-        // same way when they ever have a case of their own.
+        // same way when they ever have a case of their own. The REMEDY moved
+        // into this form's own half — the catalog used to append "write the
+        // call by hand against the table it reads" to every refusal, which is
+        // advice only this form can act on — so the text handed to the shared
+        // function is the whole reason. What the user reads is unchanged, which
+        // the literal below pins end to end.
         assert_eq!(
             reason,
             crate::db::query::result_messages::routine_call_not_writable(
                 "SCOTT.ZQ_PTF",
                 "it is a polymorphic table function, so it can only be called with a table \
-                 argument",
+                 argument. Write the call by hand against the table it reads.",
             )
         );
-        assert!(reason.contains("SCOTT.ZQ_PTF"), "{reason}");
+        assert_eq!(
+            reason,
+            "No call script can be generated for SCOTT.ZQ_PTF: it is a polymorphic table \
+             function, so it can only be called with a table argument. Write the call by hand \
+             against the table it reads."
+        );
     }
 
     /// A SQL macro is spliced into the SQL that names it, so only a query sees
@@ -15408,6 +15911,140 @@ mod tests {
         assert_eq!(
             ObjectBrowserWidget::selection_name_match(&["emp".to_string()], "EMP"),
             Some("emp".to_string())
+        );
+    }
+
+    /// A name that is BOTH a procedure and a function is a two-namespace fact,
+    /// and the backend answers it — not the order of a candidate array.
+    ///
+    /// `CREATE PROCEDURE calc` beside `CREATE FUNCTION calc` is ordinary on the
+    /// MySQL family and impossible on Oracle (ORA-00955, one namespace). The
+    /// resolver listed PROCEDURES before FUNCTIONS and took the first hit, so a
+    /// MySQL selection of `calc` in `SELECT calc(1)` always meant the
+    /// PROCEDURE — the function was unreachable, and `Generate DDL` / `Drop...`
+    /// took aim at the other object too. The FUNCTION now answers, which is the
+    /// preference this app already applies to the same ambiguity in
+    /// `get_routine_arguments_in_schema_any_kind` and
+    /// `discovered_kind_for_routine`.
+    #[test]
+    fn a_name_in_both_routine_namespaces_resolves_the_way_the_backend_says() {
+        let mut data = IntellisenseData::new();
+        data.procedures = vec!["calc".to_string()];
+        data.functions = vec!["calc".to_string()];
+        data.rebuild_indices();
+
+        let object_type_of = |db_type| {
+            let resolved = ObjectBrowserWidget::resolve_selected_object_context(
+                "calc", &data, None, db_type, None,
+            )
+            .expect("a routine selection should resolve");
+            match resolved.item {
+                ObjectItem::Simple { object_type, .. } => object_type,
+                other => panic!("expected a simple object, got {other:?}"),
+            }
+        };
+
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(
+                object_type_of(db_type),
+                "FUNCTIONS",
+                "{db_type:?} keeps two routine namespaces, so the function answers"
+            );
+        }
+
+        // Oracle cannot produce the collision at all, so the order it uses is
+        // unobservable — and a name that is only in ONE list is unaffected on
+        // every backend, which is what keeps this change to the tie alone.
+        let mut only_procedure = IntellisenseData::new();
+        only_procedure.procedures = vec!["calc".to_string()];
+        only_procedure.rebuild_indices();
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+        ] {
+            let resolved = ObjectBrowserWidget::resolve_selected_object_context(
+                "calc",
+                &only_procedure,
+                None,
+                db_type,
+                None,
+            )
+            .expect("a routine selection should resolve");
+            match resolved.item {
+                ObjectItem::Simple { object_type, .. } => {
+                    assert_eq!(object_type, "PROCEDURES", "{db_type:?}")
+                }
+                other => panic!("expected a simple object, got {other:?}"),
+            }
+        }
+
+        // The routine pair moved into its own block, so the two BOUNDARIES it
+        // sits between are pinned: everything ahead of it still wins, and it
+        // still wins over everything behind it. (Only the pair's own internal
+        // order was ever meant to change.)
+        let mut across_blocks = IntellisenseData::new();
+        across_blocks.tables = vec!["calc".to_string()];
+        across_blocks.procedures = vec!["calc".to_string()];
+        across_blocks.functions = vec!["calc".to_string()];
+        across_blocks.packages = vec!["calc".to_string()];
+        across_blocks.rebuild_indices();
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+        ] {
+            let resolved = ObjectBrowserWidget::resolve_selected_object_context(
+                "calc",
+                &across_blocks,
+                None,
+                db_type,
+                None,
+            )
+            .expect("should resolve");
+            match resolved.item {
+                ObjectItem::Simple { object_type, .. } => assert_eq!(
+                    object_type, "TABLES",
+                    "{db_type:?}: a table still outranks both routine groups"
+                ),
+                other => panic!("expected a simple object, got {other:?}"),
+            }
+        }
+        let mut routine_over_package = IntellisenseData::new();
+        routine_over_package.procedures = vec!["calc".to_string()];
+        routine_over_package.packages = vec!["calc".to_string()];
+        routine_over_package.rebuild_indices();
+        let resolved = ObjectBrowserWidget::resolve_selected_object_context(
+            "calc",
+            &routine_over_package,
+            None,
+            DatabaseType::Oracle,
+            None,
+        )
+        .expect("should resolve");
+        match resolved.item {
+            ObjectItem::Simple { object_type, .. } => assert_eq!(
+                object_type, "PROCEDURES",
+                "a routine still outranks the groups behind it"
+            ),
+            other => panic!("expected a simple object, got {other:?}"),
+        }
+
+        // The order is stated per backend, not per call site: both selection
+        // roads read it from here.
+        assert_eq!(
+            ObjectBrowserWidget::routine_selection_order(DatabaseType::Oracle),
+            [
+                super::RoutineSelectionGroup::Procedures,
+                super::RoutineSelectionGroup::Functions
+            ]
+        );
+        assert_eq!(
+            ObjectBrowserWidget::routine_selection_order(DatabaseType::MySQL),
+            [
+                super::RoutineSelectionGroup::Functions,
+                super::RoutineSelectionGroup::Procedures
+            ]
         );
     }
 
