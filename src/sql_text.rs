@@ -2029,6 +2029,198 @@ pub(crate) fn is_quoted_identifier(value: &str) -> bool {
     quoted_identifier_delimiter(value).is_some()
 }
 
+/// Oracle words that cannot stand as a bare identifier where this app writes
+/// object names — a schema, package, routine or type in a dotted name, in
+/// either a SQL statement or a PL/SQL block.
+///
+/// Such a name can only have been CREATED quoted, and the dictionary hands it
+/// back as ordinary uppercase, so nothing about its shape says it needs
+/// quotes: `BEGIN SYSTEM.SELECT; END;` is PLS-00103 and
+/// `SELECT SYSTEM.LEVEL FROM dual` is ORA-03050.
+///
+/// Derived FROM THE SERVER, not from a document, and re-derivable the same
+/// way when a new release lands: ask the parser which words behave differently
+/// from an ordinary name in each of those positions. Note the answer is WIDER
+/// than `V$RESERVED_WORDS WHERE reserved='Y'`, which omits `LEVEL`, `ROWNUM`,
+/// `USER` and the PL/SQL words.
+///
+/// ```sql
+/// CREATE OR REPLACE FUNCTION kw_hostile(kw VARCHAR2) RETURN VARCHAR2 IS
+///   FUNCTION code(stmt VARCHAR2) RETURN INTEGER IS h INTEGER;
+///   BEGIN
+///     h := DBMS_SQL.OPEN_CURSOR;
+///     DBMS_SQL.PARSE(h, stmt, DBMS_SQL.NATIVE);
+///     DBMS_SQL.CLOSE_CURSOR(h);
+///     RETURN 0;
+///   EXCEPTION WHEN OTHERS THEN
+///     IF DBMS_SQL.IS_OPEN(h) THEN DBMS_SQL.CLOSE_CURSOR(h); END IF;
+///     IF SQLCODE = -6550 AND INSTR(SQLERRM, 'PLS-00103') > 0 THEN RETURN -1; END IF;
+///     RETURN SQLCODE;
+///   END;
+///   FUNCTION differs(t VARCHAR2) RETURN BOOLEAN IS
+///   BEGIN
+///     RETURN code(REPLACE(t,'@',kw)) <> code(REPLACE(t,'@','ZZQQ_ORDINARY'));
+///   END;
+/// BEGIN
+///   IF differs('SELECT SYSTEM.@ FROM dual')
+///      OR differs('BEGIN SYSTEM.@; END;')
+///      OR differs('BEGIN SYSTEM.@.P; END;')
+///      OR differs('BEGIN @.P; END;')
+///      OR differs('DECLARE v NUMBER; BEGIN v := SYSTEM.@(1); END;')
+///   THEN RETURN 'Y'; END IF;
+///   RETURN 'N';
+/// END;
+/// /
+/// SELECT LISTAGG(keyword, ' ') WITHIN GROUP (ORDER BY keyword)
+///   FROM (SELECT DISTINCT keyword FROM v$reserved_words
+///          WHERE REGEXP_LIKE(keyword, '^[A-Za-z][A-Za-z0-9_#$]*$'))
+///  WHERE kw_hostile(keyword) = 'Y';
+/// ```
+///
+/// The list only has to be COMPLETE, not minimal: quoting a name that did not
+/// need it is the same name (`"EMP"` is `EMP`), while missing one is a
+/// statement that will not parse.
+pub(crate) const ORACLE_IDENTIFIER_RESERVED_WORDS: &[&str] = &[
+    "ACCESS",
+    "ADD",
+    "ALL",
+    "ALTER",
+    "AND",
+    "ANY",
+    "AS",
+    "ASC",
+    "AT",
+    "AUDIT",
+    "BEGIN",
+    "BETWEEN",
+    "BY",
+    "CASE",
+    "CHAR",
+    "CHECK",
+    "CLOSE",
+    "CLUSTER",
+    "COLUMN",
+    "COLUMNS",
+    "COMMENT",
+    "COMPRESS",
+    "CONNECT",
+    "CRASH",
+    "CREATE",
+    "CURRENT",
+    "DATE",
+    "DECIMAL",
+    "DECLARE",
+    "DEFAULT",
+    "DELETE",
+    "DESC",
+    "DISTINCT",
+    "DROP",
+    "ELSE",
+    "END",
+    "EXCEPT",
+    "EXCLUSIVE",
+    "EXISTS",
+    "FALSE",
+    "FETCH",
+    "FILE",
+    "FLOAT",
+    "FOR",
+    "FROM",
+    "GRANT",
+    "GROUP",
+    "HAVING",
+    "IDENTIFIED",
+    "IF",
+    "IMMEDIATE",
+    "IN",
+    "INCREMENT",
+    "INDEX",
+    "INDEXES",
+    "INITIAL",
+    "INSERT",
+    "INTEGER",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "JSON_OBJECT",
+    "LEVEL",
+    "LIKE",
+    "LOCK",
+    "LONG",
+    "MAXEXTENTS",
+    "MINUS",
+    "MLSLABEL",
+    "MOD",
+    "MODE",
+    "MODIFY",
+    "NOAUDIT",
+    "NOCOMPRESS",
+    "NOT",
+    "NOWAIT",
+    "NULL",
+    "NUMBER",
+    "OF",
+    "OFFLINE",
+    "ON",
+    "ONLINE",
+    "OPEN",
+    "OPTION",
+    "OR",
+    "ORDER",
+    "OVERLAPS",
+    "PCTFREE",
+    "PRIOR",
+    "PROCEDURE",
+    "PUBLIC",
+    "RAW",
+    "RENAME",
+    "RESOURCE",
+    "RETURN",
+    "REVOKE",
+    "ROW",
+    "ROWNUM",
+    "ROWS",
+    "SELECT",
+    "SESSION",
+    "SET",
+    "SHARE",
+    "SIZE",
+    "SMALLINT",
+    "SQL",
+    "START",
+    "SUCCESSFUL",
+    "SYNONYM",
+    "SYSDATE",
+    "TABLE",
+    "THEN",
+    "TO",
+    "TRIGGER",
+    "TRUE",
+    "UID",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USER",
+    "VALIDATE",
+    "VALUES",
+    "VARCHAR",
+    "VARCHAR2",
+    "VIEW",
+    "WHEN",
+    "WHENEVER",
+    "WHERE",
+    "WITH",
+];
+
+static ORACLE_IDENTIFIER_RESERVED_WORDS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| ORACLE_IDENTIFIER_RESERVED_WORDS.iter().copied().collect());
+
+/// Whether `identifier` is a word Oracle refuses to read as a bare name.
+pub(crate) fn is_oracle_reserved_identifier(identifier: &str) -> bool {
+    let upper = identifier.to_ascii_uppercase();
+    ORACLE_IDENTIFIER_RESERVED_WORDS_SET.contains(upper.as_str())
+}
+
 /// Strips surrounding identifier quotes and unescapes doubled quote delimiters.
 pub(crate) fn strip_identifier_quotes(value: &str) -> String {
     let trimmed = value.trim();
@@ -8409,6 +8601,79 @@ pub(crate) fn is_table_function_item_leading_keyword(word: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The reserved-word list is the one thing standing between a
+    /// quoted-created object name and a script that will not parse, and it is
+    /// a hand-written copy of a server's vocabulary. Pin its shape so an edit
+    /// has to be deliberate, and pin the words that were live-proven hostile.
+    #[test]
+    fn oracle_reserved_identifier_words_are_sorted_unique_and_cover_the_proven_words() {
+        let words = super::ORACLE_IDENTIFIER_RESERVED_WORDS;
+        assert!(
+            words.windows(2).all(|pair| pair[0] < pair[1]),
+            "the list must stay sorted and duplicate-free so additions are reviewable"
+        );
+        assert!(
+            words.iter().all(|word| {
+                !word.is_empty()
+                    && word
+                        .chars()
+                        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+            }),
+            "entries are compared against an upper-cased identifier"
+        );
+
+        // Live-proven on Oracle 23ai: written bare, each of these makes the
+        // generated script fail to parse. `LEVEL`, `ROWNUM` and `USER` are the
+        // ones V$RESERVED_WORDS(reserved='Y') does NOT list.
+        for word in [
+            "SELECT",
+            "LEVEL",
+            "ROWNUM",
+            "USER",
+            "BEGIN",
+            "END",
+            "DECLARE",
+            "SQL",
+            "DATE",
+            "NUMBER",
+            "COMMENT",
+            "SIZE",
+            "MODE",
+            "OPTION",
+            "VALUES",
+            "PROCEDURE",
+            "RETURN",
+        ] {
+            assert!(
+                super::is_oracle_reserved_identifier(word),
+                "{word} must be quoted when it names an object"
+            );
+        }
+
+        // Ordinary names must stay unquoted, or every generated statement
+        // changes for no reason.
+        for word in [
+            "EMP",
+            "SCOTT",
+            "SQ_GEN_PKG",
+            "P_SHAPES",
+            "NAME",
+            "VALUE",
+            "COUNT",
+            "STATUS",
+        ] {
+            assert!(
+                !super::is_oracle_reserved_identifier(word),
+                "{word} is an ordinary name and must not be quoted"
+            );
+        }
+
+        // The catalog reports names in upper case, but the question is asked of
+        // whatever the caller holds.
+        assert!(super::is_oracle_reserved_identifier("select"));
+        assert!(super::is_oracle_reserved_identifier("Level"));
+    }
+
     use super::*;
     use std::collections::HashSet;
 

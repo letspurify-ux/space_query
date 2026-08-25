@@ -8143,6 +8143,16 @@ impl DatabaseConnection {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     }
 
+    /// Whether writing `identifier` bare would name something other than
+    /// itself — or nothing at all.
+    ///
+    /// Two questions, not one. SHAPE answers most of it: a name that starts
+    /// wrong, carries a lowercase byte, or holds a character outside
+    /// `A-Z 0-9 _ $ #` has to be quoted or the server normalizes it into a
+    /// different name. But shape alone said yes to `SELECT` and `LEVEL`,
+    /// which are perfectly ordinary-LOOKING uppercase words the parser
+    /// refuses to read as a name at all — they can only have been created
+    /// quoted, and the dictionary hands them back with nothing to mark them.
     fn oracle_identifier_needs_quotes(identifier: &str) -> bool {
         let mut chars = identifier.chars();
         let Some(first) = chars.next() else {
@@ -8154,7 +8164,10 @@ impl DatabaseConnection {
         if identifier.bytes().any(|byte| byte.is_ascii_lowercase()) {
             return true;
         }
-        !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#'))
+        if !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#')) {
+            return true;
+        }
+        crate::sql_text::is_oracle_reserved_identifier(identifier)
     }
 
     /// Quote an Oracle identifier for a statement the app writes — the tab's

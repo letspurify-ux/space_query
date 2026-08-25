@@ -13704,6 +13704,58 @@ mod tests {
         assert!(sql.contains("AS `a``b`;"));
     }
 
+    /// A name that IS an Oracle reserved word can only have been created
+    /// quoted, and the dictionary hands it back as ordinary uppercase — so
+    /// nothing about its shape says it needs quotes, and written bare the
+    /// script does not parse (`BEGIN SYSTEM.SELECT; END;` is PLS-00103,
+    /// `SELECT SYSTEM.LEVEL FROM dual` is ORA-03050). Ordinary names must
+    /// stay unquoted.
+    #[test]
+    fn oracle_scripts_quote_reserved_word_object_names() {
+        let procedure = ObjectBrowserWidget::build_procedure_script(
+            &ObjectBrowserWidget::qualify_object_name_for_scope(
+                DatabaseType::Oracle,
+                Some("SCOTT"),
+                "SELECT",
+            ),
+            "PROCEDURE",
+            &[],
+        );
+        assert_eq!(procedure, "BEGIN\n  SCOTT.\"SELECT\";\nEND;\n/\n");
+
+        let function = ObjectBrowserWidget::build_simple_routine_script_for_db(
+            DatabaseType::Oracle,
+            &ObjectBrowserWidget::qualify_object_name_for_scope(
+                DatabaseType::Oracle,
+                Some("SCOTT"),
+                "LEVEL",
+            ),
+            "FUNCTION",
+        );
+        assert_eq!(function, "SELECT SCOTT.\"LEVEL\" AS result\nFROM dual;\n");
+
+        // A reserved-word SCHEMA and a reserved-word package MEMBER too.
+        assert_eq!(
+            ObjectBrowserWidget::qualify_package_member_name(
+                DatabaseType::Oracle,
+                Some("PUBLIC"),
+                "PKG",
+                "COMMENT",
+            ),
+            "\"PUBLIC\".PKG.\"COMMENT\""
+        );
+
+        // Ordinary names are untouched.
+        assert_eq!(
+            ObjectBrowserWidget::qualify_object_name_for_scope(
+                DatabaseType::Oracle,
+                Some("SCOTT"),
+                "SQ_PROC",
+            ),
+            "SCOTT.SQ_PROC"
+        );
+    }
+
     /// A cursor variable refuses `:= NULL` too: an IN ref-cursor argument is
     /// declared bare.
     #[test]
