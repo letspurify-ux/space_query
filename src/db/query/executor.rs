@@ -8609,11 +8609,11 @@ pub struct PackageRoutine {
 
 /// What one `ALL_OBJECTS`/`ALL_PROCEDURES` read said about a routine.
 ///
-/// Only ever built from a read that SUCCEEDED. "The read failed" is carried as
-/// `Option::None` AROUND this value rather than as an empty one, because the
-/// two answers lead opposite ways: a dictionary that said nothing means the
-/// routine's arguments cannot be trusted, while a dictionary that could not be
-/// asked means nothing at all — see
+/// Only ever built from a read that SUCCEEDED. Why a read did not happen is
+/// carried by [`RoutineDictionaryRead`] AROUND this value rather than as an
+/// empty one, because those answers lead opposite ways: a dictionary that said
+/// nothing means the routine's arguments cannot be trusted, while a dictionary
+/// that could not be asked means nothing at all — see
 /// [`ObjectBrowser::routine_definition_lookup`].
 #[derive(Debug, Default)]
 struct RoutineDictionaryEntry {
@@ -8622,6 +8622,70 @@ struct RoutineDictionaryEntry {
     status: Option<String>,
     /// One entry per overload the dictionary listed for THIS routine.
     overloads: Vec<RoutineOverload>,
+}
+
+/// The result of ONE routine-dictionary read, in the three ways it can end.
+///
+/// It used to be `Option<RoutineDictionaryEntry>`, and that folded THREE facts
+/// into two values: the read was made, the read could not be made, and the
+/// action was told to STOP. The third has to be its own answer, because the
+/// caller's response to the second — fall open to "arguments only, ordinary
+/// call form" — is exactly the wrong response to the third:
+///
+/// * for an INVALID routine (no `ALL_ARGUMENTS` rows, no `ALL_PROCEDURES` row)
+///   falling open writes the parameterless call script the readability gate
+///   exists to prevent, and says nothing at all while doing it;
+/// * for a `SQL_MACRO` it writes a PL/SQL block that RUNS and reports the
+///   macro's own source text as the value;
+/// * for a `POLYMORPHIC` table function it writes a block that "succeeds" while
+///   doing nothing.
+///
+/// All three arrive AFTER the user pressed cancel, or after a browser card's
+/// cancel timeout fired on a slow read — the arguments query has already
+/// answered by then, so the loader's own `Err` road never sees the stop.
+///
+/// The two failures are told apart ONCE, in [`Self::failed`], by the shared
+/// [`crate::db::session_policy::FailedReadDisposition`], so both Oracle
+/// protocols and the MySQL family read a stop the same way.
+#[derive(Debug)]
+enum RoutineDictionaryRead {
+    /// The read was made. The entry is what the dictionary said, which may be
+    /// "nothing" — that is an ANSWER.
+    Read(RoutineDictionaryEntry),
+    /// The read could not be made and the caller may fall open: a connection
+    /// allowed to reach `ALL_ARGUMENTS` but not `ALL_OBJECTS`/`ALL_PROCEDURES`
+    /// must still get the script it can build.
+    Unavailable,
+    /// The action was stopped before the dictionary answered. Nothing may be
+    /// invented and no further tier may be asked.
+    Stopped(String),
+}
+
+impl RoutineDictionaryRead {
+    /// The ONE place a dictionary read's failure becomes one of the two things
+    /// it can be, for both Oracle protocols.
+    fn failed(message: String) -> Self {
+        match crate::db::session_policy::FailedReadDisposition::of(&message) {
+            crate::db::session_policy::FailedReadDisposition::Stop => Self::Stopped(message),
+            crate::db::session_policy::FailedReadDisposition::FailOpen => Self::Unavailable,
+        }
+    }
+
+    /// The tier ladder both protocols climb: richest columns first, first read
+    /// wins.
+    ///
+    /// A STOP ends the climb. Re-asking with fewer columns is a second
+    /// statement of an action that was cancelled, and an answer it happened to
+    /// get would hide the stop behind a script.
+    fn from_tiers(mut read_tier: impl FnMut(RoutineDictionaryColumns) -> Self) -> Self {
+        for columns in RoutineDictionaryColumns::TIERS {
+            match read_tier(columns) {
+                answered @ (Self::Read(_) | Self::Stopped(_)) => return answered,
+                Self::Unavailable => {}
+            }
+        }
+        Self::Unavailable
+    }
 }
 
 /// Which spelling of `ALL_PROCEDURES`' invocation columns one dictionary read
@@ -8648,9 +8712,12 @@ enum RoutineDictionaryColumns {
 }
 
 impl RoutineDictionaryColumns {
-    /// Tried in order, first success wins. A failure is not diagnosed — a
-    /// missing column and a connection that just died fail the same way, and
-    /// re-asking with fewer columns costs one statement and answers both.
+    /// Tried in order, first success wins ([`RoutineDictionaryRead::from_tiers`]).
+    ///
+    /// A missing column and a connection that just died are still not told
+    /// apart — re-asking with fewer columns costs one statement and answers
+    /// both — but a STOP is, and it ends the ladder rather than spending
+    /// another statement on an action that was cancelled.
     const TIERS: [Self; 2] = [Self::Full, Self::Legacy];
 
     /// The `SQL_MACRO` / `POLYMORPHIC` select-list expressions for this tier.
@@ -9521,17 +9588,33 @@ impl ObjectBrowser {
         // arguments view entirely, which is the main bottleneck.
         let (owner, package_name) =
             QueryExecutor::split_current_schema_owner_object_name(conn, package_name)?;
-        if let Ok(routines) =
-            Self::get_package_routines_from_source(conn, Some(owner.as_str()), &package_name)
-        {
-            if !routines.is_empty() {
-                return Ok(routines);
-            }
+        match Self::get_package_routines_from_source(conn, &owner, &package_name) {
+            Ok(routines) if !routines.is_empty() => return Ok(routines),
+            Ok(_) => {}
+            // A read the action was TOLD TO STOP must not be followed by the
+            // fallback: that is a second statement of work that was cancelled,
+            // and an answer it happened to get would hide the stop. Any other
+            // failure still falls through — a wrapped package's source is
+            // unreadable by design, which is what the fallback is for.
+            Err(err) if Self::read_failure_stops_the_action(&err.to_string()) => return Err(err),
+            Err(_) => {}
         }
 
         // Fallback: query dictionary procedure/argument metadata if source parsing
         // returned no results (e.g. wrapped/encrypted packages)
-        Self::get_package_routines_from_dict(conn, Some(owner.as_str()), &package_name)
+        Self::get_package_routines_from_dict(conn, &owner, &package_name)
+    }
+
+    /// Whether a failed read ENDS the action instead of degrading it.
+    ///
+    /// One spelling for every road in this file that is allowed to continue
+    /// past a failure, off the DB-agnostic
+    /// [`crate::db::session_policy::FailedReadDisposition`] the object browser
+    /// and the result tabs already share — so "keep going" can never quietly
+    /// come to mean "keep going after a cancel" on one protocol and not the
+    /// other.
+    fn read_failure_stops_the_action(message: &str) -> bool {
+        crate::db::session_policy::FailedReadDisposition::of(message).stops_the_action()
     }
 
     pub fn get_thin_package_routines(
@@ -9542,7 +9625,7 @@ impl ObjectBrowser {
             Self::thin_split_current_schema_owner_object_name(conn, package_name)?;
         let source_sql =
             "SELECT text FROM all_source WHERE owner = :1 AND name = :2 AND type = 'PACKAGE' ORDER BY line";
-        if let Ok(lines) = Self::thin_query_single_text_column(
+        match Self::thin_query_single_text_column(
             conn,
             source_sql,
             vec![
@@ -9550,10 +9633,16 @@ impl ObjectBrowser {
                 OracleThinBindValue::Text(package_name.clone()),
             ],
         ) {
-            let routines = Self::parse_package_spec_routines(&lines.join(""));
-            if !routines.is_empty() {
-                return Ok(routines);
+            Ok(lines) => {
+                let routines = Self::parse_package_spec_routines(&lines.join(""));
+                if !routines.is_empty() {
+                    return Ok(routines);
+                }
             }
+            // Same rule as the OCI twin: a stop ends the action here rather
+            // than spending the fallback's statement on cancelled work.
+            Err(err) if Self::read_failure_stops_the_action(&err) => return Err(err),
+            Err(_) => {}
         }
 
         let dict_sql = r#"
@@ -9599,21 +9688,22 @@ impl ObjectBrowser {
     /// Parse package spec source text to extract PROCEDURE/FUNCTION declarations.
     /// Much faster than querying arguments because source text is a simple
     /// table scan with no complex joins.
+    /// The package spec's source, parsed into its member list.
+    ///
+    /// `owner` is required, not optional. It used to be an `Option` with a
+    /// `USER_SOURCE` spelling behind `None` — a branch no caller could reach,
+    /// because the one caller resolves the owner against the session's current
+    /// schema before asking. Two spellings of one query, only one of them ever
+    /// run, is how the thin twin (which has only the `ALL_SOURCE` form) and this
+    /// one could have drifted without anything noticing.
     fn get_package_routines_from_source(
         conn: &Connection,
-        owner: Option<&str>,
+        owner: &str,
         package_name: &str,
     ) -> Result<Vec<PackageRoutine>, OracleError> {
-        let sql = if owner.is_some() {
-            "SELECT text FROM all_source WHERE owner = :1 AND name = :2 AND type = 'PACKAGE' ORDER BY line"
-        } else {
-            "SELECT text FROM user_source WHERE name = :1 AND type = 'PACKAGE' ORDER BY line"
-        };
+        let sql = "SELECT text FROM all_source WHERE owner = :1 AND name = :2 AND type = 'PACKAGE' ORDER BY line";
         let mut stmt = conn.statement(sql).build()?;
-        let rows = match owner {
-            Some(owner) => stmt.query(&[&owner, &package_name])?,
-            None => stmt.query(&[&package_name])?,
-        };
+        let rows = stmt.query(&[&owner, &package_name])?;
 
         let mut source = String::new();
         for row_result in rows {
@@ -9787,13 +9877,18 @@ impl ObjectBrowser {
 
     /// Fallback: determine routine types via procedure and argument metadata.
     /// Used when source parsing fails (e.g. wrapped/encrypted packages).
+    ///
+    /// `owner` is required for the same reason it is on
+    /// [`Self::get_package_routines_from_source`]: the `USER_PROCEDURES`
+    /// spelling that used to sit behind `None` was unreachable, and a query
+    /// nobody runs is a query nobody keeps correct — this one is the twin of
+    /// the thin protocol's, which only ever had the `ALL_*` form.
     fn get_package_routines_from_dict(
         conn: &Connection,
-        owner: Option<&str>,
+        owner: &str,
         package_name: &str,
     ) -> Result<Vec<PackageRoutine>, OracleError> {
-        let sql = if owner.is_some() {
-            r#"
+        let sql = r#"
                 SELECT DISTINCT
                     p.procedure_name,
                     CASE
@@ -9814,29 +9909,7 @@ impl ObjectBrowser {
                   AND p.object_name = :2
                   AND p.procedure_name IS NOT NULL
                 ORDER BY p.procedure_name
-            "#
-        } else {
-            r#"
-                SELECT DISTINCT
-                    p.procedure_name,
-                    CASE
-                        WHEN EXISTS (
-                            SELECT 1 FROM user_arguments a
-                            WHERE a.package_name = p.object_name
-                            AND a.object_name = p.procedure_name
-                            AND a.position = 0
-                            AND a.data_level = 0
-                            AND (a.overload = p.overload OR (a.overload IS NULL AND p.overload IS NULL))
-                        ) THEN 'FUNCTION'
-                        ELSE 'PROCEDURE'
-                    END AS routine_type
-                FROM user_procedures p
-                WHERE p.object_type = 'PACKAGE'
-                  AND p.object_name = :1
-                  AND p.procedure_name IS NOT NULL
-                ORDER BY p.procedure_name
-            "#
-        };
+            "#;
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -9844,10 +9917,7 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let rows = match owner {
-            Some(owner) => stmt.query(&[&owner, &package_name]),
-            None => stmt.query(&[&package_name]),
-        };
+        let rows = stmt.query(&[&owner, &package_name]);
         let rows = match rows {
             Ok(rows) => rows,
             Err(err) => {
@@ -10245,17 +10315,13 @@ impl ObjectBrowser {
         let arguments = Self::get_procedure_arguments_inner(conn, package_name, procedure_name)
             .map_err(|err| err.to_string())?;
         let dictionary = Self::read_routine_dictionary(conn, package_name, procedure_name);
-        Ok(Self::routine_definition_lookup(
-            &display_name,
-            arguments,
-            dictionary,
-        ))
+        Self::routine_definition_lookup(&display_name, arguments, dictionary)
     }
 
-    /// The dictionary read, or `None` when it could not be MADE.
-    ///
-    /// `None` is not "the dictionary said nothing" — see
-    /// [`Self::routine_definition_lookup`] for why the two must stay apart.
+    /// The dictionary read, or why it did not happen — see
+    /// [`RoutineDictionaryRead`] for why "could not be made" and "was stopped"
+    /// are not one value, and [`Self::routine_definition_lookup`] for what the
+    /// caller does with each.
     ///
     /// Tried once per [`RoutineDictionaryColumns`] tier, richest first, so a
     /// release without the newer invocation columns keeps every fact it does
@@ -10264,12 +10330,10 @@ impl ObjectBrowser {
         conn: &Connection,
         package_name: Option<&str>,
         procedure_name: &str,
-    ) -> Option<RoutineDictionaryEntry> {
-        RoutineDictionaryColumns::TIERS
-            .into_iter()
-            .find_map(|columns| {
-                Self::read_routine_dictionary_columns(conn, package_name, procedure_name, columns)
-            })
+    ) -> RoutineDictionaryRead {
+        RoutineDictionaryRead::from_tiers(|columns| {
+            Self::read_routine_dictionary_columns(conn, package_name, procedure_name, columns)
+        })
     }
 
     fn read_routine_dictionary_columns(
@@ -10277,35 +10341,55 @@ impl ObjectBrowser {
         package_name: Option<&str>,
         procedure_name: &str,
         columns: RoutineDictionaryColumns,
-    ) -> Option<RoutineDictionaryEntry> {
+    ) -> RoutineDictionaryRead {
         let (owner, object_name, member_name) =
             Self::routine_dictionary_key(package_name, procedure_name);
-        let owner = QueryExecutor::owner_or_current_schema(conn, owner).ok()?;
+        let owner = match QueryExecutor::owner_or_current_schema(conn, owner) {
+            Ok(owner) => owner,
+            Err(err) => return RoutineDictionaryRead::failed(err.to_string()),
+        };
         let sql = Self::routine_dictionary_sql(member_name.is_some(), columns);
-        let mut stmt = conn.statement(&sql).build().ok()?;
+        let mut stmt = match conn.statement(&sql).build() {
+            Ok(stmt) => stmt,
+            Err(err) => return RoutineDictionaryRead::failed(err.to_string()),
+        };
         let rows = match member_name.as_deref() {
             Some(member_name) => stmt.query(&[&owner, &object_name, &member_name]),
             None => stmt.query(&[&owner, &object_name]),
-        }
-        .ok()?;
+        };
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(err) => return RoutineDictionaryRead::failed(err.to_string()),
+        };
 
         let mut entry = RoutineDictionaryEntry::default();
         for row_result in rows {
-            let row: Row = row_result.ok()?;
+            let row: Row = match row_result {
+                Ok(row) => row,
+                Err(err) => return RoutineDictionaryRead::failed(err.to_string()),
+            };
             // A column that cannot be read abandons the whole READ rather than
             // contributing a row that says nothing — the caller reads "nothing
             // said" as "the routine is not there".
+            let mut values: [Option<String>; ROUTINE_DICTIONARY_COLUMN_COUNT] = Default::default();
+            for (index, value) in values.iter_mut().enumerate() {
+                match row.get::<_, Option<String>>(index) {
+                    Ok(read) => *value = read,
+                    Err(err) => return RoutineDictionaryRead::failed(err.to_string()),
+                }
+            }
+            let [status, found, overload, pipelined, aggregate, sql_macro, polymorphic] = values;
             entry.absorb(Self::routine_dictionary_row(
-                row.get::<_, Option<String>>(0).ok()?,
-                row.get::<_, Option<String>>(1).ok()?,
-                row.get::<_, Option<String>>(2).ok()?,
-                row.get::<_, Option<String>>(3).ok()?,
-                row.get::<_, Option<String>>(4).ok()?,
-                row.get::<_, Option<String>>(5).ok()?,
-                row.get::<_, Option<String>>(6).ok()?,
+                status,
+                found,
+                overload,
+                pipelined,
+                aggregate,
+                sql_macro,
+                polymorphic,
             ));
         }
-        Some(entry)
+        RoutineDictionaryRead::Read(entry)
     }
 
     fn get_thin_procedure_definition_inner(
@@ -10318,11 +10402,7 @@ impl ObjectBrowser {
             Self::get_thin_procedure_arguments_inner(conn, package_name, procedure_name)?;
 
         let dictionary = Self::read_thin_routine_dictionary(conn, package_name, procedure_name);
-        Ok(Self::routine_definition_lookup(
-            &display_name,
-            arguments,
-            dictionary,
-        ))
+        Self::routine_definition_lookup(&display_name, arguments, dictionary)
     }
 
     /// The thin twin of [`Self::read_routine_dictionary`], row for row and
@@ -10331,17 +10411,10 @@ impl ObjectBrowser {
         conn: &mut OracleThinSession,
         package_name: Option<&str>,
         procedure_name: &str,
-    ) -> Option<RoutineDictionaryEntry> {
-        RoutineDictionaryColumns::TIERS
-            .into_iter()
-            .find_map(|columns| {
-                Self::read_thin_routine_dictionary_columns(
-                    conn,
-                    package_name,
-                    procedure_name,
-                    columns,
-                )
-            })
+    ) -> RoutineDictionaryRead {
+        RoutineDictionaryRead::from_tiers(|columns| {
+            Self::read_thin_routine_dictionary_columns(conn, package_name, procedure_name, columns)
+        })
     }
 
     fn read_thin_routine_dictionary_columns(
@@ -10349,10 +10422,13 @@ impl ObjectBrowser {
         package_name: Option<&str>,
         procedure_name: &str,
         columns: RoutineDictionaryColumns,
-    ) -> Option<RoutineDictionaryEntry> {
+    ) -> RoutineDictionaryRead {
         let (owner, object_name, member_name) =
             Self::routine_dictionary_key(package_name, procedure_name);
-        let owner = Self::thin_owner_or_current_schema(conn, owner).ok()?;
+        let owner = match Self::thin_owner_or_current_schema(conn, owner) {
+            Ok(owner) => owner,
+            Err(err) => return RoutineDictionaryRead::failed(err),
+        };
         let sql = Self::routine_dictionary_sql(member_name.is_some(), columns);
         let mut binds = vec![
             OracleThinBindValue::Text(owner),
@@ -10362,14 +10438,18 @@ impl ObjectBrowser {
             binds.push(OracleThinBindValue::Text(member_name));
         }
         let rows =
-            Self::thin_query_text_rows(conn, &sql, ROUTINE_DICTIONARY_COLUMN_COUNT, binds).ok()?;
+            match Self::thin_query_text_rows(conn, &sql, ROUTINE_DICTIONARY_COLUMN_COUNT, binds) {
+                Ok(rows) => rows,
+                Err(err) => return RoutineDictionaryRead::failed(err),
+            };
 
         let mut entry = RoutineDictionaryEntry::default();
         for row in rows {
             // Same rule as the OCI twin: a row that is not the shape the
-            // SELECT asked for abandons the read instead of answering it.
+            // SELECT asked for abandons the read instead of answering it. The
+            // read WAS made, so this is `Unavailable` and never a stop.
             if row.len() < ROUTINE_DICTIONARY_COLUMN_COUNT {
-                return None;
+                return RoutineDictionaryRead::Unavailable;
             }
             let read = |index: usize| {
                 row.get(index)
@@ -10385,7 +10465,7 @@ impl ObjectBrowser {
                 read(6),
             ));
         }
-        Some(entry)
+        RoutineDictionaryRead::Read(entry)
     }
 
     /// The owner / object / member triple both protocols bind, from names
@@ -10425,31 +10505,46 @@ impl ObjectBrowser {
     /// only ever reached by a routine with none, which is exactly the case
     /// "takes no arguments" and "cannot be read" used to share.
     ///
-    /// A dictionary that could not be READ (`None`) is the third case and must
-    /// not be folded into the second: a connection that can reach
-    /// `ALL_ARGUMENTS` but not `ALL_OBJECTS`/`ALL_PROCEDURES` would otherwise
-    /// lose a script it can perfectly well build. It takes the
-    /// `from_arguments` road — call forms unknown, ordinary shape — which is
-    /// the answer this app gave before it ever asked.
+    /// A dictionary that could not be READ
+    /// ([`RoutineDictionaryRead::Unavailable`]) is the third case and must not
+    /// be folded into the second: a connection that can reach `ALL_ARGUMENTS`
+    /// but not `ALL_OBJECTS`/`ALL_PROCEDURES` would otherwise lose a script it
+    /// can perfectly well build. It takes the `from_arguments` road — call
+    /// forms unknown, ordinary shape — which is the answer this app gave before
+    /// it ever asked.
+    ///
+    /// A dictionary read that was STOPPED is the fourth, and it is an `Err`:
+    /// the app was told to stop, so it may neither invent that fail-open
+    /// default nor refuse on a fact nobody established. `Err` is this layer's
+    /// "could not ask" road, and the object browser's one classifier
+    /// ([`crate::db::session_policy::FailedReadDisposition`], which is also
+    /// what named the stop here) turns it back into the STOPPED delivery — so
+    /// the answer the user gets is the same one a stopped ARGUMENTS read
+    /// already produced, on every backend.
     fn routine_definition_lookup(
         display_name: &str,
         arguments: Vec<ProcedureArgument>,
-        dictionary: Option<RoutineDictionaryEntry>,
-    ) -> RoutineDefinitionLookup {
-        let Some(dictionary) = dictionary else {
-            return RoutineDefinitionLookup::Defined(RoutineDefinition::from_arguments(arguments));
+        dictionary: RoutineDictionaryRead,
+    ) -> Result<RoutineDefinitionLookup, String> {
+        let dictionary = match dictionary {
+            RoutineDictionaryRead::Stopped(reason) => return Err(reason),
+            RoutineDictionaryRead::Unavailable => {
+                return Ok(RoutineDefinitionLookup::Defined(
+                    RoutineDefinition::from_arguments(arguments),
+                ))
+            }
+            RoutineDictionaryRead::Read(entry) => entry,
         };
         if arguments.is_empty() && dictionary.overloads.is_empty() {
-            return RoutineDefinitionLookup::Unreadable(
+            return Ok(RoutineDefinitionLookup::Unreadable(
                 result_messages::routine_arguments_unreadable(
                     display_name,
                     dictionary.status.as_deref(),
                 ),
-            );
+            ));
         }
-        RoutineDefinitionLookup::Defined(RoutineDefinition::from_dictionary(
-            arguments,
-            dictionary.overloads,
+        Ok(RoutineDefinitionLookup::Defined(
+            RoutineDefinition::from_dictionary(arguments, dictionary.overloads),
         ))
     }
 
@@ -12828,27 +12923,55 @@ mod routine_definition_tests {
     /// `ALL_PROCEDURES` is the dictionary's own answer — live-proven on 23ai:
     /// an INVALID routine is in `ALL_OBJECTS` and in NEITHER `ALL_PROCEDURES`
     /// nor `ALL_ARGUMENTS`, while an argument-less VALID one is in both.
+    ///
+    /// The gate has FOUR inputs, and the last two are the ones that used to be
+    /// one: a dictionary that could not be ASKED falls open (a connection may
+    /// legitimately reach `ALL_ARGUMENTS` and not `ALL_PROCEDURES`), while a
+    /// read that was STOPPED ends the action — inventing the fail-open default
+    /// after a cancel is how a parameterless call script came to be handed over
+    /// with no alert at all.
     #[test]
     fn a_routine_definition_exists_only_when_the_dictionary_lists_the_routine() {
         use super::RoutineDefinitionLookup;
 
         let listed = |status: &str, overloads: Vec<super::RoutineOverload>| {
-            Some(super::RoutineDictionaryEntry {
+            super::RoutineDictionaryRead::Read(super::RoutineDictionaryEntry {
                 status: Some(status.to_string()),
                 overloads,
             })
         };
-        let defined = |lookup: RoutineDefinitionLookup, what: &str| match lookup {
-            RoutineDefinitionLookup::Defined(definition) => definition,
-            RoutineDefinitionLookup::Unreadable(reason) => panic!("{what}: refused with {reason}"),
-        };
-        let unreadable = |lookup: RoutineDefinitionLookup, what: &str| match lookup {
-            RoutineDefinitionLookup::Unreadable(reason) => reason,
-            RoutineDefinitionLookup::Defined(definition) => panic!(
-                "{what}: answered with a definition of {} arguments",
-                definition.arguments.len()
-            ),
-        };
+        /// The gate ANSWERED. `Err` is the road a STOP takes and is asserted on
+        /// separately below, so a case that means to test an answer must not be
+        /// able to pass by ending the action instead.
+        fn answered(
+            lookup: Result<RoutineDefinitionLookup, String>,
+            what: &str,
+        ) -> RoutineDefinitionLookup {
+            match lookup {
+                Ok(lookup) => lookup,
+                Err(reason) => panic!("{what}: ended the action with {reason}"),
+            }
+        }
+        fn defined(
+            lookup: Result<RoutineDefinitionLookup, String>,
+            what: &str,
+        ) -> super::RoutineDefinition {
+            match answered(lookup, what) {
+                RoutineDefinitionLookup::Defined(definition) => definition,
+                RoutineDefinitionLookup::Unreadable(reason) => {
+                    panic!("{what}: refused with {reason}")
+                }
+            }
+        }
+        fn unreadable(lookup: Result<RoutineDefinitionLookup, String>, what: &str) -> String {
+            match answered(lookup, what) {
+                RoutineDefinitionLookup::Unreadable(reason) => reason,
+                RoutineDefinitionLookup::Defined(definition) => panic!(
+                    "{what}: answered with a definition of {} arguments",
+                    definition.arguments.len()
+                ),
+            }
+        }
 
         let no_args_but_listed = defined(
             ObjectBrowser::routine_definition_lookup(
@@ -12888,7 +13011,7 @@ mod routine_definition_tests {
             ObjectBrowser::routine_definition_lookup(
                 "SYSTEM.ZQ_GONE",
                 Vec::new(),
-                Some(super::RoutineDictionaryEntry::default()),
+                super::RoutineDictionaryRead::Read(super::RoutineDictionaryEntry::default()),
             ),
             "a routine the dictionary does not hold has no definition",
         );
@@ -12903,11 +13026,63 @@ mod routine_definition_tests {
         // "absent": a connection allowed to read ALL_ARGUMENTS but not
         // ALL_OBJECTS/ALL_PROCEDURES must still get its script.
         let unaskable = defined(
-            ObjectBrowser::routine_definition_lookup("SYSTEM.ZQ_NOARGS", Vec::new(), None),
+            ObjectBrowser::routine_definition_lookup(
+                "SYSTEM.ZQ_NOARGS",
+                Vec::new(),
+                super::RoutineDictionaryRead::Unavailable,
+            ),
             "an unaskable dictionary is not a refusal",
         );
         assert!(unaskable.arguments.is_empty());
         assert!(unaskable.overloads.is_empty());
+
+        // ...and a dictionary read that was STOPPED is not an unaskable one.
+        // Both leave the app knowing nothing, but the fail-open default above
+        // is an ANSWER, and after a cancel this gate has no right to give one:
+        // for an INVALID routine (no arguments, no dictionary row) it is
+        // precisely the parameterless call script this whole gate exists to
+        // prevent, handed over with no alert at all. The action ends instead,
+        // and the message travels so the object browser's one classifier can
+        // recognise the stop it already named here.
+        let stop = "ORA-01013: user requested cancel of current operation";
+        assert_eq!(
+            ObjectBrowser::routine_definition_lookup(
+                "SYSTEM.ZQ_NOARGS",
+                Vec::new(),
+                super::RoutineDictionaryRead::Stopped(stop.to_string()),
+            )
+            .err()
+            .as_deref(),
+            Some(stop),
+            "a stopped dictionary read must end the action, not fall open"
+        );
+        // The same stop with arguments already in hand: the arguments are real,
+        // but the CALL FORM is not — falling open here writes the PL/SQL block
+        // that reports a SQL macro's own source text as its value.
+        assert!(
+            ObjectBrowser::routine_definition_lookup(
+                "SYSTEM.ZQ_MACRO",
+                vec![super::ProcedureArgument {
+                    name: None,
+                    position: 0,
+                    sequence: 0,
+                    data_type: Some("VARCHAR2".to_string()),
+                    in_out: Some("OUT".to_string()),
+                    data_length: None,
+                    data_precision: None,
+                    data_scale: None,
+                    type_owner: None,
+                    type_name: None,
+                    type_subname: None,
+                    pls_type: None,
+                    overload: None,
+                    default_value: None,
+                }],
+                super::RoutineDictionaryRead::Stopped(stop.to_string()),
+            )
+            .is_err(),
+            "a stopped read must end the action even when the arguments were read"
+        );
 
         // Arguments that WERE read are proof on their own: the gate must not
         // second-guess a dictionary row it never needed.
@@ -12934,6 +13109,125 @@ mod routine_definition_tests {
             ),
             "arguments that were read are their own proof",
         );
+    }
+
+    /// A dictionary read's failure is one of exactly two things, and which one
+    /// is asked of the DB-agnostic catalog every backend shares.
+    ///
+    /// Both Oracle protocols reach this through one constructor, and the MySQL
+    /// family's own fallback (`RoutinePresence::failed`) asks the same reader —
+    /// so "was this a stop?" cannot come to mean different things on different
+    /// backends, and a new cancel marker is still added in one place.
+    #[test]
+    fn a_dictionary_read_failure_is_a_stop_only_when_the_shared_reader_says_so() {
+        use super::RoutineDictionaryRead;
+
+        // Every backend's own cancel wording, from
+        // `session_policy::query_cancel_markers_for_db_type`. A browser card's
+        // cancel timeout raises exactly these.
+        for stop in [
+            "ORA-01013: user requested cancel of current operation",
+            "DPI-1067: user requested cancel of current operation",
+            "Query execution was interrupted",
+            "ERROR 1317 (70100): Query execution was interrupted",
+            crate::db::query::result_messages::QUERY_CANCELLED,
+        ] {
+            assert!(
+                matches!(
+                    RoutineDictionaryRead::failed(stop.to_string()),
+                    RoutineDictionaryRead::Stopped(ref carried) if carried == stop
+                ),
+                "{stop} must end the action, carrying its own words"
+            );
+        }
+
+        // Everything else keeps the fail-open road R13 established: a
+        // connection allowed to read ALL_ARGUMENTS and not ALL_PROCEDURES, and
+        // a release without the newer invocation columns, must still get a
+        // script.
+        for fail_open in [
+            "ORA-00942: table or view does not exist",
+            "ORA-00904: \"P\".\"SQL_MACRO\": invalid identifier",
+            "ORA-03113: end-of-file on communication channel",
+        ] {
+            assert!(
+                matches!(
+                    RoutineDictionaryRead::failed(fail_open.to_string()),
+                    RoutineDictionaryRead::Unavailable
+                ),
+                "{fail_open} must leave the fail-open road alone"
+            );
+        }
+    }
+
+    /// The tier ladder asks for fewer columns after a failure — but never after
+    /// a STOP.
+    ///
+    /// Re-asking is a second statement of an action that was cancelled, and an
+    /// answer it happened to get would hide the stop behind a script. The
+    /// column-degradation the ladder exists for is unaffected: an `Unavailable`
+    /// tier still falls through to the next one.
+    #[test]
+    fn the_dictionary_tier_ladder_stops_climbing_when_the_action_was_stopped() {
+        use super::{RoutineDictionaryColumns, RoutineDictionaryEntry, RoutineDictionaryRead};
+
+        // A stop on the richest tier: the legacy tier is never asked.
+        let mut asked: Vec<RoutineDictionaryColumns> = Vec::new();
+        let read = RoutineDictionaryRead::from_tiers(|columns| {
+            asked.push(columns);
+            RoutineDictionaryRead::Stopped("ORA-01013: user requested cancel".to_string())
+        });
+        assert!(matches!(read, RoutineDictionaryRead::Stopped(_)));
+        assert_eq!(
+            asked,
+            vec![RoutineDictionaryColumns::Full],
+            "a stop must not spend the fallback's statement"
+        );
+
+        // The reason the ladder exists: a release without `SQL_MACRO` /
+        // `POLYMORPHIC` fails the Full tier and is answered by the Legacy one.
+        let mut asked: Vec<RoutineDictionaryColumns> = Vec::new();
+        let read = RoutineDictionaryRead::from_tiers(|columns| {
+            asked.push(columns);
+            match columns {
+                RoutineDictionaryColumns::Full => RoutineDictionaryRead::Unavailable,
+                RoutineDictionaryColumns::Legacy => {
+                    RoutineDictionaryRead::Read(RoutineDictionaryEntry::default())
+                }
+            }
+        });
+        assert!(matches!(read, RoutineDictionaryRead::Read(_)));
+        assert_eq!(
+            asked,
+            vec![
+                RoutineDictionaryColumns::Full,
+                RoutineDictionaryColumns::Legacy
+            ]
+        );
+
+        // Every tier unavailable is still the fail-open answer, not a stop.
+        let read = RoutineDictionaryRead::from_tiers(|_| RoutineDictionaryRead::Unavailable);
+        assert!(matches!(read, RoutineDictionaryRead::Unavailable));
+    }
+
+    /// Every road in this file that is allowed to continue past a failed read
+    /// asks ONE question, and it is the DB-agnostic one.
+    #[test]
+    fn continuing_past_a_failed_read_is_refused_exactly_for_a_stop() {
+        assert!(ObjectBrowser::read_failure_stops_the_action(
+            "ORA-01013: user requested cancel of current operation"
+        ));
+        assert!(ObjectBrowser::read_failure_stops_the_action(
+            "Query execution was interrupted"
+        ));
+        // A wrapped package's source really is unreadable, and the dictionary
+        // fallback is what that failure exists to reach.
+        assert!(!ObjectBrowser::read_failure_stops_the_action(
+            "ORA-24236: source object for wrap is empty"
+        ));
+        assert!(!ObjectBrowser::read_failure_stops_the_action(
+            "ORA-00942: table or view does not exist"
+        ));
     }
 
     /// Every numbered placeholder must appear in its own numeric order.

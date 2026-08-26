@@ -489,17 +489,19 @@ impl RoutineScriptLoadResult {
     /// be, so no caller can decide it for itself — or forget to.
     ///
     /// The question is asked of
-    /// [`crate::db::session_policy::message_indicates_query_cancel`], the same
-    /// DB-agnostic reader the result tabs use, so all four backends answer it
-    /// the same way and a new cancel marker is added in one place. Every
-    /// producer of this value goes through here: the loader, and the worker's
-    /// panic road.
+    /// [`crate::db::session_policy::FailedReadDisposition`], the same
+    /// DB-agnostic reader the db layer's own fail-open roads use
+    /// (`RoutineDictionaryRead::failed`, `RoutinePresence::failed`), so all four
+    /// backends answer it the same way and a new cancel marker is added in one
+    /// place. Every producer of this value goes through here: the loader, and
+    /// the worker's panic road.
     fn of(result: Result<RoutineScriptOutcome, String>) -> Self {
+        use crate::db::session_policy::FailedReadDisposition;
         match result {
             Ok(outcome) => Self::Answered(outcome),
-            Err(err) => match crate::db::session_policy::message_indicates_query_cancel(&err) {
-                true => Self::Stopped(err),
-                false => Self::Failed(err),
+            Err(err) => match FailedReadDisposition::of(&err) {
+                FailedReadDisposition::Stop => Self::Stopped(err),
+                FailedReadDisposition::FailOpen => Self::Failed(err),
             },
         }
     }
@@ -709,6 +711,48 @@ impl OracleRoutineScript {
                 reason: "it is a polymorphic table function, so it can only be called with a \
                          table argument. Write the call by hand against the table it reads.",
             },
+        }
+    }
+}
+
+/// Whether ANOTHER menu answers the right-click when this object has no action
+/// to offer.
+///
+/// The two callers differ, and folding them made one of them worse. A tree node
+/// is a dead end: nothing else opens, so entries filtered away leave the click
+/// answered by silence and the user cannot tell "this node has no actions" from
+/// "this connection will not run them". An editor selection is not: the editor's
+/// own context menu opens whenever the object menu declines, and that is a
+/// better answer than a menu holding one entry — so there the object menu keeps
+/// declining, exactly as it always has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectMenuFallback {
+    /// Nothing else will answer this click.
+    None,
+    /// The caller opens its own menu when this one declines.
+    CallerMenu,
+}
+
+/// Why an object's context menu has no action to offer.
+///
+/// Both roads end in the same menu — the reason, inactive, above `Copy Name` —
+/// and the reason is a VALUE so the two cannot drift into two wordings for one
+/// situation, and a third road has to name which of them it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectMenuRefusal {
+    /// The server was asked which kind of routine a package member is and could
+    /// not settle it, so no `Execute` label applies.
+    RoutineTypeUnavailable,
+    /// Every entry this item has would send something the database must write,
+    /// and this connection refuses writes.
+    WritesRefused,
+}
+
+impl ObjectMenuRefusal {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RoutineTypeUnavailable => "Package routine type unavailable",
+            Self::WritesRefused => "Read only connection: no action available",
         }
     }
 }
@@ -3671,19 +3715,25 @@ impl ObjectBrowserWidget {
                                     &status_callback,
                                     &action_sender,
                                     selected_scope,
+                                    // No fallback HERE, unlike the synchronous
+                                    // editor road this began on: deferring is
+                                    // what made the editor decline to open its
+                                    // own menu, and that click is long over by
+                                    // the time this answer arrives.
+                                    ObjectMenuFallback::None,
                                     mouse_x,
                                     mouse_y,
                                 );
                             } else {
-                                let _ =
-                                    ObjectBrowserWidget::show_unresolved_package_routine_menu_at(
-                                        &item,
-                                        &status_callback,
-                                        db_type,
-                                        selected_scope.as_deref(),
-                                        mouse_x,
-                                        mouse_y,
-                                    );
+                                let _ = ObjectBrowserWidget::show_object_menu_refusal_at(
+                                    &item,
+                                    &status_callback,
+                                    db_type,
+                                    selected_scope.as_deref(),
+                                    ObjectMenuRefusal::RoutineTypeUnavailable,
+                                    mouse_x,
+                                    mouse_y,
+                                );
                             }
                         }
                         ObjectActionResult::ScopeSwitchFinished {
@@ -5497,6 +5547,22 @@ impl ObjectBrowserWidget {
         }
     }
 
+    /// The name an object action writes for `scope` + `object_name` on this
+    /// backend — the browser's own composition, not a second spelling of it.
+    ///
+    /// `#[doc(hidden)]`, for the live verification harness
+    /// (`verify_proc_exec_live`), which hands the db layer the display name a
+    /// refusal has to carry and must not invent its own `schema.name`: that is
+    /// the very drift this parameter exists to remove.
+    #[doc(hidden)]
+    pub fn action_display_name_for_harness(
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+        object_name: &str,
+    ) -> String {
+        Self::qualify_object_name_for_scope(db_type, selected_scope, object_name)
+    }
+
     /// Everything `Execute Procedure`/`Execute Function`/`Execute Routine`
     /// loads for ONE item, on a real pooled session.
     ///
@@ -5604,11 +5670,18 @@ impl ObjectBrowserWidget {
             // Unreachable through the menu — its Execute arms match only the
             // two shapes above — and answered here rather than left to the
             // delivery rule, whose failed-load road would hand back a call
-            // script naming a column.
+            // script naming a column. The sentence comes from the shared
+            // catalog like every other refusal this action can produce: a road
+            // only the harness reaches is still a road the user could be shown
+            // if a later menu arm widened, and a hand-written sentence here is
+            // the one spelling nobody would keep in step.
             ObjectItem::Column { column_name, .. } => (
                 column_name.clone(),
                 Ok(RoutineScriptOutcome::Refused(
-                    "a column is not a routine".to_string(),
+                    crate::db::query::result_messages::routine_call_not_writable(
+                        column_name,
+                        "it is a column, not a routine",
+                    ),
                 )),
             ),
         };
@@ -5829,7 +5902,12 @@ impl ObjectBrowserWidget {
             // The app could not ASK, so it knows nothing about the routine:
             // the simple call script still gives the user something to edit.
             RoutineScriptLoadResult::Failed(err) => RoutineScriptDelivery {
-                alert: Some(format!("Failed to load routine arguments: {err}")),
+                alert: Some(
+                    crate::db::query::result_messages::routine_script_load_failed(
+                        qualified_name,
+                        &err,
+                    ),
+                ),
                 open_sql: (!routine_type.eq_ignore_ascii_case("UNKNOWN")).then(|| {
                     Self::build_simple_routine_script_for_db(db_type, qualified_name, routine_type)
                 }),
@@ -6020,7 +6098,7 @@ impl ObjectBrowserWidget {
                         Self::default_value_for_mysql_argument(arg, &type_str)
                     ));
                 }
-                call_args.push(session_var.clone());
+                call_args.push(Self::mysql_call_argument_expr(&arg_label, &session_var));
                 post_lines.push(format!(
                     "SELECT {} AS {};",
                     session_var,
@@ -6029,7 +6107,10 @@ impl ObjectBrowserWidget {
                 continue;
             }
 
-            call_args.push(Self::default_value_for_mysql_argument(arg, &type_str));
+            call_args.push(Self::mysql_call_argument_expr(
+                &arg_label,
+                &Self::default_value_for_mysql_argument(arg, &type_str),
+            ));
         }
 
         let multiline_args = if call_args.is_empty() {
@@ -6679,6 +6760,42 @@ impl ObjectBrowserWidget {
         }
     }
 
+    /// One MySQL/MariaDB call argument, with the parameter it fills named
+    /// beside it.
+    ///
+    /// Neither engine has named association, so the position is the only thing
+    /// binding a value to a parameter — and a generated `CALL db.p(0, '',
+    /// NULL)` told the user nothing about which is which, while the Oracle
+    /// twin above has always written `NAME => value`. A comment is the only
+    /// place the name can go, and it puts the two families' scripts back on
+    /// equal terms: the reader can see what each value is for before editing
+    /// it.
+    ///
+    /// The name goes through [`Self::mysql_comment_text`] rather than in raw:
+    /// an identifier may legally hold `*/`, which would end the comment early
+    /// and leave the rest of the name as SQL.
+    fn mysql_call_argument_expr(arg_label: &str, value: &str) -> String {
+        format!("/* {} */ {}", Self::mysql_comment_text(arg_label), value)
+    }
+
+    /// `text` as it can appear inside a `/* ... */` comment.
+    ///
+    /// Two characters cannot survive as themselves. `*/` ends the comment, so a
+    /// parameter created as `` `a*/b` `` would close it and hand `b` to the
+    /// parser as an expression; it is spaced apart instead. A newline does not
+    /// break the comment — block comments span lines — but it does break the
+    /// one-argument-per-line shape the script is read in, so it becomes a
+    /// space. Everything else is left exactly as the catalog spells it, which
+    /// is what makes the comment a truthful label; ordinary names come back
+    /// byte-identical.
+    ///
+    /// Note the leading `/* ` this is always written with: `/*!` and `/*+` are
+    /// MySQL's executable-comment and optimizer-hint forms, and the space is
+    /// what keeps a name starting with `!` or `+` from becoming one.
+    fn mysql_comment_text(text: &str) -> String {
+        text.replace("*/", "* /").replace(['\n', '\r'], " ")
+    }
+
     /// The starting value an argument the routine READS is given, `None` when
     /// the type cannot take one: `:= NULL` on a cursor variable, a record or
     /// an associative array is a compile error, and declared bare each of
@@ -6843,6 +6960,10 @@ impl ObjectBrowserWidget {
             &self.status_callback,
             &self.action_sender,
             selected_scope,
+            // Declining here is not silence: the editor opens its own context
+            // menu for any right-click this one does not take, and that beats a
+            // menu holding one entry.
+            ObjectMenuFallback::CallerMenu,
         )
     }
 
@@ -6968,13 +7089,40 @@ impl ObjectBrowserWidget {
             .map(str::to_string)
     }
 
+    /// Whether asking the server which kind of routine a package member is can
+    /// change what the user is offered.
+    ///
+    /// Asked BEFORE the round trip, because the menu that lookup feeds holds
+    /// `Execute` and nothing else: on a connection that refuses writes it is
+    /// empty WHATEVER the answer turns out to be. Resolving anyway spent a
+    /// round trip, a pooled session and a DB-activity registration on a menu
+    /// that could not appear — and deferring is what makes the editor decline
+    /// to open its own menu, so the click was then answered by silence when the
+    /// empty result arrived. Declining instead lets the ordinary road run: it
+    /// filters the same entries away and falls through to the editor's context
+    /// menu, which is a real answer.
+    ///
+    /// "Can this menu hold anything?" is not a question for the catalog. The
+    /// fact it rests on — a package routine's menu is Execute-only on every
+    /// backend — is pinned by
+    /// `a_package_routine_has_nothing_to_offer_a_write_refusing_connection`.
+    fn package_routine_kind_is_worth_resolving(
+        db_type: crate::db::DatabaseType,
+        writes_are_refused: bool,
+    ) -> bool {
+        object_browser_behavior_for(db_type).supports_package_routines() && !writes_are_refused
+    }
+
     fn defer_unknown_package_routine_context_menu(
         &self,
         item: ObjectItem,
         selected_scope: Option<String>,
         db_type: crate::db::DatabaseType,
     ) -> bool {
-        if !object_browser_behavior_for(db_type).supports_package_routines() {
+        if !Self::package_routine_kind_is_worth_resolving(
+            db_type,
+            self.write_refusal.writes_are_refused(),
+        ) {
             return false;
         }
 
@@ -7760,6 +7908,10 @@ impl ObjectBrowserWidget {
                 status_callback,
                 action_sender,
                 selected_scope,
+                // A tree node is a dead end: nothing else opens for this
+                // click, so a node whose entries were all filtered away has to
+                // say WHY rather than do nothing.
+                ObjectMenuFallback::None,
             );
         }
     }
@@ -7974,6 +8126,7 @@ impl ObjectBrowserWidget {
         status_callback: &StatusCallback,
         action_sender: &std::sync::mpsc::Sender<ObjectActionResult>,
         selected_scope: Option<String>,
+        fallback: ObjectMenuFallback,
     ) -> bool {
         Self::show_context_menu_for_object_item_at(
             connection,
@@ -7984,6 +8137,7 @@ impl ObjectBrowserWidget {
             status_callback,
             action_sender,
             selected_scope,
+            fallback,
             fltk::app::event_x(),
             fltk::app::event_y(),
         )
@@ -7998,6 +8152,7 @@ impl ObjectBrowserWidget {
         status_callback: &StatusCallback,
         action_sender: &std::sync::mpsc::Sender<ObjectActionResult>,
         selected_scope: Option<String>,
+        fallback: ObjectMenuFallback,
         mouse_x: i32,
         mouse_y: i32,
     ) -> bool {
@@ -8006,12 +8161,29 @@ impl ObjectBrowserWidget {
             Err(poisoned) => *poisoned.into_inner(),
         };
         let Some(menu_choices) = Self::menu_choices_for_object_item(&item_info, db_type) else {
+            // This item TYPE has no menu at all — a column, a category folder.
+            // Nothing to say, so nothing is shown.
             return false;
         };
         let Some(menu_choices) =
             Self::menu_choices_for_read_only(menu_choices, write_refusal.writes_are_refused())
         else {
-            return false;
+            // The item HAS a menu and the read-only filter emptied it — which
+            // only a package routine can reach, its entries being `Execute`
+            // and nothing else. Whether that is answered or declined is the
+            // CALLER's fact, not this function's: see [`ObjectMenuFallback`].
+            return match fallback {
+                ObjectMenuFallback::None => Self::show_object_menu_refusal_at(
+                    &item_info,
+                    status_callback,
+                    db_type,
+                    selected_scope.as_deref(),
+                    ObjectMenuRefusal::WritesRefused,
+                    mouse_x,
+                    mouse_y,
+                ),
+                ObjectMenuFallback::CallerMenu => false,
+            };
         };
 
         // Prevent menu from being added to parent container
@@ -8497,11 +8669,22 @@ impl ObjectBrowserWidget {
         true
     }
 
-    fn show_unresolved_package_routine_menu_at(
+    /// The menu an object gets when it has actions but none of them can be
+    /// offered — with the REASON on it, and the one entry that is still true.
+    ///
+    /// One function for both reasons, because the alternative is what this
+    /// replaced: the road that could not resolve a package routine's kind
+    /// showed `Copy Name`, while the road whose entries were all filtered out
+    /// showed NOTHING — so the better-informed case gave the user less, and a
+    /// right-click could be answered by silence. `reason` is a named value
+    /// rather than a caller-supplied label so a third road cannot invent a
+    /// third wording for one of these two situations.
+    fn show_object_menu_refusal_at(
         item_info: &ObjectItem,
         status_callback: &StatusCallback,
         db_type: crate::db::DatabaseType,
         selected_scope: Option<&str>,
+        reason: ObjectMenuRefusal,
         mouse_x: i32,
         mouse_y: i32,
     ) -> bool {
@@ -8511,12 +8694,7 @@ impl ObjectBrowserWidget {
         let mut menu = MenuButton::new(mouse_x, mouse_y, 0, 0, None);
         menu.set_color(theme::panel_raised());
         menu.set_text_color(theme::text_primary());
-        menu.add(
-            "Package routine type unavailable",
-            Shortcut::None,
-            MenuFlag::Inactive,
-            |_| {},
-        );
+        menu.add(reason.label(), Shortcut::None, MenuFlag::Inactive, |_| {});
         menu.add("Copy Name", Shortcut::None, MenuFlag::Normal, |_| {});
 
         if let Some(ref group) = current_group {
@@ -10553,6 +10731,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             action_scope,
             object_name,
             kind,
+            &qualified_name,
         )
         .map(|lookup| RoutineScriptData {
             qualified_name: qualified_name.clone(),
@@ -13811,11 +13990,110 @@ mod tests {
             .as_deref(),
             Some("Check Compilation|Generate DDL")
         );
-        // Nothing left means no menu at all, rather than an empty one.
+        // Nothing left means no CHOICE list, rather than an empty one. The
+        // caller turns that into the refusal menu — see
+        // `a_package_routine_has_nothing_to_offer_a_write_refusing_connection`,
+        // which is what makes the right-click answerable at all.
         assert_eq!(
             ObjectBrowserWidget::menu_choices_for_read_only("Execute Procedure", true),
             None
         );
+    }
+
+    /// A package routine's menu is `Execute` and nothing else, on every
+    /// backend — which is the fact two roads now depend on.
+    ///
+    /// `defer_unknown_package_routine_context_menu` returns BEFORE asking the
+    /// server which kind of routine the member is, because whatever the answer
+    /// turns out to be the menu is empty on a write-refusing connection; and
+    /// `show_context_menu_for_object_item_at` shows the refusal menu instead of
+    /// nothing, because a right-click that resolves to silence cannot be told
+    /// from a node that has no actions.
+    ///
+    /// If an entry that is NOT a write is ever added to this menu, both are
+    /// wrong: the kind would decide something again, and the refusal menu would
+    /// hide a usable action. This case is what says so.
+    #[test]
+    fn a_package_routine_has_nothing_to_offer_a_write_refusing_connection() {
+        for db_type in [
+            crate::db::DatabaseType::Oracle,
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            for routine_type in ["PROCEDURE", "FUNCTION", "UNKNOWN"] {
+                let item = ObjectItem::PackageRoutine {
+                    package_name: "PKG".to_string(),
+                    routine_name: "R".to_string(),
+                    routine_type: routine_type.to_string(),
+                };
+                let choices = ObjectBrowserWidget::menu_choices_for_object_item(&item, db_type)
+                    .unwrap_or_else(|| {
+                        panic!("{db_type:?}/{routine_type}: a package routine has a menu")
+                    });
+                assert_eq!(
+                    ObjectBrowserWidget::menu_choices_for_read_only(choices, true),
+                    None,
+                    "{db_type:?}/{routine_type}: {choices}"
+                );
+            }
+        }
+    }
+
+    /// A round trip is spent only when its answer can change what the user is
+    /// offered.
+    ///
+    /// The kind lookup feeds a menu whose only entries are `Execute`, so on a
+    /// write-refusing connection the menu is empty whatever comes back — and
+    /// deferring is what makes the editor decline to open its own menu, so the
+    /// click was answered by silence once the empty result arrived. The
+    /// backends that have no package routines at all never ask either.
+    #[test]
+    fn a_package_routine_kind_is_resolved_only_when_the_answer_can_matter() {
+        assert!(
+            ObjectBrowserWidget::package_routine_kind_is_worth_resolving(
+                crate::db::DatabaseType::Oracle,
+                false
+            )
+        );
+        assert!(
+            !ObjectBrowserWidget::package_routine_kind_is_worth_resolving(
+                crate::db::DatabaseType::Oracle,
+                true
+            ),
+            "a write-refusing connection has no Execute entry to show, whatever the kind is"
+        );
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            for writes_are_refused in [false, true] {
+                assert!(
+                    !ObjectBrowserWidget::package_routine_kind_is_worth_resolving(
+                        db_type,
+                        writes_are_refused
+                    ),
+                    "{db_type:?} has no package routines to resolve"
+                );
+            }
+        }
+    }
+
+    /// The two reasons a menu can have nothing to offer are one value with two
+    /// distinct sentences, so a road cannot tell the user the wrong one.
+    #[test]
+    fn each_object_menu_refusal_says_which_one_it_is() {
+        assert_ne!(
+            super::ObjectMenuRefusal::RoutineTypeUnavailable.label(),
+            super::ObjectMenuRefusal::WritesRefused.label()
+        );
+        assert!(super::ObjectMenuRefusal::WritesRefused
+            .label()
+            .to_lowercase()
+            .contains("read only"));
+        assert!(super::ObjectMenuRefusal::RoutineTypeUnavailable
+            .label()
+            .to_lowercase()
+            .contains("type"));
     }
 
     #[test]
@@ -14815,7 +15093,17 @@ mod tests {
                 super::RoutineScriptLoadResult::of(Err("connection lost".to_string())),
             ),
             super::RoutineScriptDelivery {
-                alert: Some("Failed to load routine arguments: connection lost".to_string()),
+                // Byte-identical to the shared sentence, like its two
+                // neighbours: this road used to own a hand-written text that
+                // named neither the routine nor the tab it was about to open,
+                // which is the one thing that made it hard to tell from a
+                // refusal in a screenshot.
+                alert: Some(
+                    crate::db::query::result_messages::routine_script_load_failed(
+                        "SCOTT.ZQ_P",
+                        "connection lost"
+                    )
+                ),
                 open_sql: Some("BEGIN\n  SCOTT.ZQ_P;\nEND;\n/\n".to_string()),
                 status: "Failed to load arguments for SCOTT.ZQ_P".to_string(),
             }
@@ -15574,9 +15862,13 @@ mod tests {
             &routine_definition(&arguments),
         );
 
+        // Each value carries the parameter it fills. The purpose of this case
+        // is the per-type LITERAL, and naming the arguments is what makes the
+        // six of them readable as the six they are.
         assert_eq!(
             sql,
-            "CALL `app`.`p`(\n    NULL,\n    NULL,\n    NULL,\n    '',\n    '',\n    0\n);\n"
+            "CALL `app`.`p`(\n    /* p_doc */ NULL,\n    /* p_kind */ NULL,\n    /* p_tags */ \
+             NULL,\n    /* p_name */ '',\n    /* p_code */ '',\n    /* p_qty */ 0\n);\n"
         );
     }
 
@@ -15597,9 +15889,14 @@ mod tests {
             "PROCEDURE",
             &routine_definition(&[procedure_argument(Some(&long_name), 1, Some("int"), "OUT")]),
         );
+        // The call argument line, whose value is now preceded by the parameter
+        // name in a comment. What this case is about is the length of the
+        // GENERATED name, so it is read off the line rather than assumed to be
+        // the whole of it.
         let session_var = mysql
             .lines()
-            .find_map(|line| line.strip_prefix("    @"))
+            .find(|line| line.starts_with("    ") && line.contains('@'))
+            .and_then(|line| line.rsplit_once('@').map(|(_, name)| name))
             .expect("the OUT argument is passed as a session variable");
         assert!(
             session_var.len() <= 64,
@@ -15641,6 +15938,95 @@ mod tests {
         assert_ne!(declared[0], declared[1], "truncation must stay unique");
         assert!(oracle.contains(&format!("{oracle_name} => ")));
         assert!(oracle.contains(&format!("{second} => ")));
+    }
+
+    /// Neither MySQL engine has named association, so a generated `CALL` used
+    /// to say nothing at all about which value fills which parameter — while
+    /// the Oracle twin has always written `NAME => value`. The name goes in a
+    /// comment, which is the only place it can go.
+    ///
+    /// The comment must be unable to end early. `*/` inside an identifier is
+    /// legal (it needs a quoted-created name) and would hand the rest of the
+    /// name to the parser as SQL; a newline is legal too and would break the
+    /// one-argument-per-line shape the script is read in. Both are neutralised,
+    /// and the leading `/* ` — with the space — is what keeps a name starting
+    /// with `!` or `+` from becoming MySQL's executable-comment or
+    /// optimizer-hint form.
+    #[test]
+    fn a_mysql_call_names_the_parameter_each_value_fills() {
+        let sql = ObjectBrowserWidget::build_mysql_routine_script(
+            "app.p",
+            "PROCEDURE",
+            &routine_definition(&[
+                procedure_argument(Some("p_id"), 1, Some("int"), "IN"),
+                procedure_argument(Some("p_out"), 2, Some("int"), "OUT"),
+            ]),
+        );
+        // IN and OUT alike: the reader should not have to know which kind an
+        // argument is to find out what it is for.
+        assert!(sql.contains("    /* p_id */ 0"), "{sql}");
+        assert!(sql.contains("    /* p_out */ @v_p_out"), "{sql}");
+
+        // A name that would close the comment, and one that would break the
+        // line. Neither may reach the script as itself.
+        assert_eq!(ObjectBrowserWidget::mysql_comment_text("a*/b"), "a* /b");
+        assert_eq!(ObjectBrowserWidget::mysql_comment_text("a\nb"), "a b");
+        assert_eq!(ObjectBrowserWidget::mysql_comment_text("a\r\nb"), "a  b");
+        // Everything else is the catalog's spelling, untouched — that is what
+        // makes the label truthful.
+        for ordinary in ["p_id", "!bang", "+plus", "여러", "a`b"] {
+            assert_eq!(ObjectBrowserWidget::mysql_comment_text(ordinary), ordinary);
+        }
+        // The space after `/*` is what keeps `!` and `+` from being read as
+        // MySQL's executable comment / optimizer hint.
+        assert_eq!(
+            ObjectBrowserWidget::mysql_call_argument_expr("!bang", "0"),
+            "/* !bang */ 0"
+        );
+
+        // A hostile name end to end: the comment closes exactly once, so the
+        // value is still the value.
+        let hostile = ObjectBrowserWidget::build_mysql_routine_script(
+            "app.p",
+            "PROCEDURE",
+            &routine_definition(&[procedure_argument(Some("a*/b"), 1, Some("int"), "IN")]),
+        );
+        assert_eq!(hostile.matches("*/").count(), 1, "{hostile}");
+        assert!(hostile.contains("/* a* /b */ 0"), "{hostile}");
+
+        // And the script the user actually runs still splits the way it did
+        // before the names went in. A comment is new TEXT inside a statement,
+        // so the thing to prove is that the splitter reads it as a comment: a
+        // parameter named `a;b` puts a statement terminator inside one, and a
+        // splitter that did not know that would cut the CALL in half and send
+        // the fragment to the server.
+        for (sql, want_statements) in [
+            (
+                ObjectBrowserWidget::build_mysql_routine_script(
+                    "app.p",
+                    "PROCEDURE",
+                    &routine_definition(&[
+                        procedure_argument(Some("p_id"), 1, Some("int"), "IN"),
+                        procedure_argument(Some("p_out"), 2, Some("int"), "OUT"),
+                    ]),
+                ),
+                2,
+            ),
+            (
+                ObjectBrowserWidget::build_mysql_routine_script(
+                    "app.p",
+                    "PROCEDURE",
+                    &routine_definition(&[procedure_argument(Some("a;b"), 1, Some("int"), "IN")]),
+                ),
+                1,
+            ),
+        ] {
+            assert_eq!(
+                crate::db::QueryExecutor::split_script_items(&sql).len(),
+                want_statements,
+                "{sql}"
+            );
+        }
     }
 
     /// The read-back alias is the only thing that says WHICH parameter a
@@ -15753,7 +16139,10 @@ mod tests {
         );
 
         assert!(sql.contains("SET @v_result = `demo_fn`(\n"));
-        assert!(sql.contains("    @v_p_out\n"));
+        // The parameter each value fills, named beside it: this family has no
+        // named association, so the comment is the only thing that says which
+        // argument the reader is looking at.
+        assert!(sql.contains("    /* p_out */ @v_p_out\n"));
         assert!(sql.contains("SELECT @v_result AS result;\n"));
         assert!(sql.contains("SELECT @v_p_out AS `p_out`;\n"));
         assert!(!sql.contains("SELECT `demo_fn`("));

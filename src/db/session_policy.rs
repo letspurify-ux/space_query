@@ -897,6 +897,49 @@ pub fn message_indicates_query_cancel(message: &str) -> bool {
         || lower_matches_any_db_marker(&lower, query_cancel_markers_for_db_type)
 }
 
+/// What a caller that is ALLOWED TO CONTINUE WITHOUT a read must do with that
+/// read's failure.
+///
+/// Several catalog reads in this app are deliberately allowed to fail open: a
+/// connection that may run a routine need not be allowed to read every view
+/// that describes it, so "the catalog would not answer" falls back to the
+/// answer the app gave before it ever asked. That default is only ever correct
+/// for a read the app TRIED AND COULD NOT MAKE. A read the app was TOLD TO STOP
+/// is a different fact: inventing a default there is acting after the stop, and
+/// sending the next statement of the same action is doing work that was
+/// cancelled.
+///
+/// Asked HERE, once, off [`message_indicates_query_cancel`] — the same
+/// DB-agnostic reader the result tabs and the routine-script loader use — so all
+/// four backends answer it identically and a new cancel marker is still added in
+/// exactly one place. A named value rather than a bare `bool` because every
+/// fail-open site has to MATCH on it: a site that forgets the question is what
+/// let a cancelled `ALL_PROCEDURES` read hand back a parameterless call script
+/// with nothing said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailedReadDisposition {
+    /// The catalog would not answer. The caller's fail-open default stands.
+    FailOpen,
+    /// The action was stopped — cancelled from the activity view, or its cancel
+    /// timeout fired. No default may be invented, and no further statement of
+    /// this action may be sent.
+    Stop,
+}
+
+impl FailedReadDisposition {
+    pub fn of(message: &str) -> Self {
+        match message_indicates_query_cancel(message) {
+            true => Self::Stop,
+            false => Self::FailOpen,
+        }
+    }
+
+    /// Whether this failure ends the action rather than degrading it.
+    pub fn stops_the_action(self) -> bool {
+        matches!(self, Self::Stop)
+    }
+}
+
 /// Whether a cancel THIS APP sent can still be sitting on a session when the
 /// next call is made on it.
 ///
@@ -1125,6 +1168,45 @@ mod tests {
     /// the work it was aimed at had already finished.
     fn our_own_cancel() -> String {
         "ORA-01013: user requested cancel of current operation".to_string()
+    }
+
+    /// A fail-open road's question and the cancel classifier are ONE reading.
+    ///
+    /// `FailedReadDisposition` exists so that every road allowed to continue
+    /// past a failed read has to MATCH on the answer instead of quietly
+    /// defaulting; it must never become a second, drifting opinion about what a
+    /// cancel is. Pinned across every backend's own wording, so a marker added
+    /// to `query_cancel_markers_for_db_type` reaches the routine-script loader,
+    /// the Oracle dictionary read and the MySQL-family presence check together.
+    #[test]
+    fn a_failed_reads_disposition_is_the_cancel_classifier_and_nothing_else() {
+        for message in [
+            "ORA-01013: user requested cancel of current operation",
+            "DPI-1067: user requested cancel of current operation",
+            "Query execution was interrupted",
+            "MySQL server error: query was killed",
+            crate::db::query::result_messages::QUERY_CANCELLED,
+            "ORA-00942: table or view does not exist",
+            "Access denied for user 'app'@'%'",
+            "ORA-03113: end-of-file on communication channel",
+            "",
+        ] {
+            assert_eq!(
+                FailedReadDisposition::of(message).stops_the_action(),
+                message_indicates_query_cancel(message),
+                "{message:?} must be read the same way by both"
+            );
+        }
+        // Every backend's markers, not just the ones spelled out above.
+        for db_type in DatabaseType::ALL {
+            for marker in query_cancel_markers_for_db_type(db_type) {
+                assert_eq!(
+                    FailedReadDisposition::of(marker),
+                    FailedReadDisposition::Stop,
+                    "{db_type:?} marker {marker:?} must stop a fail-open road"
+                );
+            }
+        }
     }
 
     /// The whole point: a break the app sent lands on the NEXT call, and the

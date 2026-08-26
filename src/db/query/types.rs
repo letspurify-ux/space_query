@@ -310,18 +310,20 @@ pub mod result_messages {
         }
     }
 
-    /// `Execute Procedure`/`Execute Function` read the routine perfectly well
-    /// and there is still no call script to write, because the routine can
-    /// only be invoked with something no generated call can supply.
+    /// `Execute Procedure`/`Execute Function` has everything it needs and there
+    /// is still no call script to write, because nothing a generated call can
+    /// name would invoke this.
     ///
     /// The other half of [`routine_arguments_unreadable`]: both end the action
     /// with a sentence and no tab, and they are kept apart because they are
-    /// different facts — "the catalog would not describe it" against "the
-    /// catalog described it, and the description says a script cannot call
-    /// it". Oracle's polymorphic table functions are the case today: their
-    /// argument is a TABLE, and their `ALL_ARGUMENTS` rows describe the
-    /// `DBMS_TF` records the implementation package receives, not anything a
-    /// caller writes.
+    /// different facts — "the catalog would not describe it" against "there is
+    /// nothing to describe a call with". Two causes reach here:
+    /// Oracle's polymorphic table functions, whose argument is a TABLE and
+    /// whose `ALL_ARGUMENTS` rows describe the `DBMS_TF` records the
+    /// implementation package receives rather than anything a caller writes;
+    /// and an action pointed at something that is not a routine at all, which
+    /// only the harness can still produce (the menu's Execute arms match two
+    /// item shapes and a column is neither).
     ///
     /// `reason` carries the remedy as well as the cause, because the two belong
     /// to the invocation FORM: this sentence used to end with "Write the call by
@@ -349,6 +351,26 @@ pub mod result_messages {
         format!(
             "Loading arguments for {display_name} was stopped, so no call script was generated: \
              {reason}"
+        )
+    }
+
+    /// `Execute Procedure`/`Execute Function` could not ASK — a session, a
+    /// driver, a connection that went away.
+    ///
+    /// The third of the three sentences this action can end with, and the only
+    /// one whose road still OPENS a script: the app knows nothing about the
+    /// routine, so the simple call gives the user something to edit. That is
+    /// why the sentence says what was and was not done rather than only naming
+    /// the failure — it used to read "Failed to load routine arguments: …",
+    /// which named neither the routine nor the tab that was about to appear,
+    /// while its two neighbours named both.
+    ///
+    /// One sentence for all four backends, for the same reason as its
+    /// neighbours: the situation is the same on all four.
+    pub fn routine_script_load_failed(display_name: &str, reason: &str) -> String {
+        format!(
+            "Failed to load arguments for {display_name}: {reason}. Any call script opened for it \
+             was written without them."
         )
     }
 

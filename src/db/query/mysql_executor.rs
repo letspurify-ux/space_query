@@ -56,6 +56,40 @@ impl MysqlRoutineKind {
     }
 }
 
+/// The catalog's answer to "do you hold this routine?", in the three ways it
+/// can end.
+///
+/// The last question a routine-script load asks before REFUSING, and the two
+/// failures behind it are not the same failure. A read that could not be MADE
+/// leaves the refusal unproven, so the load falls open and lets the server give
+/// the true answer. A read the action was TOLD TO STOP leaves everything
+/// unproven AND was asked to end: falling open there hands back a call script
+/// after a cancel, with nothing said — the same defect the Oracle dictionary
+/// read had, from the other family's fallback.
+///
+/// Told apart once, in [`Self::failed`], by the DB-agnostic
+/// [`crate::db::session_policy::FailedReadDisposition`] — the same reader
+/// `RoutineDictionaryRead::failed` and the object browser's delivery use — so a
+/// new cancel marker is still added in exactly one place for all four backends.
+#[derive(Debug)]
+enum RoutinePresence {
+    /// The catalog answered: `true` when it holds the routine.
+    Answered(bool),
+    /// The read could not be made; a refusal must not be built on it.
+    Unavailable,
+    /// The action was stopped before the catalog answered.
+    Stopped(String),
+}
+
+impl RoutinePresence {
+    fn failed(message: String) -> Self {
+        match crate::db::session_policy::FailedReadDisposition::of(&message) {
+            crate::db::session_policy::FailedReadDisposition::Stop => Self::Stopped(message),
+            crate::db::session_policy::FailedReadDisposition::FailOpen => Self::Unavailable,
+        }
+    }
+}
+
 const MYSQL_CANCEL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Which `KILL` a cancel sends. Named so the two tiers cannot be told apart
@@ -2301,6 +2335,20 @@ impl MysqlObjectBrowser {
         Some(arguments)
     }
 
+    /// `SHOW CREATE` as a last resort, `None` when it settled nothing.
+    ///
+    /// This `None` deliberately does NOT split off a stop the way
+    /// [`RoutinePresence`] and the Oracle dictionary read do, and the reason is
+    /// worth keeping: it is only ever REACHED when
+    /// `INFORMATION_SCHEMA.PARAMETERS` held no row for this routine's
+    /// namespace, and both views carry the same privilege filter — so "no
+    /// parameter rows" already means the routine takes none or is not visible,
+    /// and neither answer this can end in is wrong. `None` sends the caller to
+    /// `routine_exists_in_schema`, which asks the catalog and DOES name a stop.
+    /// A cancel landing exactly here therefore costs the user a correct script
+    /// rather than a wrong one; making it a fourth three-way would reach into
+    /// [`Self::get_routine_arguments_in_schema_any_kind`], whose answer and
+    /// round-trip count are pinned for signature help.
     fn fallback_routine_arguments_from_ddl(
         conn: &mut Conn,
         schema_name: Option<&str>,
@@ -2931,11 +2979,21 @@ impl MysqlObjectBrowser {
     /// `overloads` is always empty: the MySQL family has no per-overload call
     /// form (and no overloading at all) — a stored routine is always invoked
     /// the family's ordinary way.
+    ///
+    /// `display_name` is how the CALLER writes this routine — the same text its
+    /// generated script names — and it is taken rather than composed here for
+    /// exactly that reason. Composing `schema.routine` from the two raw lookup
+    /// values gave the refusal a different spelling from the script for any
+    /// name needing quotes: a routine created as `` `zq.dot` `` was refused as
+    /// `db.zq.dot` while every other sentence about it read ``db.`zq.dot` ``.
+    /// The Oracle loaders have always passed the written name in; this is the
+    /// same road.
     pub fn get_routine_definition_in_schema(
         conn: &mut Conn,
         schema_name: Option<&str>,
         routine_name: &str,
         kind: MysqlRoutineKind,
+        display_name: &str,
     ) -> Result<RoutineDefinitionLookup, String> {
         if let Some(arguments) =
             Self::routine_arguments_or_missing(conn, schema_name, routine_name, kind)
@@ -2950,25 +3008,25 @@ impl MysqlObjectBrowser {
         // not proof of absence. The catalog is asked before refusing, and only
         // HERE: the arguments-only entry point above discards the distinction,
         // and must not pay a round trip for an answer it throws away.
-        if Self::routine_exists_in_schema(conn, schema_name, routine_name, kind) {
-            return Ok(RoutineDefinitionLookup::Defined(
-                RoutineDefinition::from_arguments(Vec::new()),
-            ));
-        }
-        // No compile state to report: a routine whose body does not compile is
-        // never created on this family in the first place.
-        Ok(RoutineDefinitionLookup::Unreadable(
-            result_messages::routine_arguments_unreadable(
-                &Self::qualified_routine_display_name(schema_name, routine_name),
-                None,
+        match Self::routine_exists_in_schema(conn, schema_name, routine_name, kind) {
+            // The action was told to stop. Neither answer below may be given:
+            // a definition would be a fact nobody established, and a refusal
+            // would be a "no" the catalog never said. `Err` is the
+            // could-not-ask road the Oracle loaders use for the same event, and
+            // the object browser's one classifier turns it into the STOPPED
+            // delivery on every backend.
+            RoutinePresence::Stopped(reason) => Err(reason),
+            // A read that could not be MADE answers YES, exactly as it always
+            // has: this only ever decides whether to REFUSE, and a refusal has
+            // to be something the catalog said.
+            RoutinePresence::Unavailable | RoutinePresence::Answered(true) => Ok(
+                RoutineDefinitionLookup::Defined(RoutineDefinition::from_arguments(Vec::new())),
             ),
-        ))
-    }
-
-    fn qualified_routine_display_name(schema_name: Option<&str>, routine_name: &str) -> String {
-        match schema_name.map(str::trim).filter(|name| !name.is_empty()) {
-            Some(schema_name) => format!("{schema_name}.{routine_name}"),
-            None => routine_name.to_string(),
+            // No compile state to report: a routine whose body does not compile
+            // is never created on this family in the first place.
+            RoutinePresence::Answered(false) => Ok(RoutineDefinitionLookup::Unreadable(
+                result_messages::routine_arguments_unreadable(display_name, None),
+            )),
         }
     }
 
@@ -3017,6 +3075,14 @@ impl MysqlObjectBrowser {
                 rows
             }
             Err(err) => {
+                // A read the action was TOLD TO STOP must not be followed by
+                // the `SHOW CREATE` fallback. That is a second statement of
+                // cancelled work, and on this family a `KILL QUERY` ends only
+                // the statement it lands on — so the fallback really can
+                // succeed and hide the stop behind a script.
+                if Self::read_failure_stops_the_action(&err.to_string()) {
+                    return Err(err);
+                }
                 if let Some(arguments) = fallback_arguments(conn) {
                     return Ok(Some(arguments));
                 }
@@ -3031,17 +3097,33 @@ impl MysqlObjectBrowser {
         ))
     }
 
+    /// Whether a failed read ENDS the action instead of degrading it.
+    ///
+    /// One spelling for every road in this file that is allowed to continue
+    /// past a failure, off the same DB-agnostic
+    /// [`crate::db::session_policy::FailedReadDisposition`] the Oracle reader
+    /// uses — see [`RoutinePresence`].
+    fn read_failure_stops_the_action(message: &str) -> bool {
+        crate::db::session_policy::FailedReadDisposition::of(message).stops_the_action()
+    }
+
     /// Whether the catalog holds `routine_name` in `kind`'s namespace.
     ///
-    /// A read failure answers "yes": this only ever decides whether to REFUSE,
-    /// and a refusal has to be something the catalog said, never something a
-    /// broken read implied.
+    /// Three answers, not two. A read failure used to answer "yes" outright,
+    /// which is right for a read that could not be MADE — this only ever
+    /// decides whether to REFUSE, and a refusal has to be something the catalog
+    /// said, never something a broken read implied — and wrong for a read the
+    /// action was TOLD TO STOP, where "yes" hands back a call script with
+    /// nothing said. The two are told apart by the same DB-agnostic
+    /// [`crate::db::session_policy::FailedReadDisposition`] the Oracle
+    /// dictionary read uses, so the family that has this fallback and the
+    /// family that has that one answer a cancel identically.
     fn routine_exists_in_schema(
         conn: &mut Conn,
         schema_name: Option<&str>,
         routine_name: &str,
         kind: MysqlRoutineKind,
-    ) -> bool {
+    ) -> RoutinePresence {
         let schema_name = Self::effective_schema_param(conn, schema_name);
         let found: Result<Option<u8>, MysqlError> = conn.exec_first(
             "SELECT 1 FROM INFORMATION_SCHEMA.ROUTINES \
@@ -3049,8 +3131,8 @@ impl MysqlObjectBrowser {
             (schema_name, routine_name, kind.as_routine_type()),
         );
         match found {
-            Ok(found) => found.is_some(),
-            Err(_) => true,
+            Ok(found) => RoutinePresence::Answered(found.is_some()),
+            Err(err) => RoutinePresence::failed(err.to_string()),
         }
     }
 
@@ -3086,6 +3168,12 @@ impl MysqlObjectBrowser {
                 return Ok(fallback_arguments(conn).unwrap_or_default());
             }
             Err(err) => {
+                // Same rule as `routine_arguments_or_missing`: a stop ends the
+                // read rather than spending the fallback's two statements on
+                // work that was cancelled.
+                if Self::read_failure_stops_the_action(&err.to_string()) {
+                    return Err(err);
+                }
                 if let Some(arguments) = fallback_arguments(conn) {
                     return Ok(arguments);
                 }
@@ -4201,6 +4289,74 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(!results[0].is_select);
         assert_eq!(results[0].message, "Call executed successfully");
+    }
+
+    /// The catalog's presence answer has THREE values, and the two failures do
+    /// not lead the same way.
+    ///
+    /// This is the last question a MySQL-family routine-script load asks before
+    /// REFUSING, and its fail-open ("yes") is deliberate: the refusal has to be
+    /// something the catalog said, never something a broken read implied. That
+    /// reasoning does not extend to a read the action was TOLD TO STOP — there
+    /// "yes" hands back a call script after a cancel with nothing said, which is
+    /// exactly what the Oracle dictionary read did from the other family's
+    /// fallback. Both now ask ONE reader, so a cancel means the same thing on
+    /// all four backends.
+    #[test]
+    fn a_routine_presence_failure_is_a_stop_only_when_the_shared_reader_says_so() {
+        for stop in [
+            "Query execution was interrupted",
+            "ERROR 1317 (70100): Query execution was interrupted",
+            "MySQL server error: query was killed",
+            "ORA-01013: user requested cancel of current operation",
+            crate::db::query::result_messages::QUERY_CANCELLED,
+        ] {
+            assert!(
+                matches!(
+                    super::RoutinePresence::failed(stop.to_string()),
+                    super::RoutinePresence::Stopped(ref carried) if carried == stop
+                ),
+                "{stop} must end the action, carrying its own words"
+            );
+        }
+
+        for fail_open in [
+            "Access denied for user 'app'@'%' to database 'other'",
+            "Table 'information_schema.ROUTINES' doesn't exist",
+            "Lost connection to MySQL server during query",
+        ] {
+            assert!(
+                matches!(
+                    super::RoutinePresence::failed(fail_open.to_string()),
+                    super::RoutinePresence::Unavailable
+                ),
+                "{fail_open} must leave the fail-open road alone"
+            );
+        }
+    }
+
+    /// The `SHOW CREATE` fallback is not sent after a stop.
+    ///
+    /// This family's `KILL QUERY` ends only the statement it lands on, so the
+    /// fallback really can succeed on a cancelled connection — and an answer it
+    /// happened to get would hide the stop behind a script. Every road in this
+    /// file that continues past a failed read asks this one question.
+    #[test]
+    fn continuing_past_a_failed_read_is_refused_exactly_for_a_stop() {
+        assert!(MysqlObjectBrowser::read_failure_stops_the_action(
+            "Query execution was interrupted"
+        ));
+        assert!(MysqlObjectBrowser::read_failure_stops_the_action(
+            "ORA-01013: user requested cancel of current operation"
+        ));
+        // The failure the fallback EXISTS for: no SHOW_ROUTINE privilege, and
+        // an information_schema read that answered nothing useful.
+        assert!(!MysqlObjectBrowser::read_failure_stops_the_action(
+            "Access denied; you need (at least one of) the SHOW ROUTINE privilege(s)"
+        ));
+        assert!(!MysqlObjectBrowser::read_failure_stops_the_action(
+            "PROCEDURE app.p does not exist"
+        ));
     }
 
     #[test]

@@ -689,11 +689,20 @@ fn fetch_mysql_lookup(
     routine_name: &str,
     kind: space_query::db::query::mysql_executor::MysqlRoutineKind,
 ) -> Result<space_query::db::RoutineDefinitionLookup, String> {
+    // The name the object browser would write for this routine, so a refusal
+    // read here is the sentence a refusal in the app would carry.
+    let display_name =
+        space_query::ui::object_browser::ObjectBrowserWidget::action_display_name_for_harness(
+            space_query::db::DatabaseType::MySQL,
+            schema_name,
+            routine_name,
+        );
     space_query::db::query::mysql_executor::MysqlObjectBrowser::get_routine_definition_in_schema(
         conn,
         schema_name,
         routine_name,
         kind,
+        &display_name,
     )
 }
 
