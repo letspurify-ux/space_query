@@ -832,6 +832,68 @@ fn query_cancel_markers_for_db_type(db_type: DatabaseType) -> &'static [&'static
     }
 }
 
+/// Driver-specific markers that identify a statement a TIMEOUT ended, in raw
+/// error text.
+///
+/// They exist because a timeout is cancel-SHAPED on the MySQL family: both
+/// MySQL's `ERROR 3024` and MariaDB's `ERROR 1969` are worded "Query execution
+/// was interrupted …", which is also the wording of `KILL QUERY`. The driver
+/// level has always known which is which — `MysqlExecutor::is_cancel_error`
+/// answers `false` for anything `is_timeout_error` claims — and this is that
+/// same precedence, stated once more for the message level so the two readers
+/// cannot disagree about one failure.
+///
+/// Deliberately narrow: the phrase has to be the SERVER saying a limit was
+/// exceeded, never a variable name the app itself may quote. `SET SESSION
+/// max_execution_time = 5000` appears verbatim inside "Failed to apply … : Query
+/// execution was interrupted", which is a CANCEL that landed on the app's own
+/// preparation statement, and a marker of `max_execution_time` would have read
+/// it as a timeout.
+///
+/// The wordings are measured, not guessed, because they are what tells the two
+/// events apart:
+///
+/// * MySQL 8.0.46 — `ERROR 3024 (HY000): Query execution was interrupted,
+///   maximum statement execution time exceeded`. It opens with the exact
+///   sentence `KILL QUERY` produces, which is the collision this catalog
+///   exists for;
+/// * MariaDB 12.2.2 — `ERROR 1969 (70100): Query was interrupted: execution
+///   time limit 0.5 sec exceeded`. Its own phrasing, and NOT the
+///   `(max_statement_time exceeded)` older releases used, so both are listed;
+/// * MariaDB `KILL QUERY`, for contrast — `ERROR 1317 (70100): Query execution
+///   was interrupted`, with no limit named.
+const MYSQL_QUERY_TIMEOUT_MARKERS: &[&str] = &[
+    "error 3024",
+    "maximum statement execution time exceeded",
+    "error 1969",
+    "max_statement_time exceeded",
+    "execution time limit",
+];
+
+fn query_timeout_markers_for_db_type(db_type: DatabaseType) -> &'static [&'static str] {
+    match db_type {
+        // ODPI-C's call timeout, and the thin driver's own equivalent of it
+        // (`tns_thin::ORACLE_THIN_CALL_TIMEOUT_MESSAGE`). Neither is a
+        // substring of the app's prose about restoring a call timeout, which is
+        // text that can accompany a real cancel.
+        DatabaseType::Oracle => &["dpi-1067", "oracle thin call timeout exceeded"],
+        DatabaseType::MySQL => MYSQL_QUERY_TIMEOUT_MARKERS,
+        DatabaseType::MariaDB => MYSQL_QUERY_TIMEOUT_MARKERS,
+    }
+}
+
+/// Whether this message reports a query TIMEOUT — the app's own sentence for
+/// one, or a server that said a limit was exceeded.
+///
+/// The app's phrase is here because every backend's timeout is normalized to it
+/// (`SqlEditorWidget::timeout_message`) with the driver's own words appended,
+/// so the composed text carries both a timeout report and, on the MySQL family,
+/// the server's cancel-shaped wording.
+fn message_reports_query_timeout(lower: &str) -> bool {
+    lower.contains("query timed out")
+        || lower_matches_any_db_marker(lower, query_timeout_markers_for_db_type)
+}
+
 /// Driver-specific markers that identify a lost/dead connection in messages
 /// shown to generic UI. Display-level classification: narrower than the
 /// fail-closed session-reuse list in `has_fatal_connection_marker`, which
@@ -890,11 +952,34 @@ fn lower_matches_any_db_marker(
 
 /// DB-agnostic classifier for generic UI: does this message report a
 /// user-initiated cancel on any backend?
+///
+/// Three questions in order, and the order is the whole of it:
+///
+/// 1. the APP's own cancel sentence, which every executor normalizes a
+///    confirmed cancel to. When the app says it cancelled, it knew — it was
+///    holding the cancel flag — and nothing in the driver's words outranks
+///    that;
+/// 2. a TIMEOUT report, which is not a cancel however cancel-shaped the
+///    server's words are. MySQL's `ERROR 3024` and MariaDB's `ERROR 1969` both
+///    read "Query execution was interrupted …", the same sentence `KILL QUERY`
+///    produces, so a timed-out statement reported itself as the user's own
+///    cancel — F6 Explain Plan showed "Explain plan cancelled" for a query the
+///    server had killed on `max_statement_time`. The driver-level readers have
+///    always put the timeout first (`MysqlExecutor::is_cancel_error`); this is
+///    that precedence at the message level, so one failure cannot be two
+///    different events depending on which reader is asked;
+/// 3. only then the driver's cancel markers.
 pub fn message_indicates_query_cancel(message: &str) -> bool {
     let lower = message.trim().to_ascii_lowercase();
-    lower.contains(&crate::db::query::result_messages::QUERY_CANCELLED.to_ascii_lowercase())
+    if lower.contains(&crate::db::query::result_messages::QUERY_CANCELLED.to_ascii_lowercase())
         || lower.contains("query canceled")
-        || lower_matches_any_db_marker(&lower, query_cancel_markers_for_db_type)
+    {
+        return true;
+    }
+    if message_reports_query_timeout(&lower) {
+        return false;
+    }
+    lower_matches_any_db_marker(&lower, query_cancel_markers_for_db_type)
 }
 
 /// What a caller that is ALLOWED TO CONTINUE WITHOUT a read must do with that
@@ -1132,12 +1217,23 @@ pub fn answer_a_call_a_cancel_could_be_aimed_at<T, E: std::fmt::Display>(
 
 /// DB-agnostic classifier for generic UI: cancel or timeout — the statement
 /// was aborted before producing a normal result.
+///
+/// Both halves are NAMED here. The timeout half used to be prose alone
+/// ("timed out"/"timeout") and leaned on the cancel classifier to cover the
+/// server codes that say neither: MySQL's `ERROR 3024` reads "… maximum
+/// statement execution time exceeded" and MariaDB's `ERROR 1969` reads
+/// "(max_statement_time exceeded)", and both were caught only because they are
+/// worded like a `KILL QUERY`. That coupling is what made one failure two
+/// different events depending on the reader; the abort question keeps its
+/// answer by asking the timeout catalog itself.
 pub fn message_indicates_execution_abort(message: &str) -> bool {
     if message_indicates_query_cancel(message) {
         return true;
     }
     let lower = message.trim().to_ascii_lowercase();
-    lower.contains("timed out") || lower.contains("timeout")
+    message_reports_query_timeout(&lower)
+        || lower.contains("timed out")
+        || lower.contains("timeout")
 }
 
 /// DB-agnostic classifier for generic UI: does this message report a lost or
@@ -3830,6 +3926,74 @@ mod tests {
         assert!(!message_indicates_query_cancel(
             "ERROR 1064 (42000): You have an error in your SQL syntax"
         ));
+    }
+
+    /// A TIMEOUT is not a cancel, on any backend, however cancel-shaped the
+    /// server's words are.
+    ///
+    /// Nobody pressed anything: the statement ran out of the time the tab gave
+    /// it. The MySQL family is where the two become hard to tell apart — both
+    /// `ERROR 3024` and `ERROR 1969` are worded exactly like a `KILL QUERY` —
+    /// and F6 Explain Plan is where it showed: a MariaDB plan the server killed
+    /// on `max_statement_time` reported itself as "Explain plan cancelled",
+    /// with the timeout it actually hit thrown away.
+    ///
+    /// The driver-level readers have always answered this correctly
+    /// (`MysqlExecutor::is_cancel_error` returns false for anything
+    /// `is_timeout_error` claims; `oracle_error_allows_session_reuse` asks both
+    /// and `oracle_select_cancel_reuse_policy_allows_only_plain_cancel` pins
+    /// the Oracle composite). This is the same precedence at the message level,
+    /// so one failure cannot be two different events depending on the reader.
+    #[test]
+    fn a_timeout_is_not_a_cancel_on_any_backend() {
+        for timeout in [
+            // The app's own sentence, whatever it carries after it.
+            "Query timed out after 5 seconds",
+            "Query timed out after 5 seconds: Query execution was interrupted \
+             (max_statement_time exceeded)",
+            // MySQL 8 and MariaDB, raw and measured — see
+            // `MYSQL_QUERY_TIMEOUT_MARKERS` for where each was read off.
+            "ERROR 3024 (HY000): Query execution was interrupted, maximum statement \
+             execution time exceeded",
+            "Query execution was interrupted (max_statement_time exceeded)",
+            "ERROR 1969 (70100): Query execution was interrupted (max_statement_time exceeded)",
+            "ERROR 1969 (70100): Query was interrupted: execution time limit 0.5 sec exceeded",
+            // ODPI-C enforces a call timeout by breaking the call, so its
+            // timeout error carries the break's own ORA-01013 inside it.
+            "DPI-1067: call timeout of 5000 ms exceeded with ORA-01013",
+            // The thin driver's equivalent evidence.
+            "Oracle thin call timeout exceeded",
+        ] {
+            assert!(
+                !message_indicates_query_cancel(timeout),
+                "{timeout:?} is a timeout, not a cancel"
+            );
+            // ... and it is still an ABORT: the statement produced no normal
+            // result, which is the question the result table asks.
+            assert!(
+                message_indicates_execution_abort(timeout),
+                "{timeout:?} must still read as an aborted statement"
+            );
+        }
+
+        // A real cancel keeps its answer, including the ones the app wraps in
+        // its own prose and the ones whose text merely mentions a timeout
+        // setting the app was in the middle of applying.
+        for cancel in [
+            "ORA-01013: user requested cancel of current operation",
+            "ERROR 1317 (70100): Query execution was interrupted",
+            "Query execution was interrupted",
+            "Failed to apply MySQL session setting `SET SESSION max_execution_time = 5000`: \
+             Query execution was interrupted",
+            "ORA-01013: user requested cancel of current operation; \
+             Failed to reset Oracle thin call timeout: not connected",
+            crate::db::query::result_messages::QUERY_CANCELLED,
+        ] {
+            assert!(
+                message_indicates_query_cancel(cancel),
+                "{cancel:?} is a cancel"
+            );
+        }
     }
 
     #[test]

@@ -9251,9 +9251,13 @@ impl DatabaseConnection {
         mode: TransactionMode,
     ) -> Result<(), String> {
         for statement in Self::transaction_mode_statements_for(DatabaseType::Oracle, mode)? {
-            let request = StatementRequest::statement(statement.clone());
+            // `query_drop`, not `execute_typed`: the thin driver returns the
+            // server cursor inside the result and closes nothing, so dropping
+            // the result leaks it. The same shape as the explain plan's
+            // (`read_oracle_thin_explain_plan`) and as the connect-time
+            // `ALTER SESSION` this repo already fixed once.
             session
-                .execute_typed(&request, &[])
+                .query_drop(&statement)
                 .map_err(|err| format!("Failed to apply transaction mode: {err}"))?;
         }
         Ok(())

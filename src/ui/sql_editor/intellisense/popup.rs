@@ -1,12 +1,24 @@
 trait QuickDescribeBackend: Sync {
     /// `scope` is the schema/database the requesting query tab has selected,
     /// which is what an unqualified name must resolve against.
+    ///
+    /// `query_timeout` is the requesting tab's, and every backend must apply it
+    /// to the calls it makes. This read runs on the connection's OWN session —
+    /// the one every tab's work on that connection queues behind — and it had
+    /// no bound at all: a describe against a stalled server held the connection
+    /// mutex until someone cancelled it from the activity view. It is the tab's
+    /// timeout rather than a fixed metadata one because this is a deliberate
+    /// user action whose result opens a tab, exactly like F6, and the timeout
+    /// box is where the user says how long their own work may take. (The
+    /// signature hints, which the user never asked for, keep their own fixed
+    /// `SIGNATURE_METADATA_TIMEOUT` for the opposite reason.)
     fn describe_object(
         &self,
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         object_name: &str,
         qualifier: Option<&str>,
         scope: Option<&str>,
+        query_timeout: Option<Duration>,
     ) -> Result<QuickDescribeData, String>;
 }
 
@@ -33,6 +45,7 @@ impl QuickDescribeBackend for OracleQuickDescribeBackend {
         object_name: &str,
         qualifier: Option<&str>,
         scope: Option<&str>,
+        query_timeout: Option<Duration>,
     ) -> Result<QuickDescribeData, String> {
         // The lookup name carries the schema, so the tab's scope only has to
         // reach the name — the shared live session keeps its own tracked
@@ -45,29 +58,46 @@ impl QuickDescribeBackend for OracleQuickDescribeBackend {
             .tracked_oracle_current_schema()
             .map(str::to_string);
         match conn_guard.require_live_db_connection() {
-            Ok(crate::db::DbConnection::Oracle(db_conn)) => SqlEditorWidget::describe_object(
-                db_conn.as_ref(),
-                object_name,
-                qualifier,
-                lookup_schema.as_deref(),
-            ),
+            Ok(crate::db::DbConnection::Oracle(db_conn)) => {
+                SqlEditorWidget::run_oracle_action_with_timeout(
+                    db_conn,
+                    query_timeout,
+                    "Quick describe",
+                    |db_conn| {
+                        SqlEditorWidget::describe_object(
+                            db_conn.as_ref(),
+                            object_name,
+                            qualifier,
+                            lookup_schema.as_deref(),
+                        )
+                    },
+                )
+            }
             Ok(crate::db::DbConnection::OracleThin(db_conn)) => {
                 let mut session = db_conn
                     .lock()
                     .map_err(|_| "Oracle Thin connection lock was poisoned".to_string())?;
-                // Go to Declaration describes ONE object by name: resolving it
-                // in the login schema because the tab's is gone would describe
-                // a different object of the same name and say nothing.
-                crate::db::DatabaseConnection::apply_tracked_oracle_thin_current_schema(
+                SqlEditorWidget::run_oracle_thin_action_with_timeout(
                     &mut session,
-                    tracked_schema.as_deref(),
-                )?
-                .require_applied(crate::db::DatabaseType::Oracle)?;
-                SqlEditorWidget::describe_thin_object(
-                    &mut session,
-                    object_name,
-                    qualifier,
-                    lookup_schema.as_deref(),
+                    query_timeout,
+                    |session| {
+                        // Go to Declaration describes ONE object by name:
+                        // resolving it in the login schema because the tab's is
+                        // gone would describe a different object of the same
+                        // name and say nothing. Inside the timeout because it is
+                        // a server round trip like the describe itself.
+                        crate::db::DatabaseConnection::apply_tracked_oracle_thin_current_schema(
+                            session,
+                            tracked_schema.as_deref(),
+                        )?
+                        .require_applied(crate::db::DatabaseType::Oracle)?;
+                        SqlEditorWidget::describe_thin_object(
+                            session,
+                            object_name,
+                            qualifier,
+                            lookup_schema.as_deref(),
+                        )
+                    },
                 )
             }
             Ok(crate::db::DbConnection::MySQL { .. }) => {
@@ -85,6 +115,7 @@ impl QuickDescribeBackend for MysqlQuickDescribeBackend {
         object_name: &str,
         qualifier: Option<&str>,
         scope: Option<&str>,
+        query_timeout: Option<Duration>,
     ) -> Result<QuickDescribeData, String> {
         // Name the database in the lookup instead of switching the session to
         // it: MySQL 8 and MariaDB fold `DATABASE()` into a prepared
@@ -93,17 +124,30 @@ impl QuickDescribeBackend for MysqlQuickDescribeBackend {
         // in back then.
         let lookup_database = conn_guard.mysql_database_for_scope(scope).to_string();
         let lookup_database = (!lookup_database.is_empty()).then_some(lookup_database);
-        conn_guard
-            .get_mysql_connection_mut()
-            .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
-            .and_then(|mysql_conn| {
-                SqlEditorWidget::describe_mysql_object(
-                    mysql_conn,
-                    object_name,
-                    qualifier,
-                    lookup_database.as_deref(),
-                )
-            })
+        // The session half of the execution ceremony and nothing else: this
+        // read must be bounded by the tab's timeout like any other work on the
+        // connection's own session, and it must not touch that session's
+        // database (see above) or publish a cancel target (the connection lock
+        // already published one for whatever holds it).
+        SqlEditorWidget::run_mysql_main_connection_action(
+            conn_guard,
+            None,
+            query_timeout,
+            "Quick describe",
+            |conn_guard| {
+                conn_guard
+                    .get_mysql_connection_mut()
+                    .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                    .and_then(|mysql_conn| {
+                        SqlEditorWidget::describe_mysql_object(
+                            mysql_conn,
+                            object_name,
+                            qualifier,
+                            lookup_database.as_deref(),
+                        )
+                    })
+            },
+        )
     }
 }
 
@@ -1273,6 +1317,9 @@ impl SqlEditorWidget {
             return;
         };
         let tab_scope = self.connection_binding.snapshot().scope;
+        // The tab's own answer to "how long may my work take", read on the UI
+        // thread where the input lives — the same value F6 reads.
+        let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         let sender = self.ui_action_sender.clone();
         let sender_for_thread = sender.clone();
         set_cursor(Cursor::Wait);
@@ -1301,6 +1348,7 @@ impl SqlEditorWidget {
                         &raw_word,
                         describe_qualifier,
                         tab_scope.as_deref(),
+                        query_timeout,
                     );
 
                     let _ = sender_for_thread.send(UiActionResult::QuickDescribe {
@@ -1339,12 +1387,14 @@ impl SqlEditorWidget {
         object_name: &str,
         qualifier: Option<&str>,
         scope: Option<&str>,
+        query_timeout: Option<Duration>,
     ) -> Result<QuickDescribeData, String> {
         quick_describe_backend_for(conn_guard.db_type()).describe_object(
             conn_guard,
             object_name,
             qualifier,
             scope,
+            query_timeout,
         )
     }
 

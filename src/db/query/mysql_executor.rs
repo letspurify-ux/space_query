@@ -295,6 +295,47 @@ struct MysqlResultSetSnapshot {
     info: String,
 }
 
+/// One MySQL-family explain: the text that goes on the wire, and whether the
+/// APP chose what that text explains.
+///
+/// The twin of [`crate::db::query::OracleExplainStatement`], and one value for
+/// the same reason: the gates judge what the wire receives, and a second
+/// derivation of "did we wrap this, or pass the user's own explain through?"
+/// is how the question and the answer come to be about different statements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MysqlExplainStatement {
+    sql: String,
+    app_chosen_target: Option<String>,
+}
+
+impl MysqlExplainStatement {
+    /// The statement that goes on the wire, and the text every gate is asked
+    /// about.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// The statement the APP decided to explain, or `None` when the user's own
+    /// explain was passed through unchanged.
+    ///
+    /// `None` is not "nothing is explained" — it is "the user named the server
+    /// statement themselves". `EXPLAIN EXPLAIN …` is not a statement, so an
+    /// explain the user typed has always been passed straight to the server,
+    /// tool command or not; where the app is not choosing, there is nothing for
+    /// it to second-guess.
+    ///
+    /// Where the app IS choosing, this is what the "has this statement a plan
+    /// at all?" gate must be asked about. It was not asked at all, and
+    /// `ANALYZE TABLE t` is what that cost: the app wrapped this family's table
+    /// maintenance statement into `EXPLAIN ANALYZE TABLE t`, which MySQL reads
+    /// as an executing explain of the `TABLE t` QUERY — so F6 on a maintenance
+    /// statement drew a real plan for something else entirely, while MariaDB
+    /// answered `ERROR 1064` to the same keystroke.
+    pub fn app_chosen_target(&self) -> Option<&str> {
+        self.app_chosen_target.as_deref()
+    }
+}
+
 impl MysqlExecutor {
     fn timeout_millis(timeout: Option<Duration>) -> u128 {
         timeout.map(|value| value.as_millis()).unwrap_or(0)
@@ -1215,28 +1256,63 @@ impl MysqlExecutor {
         results
     }
 
-    /// The statement the explain path will send, so the tab's transaction-mode
-    /// gate can be asked about what actually runs.
-    pub fn explain_plan_sql(sql: &str) -> String {
-        Self::build_explain_sql(sql)
-    }
-
-    fn build_explain_sql(sql: &str) -> String {
+    /// The statement the explain path will send, so the read-only gates can be
+    /// asked about what actually runs.
+    ///
+    /// One builder: `get_explain_plan` used to rebuild the same text privately,
+    /// which meant the statement the gates judged and the statement that ran
+    /// were two derivations of one rule. It now takes what this built.
+    ///
+    /// An explain the user typed is passed through rather than wrapped again,
+    /// because `EXPLAIN EXPLAIN …` is not a statement — and that has to include
+    /// the spelling THIS family uses. MariaDB rejects `EXPLAIN ANALYZE` and
+    /// writes its executing explain as `ANALYZE <statement>`, so wrapping that
+    /// produced a syntax error and MariaDB users could not reach a measured
+    /// plan at all while MySQL users could. `db_type` is taken for exactly that
+    /// reason; the reader that knows both spellings
+    /// (`mysql_explain_executed_statement`) decides, so this cannot disagree
+    /// with the gate that judges the result.
+    ///
+    /// Deliberately NOT passed through: `ANALYZE [modifiers] TABLE …`, which is
+    /// table maintenance and not an explain on either family. It is WRAPPED,
+    /// and it is the wrapping that made it worth saying so out loud — see
+    /// [`MysqlExplainStatement::app_chosen_target`].
+    pub fn explain_plan_statement(db_type: DatabaseType, sql: &str) -> MysqlExplainStatement {
         let normalized = QueryExecutor::normalize_sql_for_execute(sql);
-        match QueryExecutor::leading_keyword(&normalized).as_deref() {
-            Some("EXPLAIN") | Some("DESCRIBE") | Some("DESC") => normalized,
-            _ => format!("EXPLAIN {}", normalized),
+        let passes_through = match QueryExecutor::leading_keyword(&normalized).as_deref() {
+            Some("EXPLAIN") | Some("DESCRIBE") | Some("DESC") => true,
+            Some("ANALYZE") => crate::db::sql_classification::mysql_explain_executed_statement(
+                db_type,
+                &normalized,
+            )
+            .is_some(),
+            _ => false,
+        };
+        if passes_through {
+            return MysqlExplainStatement {
+                sql: normalized,
+                app_chosen_target: None,
+            };
+        }
+        MysqlExplainStatement {
+            sql: format!("EXPLAIN {}", normalized),
+            app_chosen_target: Some(normalized),
         }
     }
 
-    /// Run EXPLAIN and hand back the server's own result, columns and all.
+    /// Run the prepared EXPLAIN and hand back the server's own result, columns
+    /// and all.
+    ///
+    /// `explain_sql` is what [`Self::explain_plan_sql`] built — the same text
+    /// the caller's read-only gates were asked about. It is taken rather than
+    /// rebuilt here so the statement that was judged is the statement that
+    /// runs.
     ///
     /// Nothing is reshaped here: classic `EXPLAIN` has no parent column, so the
     /// caller renders the rows flat rather than inventing a tree out of
     /// `id`/`select_type`.
-    pub fn get_explain_plan(conn: &mut Conn, sql: &str) -> Result<QueryResult, MysqlError> {
-        let explain_sql = Self::build_explain_sql(sql);
-        Self::execute_select(conn, &explain_sql)
+    pub fn get_explain_plan(conn: &mut Conn, explain_sql: &str) -> Result<QueryResult, MysqlError> {
+        Self::execute_select(conn, explain_sql)
     }
 
     fn build_cancel_opts(info: &ConnectionInfo) -> mysql::OptsBuilder {
@@ -3361,24 +3437,89 @@ mod tests {
         );
     }
 
+    /// Both facts below hold on both products, so both products are asked.
+    /// The builder took no `db_type` at all until MariaDB's own explain
+    /// spelling had to be recognised, and a rule stated for "the MySQL family"
+    /// that is only ever exercised on MySQL is how the two came to differ.
+    const MYSQL_FAMILY: [DatabaseType; 2] = [DatabaseType::MySQL, DatabaseType::MariaDB];
+
     #[test]
-    fn mysql_build_explain_sql_trims_statement_terminator() {
-        assert_eq!(
-            MysqlExecutor::build_explain_sql("  SELECT * FROM employees;   "),
-            "EXPLAIN SELECT * FROM employees"
-        );
+    fn mysql_explain_plan_sql_trims_statement_terminator() {
+        for db_type in MYSQL_FAMILY {
+            assert_eq!(
+                MysqlExecutor::explain_plan_statement(db_type, "  SELECT * FROM employees;   ")
+                    .sql(),
+                "EXPLAIN SELECT * FROM employees",
+                "{db_type}"
+            );
+        }
     }
 
     #[test]
-    fn mysql_build_explain_sql_keeps_existing_explain_statement() {
+    fn mysql_explain_plan_sql_keeps_existing_explain_statement() {
+        for db_type in MYSQL_FAMILY {
+            assert_eq!(
+                MysqlExecutor::explain_plan_statement(
+                    db_type,
+                    " EXPLAIN SELECT * FROM employees; "
+                )
+                .sql(),
+                "EXPLAIN SELECT * FROM employees",
+                "{db_type}"
+            );
+            assert_eq!(
+                MysqlExecutor::explain_plan_statement(db_type, "DESC employees;").sql(),
+                "DESC employees",
+                "{db_type}"
+            );
+        }
+    }
+
+    /// MariaDB's executing explain is `ANALYZE <statement>`; it rejects
+    /// `EXPLAIN ANALYZE` outright. Wrapping it produced a syntax error, so a
+    /// MariaDB user could not reach a measured plan through F6 at all while a
+    /// MySQL user could — the divergence, in the one builder that decides.
+    ///
+    /// `ANALYZE TABLE` is NOT an explain on either product and keeps the
+    /// wrapping it has always had: passing it through would send maintenance
+    /// where a plan was asked for.
+    #[test]
+    fn mysql_explain_plan_sql_keeps_mariadbs_own_executing_explain() {
         assert_eq!(
-            MysqlExecutor::build_explain_sql(" EXPLAIN SELECT * FROM employees; "),
-            "EXPLAIN SELECT * FROM employees"
+            MysqlExecutor::explain_plan_statement(
+                DatabaseType::MariaDB,
+                "ANALYZE SELECT * FROM t;"
+            )
+            .sql(),
+            "ANALYZE SELECT * FROM t"
         );
         assert_eq!(
-            MysqlExecutor::build_explain_sql("DESC employees;"),
-            "DESC employees"
+            MysqlExecutor::explain_plan_statement(
+                DatabaseType::MariaDB,
+                "ANALYZE FORMAT=JSON SELECT * FROM t"
+            )
+            .sql(),
+            "ANALYZE FORMAT=JSON SELECT * FROM t"
         );
+        // MySQL has no such form: there `ANALYZE` can only begin the
+        // maintenance statement, so the wrapping stays.
+        assert_eq!(
+            MysqlExecutor::explain_plan_statement(DatabaseType::MySQL, "ANALYZE SELECT * FROM t")
+                .sql(),
+            "EXPLAIN ANALYZE SELECT * FROM t"
+        );
+        for db_type in MYSQL_FAMILY {
+            assert_eq!(
+                MysqlExecutor::explain_plan_statement(db_type, "ANALYZE TABLE t").sql(),
+                "EXPLAIN ANALYZE TABLE t",
+                "{db_type}"
+            );
+            assert_eq!(
+                MysqlExecutor::explain_plan_statement(db_type, "ANALYZE LOCAL TABLE t").sql(),
+                "EXPLAIN ANALYZE LOCAL TABLE t",
+                "{db_type}"
+            );
+        }
     }
 
     #[test]

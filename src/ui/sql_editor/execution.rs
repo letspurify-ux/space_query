@@ -47,6 +47,71 @@ use crate::utils::arithmetic::{safe_div, safe_rem};
 
 use super::*;
 
+/// The text a single-statement action takes, and where it came from.
+///
+/// The two arms are consumed differently — execution runs a selection as it
+/// stands, while Explain must have exactly one statement out of it — but WHICH
+/// text they are about is decided once, by
+/// [`SqlEditorWidget::statement_source_for_single_action`].
+pub(crate) enum EditorStatementSource {
+    /// The user selected text. It may hold more than one statement, and the
+    /// MySQL delimiter in force where the selection begins goes with it.
+    Selection {
+        text: String,
+        mysql_delimiter: Option<String>,
+    },
+    /// No selection: the statement the caret sits in, normalized the way a
+    /// single execution normalizes it.
+    AtCursor(String),
+}
+
+/// What this tab's connection is, for the guards that must answer before a
+/// statement is sent — including from a worker thread, where the widget and its
+/// caches are out of reach.
+pub(crate) struct BoundConnectionFacts {
+    /// The dialect every classification is made under.
+    pub(crate) db_type: crate::db::DatabaseType,
+    /// Set when the user marked this connection read-only.
+    pub(crate) read_only: Option<ReadOnlyConnection>,
+}
+
+/// A connection the user marked read-only, carried as a value so the guard can
+/// travel to whatever thread is about to send a statement.
+///
+/// It holds the connection NAME and nothing else on purpose: the db type a
+/// refusal classifies under belongs to the caller, who has just checked which
+/// connection it is holding. Two db types inside one guard is how a guard comes
+/// to judge one connection and refuse for another.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadOnlyConnection {
+    name: String,
+}
+
+impl ReadOnlyConnection {
+    /// Why this connection refuses `sql`, if it does. `None` means every
+    /// statement in the text only reads.
+    ///
+    /// The ONE wording, because the two askers are on different threads: the
+    /// editor asks before it prompts for placeholder values, and the explain
+    /// worker asks about the statement it is about to send.
+    pub(crate) fn refusal(
+        &self,
+        db_type: crate::db::DatabaseType,
+        sql: &str,
+        initial_mysql_delimiter: Option<&str>,
+    ) -> Option<String> {
+        let reason = crate::db::sql_classification::read_only_block_reason(
+            db_type,
+            sql,
+            initial_mysql_delimiter,
+        )?;
+        Some(format!(
+            "Connection \"{}\" is read-only, so {} was not sent to the database.",
+            self.name, reason
+        ))
+    }
+}
+
 /// One routine a bind-prompt type lookup fetches: written qualifier, routine
 /// name, and — on the MySQL family — which namespace the call site named,
 /// since one name can be a procedure and a function at once.
@@ -4023,7 +4088,11 @@ impl SqlEditorWidget {
                     self.execute_sql_with_mysql_delimiter(
                         &selected_text,
                         true,
-                        self.mysql_delimiter_before_offset(start as usize),
+                        self.mysql_delimiter_before_offset(
+                            self.current_db_type(),
+                            self.current_mysql_delimiter().as_deref(),
+                            start as usize,
+                        ),
                     );
                     return;
                 }
@@ -4033,29 +4102,64 @@ impl SqlEditorWidget {
         self.execute_sql(&sql, true);
     }
 
-    pub fn execute_statement_at_cursor(&self) {
-        // Check if there's a selection
+    /// Which text this tab would send for a single-statement action.
+    ///
+    /// ONE answer, because F6 Explain Plan must be about what `Ctrl+Enter`
+    /// would run. They used to decide separately — execution preferred the
+    /// selection and F6 ignored it — so a user who selected one query and
+    /// pressed F6 got the plan of whichever statement the caret happened to sit
+    /// in. Two conditions for one question is also how they came to disagree
+    /// about the empty case: an empty SELECTION TEXT is what execution has
+    /// always fallen back on, not `Fl_Text_Buffer::selected()`, which can be
+    /// true for a collapsed selection that carries no text at all.
+    /// `db_type` and `session_mysql_delimiter` are the caller's ONE reading of
+    /// the dialect for this action. Nothing below re-reads either from a cache:
+    /// F6 takes them from the bound connection's own profile and execution
+    /// takes them from the editor's caches, and each is right for its caller —
+    /// what must not happen again is one action taking them from both.
+    pub(super) fn statement_source_for_single_action(
+        &self,
+        db_type: crate::db::DatabaseType,
+        session_mysql_delimiter: Option<&str>,
+    ) -> Option<EditorStatementSource> {
         let selected_text = self.buffer.selection_text();
         if !selected_text.is_empty() {
-            // Execute selected text
             let selection_start = self
                 .buffer
                 .selection_position()
                 .map(|(start, end)| start.min(end) as usize)
                 .unwrap_or(0);
-            self.execute_sql_with_mysql_delimiter(
-                &selected_text,
-                false,
-                self.mysql_delimiter_before_offset(selection_start),
-            );
-        } else {
-            // Execute statement at cursor position
-            if let Some(statement) = self.statement_at_cursor_text() {
-                let normalized = self.normalize_statement_for_single_execution(&statement);
-                self.execute_sql(&normalized, false);
-            } else {
-                SqlEditorWidget::show_alert_dialog("No SQL at cursor");
+            return Some(EditorStatementSource::Selection {
+                mysql_delimiter: self.mysql_delimiter_before_offset(
+                    db_type,
+                    session_mysql_delimiter,
+                    selection_start,
+                ),
+                text: selected_text,
+            });
+        }
+        let statement = self.statement_at_cursor_text(db_type, session_mysql_delimiter)?;
+        Some(EditorStatementSource::AtCursor(
+            self.normalize_statement_for_single_execution(
+                db_type,
+                session_mysql_delimiter,
+                &statement,
+            ),
+        ))
+    }
+
+    pub fn execute_statement_at_cursor(&self) {
+        let db_type = self.current_db_type();
+        let session_mysql_delimiter = self.current_mysql_delimiter();
+        match self.statement_source_for_single_action(db_type, session_mysql_delimiter.as_deref()) {
+            Some(EditorStatementSource::Selection {
+                text,
+                mysql_delimiter,
+            }) => self.execute_sql_with_mysql_delimiter(&text, false, mysql_delimiter),
+            Some(EditorStatementSource::AtCursor(sql)) => {
+                self.execute_sql(&sql, false);
             }
+            None => SqlEditorWidget::show_alert_dialog("No SQL at cursor"),
         }
     }
 
@@ -4075,7 +4179,11 @@ impl SqlEditorWidget {
         self.execute_sql_with_mysql_delimiter(
             &sql,
             false,
-            self.mysql_delimiter_before_offset(selection_start),
+            self.mysql_delimiter_before_offset(
+                self.current_db_type(),
+                self.current_mysql_delimiter().as_deref(),
+                selection_start,
+            ),
         );
         if let Some((start, end)) = selection {
             buffer.select(start, end);
@@ -11988,7 +12096,18 @@ impl SqlEditorWidget {
         }
     }
 
-    fn resolve_bind_parameter_values(&self, sql: &str) -> Option<String> {
+    /// `db_type` is the caller's, for the reason
+    /// [`Self::statement_source_for_single_action`] takes one: which
+    /// placeholders this text even HAS is a property of the dialect
+    /// (`:name` against `?`), and F6 had already decided which product it was
+    /// talking to from the bound connection's profile before it got here.
+    /// Reading the cache again would have collected — or failed to collect —
+    /// values under a dialect the rest of the action was not using.
+    pub(super) fn resolve_bind_parameter_values(
+        &self,
+        db_type: crate::db::DatabaseType,
+        sql: &str,
+    ) -> Option<String> {
         // Statements this app generates for itself (a grid save, a browse page)
         // carry no user placeholder, and their marker text must reach execution
         // exactly as written.
@@ -12004,7 +12123,6 @@ impl SqlEditorWidget {
             return Some(sql.to_string());
         }
 
-        let db_type = self.current_db_type();
         let session = self.connection_binding.session_state();
         // Resolved before the session lock below, because loading metadata
         // takes its own pooled session and must not do so holding this one.
@@ -12070,6 +12188,37 @@ impl SqlEditorWidget {
         Some(prepared.sql)
     }
 
+    /// What the guards need to know about the connection this tab is bound to.
+    ///
+    /// One lookup, from ONE snapshot, because the two answers are asked together
+    /// and must describe the same connection.
+    ///
+    /// The db type comes from that connection's own profile rather than from
+    /// [`Self::current_db_type`], which answers from a CACHE whenever the
+    /// connection mutex is busy — exactly when a tab-initiated lookup is most
+    /// likely to be started, and a guard that classifies under the wrong
+    /// dialect is a guard that refuses the wrong statements.
+    ///
+    /// A detached runtime counts. It is still the connection this tab is about,
+    /// and a guard that quietly stops applying the moment a connection drops is
+    /// the wrong shape for a safety feature — the only failure it can add is
+    /// refusing a write on a connection the user already marked read-only.
+    pub(super) fn bound_connection_facts_from(
+        snapshot: &crate::db::TabConnectionSnapshot,
+    ) -> Option<BoundConnectionFacts> {
+        let info = snapshot
+            .runtime
+            .as_ref()
+            .or(snapshot.detached_runtime.as_ref())?
+            .sanitized_info();
+        Some(BoundConnectionFacts {
+            db_type: info.db_type,
+            read_only: info
+                .read_only
+                .then_some(ReadOnlyConnection { name: info.name }),
+        })
+    }
+
     /// The refusal message when this editor's connection is read-only and the
     /// text about to run is not purely a read; `None` when there is nothing to
     /// refuse.
@@ -12082,29 +12231,10 @@ impl SqlEditorWidget {
         sql: &str,
         initial_mysql_delimiter: Option<&str>,
     ) -> Option<String> {
-        let snapshot = self.connection_binding.snapshot();
-        // A detached runtime counts. It is still the connection this tab is
-        // about, and a guard that quietly stops applying the moment a
-        // connection drops is the wrong shape for a safety feature — the only
-        // failure it can add is refusing a write on a connection the user
-        // already marked read-only.
-        let info = snapshot
-            .runtime
-            .as_ref()
-            .or(snapshot.detached_runtime.as_ref())?
-            .sanitized_info();
-        if !info.read_only {
-            return None;
-        }
-        let reason = crate::db::sql_classification::read_only_block_reason(
-            info.db_type,
-            sql,
-            initial_mysql_delimiter,
-        )?;
-        Some(format!(
-            "Connection \"{}\" is read-only, so {} was not sent to the database.",
-            info.name, reason
-        ))
+        let facts = Self::bound_connection_facts_from(&self.connection_binding.snapshot())?;
+        facts
+            .read_only?
+            .refusal(facts.db_type, sql, initial_mysql_delimiter)
     }
 
     fn execute_sql_with_mysql_delimiter_after_lazy_cancel(
@@ -12145,10 +12275,11 @@ impl SqlEditorWidget {
         // and F6 explain without a hook in each of them. On MySQL the answers
         // are substituted into the text, so `sql` below is what actually runs
         // — the run reservation, the batch and the history row all agree.
-        let bind_prompted_sql = match self.resolve_bind_parameter_values(sql) {
-            Some(prepared) => prepared,
-            None => return false,
-        };
+        let bind_prompted_sql =
+            match self.resolve_bind_parameter_values(self.current_db_type(), sql) {
+                Some(prepared) => prepared,
+                None => return false,
+            };
         let sql = bind_prompted_sql.as_str();
 
         // The read-only guard, asked a SECOND time — of the text that will
@@ -24466,6 +24597,39 @@ impl SqlEditorWidget {
             })
     }
 
+    /// BOTH halves of "would this statement be refused before it reached the
+    /// server?", in one answer, for a path that has to ask off the UI thread.
+    ///
+    /// read-only has two independent owners and every control that offers a
+    /// write already asks both — `MainWindow::active_tab_write_would_be_refused`
+    /// for the toolbar and the result grid, `CardWriteRefusal` for the object
+    /// browser's menus. The paths that SEND had no such joining, and F6 Explain
+    /// Plan is where that showed: it learned to ask the tab's READ ONLY pin
+    /// (`transaction_mode_refusal_for_statement`) and never asked the
+    /// connection's read-only flag, so `EXPLAIN PLAN FOR` — an INSERT into
+    /// `PLAN_TABLE` — still wrote on a connection the user had marked read-only,
+    /// which `docs/session.md` says is exactly what cannot happen.
+    ///
+    /// The connection's flag is asked first because it is the wider guard: it
+    /// refuses on every backend and for statements no transaction mode judges
+    /// (`@file`, `CONNECT`).
+    ///
+    /// `sql` must be the statement that will ACTUALLY be sent. For Explain that
+    /// is `OracleExplainStatement::sql()` / `MysqlExecutor::explain_plan_statement()`,
+    /// not the `SELECT` being explained — asking with the user's text answers
+    /// "this is a read" and lets the write through.
+    pub(super) fn write_refusal_for_statement(
+        db_type: crate::db::DatabaseType,
+        mode: crate::db::TransactionMode,
+        connection: Option<&ReadOnlyConnection>,
+        sql: &str,
+        initial_mysql_delimiter: Option<&str>,
+    ) -> Option<String> {
+        connection
+            .and_then(|connection| connection.refusal(db_type, sql, initial_mysql_delimiter))
+            .or_else(|| Self::transaction_mode_refusal_for_statement(db_type, mode, sql))
+    }
+
     /// The refusal for ONE statement. Every clause here is a question about a
     /// single statement, because the text was split by the caller above.
     fn transaction_mode_refusal_for_single_statement(
@@ -25907,7 +26071,10 @@ impl SqlEditorWidget {
             || lower.contains("resource busy and acquire with nowait")
     }
 
-    fn timeout_message(timeout: Option<Duration>) -> String {
+    /// The app's one sentence for a query that ran out of time, on every
+    /// backend. `pub(super)` so the Oracle main-session ceremony speaks it too
+    /// rather than passing the driver's own words through.
+    pub(super) fn timeout_message(timeout: Option<Duration>) -> String {
         match timeout {
             Some(duration) => format!("Query timed out after {} seconds", duration.as_secs()),
             None => "Query timed out".to_string(),
@@ -29263,6 +29430,22 @@ impl SqlEditorWidget {
     /// offer, nothing the stale sweep could retire. Naming the guard means
     /// `ConnectionLockGuard::get_mysql_connection_mut` runs instead, and that
     /// one attaches before it delegates.
+    ///
+    /// The MySQL twin of [`SqlEditorWidget::run_oracle_main_session_action`],
+    /// and the same ceremony in the same order: the cancel TARGET is published
+    /// before the first server round trip, the tab's SCOPE and the caller's
+    /// work both run inside the tab's query TIMEOUT, and a cancel that arrived
+    /// first is answered rather than worked through.
+    ///
+    /// The scope apply is INSIDE that window, and it had to be moved there: it
+    /// is two server round trips of its own (a `USE`, a `SET NAMES`), and
+    /// applied before the ceremony began they were reachable by no cancel and
+    /// bounded by no timeout — a stalled server held the worker with the Cancel
+    /// button pointing at nothing. A cancel that landed in that window was also
+    /// reported as a driver complaint about the app's own preparation statement
+    /// rather than as the cancel it was, which is the rule
+    /// [`Self::session_preparation_failure`] states and every batch path
+    /// already followed.
     pub(super) fn run_mysql_action_with_timeout<T, F>(
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         scope: Option<&str>,
@@ -29275,9 +29458,6 @@ impl SqlEditorWidget {
     where
         F: FnOnce(&mut mysql::Conn) -> Result<T, MysqlError>,
     {
-        conn_guard.apply_mysql_current_database_for_scope(scope)?;
-        let db_type = conn_guard.db_type();
-
         let connection_id = match conn_guard.get_mysql_connection_mut() {
             Some(mysql_conn) => mysql_conn.connection_id(),
             None => return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
@@ -29309,6 +29489,57 @@ impl SqlEditorWidget {
             )),
         );
 
+        Self::run_mysql_main_connection_action(
+            conn_guard,
+            Some(cancel_flag),
+            query_timeout,
+            log_context,
+            |conn_guard| {
+                // The tab's SCOPE, inside the guarded window for the reason the
+                // doc comment gives: it is a server round trip like the work.
+                conn_guard.apply_mysql_current_database_for_scope(scope)?;
+                match conn_guard.get_mysql_connection_mut() {
+                    Some(mysql_conn) => action(mysql_conn)
+                        .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout)),
+                    None => Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
+                }
+            },
+        )
+    }
+
+    /// Run `action` on the connection's OWN MySQL-family session under the
+    /// caller's timeout, and put the session's timeout settings back however it
+    /// ends — including through a panic, and including the tear-down that a
+    /// session whose settings could not be restored requires.
+    ///
+    /// The half of [`Self::run_mysql_action_with_timeout`] that is about the
+    /// SESSION rather than about the statement, so the roads that must not have
+    /// the other half can still have this one. Quick describe is the road that
+    /// asked for it: it reaches this same session and names its database in the
+    /// lookup instead of switching the session to it (MySQL folds `DATABASE()`
+    /// into a prepared `INFORMATION_SCHEMA` statement, so a session switch would
+    /// be answered by a cached plan for the old database), and it publishes no
+    /// cancel target of its own because the CONNECTION LOCK already publishes
+    /// one for whatever holds it. What it had none of was a timeout, so a
+    /// describe against a stalled server held the connection mutex — and with
+    /// it every other tab's work on that connection — until someone cancelled
+    /// it from the activity view.
+    ///
+    /// `cancel_flag` is optional because "is there a cancel flag to consult?"
+    /// is a real difference between the roads, not something to fake: an
+    /// execution has one and a describe does not, and passing a permanently
+    /// false flag would have said the opposite in the source.
+    pub(super) fn run_mysql_main_connection_action<T, F>(
+        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
+        cancel_flag: Option<&Arc<Mutex<bool>>>,
+        query_timeout: Option<Duration>,
+        log_context: &str,
+        action: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(&mut crate::db::ConnectionLockGuard<'_>) -> Result<T, String>,
+    {
+        let db_type = conn_guard.db_type();
         let timeout_restore;
         {
             let Some(mysql_conn) = conn_guard.get_mysql_connection_mut() else {
@@ -29336,7 +29567,7 @@ impl SqlEditorWidget {
                     ));
                 }
             };
-            if let Err(cancelled) = Self::abort_if_cancelled(cancel_flag) {
+            if let Some(Err(cancelled)) = cancel_flag.map(Self::abort_if_cancelled) {
                 let timeout_restore_ok = Self::reset_mysql_timeout_on_connection(
                     mysql_conn,
                     db_type,
@@ -29352,13 +29583,7 @@ impl SqlEditorWidget {
             }
         }
 
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            match conn_guard.get_mysql_connection_mut() {
-                Some(mysql_conn) => action(mysql_conn)
-                    .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout)),
-                None => Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
-            }
-        }));
+        let result = panic::catch_unwind(AssertUnwindSafe(|| action(conn_guard)));
 
         let teardown =
             (!Self::reset_mysql_timeout(conn_guard, timeout_restore.as_ref(), log_context)).then(
@@ -29369,10 +29594,9 @@ impl SqlEditorWidget {
                 },
             );
         match result {
-            Ok(Err(_)) if load_mutex_bool(cancel_flag) => Err(Self::with_main_session_teardown(
-                Self::cancel_message(),
-                teardown,
-            )),
+            Ok(Err(_)) if cancel_flag.is_some_and(load_mutex_bool) => Err(
+                Self::with_main_session_teardown(Self::cancel_message(), teardown),
+            ),
             Ok(Ok(value)) => match teardown.as_ref().and_then(MainSessionTeardown::message) {
                 // The action itself succeeded, but the connection it ran on is
                 // gone: reporting only the success would leave every other tab
@@ -30182,6 +30406,47 @@ impl SqlEditorWidget {
             return format!("{timeout_message}: {raw_message}");
         }
         Self::choose_execution_error_message(cancelled, timed_out, timeout, raw_message)
+    }
+
+    /// The app's word for a failure of work that ran on the connection's OWN
+    /// Oracle session — the twin of [`Self::mysql_error_message`].
+    ///
+    /// One operation must answer one event with one sentence on all four
+    /// backends. The MySQL ceremony has always done this for itself: a cancel
+    /// it was holding the flag for becomes
+    /// [`crate::db::query::result_messages::QUERY_CANCELLED`], and a server
+    /// timeout becomes [`Self::timeout_message`] with the driver's own words
+    /// kept after it. The Oracle ceremony reported the driver verbatim, so F6
+    /// answered a cancel with `ORA-01013` on one family and the shared cancel
+    /// sentence on the other, and a timeout with `DPI-1067` (OCI) or a socket
+    /// error (thin) against the shared timeout sentence.
+    ///
+    /// `cancelled` is the app's own flag, asked first for the reason the MySQL
+    /// twin asks it first: the app pressing Cancel is a fact about what the
+    /// user did, not an interpretation of what the driver said. The driver's
+    /// cancel markers are asked last, through the same shared reader every
+    /// other surface uses, so a cancel that arrived without the flag (a
+    /// registry cancel, a cancel timeout) still reads as one.
+    pub(super) fn oracle_main_session_error_message(
+        message: String,
+        query_timeout: Option<Duration>,
+        cancelled: bool,
+    ) -> String {
+        if cancelled {
+            return Self::cancel_message();
+        }
+        if Self::timeout_error_message_contains_timeout_signal(&message) {
+            let timeout_message = Self::timeout_message(query_timeout);
+            let trimmed = message.trim();
+            if trimmed.is_empty() || trimmed == timeout_message {
+                return timeout_message;
+            }
+            return format!("{timeout_message}: {trimmed}");
+        }
+        if crate::db::session_policy::message_indicates_query_cancel(&message) {
+            return Self::cancel_message();
+        }
+        message
     }
 
     pub(super) fn mysql_timeout_apply_error_message(
@@ -34373,7 +34638,12 @@ mod query_execution_cleanup_tests {
 
         let plan = QueryExecutor::get_explain_plan(
             conn.as_ref(),
-            "SELECT 'ORACLE_ROUTE_EXPLAIN' AS marker FROM dual",
+            &crate::db::query::OracleExplainStatement::new(
+                "SELECT 'ORACLE_ROUTE_EXPLAIN' AS marker FROM dual",
+            ),
+            // This probe sent no cancel, so the rollback's late-cancel door has
+            // nothing to re-ask for.
+            || crate::db::SessionCancelResidue::NothingLeftToLand,
         )
         .expect("Oracle explain plan route monitor should succeed");
         let explain_event = QueryProgress::ExplainPlanOutput {
@@ -35724,7 +35994,16 @@ mod query_execution_cleanup_tests {
         );
         let read_write = crate::db::TransactionMode::default();
         let select = "SELECT 1 FROM DUAL";
-        let oracle_explain = QueryExecutor::oracle_explain_plan_sql(select);
+        // Built through the production door, so this test is about the text F6
+        // actually sends.
+        let oracle_explain = super::explain_plan_backend_for(crate::db::DatabaseType::Oracle)
+            .statement(crate::db::DatabaseType::Oracle, select)
+            .sql()
+            .to_string();
+        assert!(
+            oracle_explain.starts_with("EXPLAIN PLAN SET STATEMENT_ID = "),
+            "the explain statement stamps its own id: {oracle_explain}"
+        );
 
         assert!(
             SqlEditorWidget::transaction_mode_refusal_for_statement(
@@ -35765,10 +36044,120 @@ mod query_execution_cleanup_tests {
                 SqlEditorWidget::transaction_mode_refusal_for_statement(
                     db_type,
                     read_only,
-                    &crate::db::query::mysql_executor::MysqlExecutor::explain_plan_sql(select),
+                    crate::db::query::mysql_executor::MysqlExecutor::explain_plan_statement(
+                        db_type, select
+                    )
+                    .sql(),
                 )
                 .is_none(),
                 "{db_type} EXPLAIN is a read"
+            );
+        }
+    }
+
+    /// read-only has two independent owners, and F6 used to ask only one.
+    ///
+    /// The tab's READ ONLY pin was asked (the test above); the connection's own
+    /// read-only flag was not, so `EXPLAIN PLAN … FOR` — an INSERT into
+    /// `PLAN_TABLE` — still wrote on a connection the user had marked
+    /// read-only. `docs/session.md` says that connection makes F6 unavailable
+    /// on Oracle, and `sql_classification` has always classified the statement
+    /// as a write; only the asking was missing.
+    #[test]
+    fn a_read_only_connection_refuses_the_explain_statement_on_oracle_only() {
+        let read_write = crate::db::TransactionMode::default();
+        let connection = super::ReadOnlyConnection {
+            name: "GUARDED".to_string(),
+        };
+        let select = "SELECT 1 FROM DUAL";
+
+        let oracle_explain = super::explain_plan_backend_for(crate::db::DatabaseType::Oracle)
+            .statement(crate::db::DatabaseType::Oracle, select)
+            .sql()
+            .to_string();
+        let refusal = SqlEditorWidget::write_refusal_for_statement(
+            crate::db::DatabaseType::Oracle,
+            read_write,
+            Some(&connection),
+            &oracle_explain,
+            None,
+        )
+        .expect("a read-only connection refuses the statement that writes to PLAN_TABLE");
+        assert!(
+            refusal.contains("GUARDED") && refusal.contains("read-only"),
+            "the refusal names the connection: {refusal}"
+        );
+        // ... and not the SELECT it explains, which only reads.
+        assert!(SqlEditorWidget::write_refusal_for_statement(
+            crate::db::DatabaseType::Oracle,
+            read_write,
+            Some(&connection),
+            select,
+            None,
+        )
+        .is_none());
+
+        // The MySQL family's EXPLAIN only reports. Over-blocking it would be
+        // its own bug: a read-only connection is where reading a plan matters
+        // most.
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            let explain = super::explain_plan_backend_for(db_type)
+                .statement(db_type, select)
+                .sql()
+                .to_string();
+            assert!(
+                SqlEditorWidget::write_refusal_for_statement(
+                    db_type,
+                    read_write,
+                    Some(&connection),
+                    &explain,
+                    None,
+                )
+                .is_none(),
+                "{db_type} EXPLAIN is a read, so a read-only connection still explains"
+            );
+        }
+    }
+
+    /// Whichever half refuses, the combined gate refuses — and a tab with
+    /// neither pin is not refused at all.
+    #[test]
+    fn the_write_gate_answers_for_both_halves_of_read_only() {
+        let read_only = crate::db::TransactionMode::new(
+            crate::db::TransactionIsolation::Default,
+            crate::db::TransactionAccessMode::ReadOnly,
+        );
+        let read_write = crate::db::TransactionMode::default();
+        let connection = super::ReadOnlyConnection {
+            name: "GUARDED".to_string(),
+        };
+        let oracle_explain = super::explain_plan_backend_for(crate::db::DatabaseType::Oracle)
+            .statement(crate::db::DatabaseType::Oracle, "SELECT 1 FROM DUAL")
+            .sql()
+            .to_string();
+
+        for (mode, pin, expected) in [
+            (read_write, None, false),
+            (read_only, None, true),
+            (read_write, Some(&connection), true),
+            (read_only, Some(&connection), true),
+        ] {
+            assert_eq!(
+                SqlEditorWidget::write_refusal_for_statement(
+                    crate::db::DatabaseType::Oracle,
+                    mode,
+                    pin,
+                    &oracle_explain,
+                    None,
+                )
+                .is_some(),
+                expected,
+                "mode read-only: {}, connection read-only: {}",
+                mode.access_mode == crate::db::TransactionAccessMode::ReadOnly,
+                pin.is_some()
             );
         }
     }
@@ -40991,6 +41380,75 @@ mod query_execution_cleanup_tests {
         ));
     }
 
+    /// The Oracle twin of the test below: one operation, one sentence, on all
+    /// four backends.
+    ///
+    /// Work on the connection's own Oracle session used to report the driver
+    /// verbatim, so F6 Explain Plan answered a cancel with `ORA-01013` on one
+    /// family and `Query cancelled` on the other, and a timeout with `DPI-1067`
+    /// (OCI) or a bare socket error (thin) against
+    /// `Query timed out after N seconds`.
+    #[test]
+    fn oracle_main_session_errors_are_said_in_the_same_words_the_mysql_family_uses() {
+        let timeout = Some(Duration::from_secs(5));
+        let raw = |message: &str, cancelled: bool| {
+            SqlEditorWidget::oracle_main_session_error_message(
+                message.to_string(),
+                timeout,
+                cancelled,
+            )
+        };
+
+        // The app's own flag is the strongest evidence there is: the user
+        // pressed Cancel, whatever the driver made of the break.
+        assert_eq!(
+            raw(
+                "ORA-01013: user requested cancel of current operation",
+                true
+            ),
+            SqlEditorWidget::cancel_message()
+        );
+        assert_eq!(
+            raw("ORA-24338: statement handle not executed", true),
+            SqlEditorWidget::cancel_message()
+        );
+        // A cancel that arrived without the flag — a registry cancel, a stale
+        // sweep — is still a cancel, read through the one shared reader.
+        assert_eq!(
+            raw(
+                "ORA-01013: user requested cancel of current operation",
+                false
+            ),
+            SqlEditorWidget::cancel_message()
+        );
+
+        // Both drivers' timeout evidence becomes the app's timeout sentence,
+        // with the driver's own words kept after it exactly as the MySQL twin
+        // keeps them — the recoverability classifiers read that evidence.
+        for driver_words in [
+            "DPI-1067: call timeout of 5000 ms expired",
+            tns_thin::ORACLE_THIN_CALL_TIMEOUT_MESSAGE,
+        ] {
+            let message = raw(driver_words, false);
+            assert!(
+                message.starts_with(&SqlEditorWidget::timeout_message(timeout)),
+                "{message}"
+            );
+            assert!(message.contains(driver_words), "{message}");
+            assert!(
+                SqlEditorWidget::timeout_error_message_contains_timeout_signal(&message),
+                "the driver's evidence must survive the app's wording: {message}"
+            );
+        }
+
+        // Everything else is the server's own answer, which is what the user
+        // wants to read: ORA codes are not paraphrased.
+        assert_eq!(
+            raw("ORA-00942: table or view does not exist", false),
+            "ORA-00942: table or view does not exist"
+        );
+    }
+
     #[test]
     fn mysql_error_message_normalizes_timeout_and_cancel_errors() {
         let timeout = Some(Duration::from_secs(5));
@@ -42345,9 +42803,18 @@ mod mysql_batch_execution_regression_tests {
         let conn = connection
             .get_mysql_connection_mut()
             .expect("MySQL/MariaDB route monitor should expose a live connection");
-        let plan =
-            crate::db::query::mysql_executor::MysqlExecutor::get_explain_plan(conn, "SELECT 1")
-                .expect("MySQL/MariaDB explain route monitor should succeed");
+        // The prepared statement, exactly as the backend builds it:
+        // `get_explain_plan` runs what it is handed rather than re-deriving it,
+        // so the text judged by the read-only gates is the text that runs.
+        let explain_statement =
+            crate::db::query::mysql_executor::MysqlExecutor::explain_plan_statement(
+                db_type, "SELECT 1",
+            );
+        let plan = crate::db::query::mysql_executor::MysqlExecutor::get_explain_plan(
+            conn,
+            explain_statement.sql(),
+        )
+        .expect("MySQL/MariaDB explain route monitor should succeed");
         let explain_event = QueryProgress::ExplainPlanOutput {
             result: SqlEditorWidget::build_explain_plan_result(
                 &crate::ui::explain_plan::ExplainPlanData::Flat {
@@ -49443,7 +49910,9 @@ mod tab_scope_live_tests {
         scope: Option<&str>,
     ) -> Result<QuickDescribeData, String> {
         let mut guard = lock_connection_with_activity(connection, "tab scope probe".to_string());
-        SqlEditorWidget::describe_object_for_current_db(&mut guard, object_name, None, scope)
+        // This probe is about the SCOPE a describe resolves in, so it sets no
+        // timeout of its own — the tab's box is empty in the harness too.
+        SqlEditorWidget::describe_object_for_current_db(&mut guard, object_name, None, scope, None)
     }
 
     fn explain(
@@ -49452,9 +49921,13 @@ mod tab_scope_live_tests {
         scope: Option<&str>,
     ) -> Result<ExplainPlanData, String> {
         let guard = lock_connection_with_activity(connection, "tab scope probe".to_string());
+        // Prepared through the production door for the backend this connection
+        // is, so the probe sends what F6 sends.
+        let statement = crate::ui::sql_editor::explain_plan_backend_for(guard.db_type())
+            .statement(guard.db_type(), sql);
         SqlEditorWidget::get_explain_plan_for_locked_connection(
             guard,
-            sql,
+            &statement,
             scope,
             None,
             &crate::ui::sql_editor::MainSessionCancelSlots::new(

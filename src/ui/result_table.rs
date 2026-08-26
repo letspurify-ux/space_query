@@ -5999,10 +5999,6 @@ impl ResultTableWidget {
         crate::db::session_policy::message_indicates_execution_abort(message)
     }
 
-    fn is_query_cancel_message(message: &str) -> bool {
-        crate::db::session_policy::message_indicates_query_cancel(message)
-    }
-
     fn is_connection_loss_message(message: &str) -> bool {
         crate::db::session_policy::message_indicates_connection_loss(message)
     }
@@ -8629,8 +8625,20 @@ impl ResultTableWidget {
                 self.clear_pending_stream_buffers();
                 return;
             }
+            // A query that was ABORTED — cancelled by the user, or ended by the
+            // tab's timeout — leaves rows that are real: the server sent them
+            // and the grid is showing them. Replacing them with an error row
+            // throws away data the user asked for and already has.
+            //
+            // The question is the abort, not the cancel, and the difference is
+            // not academic: a MySQL timeout is worded exactly like a `KILL
+            // QUERY` (`ERROR 3024 … Query execution was interrupted, …`) so it
+            // used to reach this branch by accident, while Oracle's `DPI-1067`
+            // and the app's own "Query timed out …" sentence never did. Same
+            // event, same partial grid, two answers depending on which backend
+            // spoke.
             if result.is_select
-                && Self::is_query_cancel_message(&result.message)
+                && Self::is_execution_abort_message(&result.message)
                 && self.table.rows() > 0
             {
                 self.clear_pending_stream_buffers();
@@ -18060,6 +18068,42 @@ mod tests {
         assert!(ResultTableWidget::is_execution_abort_message(
             "User requested cancel",
         ));
+    }
+
+    /// The rows an aborted SELECT already streamed are kept, and "aborted"
+    /// means the same thing on all four backends.
+    ///
+    /// The grid asks this to decide whether to keep what it is showing or
+    /// replace it with an error row. A cancel and a timeout leave the same
+    /// thing behind — real rows the server sent — so both must answer yes;
+    /// every wording below is one a backend actually produces, and only the
+    /// first two used to be recognised.
+    #[test]
+    fn an_aborted_select_keeps_its_rows_whichever_backend_ended_it() {
+        for aborted in [
+            "Query cancelled",
+            "ORA-01013: user requested cancel of current operation",
+            "ERROR 1317 (70100): Query execution was interrupted",
+            "Query timed out after 5 seconds",
+            "Query timed out after 5 seconds: ERROR 3024 (HY000): Query execution was \
+             interrupted, maximum statement execution time exceeded",
+            "ERROR 1969 (70100): Query was interrupted: execution time limit 0.5 sec exceeded",
+            "DPI-1067: call timeout of 5000 ms expired",
+            "Oracle thin call timeout exceeded",
+        ] {
+            assert!(
+                ResultTableWidget::is_execution_abort_message(aborted),
+                "{aborted:?} leaves real rows on screen and must not clear the grid"
+            );
+        }
+        // A statement that FAILED is not an abort: its rows, if any, are not
+        // the answer to anything and the error belongs on screen.
+        for failed in [
+            "ORA-00942: table or view does not exist",
+            "ERROR 1064 (42000): You have an error in your SQL syntax",
+        ] {
+            assert!(!ResultTableWidget::is_execution_abort_message(failed));
+        }
     }
 
     #[test]

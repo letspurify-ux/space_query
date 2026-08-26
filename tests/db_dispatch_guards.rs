@@ -2100,9 +2100,15 @@ fn backend_traits_with_required_policy_have_no_default_method_bodies() {
             "src/ui/sql_editor/execution.rs",
             &["ExecutionWorkerBackend"][..],
         ),
+        // `ExplainPlanBackend` is NOT here any more, and the reason is the one
+        // `core_backend_traits_allow_only_documented_derived_default_methods`
+        // exists to serve: it has exactly one derived default, named and
+        // justified there, and everything else it asks is still required of
+        // every backend. Moving it does not weaken anything — that test refuses
+        // every default it does not name, where this one refuses all of them.
         (
             "src/ui/sql_editor/mod.rs",
-            &["ExplainPlanBackend", "TransactionActionBackend"][..],
+            &["TransactionActionBackend"][..],
         ),
         ("src/ui/main_window.rs", &["SchemaMetadataLoader"][..]),
         (
@@ -2184,6 +2190,29 @@ fn core_backend_traits_allow_only_documented_derived_default_methods() {
                     // which is the opposite of a policy decision left
                     // unimplemented.
                     "effects_for_sql",
+                ],
+            )],
+        ),
+        (
+            "src/ui/sql_editor/mod.rs",
+            &[(
+                "ExplainPlanBackend",
+                &[
+                    // Derived, and deliberately NOT a backend's to answer. It
+                    // has two halves: a shared question about the STATEMENT —
+                    // "has this an execution plan at all?", asked of the
+                    // statement the APP chose to explain — and then the
+                    // backend's own `refusal_from_what_this_explain_does`,
+                    // which stays required. F6 wraps whatever it is handed, so
+                    // a PL/SQL block, a routine call, transaction or session
+                    // control and this family's `ANALYZE … TABLE` were all
+                    // wrapped and SENT: four backends answering one keystroke
+                    // with four different server complaints, and MySQL
+                    // answering it with a real plan for a DIFFERENT statement.
+                    // A backend that could answer here is a backend that could
+                    // go back to not asking, which is the defect this default
+                    // exists to make unrepresentable.
+                    "refusal_before_sending",
                 ],
             )],
         ),

@@ -40,6 +40,134 @@ connector glyphs in the `Operation` column — and MySQL/MariaDB plans as
 `ExplainPlanData::Flat`, which keeps the server's own `EXPLAIN` columns. Every
 column is text, because the values are already formatted for reading.
 
+A plan the SERVER draws itself is split one grid row per line
+(`one_grid_row_per_plan_line`). MySQL's `EXPLAIN ANALYZE` and `FORMAT = TREE`,
+and both products' `FORMAT = JSON`, answer with ONE column holding the whole
+plan as a single string, newlines and all — as one cell the grid sized the row
+to one line, so the user saw the first line of their plan and the rest lived
+behind a double-click, while the same keystroke on MariaDB's tabular
+`ANALYZE SELECT` produced a readable table. Only the one-column-with-newlines
+shape is split, the server's column keeps its name, no column is invented, and
+each line stays exactly as the server drew it, so grid search, selection and
+export work on it like any other result. Live-gated by
+`verify_a_server_drawn_plan_is_readable`, in a spelling each product really has.
+
+F6 asks the splitter TWO things about that text, on both roads: which statement
+it is, and whether it is a statement at all. Only the selection road used to ask
+the second one, so a line the app runs ITSELF — `DESC t`, `CONNECT user/pass@db`,
+`@script.sql` — was wrapped into an explain and SENT from the caret while the
+identical text selected was refused and `Ctrl+Enter` answered it from the app's
+own catalog. On the MySQL family the send even succeeded: `explain_plan_sql`
+passes a `DESC` through, so the server answered with a TABLE DESCRIPTION under
+the label "Explain Plan". `EXPLAIN ANALYZE <statement>` is unaffected — it is not
+a tool command — and `DESC ANALYZE <statement>`, which is, is the same server
+statement written the one way this app has never sent.
+
+The splitter says which statement and where it ends; the user's text says what
+the statement IS (`statement_with_its_leading_comments`), so routing the caret
+road through it changes no bytes on the wire.
+
+There is a THIRD question, and it is asked of the statement rather than of the
+text: **has this statement an execution plan at all?** F6 wraps whatever it is
+handed, so a PL/SQL block, a routine call, transaction or session control, and
+this family's `ANALYZE … TABLE` maintenance statement were all wrapped and SENT
+— four backends answering one keystroke with four different server complaints
+(measured: Oracle 23c answers `ORA-00905` to `EXPLAIN PLAN FOR CALL p(1)`, a
+block, `COMMIT` and `ANALYZE TABLE … COMPUTE STATISTICS`, and `ORA-00900` to
+`ALTER SESSION SET …`; MySQL 8.0.46 answers `ERROR 1064` to `EXPLAIN CALL p(1)`
+and `EXPLAIN DO …`). `ANALYZE TABLE t` was worse than an unhelpful error:
+MySQL reads the wrapped `EXPLAIN ANALYZE TABLE t` as an executing explain of the
+`TABLE t` QUERY, so F6 on a maintenance statement drew a real measured plan of a
+full scan of that table, while MariaDB answered `ERROR 1064` and Oracle a parse
+error. One keystroke, three different wrong answers.
+
+`sql_classification::statement_without_an_execution_plan_reason` is the one
+reader, and it is FAIL-OPEN by design: only what the app can PROVE has no plan
+is named, so DDL as a class is deliberately absent — Oracle plans a
+`CREATE TABLE … AS SELECT` and a `CREATE INDEX`, which share a `SqlKind` with
+`CREATE PROCEDURE`. It is asked in the body of
+`ExplainPlanBackend::refusal_before_sending`, the only default method that trait
+has, so no backend can answer it differently or skip it; each backend still
+answers its own half (`refusal_from_what_this_explain_does`). And it is asked of
+`ExplainStatement::statement_the_app_chose_to_explain()`, never of the wire
+text: where the user typed the explain themselves the app is not choosing and
+has nothing to second-guess, which is why the MySQL family answers `None` for a
+passthrough while Oracle always answers `Some` (it re-wraps even an
+`EXPLAIN PLAN` the user typed, because the read-back needs the `STATEMENT_ID`
+that write stamps).
+
+What F6 explains is what `Ctrl+Enter` would send, and that is ONE decision:
+`SqlEditorWidget::statement_source_for_single_action` — the selection when there
+is one, otherwise the statement at the caret, normalized the same way. Both
+`execute_statement_at_cursor` and `statement_to_explain` take it whole. They
+used to decide separately, so F6 ignored the selection entirely and explained
+whichever statement the caret sat in; two conditions for one question is also
+how they came to disagree about the empty case (`selection_text().is_empty()`
+versus `Fl_Text_Buffer::selected()`, which is true for a collapsed selection
+carrying no text). A selection holding more than one statement is refused rather
+than narrowed to its first — execution would run all of them, and picking one is
+a guess (`single_statement_in_selection`). Placeholder values come from the same
+prompt every other execution entry point uses, where they change what is sent
+(`ExplainPlanBackend::prompts_for_placeholder_values`: the MySQL family
+substitutes them into the text, while Oracle's `EXPLAIN PLAN` only parses the
+statement it explains and needs none).
+
+Both roads are driven against a real server by
+`verify_explain_plan_live`, whose two statements read different tables so the
+plan itself says which one was explained.
+
+The status line and the Messages pane say what the result said: a plan with no
+steps reports `No plan output.` rather than claiming it loaded, and a cancelled
+F6 reports `result_messages::EXPLAIN_PLAN_CANCELLED` on every backend instead of
+`ORA-01013` on Oracle and `Query execution was interrupted` on the MySQL family.
+
+A REFUSAL is not a FAILURE, and `ExplainPlanError` carries the difference. Both
+used to be a bare `String`, so the pane prefixed every one of them and a refusal
+read `Explain plan failed: Explain plan was not run: …` — the app announcing a
+failure of its own rule. `Refused` reaches the pane as its own sentence,
+`Failed` is evidence and gets the prefix, a cancel can only hide in `Failed`
+(a refusal never travelled to a server to be cancelled), and the note that says
+what a plan cannot see goes with `Failed` alone: it opens "This plan was built
+on the connection's own DB session", which is a fact about a plan that was
+attempted.
+
+Both refusals name their subject in the words of the product that answered.
+`explain_plan_would_run_the_statement` takes the SPELLING out of the same answer
+that decided the statement is an executing explain
+(`ExecutingExplainWrite::spelling`), because MySQL writes
+`EXPLAIN ANALYZE <statement>` and MariaDB — which rejects that spelling outright
+— writes `ANALYZE <statement>`; a hardcoded `EXPLAIN ANALYZE` told a MariaDB
+user their statement was refused for being a form of explain their server does
+not have and they had not typed, and the guard test asserted that on both
+products. A read-only refusal goes through
+`explain_plan_write_refused`, which keeps the shared read-only wording verbatim
+and adds the sentence only the backend can
+(`ExplainPlanBackend::why_building_the_plan_is_itself_a_write`): on Oracle the
+plan itself is the write, which is why F6 is refused there for a `SELECT` and
+simply works on the other family. And a tab bound to no connection is told that,
+not that the connection is busy.
+
+A TIMEOUT is not a cancel, and telling them apart is the server's wording
+against the app's: measured on MySQL 8.0.46, `max_execution_time` reports
+`ERROR 3024 (HY000): Query execution was interrupted, maximum statement
+execution time exceeded` — which opens with the exact sentence `KILL QUERY`
+produces, so a timed-out F6 announced itself as the user's own cancel and threw
+the timeout away. `session_policy::message_indicates_query_cancel` now asks the
+app's own cancel sentence first, a timeout report second (its markers are
+measured per backend), and the driver's cancel markers last — the same
+precedence the driver-level readers have always applied. The note that says what
+a plan cannot see goes with a failure but never with a cancel: nothing about
+what the tab's session holds explains a plan the user stopped.
+
+The grid asks the wider question — was this statement ABORTED, cancelled or
+timed out? — before deciding whether to keep the rows a SELECT already
+streamed. Both leave the same thing behind: real rows the server sent and the
+user is looking at. It used to ask about the cancel alone, which reached a
+MySQL timeout only because that server words one like a `KILL QUERY`, and never
+reached Oracle's `DPI-1067` or the app's own timeout sentence — so the same
+event kept the partial grid on one backend and replaced it with an error row on
+another (`an_aborted_select_keeps_its_rows_whichever_backend_ended_it`).
+
 ## Selection totals
 
 `selection_summary.rs` aggregates the selected cells for the status bar. The

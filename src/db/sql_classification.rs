@@ -844,10 +844,26 @@ fn classify_first_word_for_db_type(db_type: DatabaseType, first_word: &str, sql:
     match first_word {
         "WITH" => classify_with_sql_for_db_type(db_type, sql),
         "SELECT" => classify_select_sql_for_db_type(db_type, sql, mysql_compatible_comments),
+        // `DESCRIBE`/`DESC` are the MySQL family's own spellings of `EXPLAIN`
+        // (`DESCRIBE ANALYZE <statement>` is `EXPLAIN ANALYZE <statement>`), so
+        // they are read by the explain classifier there rather than being taken
+        // for a table description. Asking only about the word `EXPLAIN` is what
+        // let `DESC ANALYZE UPDATE ...` — which RUNS the update — read as a
+        // plain query.
+        "DESCRIBE" | "DESC" if mysql_family => {
+            classify_explain_sql_for_db_type(db_type, first_word, sql)
+        }
         "DESCRIBE" | "DESC" | "SHOW" => SqlKind::SelectLike,
-        "EXPLAIN" => classify_explain_sql_for_db_type(db_type, sql),
+        "EXPLAIN" => classify_explain_sql_for_db_type(db_type, first_word, sql),
         "VALUES" | "TABLE" if mysql_family => SqlKind::SelectLike,
-        "ANALYZE" | "CHECK" | "CHECKSUM" | "OPTIMIZE" | "REPAIR" if mysql_family => {
+        // `ANALYZE` begins TWO statements on this family, and only one of them
+        // is maintenance: MariaDB's `ANALYZE <statement>` is its executing
+        // explain and is whatever it runs. Read as DDL without being asked,
+        // `ANALYZE UPDATE …` — which really writes — was both refused as a
+        // read and claimed to commit implicitly. The explain classifier
+        // answers for both, and says DDL when nothing was explained.
+        "ANALYZE" if mysql_family => classify_explain_sql_for_db_type(db_type, first_word, sql),
+        "CHECK" | "CHECKSUM" | "OPTIMIZE" | "REPAIR" if mysql_family => {
             // These MySQL/MariaDB table-maintenance statements return result
             // sets, but they are not read-only SELECTs for cancel/timeout
             // safety; keep result-display routing separate from session reuse.
@@ -1120,9 +1136,403 @@ fn classify_oracle_lock_sql(sql: &str) -> SqlKind {
     }
 }
 
-fn classify_explain_sql_for_db_type(db_type: DatabaseType, sql: &str) -> SqlKind {
+/// The statement an Oracle `EXPLAIN PLAN … FOR <statement>` explains.
+///
+/// `None` when `sql` is not one — including an `EXPLAIN PLAN` with nothing
+/// after its `FOR`.
+///
+/// The MySQL family's explain builder has always passed an `EXPLAIN` the user
+/// already typed straight through (`MysqlExecutor::explain_plan_sql` keeps
+/// `EXPLAIN`/`DESCRIBE`/`DESC`), because `EXPLAIN EXPLAIN …` is not a
+/// statement. Oracle wrapped it again and the server rejected the result, so
+/// F6 answered a raw `ORA-00905` for a statement whose plan the user was
+/// plainly asking for. Oracle cannot pass one through — the read-back needs the
+/// `STATEMENT_ID` THIS call stamps, and the user's own statement may name a
+/// different `PLAN_TABLE` with `INTO` — so it is read instead: what an
+/// `EXPLAIN PLAN … FOR X` asks about is `X`.
+///
+/// Only TOP-LEVEL words are read, and `next_top_level_word` steps over string
+/// literals, quoted identifiers and comments — so neither `SET STATEMENT_ID =
+/// 'FOR'` nor `INTO "FOR"` is mistaken for the separator. Everything the
+/// grammar allows before `FOR` (`SET STATEMENT_ID = <literal>`,
+/// `INTO [schema.]table[@dblink]`) is keywords and identifiers, and `FOR` is
+/// reserved, so the first top-level `FOR` is the separator.
+pub(crate) fn oracle_explain_plan_target(sql: &str) -> Option<&str> {
+    let (first, _, after_first) = next_top_level_word(sql, 0, false)?;
+    if first != "EXPLAIN" {
+        return None;
+    }
+    let (second, _, after_second) = next_top_level_word(sql, after_first, false)?;
+    if second != "PLAN" {
+        return None;
+    }
+
+    let mut idx = after_second;
+    while let Some((word, _, after_word)) = next_top_level_word(sql, idx, false) {
+        if word == "FOR" {
+            let target = sql.get(after_word..)?.trim();
+            return (!target.is_empty()).then_some(target);
+        }
+        idx = after_word;
+    }
+    None
+}
+
+/// The statement a MySQL-family explain RUNS, if it runs one.
+///
+/// An explain is a plan-only statement with exactly one exception: the
+/// EXECUTING explain, which runs what it explains. That is the point of it: the
+/// plan it prints carries measured times and row counts rather than estimates.
+/// So every question the app asks about such a statement (is this a read? does
+/// it carry work? may a read-only connection send it? does it implicitly
+/// commit?) has to be asked of the statement it runs, not of the word in front
+/// of it.
+///
+/// **The two families spell it differently, and this is the ONE place that
+/// knows both.** MySQL writes `EXPLAIN ANALYZE <statement>` (and the same in
+/// its `DESCRIBE`/`DESC` spellings); MariaDB rejects that outright and writes
+/// `ANALYZE <statement>`. Reading only MySQL's spelling is what let MariaDB's
+/// own executing explain be taken for the table-maintenance `ANALYZE TABLE`
+/// it shares a first word with — classified `Ddl`, and therefore claimed to
+/// commit implicitly, which `ANALYZE UPDATE …` (measured on MariaDB 12.2.2:
+/// it really writes) does not do.
+///
+/// The `ANALYZE` spelling is read for MariaDB only, because that is the truth
+/// about the two servers rather than a guess: on MySQL `ANALYZE` has no such
+/// form and `ANALYZE TABLE` is the only thing the word can begin. It is the
+/// same per-product split `mariadb_set_statement_inner_sql` already makes.
+///
+/// WHICH statements the executing explain will run is a property of the
+/// server, which is why the app does not try to predict it. Measured on MySQL
+/// 8.0.46: `EXPLAIN ANALYZE` runs a `SELECT` (and drops a `FOR UPDATE` — no
+/// lock is taken), while DML comes back `<not executable by iterator executor>`
+/// and writes nothing. MySQL 8.3 extended the iterator executor to
+/// `INSERT`/`UPDATE`/`DELETE`, so the same text writes there. Reading the
+/// statement instead of the server version is the same choice
+/// `statement_reconfigures_the_server_for_analysis` makes, and for the same
+/// reason: an answer that is a function of the server version is one that
+/// changes under the user without the app noticing.
+///
+/// `None` for every plan-only explain, including a plain `EXPLAIN UPDATE ...`,
+/// which only plans — over-reading THAT as a write would refuse the one thing a
+/// read-only connection most wants to do — and for `ANALYZE [modifiers] TABLE
+/// ...`, which is table maintenance on both families.
+///
+/// Only TOP-LEVEL words are read, and `next_top_level_word` steps over string
+/// literals, quoted identifiers and comments — so `` DESCRIBE `analyze` `` (a
+/// table named with the reserved word) is a description, not an execution.
+/// Whether this product writes its EXECUTING explain as a bare
+/// `ANALYZE <statement>`.
+///
+/// Exhaustive, so a product added later cannot inherit an answer by omission:
+/// the word `ANALYZE` begins two completely different statements depending on
+/// the answer, and getting it wrong in either direction is a real defect —
+/// "maintenance" claims an implicit commit an explain never performs, and
+/// "explain" would let `ANALYZE TABLE` past a read-only guard.
+/// What may stand between `ANALYZE` and `TABLE` on the MySQL family.
+///
+/// ONE list, read by the reader that tells this family's maintenance statement
+/// from MariaDB's executing explain and by the one that names the maintenance
+/// statement for a user. Two copies of it would be two answers to "where does
+/// `ANALYZE TABLE` start?".
+const MYSQL_ANALYZE_TABLE_MODIFIERS: [&str; 2] = ["NO_WRITE_TO_BINLOG", "LOCAL"];
+
+fn family_spells_its_executing_explain_as_bare_analyze(db_type: DatabaseType) -> bool {
+    match db_type {
+        // MariaDB 12.2.2 (measured): rejects `EXPLAIN ANALYZE` outright and
+        // executes `ANALYZE <statement>` instead — a write really writes.
+        DatabaseType::MariaDB => true,
+        // MySQL's executing explain is `EXPLAIN ANALYZE …`; there `ANALYZE`
+        // can only begin `ANALYZE [modifiers] TABLE …`.
+        DatabaseType::MySQL => false,
+        // Oracle's `ANALYZE` is its own DDL statement, and its `EXPLAIN PLAN`
+        // never runs what it explains.
+        DatabaseType::Oracle => false,
+    }
+}
+
+pub(crate) fn mysql_explain_executed_statement(db_type: DatabaseType, sql: &str) -> Option<&str> {
+    let (first, _, after_first) = next_top_level_word(sql, 0, true)?;
+    let after_executing_keyword = match first.as_str() {
+        "EXPLAIN" | "DESCRIBE" | "DESC" => {
+            let (second, _, after_second) = next_top_level_word(sql, after_first, true)?;
+            if second != "ANALYZE" {
+                return None;
+            }
+            after_second
+        }
+        // MariaDB's own spelling. The word that follows separates the two
+        // statements it can begin: `TABLE` — with the maintenance-only
+        // `NO_WRITE_TO_BINLOG`/`LOCAL` modifiers ahead of it — is
+        // `ANALYZE TABLE`, the maintenance statement that really does commit
+        // implicitly. Anything else is the executing explain.
+        //
+        // Unrecognised text falls on the EXECUTING side deliberately: from
+        // there the answer is a refusal (`read_only_block_reason` cannot prove
+        // an unknown statement is a read) and no implicit-commit claim, which
+        // is the safe direction for both questions. Reading it as maintenance
+        // would claim a commit that did not happen and lose the user's
+        // transaction.
+        "ANALYZE" if family_spells_its_executing_explain_as_bare_analyze(db_type) => {
+            match next_top_level_word(sql, after_first, true) {
+                Some((word, _, _))
+                    if word == "TABLE"
+                        || MYSQL_ANALYZE_TABLE_MODIFIERS.contains(&word.as_str()) =>
+                {
+                    return None
+                }
+                Some(_) => after_first,
+                // `ANALYZE` with nothing after it is the server's to refuse.
+                None => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    // `[FORMAT = TREE|JSON]` and `[FOR SCHEMA|DATABASE <name>]` belong to the
+    // explain, not to the statement it runs. The `FOR SCHEMA` clause is the
+    // same one this app's completion grammar already models
+    // (`mysql_explain_schema_slot`); without skipping it the target read back
+    // was `FOR SCHEMA app SELECT 1`, which no classifier can prove is a read,
+    // so a pure read was refused.
+    //
+    // An option whose VALUE is missing is not skipped, and the remainder
+    // becomes the target as it stands: `EXPLAIN ANALYZE FORMAT` then reads as
+    // an executing explain of `FORMAT`, which nothing can prove is a read, so
+    // it is refused. Answering `None` there instead would call a malformed
+    // executing explain plan-only and hand it to the read-only guards as a
+    // read — the wrong direction for text the app could not parse.
+    let mut idx = after_executing_keyword;
+    if let Some((word, _, after_format)) = next_top_level_word(sql, idx, true) {
+        if word == "FORMAT" {
+            if let Some((_, _, after_value)) = next_top_level_word(sql, after_format, true) {
+                idx = after_value;
+            }
+        }
+    }
+    if let Some((word, _, after_for)) = next_top_level_word(sql, idx, true) {
+        if word == "FOR" {
+            if let Some((scope, _, after_scope)) = next_top_level_word(sql, after_for, true) {
+                if matches!(scope.as_str(), "SCHEMA" | "DATABASE") {
+                    if let Some((_, _, after_name)) = next_top_level_word(sql, after_scope, true) {
+                        idx = after_name;
+                    }
+                }
+            }
+        }
+    }
+
+    let target = sql.get(idx..)?.trim();
+    (!target.is_empty()).then_some(target)
+}
+
+/// The statement underneath every layer of executing explain, or `None` when
+/// this is not one.
+///
+/// The unwrapping is a LOOP rather than a re-entry per layer: the text comes
+/// from an editor buffer, so `EXPLAIN ANALYZE ` repeated far enough would
+/// otherwise be as deep a recursion as the user cared to type. Each turn drops
+/// at least the words it read, and the length check says so rather than
+/// trusting it.
+///
+/// One helper, because three separate questions need the same unwrapped
+/// statement — what kind is it, does it leave uncommitted work, does it commit
+/// implicitly — and three private loops is how they would come to disagree.
+pub(crate) fn mysql_fully_executed_explain_target(
+    db_type: DatabaseType,
+    sql: &str,
+) -> Option<&str> {
+    let mut target = mysql_explain_executed_statement(db_type, sql)?;
+    while let Some(inner) = mysql_explain_executed_statement(db_type, target) {
+        if inner.len() >= target.len() {
+            break;
+        }
+        target = inner;
+    }
+    Some(target)
+}
+
+/// Why an Explain Plan must not SEND this statement at all: it would RUN what
+/// it explains, and what it explains is not provably a read.
+///
+/// Asked in addition to — never instead of — the read-only gates, because the
+/// answer does not depend on either of them. An explain runs on the
+/// connection's OWN DB session, which no query tab owns: nothing in the
+/// transaction model would ever commit or roll back what it changed there, and
+/// a tab pinned READ ONLY cannot help either, since on this family that pin is
+/// a characteristic of the TAB's session and the explain does not run on it.
+/// Oracle's own explain writes to `PLAN_TABLE` and is the exception that proves
+/// the rule: the app takes that write back itself, in the same call.
+///
+/// The same "anything not provably a read" rule the connection's read-only
+/// guard uses ([`read_only_block_reason`]), because the question is the same
+/// one — a statement the app cannot classify must not be run on that session
+/// either.
+pub(crate) struct ExecutingExplainWrite {
+    /// How THIS product spells the explain that runs what it explains.
+    ///
+    /// Carried out of the answer rather than looked up again by whoever
+    /// reports it: the two products spell it differently, and a reporter that
+    /// re-derived the spelling told a MariaDB user their statement was refused
+    /// for being an `EXPLAIN ANALYZE` — a form MariaDB rejects outright and
+    /// they had not typed.
+    pub(crate) spelling: &'static str,
+    /// The shared read-only wording for the statement that would run.
+    pub(crate) reason: String,
+}
+
+/// How this product writes the explain that RUNS what it explains, when it has
+/// one at all.
+///
+/// Exhaustive, and `None` for Oracle rather than a plausible default: Oracle's
+/// `EXPLAIN PLAN` only parses, so there is no such statement to name and a
+/// caller that got a name for it would be reporting one that does not exist.
+fn executing_explain_spelling(db_type: DatabaseType) -> Option<&'static str> {
+    match db_type {
+        DatabaseType::MariaDB => Some("ANALYZE"),
+        DatabaseType::MySQL => Some("EXPLAIN ANALYZE"),
+        DatabaseType::Oracle => None,
+    }
+}
+
+pub(crate) fn mysql_explain_executes_a_write(
+    db_type: DatabaseType,
+    sql: &str,
+) -> Option<ExecutingExplainWrite> {
+    // The SPELLING first, and the order is load-bearing. A product with no
+    // executing explain has no such statement to judge, and the reader below
+    // recognises the `EXPLAIN … ANALYZE` shape whatever product it is asked
+    // about — so asking it first would read Oracle text as this family's and
+    // then have to invent a name for a statement Oracle does not have.
+    let spelling = executing_explain_spelling(db_type)?;
+    let target = mysql_explain_executed_statement(db_type, sql)?;
+    let reason = read_only_block_reason(db_type, target, None)?;
+    Some(ExecutingExplainWrite { spelling, reason })
+}
+
+/// Why this product's explain has no plan to give for `sql`, if it has none.
+///
+/// Fail-OPEN by design, and that is the whole shape of it: only what the app
+/// can PROVE has no plan is named here, and everything else goes to the server
+/// exactly as before. Over-reading would refuse statements a server really does
+/// explain — Oracle plans a `CREATE TABLE … AS SELECT` and a
+/// `CREATE INDEX`, which share a `SqlKind` with `CREATE PROCEDURE`, so DDL as a
+/// class is deliberately absent.
+///
+/// What it does catch is what every backend agrees has no plan, so F6 answers
+/// it with ONE sentence instead of four server complaints:
+///
+/// * a PL/SQL block and a routine call — neither family's explain accepts one;
+/// * transaction control and session control — nothing to plan;
+/// * this family's `ANALYZE [modifiers] TABLE …`, which is table maintenance.
+///   That one was not merely an unhelpful error: F6 wrapped it, and MySQL reads
+///   the result (`EXPLAIN ANALYZE TABLE t`) as an executing explain of the
+///   `TABLE t` QUERY, so the user pressed F6 on a maintenance statement and was
+///   shown a real plan for something else. MariaDB answered `ERROR 1064` and
+///   Oracle a parse error, from the same one action.
+///
+/// Asked of the statement the APP CHOSE to explain, never of an explain the
+/// user typed — see
+/// [`crate::ui::sql_editor::ExplainStatement::statement_the_app_chose_to_explain`].
+pub(crate) fn statement_without_an_execution_plan_reason(
+    db_type: DatabaseType,
+    sql: &str,
+) -> Option<&'static str> {
+    let analysis = SqlStatementAnalysis::new_for_db_type(db_type, sql);
+    // Read before the kind, because the kind cannot tell these apart:
+    // `ANALYZE TABLE t` classifies as `Ddl` on both families, which is the
+    // same answer `CREATE TABLE … AS SELECT` gets, and that one has a plan.
+    if statement_is_table_maintenance(db_type, &analysis) {
+        return Some("a table maintenance statement");
+    }
+    match analysis.classify_for_db_type(db_type) {
+        SqlKind::PlsqlOrProcedure => Some(match analysis.leading_keyword() {
+            Some("BEGIN") | Some("DECLARE") => "a PL/SQL block",
+            Some("CALL") | Some("EXEC") => "a routine call",
+            // MySQL's `DO <expr>` and `EXECUTE <prepared>`, MariaDB's
+            // `BEGIN NOT ATOMIC`: they run code rather than a query, and
+            // calling any of them a routine call would be a guess.
+            _ => "a procedural statement",
+        }),
+        SqlKind::TransactionControl => Some("a transaction control statement"),
+        SqlKind::SessionControl => Some("a session control statement"),
+        // Everything else keeps going to the server exactly as it did.
+        // `Ddl` is the deliberate omission above; `Script` and `Unknown` are
+        // text the app could not read, and refusing what it could not read is
+        // the wrong direction for a report-only feature.
+        SqlKind::SelectLike | SqlKind::Dml | SqlKind::Ddl | SqlKind::Script | SqlKind::Unknown => {
+            None
+        }
+    }
+}
+
+/// Whether this is the statistics-gathering maintenance statement rather than
+/// anything a plan could be about.
+///
+/// Read from the GRAMMAR, not from "it is not an explain". The looser reading
+/// is what a first attempt at this used, and it called MySQL's
+/// `ANALYZE UPDATE t SET c = 1` — which is not maintenance, is not valid there
+/// at all, and which F6 wraps into an executing explain of a WRITE — a
+/// maintenance statement, replacing the refusal that says it would run the
+/// update with one that describes a statement the user did not type. Naming
+/// only what the word really begins keeps that refusal where it belongs.
+fn statement_is_table_maintenance(
+    db_type: DatabaseType,
+    analysis: &SqlStatementAnalysis<'_>,
+) -> bool {
+    let words = analysis.words();
+    if words.first().map(String::as_str) != Some("ANALYZE") {
+        return false;
+    }
     match classification_profile_for_db_type(db_type) {
-        SqlClassificationProfile::MySqlCompatible => return SqlKind::SelectLike,
+        // `ANALYZE [NO_WRITE_TO_BINLOG | LOCAL] TABLE …`. The modifier list is
+        // the shared one, so this and the reader that tells maintenance from
+        // MariaDB's executing explain cannot come to disagree about where the
+        // maintenance statement starts.
+        SqlClassificationProfile::MySqlCompatible => {
+            let after_modifier = usize::from(
+                words
+                    .get(1)
+                    .is_some_and(|word| MYSQL_ANALYZE_TABLE_MODIFIERS.contains(&word.as_str())),
+            ) + 1;
+            words.get(after_modifier).map(String::as_str) == Some("TABLE")
+        }
+        // Oracle's `ANALYZE TABLE|INDEX|CLUSTER …` is only ever maintenance,
+        // and the word begins nothing else there.
+        SqlClassificationProfile::Oracle => matches!(
+            words.get(1).map(String::as_str),
+            Some("TABLE" | "INDEX" | "CLUSTER")
+        ),
+    }
+}
+
+/// The kind of a statement whose first word begins an explain on this family:
+/// `EXPLAIN`, the `DESCRIBE`/`DESC` spellings of it, and MariaDB's `ANALYZE`.
+///
+/// `first_word` is the caller's, not re-derived: it decides what "this explains
+/// nothing" means. A plan-only `EXPLAIN`/`DESCRIBE` is a query; an `ANALYZE`
+/// that explains nothing is this family's table-maintenance statement, which is
+/// DDL — and reading that one as a query would make `ANALYZE TABLE t` look
+/// harmless to every guard that asks.
+fn classify_explain_sql_for_db_type(db_type: DatabaseType, first_word: &str, sql: &str) -> SqlKind {
+    match classification_profile_for_db_type(db_type) {
+        SqlClassificationProfile::MySqlCompatible => {
+            // An explain that RUNS what it explains is whatever that statement
+            // is. Read as a query — which every explain here used to be, without
+            // being asked — `EXPLAIN ANALYZE UPDATE ...` was "provably a read"
+            // to the read-only connection guard, left no work recorded on the
+            // session it changed, and passed the gate F6 asks before it sends.
+            if let Some(target) = mysql_fully_executed_explain_target(db_type, sql) {
+                return SqlStatementAnalysis::new_for_db_type(db_type, target)
+                    .classify_for_db_type(db_type);
+            }
+            // Nothing was unwrapped, so asking the classifier about the same
+            // text again would come straight back here.
+            return match first_word {
+                "ANALYZE" => SqlKind::Ddl,
+                _ => SqlKind::SelectLike,
+            };
+        }
         SqlClassificationProfile::Oracle => {}
     }
 
@@ -3394,8 +3804,15 @@ mod tests {
                 "{db_type:?} allowed a locking SELECT"
             );
         }
-        // Oracle's EXPLAIN PLAN inserts rows into PLAN_TABLE.
+        // Oracle's EXPLAIN PLAN inserts rows into PLAN_TABLE — including the
+        // spelling F6 actually sends, which names the rows it writes so it can
+        // read exactly those back.
         assert!(blocked(DatabaseType::Oracle, "EXPLAIN PLAN FOR SELECT * FROM t").is_some());
+        assert!(blocked(
+            DatabaseType::Oracle,
+            "EXPLAIN PLAN SET STATEMENT_ID = 'SQ1F_2A' FOR SELECT * FROM t"
+        )
+        .is_some());
         // MySQL's EXPLAIN only reports, so it stays available.
         assert_eq!(
             blocked(DatabaseType::MySQL, "EXPLAIN SELECT * FROM t"),
@@ -3405,6 +3822,551 @@ mod tests {
             blocked(DatabaseType::MariaDB, "EXPLAIN SELECT * FROM t"),
             None
         );
+    }
+
+    /// `EXPLAIN ANALYZE X` RUNS X, so it is whatever X is.
+    ///
+    /// Every explain on this family used to read as a query without being
+    /// asked, which made `EXPLAIN ANALYZE UPDATE …` "provably a read": a
+    /// read-only connection sent it, the session it changed was left recorded
+    /// as carrying no work, and the gate F6 asks before it sends said yes.
+    #[test]
+    fn read_only_refuses_an_explain_that_runs_what_it_explains() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            for sql in [
+                "EXPLAIN ANALYZE UPDATE t SET c = 1",
+                "EXPLAIN ANALYZE DELETE FROM t",
+                "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+                // The format option belongs to the explain, not to the
+                // statement it runs.
+                "EXPLAIN ANALYZE FORMAT = TREE UPDATE t SET c = 1",
+                "EXPLAIN ANALYZE FORMAT=JSON UPDATE t SET c = 1",
+                // Written twice, still a write underneath.
+                "EXPLAIN ANALYZE EXPLAIN ANALYZE UPDATE t SET c = 1",
+                // A read that takes locks is a write for this guard, and
+                // `EXPLAIN ANALYZE` really takes them.
+                "EXPLAIN ANALYZE SELECT * FROM t FOR UPDATE",
+                // Nothing to classify is refused, not waved through.
+                "EXPLAIN ANALYZE FROBNICATE t",
+            ] {
+                assert!(
+                    blocked(db_type, sql).is_some(),
+                    "{db_type:?} allowed `{sql}`, which RUNS what it explains"
+                );
+            }
+
+            // ... and the plan-only forms stay available, which is the whole
+            // point of having a read-only connection.
+            for sql in [
+                "EXPLAIN SELECT * FROM t",
+                "EXPLAIN UPDATE t SET c = 1",
+                "EXPLAIN ANALYZE SELECT * FROM t",
+                "EXPLAIN ANALYZE FORMAT = TREE SELECT * FROM t",
+                // The statement it runs is read through the same classifier as
+                // any other, so the shapes a query really takes are reads:
+                // a CTE, a set operation, a parenthesized query, MySQL's own
+                // table-value statement.
+                "EXPLAIN ANALYZE WITH cte AS (SELECT 1) SELECT * FROM cte",
+                "EXPLAIN ANALYZE (SELECT 1) UNION (SELECT 2)",
+                "EXPLAIN ANALYZE TABLE t",
+                "EXPLAIN FORMAT = JSON SELECT * FROM t",
+                "DESCRIBE t",
+                "DESC t",
+                // A table named with the reserved word is a description, not an
+                // execution: the scanner steps over the quoted identifier.
+                "DESCRIBE `analyze`",
+                // An explain with nothing after it is the server's to refuse.
+                "EXPLAIN ANALYZE",
+            ] {
+                assert_eq!(
+                    blocked(db_type, sql),
+                    None,
+                    "{db_type:?} refused `{sql}`, which only reports"
+                );
+            }
+        }
+
+        // Oracle has no such spelling: `EXPLAIN PLAN` never runs what it
+        // explains, and `ANALYZE` there is its own DDL statement. Asked of
+        // every backend, because the reader now takes a `db_type` and "not an
+        // executing explain" has to hold for all of them.
+        for db_type in EVERY_DB_TYPE {
+            assert_eq!(
+                mysql_explain_executed_statement(db_type, "EXPLAIN PLAN FOR SELECT 1 FROM DUAL"),
+                None,
+                "{db_type:?}"
+            );
+        }
+        assert!(blocked(DatabaseType::Oracle, "ANALYZE TABLE t COMPUTE STATISTICS").is_some());
+
+        // `DESCRIBE`/`DESC ANALYZE …` is the same server statement, and this
+        // guard says nothing about it — deliberately, and only because the text
+        // never reaches a server as SQL from the editor: the app's own splitter
+        // reads a line opening with `DESC`/`DESCRIBE` as the TOOL command, so
+        // what runs is the app's catalog describe of an object with that name.
+        // The classifier below still answers for the text itself, and F6 —
+        // which passes an explain the user typed straight to the server, tool
+        // command or not — is guarded where that passing happens
+        // (`ExplainPlanBackend::refusal_before_sending`, pinned by
+        // `an_explain_that_would_run_what_it_explains_is_never_sent`).
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            for sql in [
+                "DESCRIBE ANALYZE UPDATE t SET c = 1",
+                "DESC ANALYZE UPDATE t SET c = 1",
+            ] {
+                assert!(
+                    matches!(
+                        crate::db::query::QueryExecutor::split_script_items_for_db_type_with_mysql_delimiter(
+                            sql,
+                            Some(db_type),
+                            None,
+                        )
+                        .as_slice(),
+                        [crate::db::query::ScriptItem::ToolCommand(_)]
+                    ),
+                    "{db_type:?}: `{sql}` is the app's own describe, not SQL it sends"
+                );
+                assert_eq!(
+                    SqlStatementAnalysis::new_for_db_type(db_type, sql)
+                        .classify_for_db_type(db_type),
+                    SqlKind::Dml,
+                    "{db_type:?}: the TEXT still says what it would do"
+                );
+            }
+        }
+    }
+
+    /// The statements that have no execution plan on ANY of the four backends,
+    /// named the same way by all of them.
+    ///
+    /// F6 wraps whatever it is handed, so each of these used to be wrapped into
+    /// an explain and SENT — four servers answering one keystroke with four
+    /// different complaints. `ANALYZE TABLE t` was worse than an unhelpful
+    /// error: MySQL reads the wrapped `EXPLAIN ANALYZE TABLE t` as an executing
+    /// explain of the `TABLE t` QUERY, so F6 on a maintenance statement drew a
+    /// real plan for something else.
+    #[test]
+    fn statements_with_no_execution_plan_are_named_on_every_backend() {
+        for db_type in EVERY_DB_TYPE {
+            for (sql, subject) in [
+                ("CALL p(1)", "a routine call"),
+                ("COMMIT", "a transaction control statement"),
+                ("ROLLBACK", "a transaction control statement"),
+                ("SAVEPOINT s", "a transaction control statement"),
+                ("ANALYZE TABLE t", "a table maintenance statement"),
+            ] {
+                assert_eq!(
+                    statement_without_an_execution_plan_reason(db_type, sql),
+                    Some(subject),
+                    "{db_type}: `{sql}`"
+                );
+            }
+        }
+
+        // The family-specific spellings, each on the products that have them.
+        // A `BEGIN … END` block is Oracle's; on the MySQL family that same text
+        // is a multi-statement script and is left alone, which is the fail-open
+        // half of this gate working as intended.
+        for (sql, subject) in [
+            ("BEGIN NULL; END;", "a PL/SQL block"),
+            ("DECLARE x NUMBER; BEGIN NULL; END;", "a PL/SQL block"),
+            ("EXEC p(1)", "a routine call"),
+            (
+                "ALTER SESSION SET CURRENT_SCHEMA = app",
+                "a session control statement",
+            ),
+            (
+                "ANALYZE INDEX i COMPUTE STATISTICS",
+                "a table maintenance statement",
+            ),
+            (
+                "ANALYZE TABLE t COMPUTE STATISTICS",
+                "a table maintenance statement",
+            ),
+        ] {
+            assert_eq!(
+                statement_without_an_execution_plan_reason(DatabaseType::Oracle, sql),
+                Some(subject),
+                "Oracle: `{sql}`"
+            );
+        }
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            for (sql, subject) in [
+                ("USE app", "a session control statement"),
+                // This family's own model calls it transaction control, and
+                // that is the app's one answer for it everywhere else — what
+                // matters here is that a statement with no plan says so.
+                ("SET autocommit = 1", "a transaction control statement"),
+                ("LOCK TABLES t WRITE", "a session control statement"),
+                ("DO SLEEP(1)", "a procedural statement"),
+                ("ANALYZE LOCAL TABLE t", "a table maintenance statement"),
+                (
+                    "ANALYZE NO_WRITE_TO_BINLOG TABLE t",
+                    "a table maintenance statement",
+                ),
+            ] {
+                assert_eq!(
+                    statement_without_an_execution_plan_reason(db_type, sql),
+                    Some(subject),
+                    "{db_type}: `{sql}`"
+                );
+            }
+        }
+    }
+
+    /// ... and the gate is FAIL-OPEN everywhere else, which is the half that
+    /// keeps it from swallowing the feature.
+    ///
+    /// The dangerous direction here is refusing a statement a server really
+    /// does explain, so only what the app can PROVE has no plan is named.
+    /// Oracle plans a `CREATE TABLE … AS SELECT` and a `CREATE INDEX`, which
+    /// share a `SqlKind` with `CREATE PROCEDURE` — so DDL as a class stays
+    /// absent and reaches the server exactly as it did before.
+    #[test]
+    fn a_statement_that_may_have_a_plan_is_never_refused_for_want_of_one() {
+        for db_type in EVERY_DB_TYPE {
+            for sql in [
+                "SELECT * FROM t",
+                "WITH cte AS (SELECT 1) SELECT * FROM cte",
+                "(SELECT 1) UNION (SELECT 2)",
+                "UPDATE t SET c = 1",
+                "DELETE FROM t",
+                "INSERT INTO t VALUES (1)",
+                "CREATE TABLE copy AS SELECT * FROM t",
+                "CREATE INDEX i ON t (c)",
+                "CREATE PROCEDURE p() BEGIN SELECT 1; END",
+                // Text the app could not read is not text it may refuse.
+                "FROBNICATE t",
+                "",
+            ] {
+                assert_eq!(
+                    statement_without_an_execution_plan_reason(db_type, sql),
+                    None,
+                    "{db_type}: `{sql}` was refused a plan it may well have"
+                );
+            }
+        }
+
+        // MariaDB's own executing explain shares its first word with the
+        // maintenance statement, and only one of the two is refused.
+        assert_eq!(
+            statement_without_an_execution_plan_reason(DatabaseType::MariaDB, "ANALYZE SELECT 1"),
+            None
+        );
+        // MySQL has no such form, so `ANALYZE UPDATE …` is not maintenance
+        // either — it is malformed, and the refusal that belongs to it is the
+        // one that says the wrapped explain would RUN the update. Calling it
+        // maintenance here would take that refusal away.
+        assert_eq!(
+            statement_without_an_execution_plan_reason(
+                DatabaseType::MySQL,
+                "ANALYZE UPDATE t SET c = 1"
+            ),
+            None
+        );
+        assert_eq!(
+            statement_without_an_execution_plan_reason(
+                DatabaseType::MariaDB,
+                "ANALYZE UPDATE t SET c = 1"
+            ),
+            None
+        );
+    }
+
+    /// The executing explain is named in the SPELLING of the product that has
+    /// one — and a product that has none never reports one.
+    ///
+    /// The two families spell it differently and the answer used to carry no
+    /// spelling at all, so whoever reported it wrote `EXPLAIN ANALYZE` — the
+    /// form MariaDB rejects outright. Carrying the spelling out of the same
+    /// answer that decided this IS an executing explain is what keeps the two
+    /// halves of that sentence about one product.
+    #[test]
+    fn an_executing_explain_is_named_in_its_own_products_spelling() {
+        let write = "UPDATE t SET c = 1";
+        let mysql = mysql_explain_executes_a_write(
+            DatabaseType::MySQL,
+            &format!("EXPLAIN ANALYZE {write}"),
+        )
+        .expect("MySQL's executing explain of a write");
+        assert_eq!(mysql.spelling, "EXPLAIN ANALYZE");
+        // The shared read-only wording, verbatim — including its article,
+        // which `describe_blocked_statement` has always written as "a" for
+        // every keyword. That wart is not F6's to fix here: the same sentence
+        // is what every read-only refusal in the app says.
+        assert_eq!(mysql.reason, "a UPDATE statement");
+
+        let mariadb =
+            mysql_explain_executes_a_write(DatabaseType::MariaDB, &format!("ANALYZE {write}"))
+                .expect("MariaDB's executing explain of a write");
+        assert_eq!(mariadb.spelling, "ANALYZE");
+
+        // Oracle has no such statement, so it never reports one — asked FIRST,
+        // because the reader below recognises the `EXPLAIN … ANALYZE` shape
+        // whatever product it is asked about and would otherwise leave a
+        // spelling to be invented for a form Oracle does not have.
+        for sql in [
+            "EXPLAIN ANALYZE UPDATE t SET c = 1",
+            "ANALYZE UPDATE t SET c = 1",
+            "EXPLAIN PLAN FOR UPDATE t SET c = 1",
+        ] {
+            assert!(
+                mysql_explain_executes_a_write(DatabaseType::Oracle, sql).is_none(),
+                "Oracle reported an executing explain for `{sql}`"
+            );
+        }
+
+        // A plan-only explain of a write is not one either, on both products.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert!(
+                mysql_explain_executes_a_write(db_type, &format!("EXPLAIN {write}")).is_none(),
+                "{db_type}"
+            );
+        }
+    }
+
+    /// The kind an explain reports is the kind of what it RUNS — which is what
+    /// the session's work tracking, the transaction gates and the read-only
+    /// guards all read.
+    #[test]
+    fn an_explain_that_runs_a_write_classifies_as_that_write() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let kind = |sql: &str| {
+                SqlStatementAnalysis::new_for_db_type(db_type, sql).classify_for_db_type(db_type)
+            };
+            assert_eq!(kind("EXPLAIN ANALYZE UPDATE t SET c = 1"), SqlKind::Dml);
+            assert_eq!(kind("EXPLAIN ANALYZE CALL p()"), SqlKind::PlsqlOrProcedure);
+            assert_eq!(kind("EXPLAIN ANALYZE SELECT 1"), SqlKind::SelectLike);
+            assert_eq!(kind("EXPLAIN ANALYZE TABLE t"), SqlKind::SelectLike);
+            assert_eq!(kind("EXPLAIN UPDATE t SET c = 1"), SqlKind::SelectLike);
+            assert_eq!(kind("DESCRIBE t"), SqlKind::SelectLike);
+            assert_eq!(kind("SHOW TABLES"), SqlKind::SelectLike);
+        }
+        // The display route is a different question and keeps its own answer:
+        // `EXPLAIN ANALYZE UPDATE` returns a result set whatever it does to the
+        // data, so the grid still shows one.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(
+                crate::db::query::statement_execution_profile_for_db_type(
+                    db_type,
+                    "EXPLAIN ANALYZE UPDATE t SET c = 1"
+                )
+                .result_kind,
+                crate::db::query::StatementResultKind::Select,
+                "{db_type:?}"
+            );
+        }
+    }
+
+    /// The layers are unwrapped in a loop, not classified one call at a time.
+    ///
+    /// The text comes from an editor buffer, so how many layers it carries is
+    /// the user's choice, and a classifier that re-entered itself once per
+    /// layer would run out of stack rather than answer.
+    #[test]
+    fn an_explain_written_in_many_layers_is_answered_without_running_out_of_stack() {
+        let mut deep = "EXPLAIN ANALYZE ".repeat(20_000);
+        deep.push_str("UPDATE t SET c = 1");
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(
+                SqlStatementAnalysis::new_for_db_type(db_type, &deep).classify_for_db_type(db_type),
+                SqlKind::Dml,
+                "{db_type:?}"
+            );
+            assert!(blocked(db_type, &deep).is_some(), "{db_type:?}");
+        }
+
+        // MariaDB's own spelling is one word shorter per layer, so it nests
+        // deeper for the same text and needs the same flattening. It reaches
+        // the loop through a different arm of the reader, which is why it is
+        // asked rather than assumed.
+        let mut deep = "ANALYZE ".repeat(20_000);
+        deep.push_str("UPDATE t SET c = 1");
+        assert_eq!(
+            SqlStatementAnalysis::new_for_db_type(DatabaseType::MariaDB, &deep)
+                .classify_for_db_type(DatabaseType::MariaDB),
+            SqlKind::Dml
+        );
+        assert!(blocked(DatabaseType::MariaDB, &deep).is_some());
+    }
+
+    /// The other way an explain can nest: through a wrapper the ANALYSIS
+    /// unwraps rather than the loop above.
+    ///
+    /// `SET STATEMENT … FOR <statement>` is taken apart by
+    /// `SqlStatementAnalysis::new_for_db_type` before any classification
+    /// happens, so a text that ALTERNATES the two wrappers re-enters the
+    /// classifier once per pair — the loop above flattens its own nesting but
+    /// cannot flatten that one.
+    ///
+    /// The answer is what matters here and it is fail-closed: the write
+    /// underneath is found however many wrappers sit on top. The cost is worth
+    /// stating too, because the shape is the only one in this file that
+    /// re-enters the analysis: each pair re-scans what is left, so a crafted
+    /// alternation is quadratic in its own length. It stays a curiosity rather
+    /// than a hazard because MariaDB does not allow one `SET STATEMENT` inside
+    /// another — an input deep enough to matter is one no server would run —
+    /// and because a plain `EXPLAIN ANALYZE` nest, which a user could actually
+    /// produce, is flattened by the loop in one pass
+    /// (`an_explain_written_in_many_layers_is_answered_without_running_out_of_stack`).
+    #[test]
+    fn an_explain_nested_through_a_set_statement_wrapper_still_answers() {
+        for depth in [1, 2, 200] {
+            let mut deep = "SET STATEMENT max_statement_time=1 FOR EXPLAIN ANALYZE ".repeat(depth);
+            deep.push_str("UPDATE t SET c = 1");
+            assert_eq!(
+                SqlStatementAnalysis::new_for_db_type(DatabaseType::MariaDB, &deep)
+                    .classify_for_db_type(DatabaseType::MariaDB),
+                SqlKind::Dml,
+                "depth {depth}"
+            );
+            assert!(
+                blocked(DatabaseType::MariaDB, &deep).is_some(),
+                "depth {depth}"
+            );
+        }
+    }
+
+    /// The statement an explain runs, read apart from the explain around it.
+    #[test]
+    fn the_statement_an_explain_runs_is_read_apart_from_the_explain() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let executed = |sql| mysql_explain_executed_statement(db_type, sql);
+            assert_eq!(executed("EXPLAIN ANALYZE SELECT 1"), Some("SELECT 1"));
+            assert_eq!(
+                executed("explain analyze format = tree select 1"),
+                Some("select 1")
+            );
+            assert_eq!(
+                executed("EXPLAIN /* c */ ANALYZE SELECT 1"),
+                Some("SELECT 1")
+            );
+            // The schema clause belongs to the explain, like the format option
+            // beside it. Read as part of the target, `FOR SCHEMA app SELECT 1`
+            // is a statement no classifier can prove is a read, so a pure read
+            // was refused. The app's own completion grammar has always known
+            // this clause (`mysql_explain_schema_slot`).
+            assert_eq!(
+                executed("EXPLAIN ANALYZE FOR SCHEMA app SELECT 1"),
+                Some("SELECT 1"),
+                "{db_type:?}"
+            );
+            assert_eq!(
+                executed("EXPLAIN ANALYZE FORMAT = TREE FOR DATABASE app UPDATE t SET c = 1"),
+                Some("UPDATE t SET c = 1"),
+                "{db_type:?}"
+            );
+            // Not an executing explain at all.
+            for sql in [
+                "EXPLAIN SELECT 1",
+                "EXPLAIN FORMAT = TREE SELECT 1",
+                "DESCRIBE t",
+                "SELECT 1",
+                "EXPLAIN ANALYZE   ",
+                "DESCRIBE `analyze`",
+                // Table maintenance on both products, and the only thing
+                // `ANALYZE` can begin on MySQL.
+                "ANALYZE TABLE t",
+                "ANALYZE NO_WRITE_TO_BINLOG TABLE t",
+                "ANALYZE LOCAL TABLE t",
+                "ANALYZE TABLE t UPDATE HISTOGRAM ON c",
+                "ANALYZE",
+            ] {
+                assert_eq!(executed(sql), None, "{db_type:?}: {sql}");
+            }
+            // An option with no value left is not skipped, so the malformed
+            // remainder becomes the target and nothing can prove it is a read.
+            // Answering `None` there would call it plan-only and hand it to
+            // the read-only guards as a read.
+            for (sql, target) in [
+                ("EXPLAIN ANALYZE FORMAT", "FORMAT"),
+                ("EXPLAIN ANALYZE FOR SCHEMA", "FOR SCHEMA"),
+            ] {
+                assert_eq!(executed(sql), Some(target), "{db_type:?}: {sql}");
+                assert!(
+                    blocked(db_type, sql).is_some(),
+                    "{db_type:?}: `{sql}` could not be parsed and must not read as a read"
+                );
+            }
+        }
+
+        // MariaDB's own spelling of the executing explain, which it has and
+        // MySQL does not. Reading only MySQL's spelling is what let
+        // `ANALYZE UPDATE …` — which measurably writes — be taken for the
+        // maintenance statement it shares a first word with.
+        let mariadb = |sql| mysql_explain_executed_statement(DatabaseType::MariaDB, sql);
+        assert_eq!(mariadb("ANALYZE SELECT 1"), Some("SELECT 1"));
+        assert_eq!(
+            mariadb("ANALYZE UPDATE t SET c = 1"),
+            Some("UPDATE t SET c = 1")
+        );
+        assert_eq!(
+            mariadb("analyze format = json delete from t"),
+            Some("delete from t")
+        );
+        assert_eq!(
+            mariadb("ANALYZE (SELECT 1) UNION (SELECT 2)"),
+            Some("(SELECT 1) UNION (SELECT 2)")
+        );
+        // ... and MySQL keeps `ANALYZE` as maintenance, because that is the
+        // only statement the word begins there.
+        for sql in [
+            "ANALYZE SELECT 1",
+            "ANALYZE UPDATE t SET c = 1",
+            "ANALYZE FORMAT = JSON SELECT 1",
+        ] {
+            assert_eq!(
+                mysql_explain_executed_statement(DatabaseType::MySQL, sql),
+                None,
+                "{sql}"
+            );
+        }
+    }
+
+    /// MariaDB's `ANALYZE <statement>` is its EXECUTING EXPLAIN, and every
+    /// question the app asks about one has to be asked of what it runs.
+    ///
+    /// The word it shares with `ANALYZE TABLE` is the whole trap: read as
+    /// maintenance, `ANALYZE UPDATE …` classified as DDL — which made it a
+    /// statement that "commits implicitly" and leaves no uncommitted work,
+    /// neither of which is true of an UPDATE. Measured on MariaDB 12.2.2: it
+    /// really writes.
+    #[test]
+    fn mariadbs_own_executing_explain_is_classified_by_what_it_runs() {
+        let kind = |sql: &str| {
+            SqlStatementAnalysis::new_for_db_type(DatabaseType::MariaDB, sql)
+                .classify_for_db_type(DatabaseType::MariaDB)
+        };
+        assert_eq!(kind("ANALYZE UPDATE t SET c = 1"), SqlKind::Dml);
+        assert_eq!(kind("ANALYZE DELETE FROM t"), SqlKind::Dml);
+        assert_eq!(kind("ANALYZE SELECT 1"), SqlKind::SelectLike);
+        assert_eq!(kind("ANALYZE FORMAT = JSON SELECT 1"), SqlKind::SelectLike);
+        // The maintenance statement keeps its own answer on both products —
+        // reading THAT as a query is the mirror-image defect, and it is the
+        // one that would let a read-only connection run it.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let kind = |sql: &str| {
+                SqlStatementAnalysis::new_for_db_type(db_type, sql).classify_for_db_type(db_type)
+            };
+            assert_eq!(kind("ANALYZE TABLE t"), SqlKind::Ddl, "{db_type:?}");
+            assert_eq!(kind("ANALYZE LOCAL TABLE t"), SqlKind::Ddl, "{db_type:?}");
+            assert!(
+                blocked(db_type, "ANALYZE TABLE t").is_some(),
+                "{db_type:?} allowed table maintenance on a read-only connection"
+            );
+        }
+        // MySQL has no executing `ANALYZE`, so the word stays maintenance there.
+        assert_eq!(
+            SqlStatementAnalysis::new_for_db_type(
+                DatabaseType::MySQL,
+                "ANALYZE UPDATE t SET c = 1"
+            )
+            .classify_for_db_type(DatabaseType::MySQL),
+            SqlKind::Ddl
+        );
+        // A read-only connection refuses the write it runs and allows the read.
+        assert!(blocked(DatabaseType::MariaDB, "ANALYZE UPDATE t SET c = 1").is_some());
+        assert_eq!(blocked(DatabaseType::MariaDB, "ANALYZE SELECT 1"), None);
     }
 
     #[test]

@@ -796,6 +796,10 @@ impl SessionResidueState {
         self.may_have_user_variable
     }
 
+    pub fn may_have_session_setting(self) -> bool {
+        self.may_have_session_setting
+    }
+
     pub(crate) fn may_have_statement_diagnostics(self) -> bool {
         self.may_have_statement_diagnostics
     }
@@ -804,7 +808,7 @@ impl SessionResidueState {
         self.may_have_next_transaction_mode_override || self.may_have_transaction_mode_override
     }
 
-    fn may_have_unknown_session_state(self) -> bool {
+    pub fn may_have_unknown_session_state(self) -> bool {
         self.may_have_unknown_session_state
     }
 
@@ -3886,7 +3890,11 @@ pub(crate) fn mysql_statement_consumes_pending_transaction_mode_override_for_pre
     ) || mysql_reset_connection_statement(&analysis)
         || mysql_statement_starts_read_transaction_for_analysis(db_type, &effective_sql, &analysis)
         || mysql_statement_acquires_table_lock_for_analysis(&analysis)
-        || mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit(&analysis)
+        || mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit(
+            db_type,
+            &effective_sql,
+            &analysis,
+        )
         || (mysql_statement_may_leave_uncommitted_work_for_analysis(
             db_type,
             &effective_sql,
@@ -4427,7 +4435,9 @@ fn mysql_statement_consumes_next_transaction_mode_override_for_execution(
     ) || mysql_reset_connection_statement(analysis)
         || mysql_statement_opens_transaction_state_for_analysis(analysis)
         || mysql_statement_acquires_table_lock_for_analysis(analysis)
-        || mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit(analysis)
+        || mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit(
+            db_type, sql, analysis,
+        )
     {
         return true;
     }
@@ -4444,6 +4454,8 @@ fn mysql_statement_consumes_next_transaction_mode_override_for_execution(
 }
 
 fn mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit(
+    db_type: DatabaseType,
+    sql: &str,
     analysis: &SqlStatementAnalysis<'_>,
 ) -> bool {
     match analysis.leading_keyword() {
@@ -4453,6 +4465,21 @@ fn mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit(
         Some("DROP") if mysql_drop_statement_is_temporary_for_analysis(analysis) => false,
         Some("RESET") if mysql_reset_connection_statement(analysis) => false,
         Some("RESET") if mysql_reset_persist_statement(analysis) => false,
+        // MariaDB's `ANALYZE <statement>` is its EXECUTING EXPLAIN, not the
+        // maintenance statement it shares a first word with, and an explain
+        // commits nothing. Claimed as an implicit commit it cleared a
+        // transaction decision the tab really had, and — for the `UPDATE`
+        // form, which measurably writes — reported work as committed that the
+        // server still held open. The one reader that knows both families'
+        // spellings answers here (`mysql_explain_executed_statement`), so
+        // this cannot drift from what the classifier and the read-only gates
+        // make of the same text.
+        Some("ANALYZE")
+            if crate::db::sql_classification::mysql_explain_executed_statement(db_type, sql)
+                .is_some() =>
+        {
+            false
+        }
         Some("START" | "STOP" | "CHANGE") if mysql_replication_control_statement(analysis) => true,
         Some("CREATE") | Some("ALTER") | Some("DROP") | Some("RENAME") | Some("TRUNCATE")
         | Some("GRANT") | Some("REVOKE") | Some("ANALYZE") | Some("CACHE") | Some("CHECK")
@@ -4462,9 +4489,14 @@ fn mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit(
     }
 }
 
-fn mysql_statement_has_implicit_commit_for_analysis(analysis: &SqlStatementAnalysis<'_>) -> bool {
-    mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit(analysis)
-        || mysql_statement_acquires_table_lock_for_analysis(analysis)
+fn mysql_statement_has_implicit_commit_for_analysis(
+    db_type: DatabaseType,
+    sql: &str,
+    analysis: &SqlStatementAnalysis<'_>,
+) -> bool {
+    mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit(
+        db_type, sql, analysis,
+    ) || mysql_statement_acquires_table_lock_for_analysis(analysis)
 }
 
 pub(crate) fn mysql_statement_session_effects_for_execution_context_for_db_type(
@@ -4648,7 +4680,36 @@ pub(crate) fn mysql_server_probe_reports_uncommitted_work_for_statement(
         )
 }
 
+/// Whether this statement can leave work the session has not committed.
+///
+/// An EXECUTING explain leaves whatever the statement it runs leaves, so the
+/// question is passed down to that statement — MySQL's `EXPLAIN ANALYZE
+/// <statement>` and MariaDB's `ANALYZE <statement>` alike. Asked of the word in
+/// front instead, `EXPLAIN ANALYZE UPDATE …` and `ANALYZE UPDATE …` both
+/// answered "leaves nothing" for a statement that really writes, which is the
+/// same blindness `classify_explain_sql_for_db_type` and
+/// `mysql_statement_consumes_next_transaction_mode_override_via_implicit_commit`
+/// were fixed for — one root, asked in three places, so all three take it from
+/// the same reader.
 fn mysql_statement_may_leave_uncommitted_work_for_analysis(
+    db_type: DatabaseType,
+    sql: &str,
+    analysis: &SqlStatementAnalysis<'_>,
+) -> bool {
+    match crate::db::sql_classification::mysql_fully_executed_explain_target(db_type, sql) {
+        Some(executed) => {
+            let executed_analysis = SqlStatementAnalysis::new_for_db_type(db_type, executed);
+            mysql_statement_may_leave_uncommitted_work_for_statement(
+                db_type,
+                executed,
+                &executed_analysis,
+            )
+        }
+        None => mysql_statement_may_leave_uncommitted_work_for_statement(db_type, sql, analysis),
+    }
+}
+
+fn mysql_statement_may_leave_uncommitted_work_for_statement(
     db_type: DatabaseType,
     sql: &str,
     analysis: &SqlStatementAnalysis<'_>,
@@ -5292,6 +5353,22 @@ fn oracle_statement_may_open_untracked_transaction_for_words(words: &[String]) -
     )
 }
 
+/// Whether this Oracle statement creates a table that lives and dies with the
+/// SESSION.
+///
+/// `PRIVATE` only, and the distinction is the whole point:
+/// `CREATE GLOBAL TEMPORARY TABLE` makes a permanent schema object — every
+/// session sees the table and only its rows are private — so nothing about it
+/// is session residue, and calling it residue would pin a tab's session for a
+/// table that outlives it. A `CREATE PRIVATE TEMPORARY TABLE` (18c and later)
+/// makes an object that exists nowhere but on the session that ran it.
+fn oracle_creates_private_temporary_table(words: &[String]) -> bool {
+    words.first().is_some_and(|word| word == "CREATE")
+        && words.get(1).is_some_and(|word| word == "PRIVATE")
+        && words.get(2).is_some_and(|word| word == "TEMPORARY")
+        && words.get(3).is_some_and(|word| word == "TABLE")
+}
+
 fn oracle_session_residue_effects(sql: &str, words: &[String]) -> StatementSessionResidueEffects {
     let alter_session = words.first().is_some_and(|word| word == "ALTER")
         && words.get(1).is_some_and(|word| word == "SESSION");
@@ -5302,6 +5379,21 @@ fn oracle_session_residue_effects(sql: &str, words: &[String]) -> StatementSessi
         };
         if oracle_statement_may_open_untracked_transaction_for_words(words) {
             return unknown_state;
+        }
+        // The SAME field the MySQL family sets for `CREATE TEMPORARY TABLE`,
+        // deliberately: this is the one kind of session residue both families
+        // really have, and Explain Plan's "what this plan cannot see" note
+        // names it by that field. Oracle's residue model knew only
+        // `may_leave_unknown_state`, and no statement set even that for a
+        // private temporary table — so a tab that made one was told nothing
+        // when F6, which builds its plan on the connection's OWN session,
+        // answered `ORA-00942` for a table only this tab has. The MySQL half of
+        // that same sentence has always worked.
+        if oracle_creates_private_temporary_table(words) {
+            return StatementSessionResidueEffects {
+                creates_temporary_table: true,
+                ..StatementSessionResidueEffects::default()
+            };
         }
         return match words.first().map(String::as_str) {
             Some("SET") if words.get(1).is_some_and(|word| word == "ROLE") => unknown_state,
@@ -5817,7 +5909,11 @@ impl StatementSessionPostProcessor for MysqlStatementSessionPostProcessor {
             transaction: StatementTransactionEffects {
                 clears_state: transaction_control_outcome.clears_transaction_state()
                     || transaction_control_outcome.starts_transaction_state(),
-                has_implicit_commit: mysql_statement_has_implicit_commit_for_analysis(&analysis),
+                has_implicit_commit: mysql_statement_has_implicit_commit_for_analysis(
+                    self.db_type,
+                    &effective_sql,
+                    &analysis,
+                ),
                 starts_state: mysql_statement_opens_transaction_state_for_analysis(&analysis),
                 may_leave_uncommitted_work: mysql_statement_may_leave_uncommitted_work_for_analysis(
                     self.db_type,
@@ -6459,6 +6555,97 @@ mod tests {
             retained.transaction_state(),
             TransactionSessionState::DecisionRequired
         );
+    }
+
+    /// An EXECUTING explain commits nothing and leaves whatever it ran.
+    ///
+    /// The two families spell it differently, and MariaDB's spelling shares its
+    /// first word with `ANALYZE TABLE` — which really is implicitly committing
+    /// maintenance. Read by that word alone, `ANALYZE UPDATE t SET c = 1`
+    /// (measured on MariaDB 12.2.2: it really writes) told the transaction
+    /// model two false things at once: that it had committed, and that it left
+    /// no work behind. The first cleared a decision the tab really had; the
+    /// second meant nothing recorded the rows the server still held open.
+    ///
+    /// MySQL's own spelling had the second half of the same blindness:
+    /// `EXPLAIN ANALYZE UPDATE …` runs the update from 8.3 on, and
+    /// "leaves uncommitted work" was answered from the word `EXPLAIN`.
+    ///
+    /// Both are now answered from `mysql_explain_executed_statement`, the one
+    /// reader that knows both spellings — the same one the classifier and the
+    /// read-only gates ask.
+    #[test]
+    fn an_executing_explain_commits_nothing_and_leaves_what_it_ran() {
+        for (db_type, executing_explain) in [
+            (DatabaseType::MariaDB, "ANALYZE"),
+            (DatabaseType::MySQL, "EXPLAIN ANALYZE"),
+            (DatabaseType::MariaDB, "EXPLAIN ANALYZE"),
+        ] {
+            let post_processor = statement_session_post_processor_for(db_type);
+            for statement in [
+                "UPDATE t SET c = 1",
+                "DELETE FROM t",
+                "INSERT INTO t VALUES (1)",
+            ] {
+                let sql = format!("{executing_explain} {statement}");
+                let effects = post_processor.effects_for_sql(&sql);
+                assert!(
+                    !effects.has_implicit_commit(),
+                    "{db_type:?}: `{sql}` claimed to commit implicitly"
+                );
+                assert!(
+                    effects.may_leave_uncommitted_work(),
+                    "{db_type:?}: `{sql}` left its write unrecorded"
+                );
+            }
+            // A read it runs is still a read: nothing to commit, nothing left.
+            let sql = format!("{executing_explain} SELECT 1");
+            let effects = post_processor.effects_for_sql(&sql);
+            assert!(!effects.has_implicit_commit(), "{db_type:?}: {sql}");
+            assert!(!effects.may_leave_uncommitted_work(), "{db_type:?}: {sql}");
+        }
+
+        // The maintenance statement keeps its own answer on both products —
+        // it really does commit implicitly, and reading THAT as an explain
+        // would be the mirror-image defect.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let post_processor = statement_session_post_processor_for(db_type);
+            for sql in [
+                "ANALYZE TABLE t",
+                "ANALYZE LOCAL TABLE t",
+                "ANALYZE NO_WRITE_TO_BINLOG TABLE t",
+                "ANALYZE TABLE t UPDATE HISTOGRAM ON c",
+            ] {
+                assert!(
+                    post_processor.effects_for_sql(sql).has_implicit_commit(),
+                    "{db_type:?}: `{sql}` is maintenance and does commit"
+                );
+            }
+            // ... and a plan-only explain stays what it always was: it runs
+            // nothing, so it leaves nothing and commits nothing.
+            for sql in ["EXPLAIN UPDATE t SET c = 1", "EXPLAIN SELECT 1"] {
+                let effects = post_processor.effects_for_sql(sql);
+                assert!(!effects.has_implicit_commit(), "{db_type:?}: {sql}");
+                assert!(!effects.may_leave_uncommitted_work(), "{db_type:?}: {sql}");
+            }
+        }
+
+        // MySQL has no bare executing `ANALYZE`, so the word keeps meaning
+        // maintenance there whatever follows it.
+        assert!(statement_session_post_processor_for(DatabaseType::MySQL)
+            .effects_for_sql("ANALYZE UPDATE t SET c = 1")
+            .has_implicit_commit());
+
+        // The answer is read from the SAME text the analysis was built from.
+        // MariaDB's `SET STATEMENT … FOR <statement>` is unwrapped before
+        // either is taken (`mysql_effective_statement_sql_for_db_type`), so a
+        // wrapper cannot leave the leading keyword saying one thing and the
+        // text another — which would have put the reader back on the wrapped
+        // text and restored the false implicit-commit claim.
+        let wrapped = statement_session_post_processor_for(DatabaseType::MariaDB)
+            .effects_for_sql("SET STATEMENT max_statement_time=1 FOR ANALYZE UPDATE t SET c = 1");
+        assert!(!wrapped.has_implicit_commit());
+        assert!(wrapped.may_leave_uncommitted_work());
     }
 
     #[test]
@@ -9292,6 +9479,55 @@ mod tests {
             .session_residue_state()
             .may_have_temporary_table());
         assert!(!after_or_replace_temp_table.may_have_uncommitted_work());
+    }
+
+    /// Oracle's session-only table is tracked as the temporary table it is, in
+    /// the SAME field the MySQL family uses.
+    ///
+    /// That field is what Explain Plan's "what this plan cannot see" note reads
+    /// to name temporary tables. Oracle set it for nothing at all, so a tab
+    /// that had made a private temporary table was told nothing when F6 —
+    /// which builds its plan on the connection's OWN session — answered
+    /// `ORA-00942` for a table only that tab has. The MySQL half of the same
+    /// sentence has always worked, which is the asymmetry the note exists to
+    /// remove.
+    ///
+    /// `GLOBAL` is deliberately NOT residue: that one is a permanent schema
+    /// object whose ROWS are session-private, so every session — the plan's
+    /// included — resolves the name, and calling it residue would pin the tab's
+    /// session for a table that outlives it.
+    #[test]
+    fn retained_state_tracks_an_oracle_private_temporary_table() {
+        let post_processor = statement_session_post_processor_for(DatabaseType::Oracle);
+        let after = |sql: &str| {
+            retained_session_state_after_statement(
+                post_processor,
+                RetainedSessionState::default(),
+                post_processor.effects_for_sql(sql),
+                false,
+                false,
+                false,
+                false,
+            )
+        };
+
+        let private = after("CREATE PRIVATE TEMPORARY TABLE ora$ptt_scratch (id NUMBER)");
+        assert!(
+            private.session_residue_state().may_have_temporary_table(),
+            "a private temporary table lives and dies with the session"
+        );
+
+        for permanent in [
+            "CREATE GLOBAL TEMPORARY TABLE gtt_scratch (id NUMBER) ON COMMIT PRESERVE ROWS",
+            "CREATE TABLE t (id NUMBER)",
+        ] {
+            assert!(
+                !after(permanent)
+                    .session_residue_state()
+                    .may_have_temporary_table(),
+                "`{permanent}` makes a schema object every session can see"
+            );
+        }
     }
 
     #[test]

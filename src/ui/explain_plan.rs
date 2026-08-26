@@ -100,6 +100,10 @@ fn tree_grid(nodes: &[PlanNode]) -> (Vec<String>, Vec<Vec<String>>) {
 }
 
 fn flat_grid(columns: &[String], rows: &[Vec<String>]) -> (Vec<String>, Vec<Vec<String>>) {
+    if let Some(rows) = one_grid_row_per_plan_line(columns, rows) {
+        return (columns.to_vec(), rows);
+    }
+
     let Some(rows_column) = columns
         .iter()
         .position(|column| column.eq_ignore_ascii_case("rows"))
@@ -138,6 +142,56 @@ fn flat_grid(columns: &[String], rows: &[Vec<String>]) -> (Vec<String>, Vec<Vec<
         })
         .collect();
     (columns, rows)
+}
+
+/// A plan the server drew ITSELF, one grid row per drawn line.
+///
+/// The measured and structured formats of this family — MySQL's
+/// `EXPLAIN ANALYZE` and `FORMAT = TREE|JSON`, MariaDB's `ANALYZE FORMAT=JSON`
+/// — come back as ONE column holding one string with the whole plan drawn
+/// inside it, newlines and all. Passed through as the server's own columns
+/// that is a single cell: the grid sizes a row to one line, so the user saw the
+/// first line of their plan and had to double-click into the value viewer for
+/// the rest. The same keystroke on MariaDB's `ANALYZE SELECT`, which answers in
+/// the classic tabular form, produced a readable table — so how legible a
+/// measured plan was depended on which product answered.
+///
+/// Splitting is the whole fix, and nothing else changes: the server's column
+/// keeps its name, no column is invented, and every line stays exactly as the
+/// server drew it — so grid search, selection and export work on it like any
+/// other result.
+///
+/// `None` — leaving the rows untouched — for every tabular plan, which is what
+/// a classic `EXPLAIN` returns on both products.
+fn one_grid_row_per_plan_line(
+    columns: &[String],
+    rows: &[Vec<String>],
+) -> Option<Vec<Vec<String>>> {
+    if columns.len() != 1 {
+        return None;
+    }
+    fn value_of(row: &[String]) -> &str {
+        row.first().map(String::as_str).unwrap_or_default()
+    }
+    if !rows.iter().any(|row| value_of(row).contains('\n')) {
+        return None;
+    }
+    Some(
+        rows.iter()
+            .flat_map(|row| {
+                let value = value_of(row);
+                // An empty value has no lines at all, and dropping the row for
+                // it would lose a row the server really returned.
+                if value.is_empty() {
+                    return vec![vec![String::new()]];
+                }
+                value
+                    .lines()
+                    .map(|line| vec![line.to_string()])
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+    )
 }
 
 /// Total reported cost of each step's direct children.
@@ -323,11 +377,12 @@ fn parse_count(value: &str) -> Option<i64> {
     trimmed.parse::<i64>().ok()
 }
 
-/// Columns the Oracle plan query selects, in order. Both drivers hand the rows
-/// back as text so the two paths cannot drift.
-pub const ORACLE_PLAN_COLUMN_COUNT: usize = 11;
-
 /// Build plan nodes from the text rows of the Oracle plan query.
+///
+/// The rows are `ORACLE_EXPLAIN_PLAN_SQL`'s, in its column order, and both
+/// Oracle drivers hand them back as text so the two paths parse identically.
+/// The count lives beside that query rather than here; a row that arrives short
+/// anyway reads as empty columns rather than panicking.
 ///
 /// A row without a usable `ID` is dropped rather than guessed at: it would have
 /// no place in the parent chain, and inventing one would draw a tree the
@@ -629,6 +684,77 @@ mod tests {
         let (_, rows) = plan_grid(&data);
         assert!(rows[0][1].ends_with(" 100%"), "{}", rows[0][1]);
         assert_eq!(rows[1][1], "");
+    }
+
+    /// The formats where the server draws the plan itself come back as ONE
+    /// column holding the whole thing, newlines and all — MySQL's
+    /// `EXPLAIN ANALYZE` and `FORMAT = TREE|JSON`, MariaDB's
+    /// `ANALYZE FORMAT=JSON`. As a single cell the grid showed one line of it.
+    #[test]
+    fn a_server_drawn_plan_becomes_one_grid_row_per_line() {
+        let data = ExplainPlanData::Flat {
+            columns: vec!["EXPLAIN".to_string()],
+            rows: vec![vec![
+                "-> Table scan on t  (cost=0.35 rows=1)\n    -> Filter: (t.c = 1)\n".to_string(),
+            ]],
+        };
+        let (columns, rows) = plan_grid(&data);
+        assert_eq!(columns, vec!["EXPLAIN".to_string()]);
+        assert_eq!(
+            rows,
+            vec![
+                vec!["-> Table scan on t  (cost=0.35 rows=1)".to_string()],
+                vec!["    -> Filter: (t.c = 1)".to_string()],
+            ]
+        );
+    }
+
+    /// Windows line endings are the same plan, and an empty row is still a row.
+    #[test]
+    fn splitting_a_server_drawn_plan_keeps_every_line_and_loses_no_row() {
+        let data = ExplainPlanData::Flat {
+            columns: vec!["EXPLAIN".to_string()],
+            rows: vec![
+                vec!["first\r\nsecond".to_string()],
+                vec![String::new()],
+                vec!["third".to_string()],
+            ],
+        };
+        let (_, rows) = plan_grid(&data);
+        assert_eq!(
+            rows,
+            vec![
+                vec!["first".to_string()],
+                vec!["second".to_string()],
+                vec![String::new()],
+                vec!["third".to_string()],
+            ]
+        );
+    }
+
+    /// A tabular plan is untouched — which is what a classic `EXPLAIN` returns
+    /// on both products, and what the `Rows %` column is added to.
+    #[test]
+    fn a_tabular_plan_is_never_split_into_lines() {
+        // More than one column: never split, even with a newline in a value.
+        let data = ExplainPlanData::Flat {
+            columns: vec!["id".to_string(), "Extra".to_string()],
+            rows: vec![vec![
+                "1".to_string(),
+                "Using where;\nUsing index".to_string(),
+            ]],
+        };
+        let (columns, rows) = plan_grid(&data);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 1);
+
+        // One column and no newline anywhere: nothing to split.
+        let data = ExplainPlanData::Flat {
+            columns: vec!["EXPLAIN".to_string()],
+            rows: vec![vec!["single line".to_string()]],
+        };
+        let (_, rows) = plan_grid(&data);
+        assert_eq!(rows, vec![vec!["single line".to_string()]]);
     }
 
     #[test]

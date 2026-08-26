@@ -254,6 +254,133 @@ pub mod result_messages {
     pub const PLSQL_BLOCK_EXECUTED: &str = "PL/SQL block executed successfully";
     pub const STATEMENT_EXECUTED: &str = "Statement executed successfully";
     pub const QUERY_CANCELLED: &str = "Query cancelled";
+    /// Said beside an Explain Plan when the requesting tab's OWN DB session may
+    /// hold state the plan cannot see.
+    ///
+    /// The plan is built on the connection's own session, never on the tab's,
+    /// and deliberately: a plan must not queue behind the tab's own statement,
+    /// and on the MySQL family building one THERE would leave the tab looking
+    /// like it is carrying a transaction. That is measured, not assumed —
+    /// `EXPLAIN` under `autocommit = 0` opens one and
+    /// `performance_schema.events_transactions_current` reports it `ACTIVE`,
+    /// which is the app's own first and unfiltered dirty probe. The app could
+    /// not end that transaction either, because it cannot tell it apart from
+    /// one the user really had.
+    ///
+    /// The consequence is that anything living only in the TAB's session —
+    /// a temporary table, a user variable, a session setting — is invisible to
+    /// the plan. The app already tracks what that session may hold, so it says
+    /// which of those is in play rather than leaving the user to read it out of
+    /// an "object does not exist" error or, worse, out of a plan that is
+    /// quietly about different settings.
+    pub fn explain_plan_excludes_tab_session_state(items: &[&str]) -> String {
+        let named = match items {
+            [] => return String::new(),
+            [only] => (*only).to_string(),
+            [head @ .., last] => format!("{} and {last}", head.join(", ")),
+        };
+        format!(
+            "This plan was built on the connection's own DB session, so it does not see the \
+             {named} that only this tab's session has."
+        )
+    }
+
+    /// A cancelled Explain Plan (F6).
+    ///
+    /// Its own sentence rather than [`QUERY_CANCELLED`] because it names what
+    /// was cancelled, and a catalog entry rather than the driver's words
+    /// because the driver's words differ per backend: Oracle answers a break
+    /// with `ORA-01013`, the MySQL family with `Query execution was
+    /// interrupted`, and the user pressed one Cancel button.
+    pub const EXPLAIN_PLAN_CANCELLED: &str = "Explain plan cancelled";
+
+    /// An Explain Plan (F6) that was not sent because it would have RUN what it
+    /// explains.
+    ///
+    /// `EXPLAIN ANALYZE <statement>` on the MySQL family executes the statement
+    /// it explains — that is what makes its numbers measured rather than
+    /// estimated. An explain runs on the connection's OWN DB session, which no
+    /// query tab owns, so a change made there is one nothing in the transaction
+    /// model would ever commit or roll back, and no tab's READ ONLY pin governs
+    /// it either (on this family that pin is a characteristic of the TAB's
+    /// session). Oracle's `EXPLAIN PLAN` writes to `PLAN_TABLE` and is the
+    /// exception that proves the rule: the app takes that write back itself, in
+    /// the same call.
+    ///
+    /// Which statements the server will actually run this way changes with the
+    /// version — measured on MySQL 8.0.46, DML comes back
+    /// `<not executable by iterator executor>` and writes nothing; MySQL 8.3
+    /// extended the iterator executor to `INSERT`/`UPDATE`/`DELETE` — so the
+    /// refusal is about what the statement ASKS for rather than about what a
+    /// particular server would do with it. Nothing is lost on the servers that
+    /// refuse it themselves: their answer is an error either way.
+    ///
+    /// `spelling` is how THIS product writes that statement, and it is taken
+    /// rather than assumed: MySQL writes `EXPLAIN ANALYZE <statement>` and
+    /// MariaDB — which rejects that spelling outright — writes
+    /// `ANALYZE <statement>`. A hardcoded `EXPLAIN ANALYZE` told a MariaDB user
+    /// their statement had been refused for being a form of explain their
+    /// server does not have and they had not typed. It comes from the same
+    /// answer that decided this IS an executing explain
+    /// ([`crate::db::sql_classification::ExecutingExplainWrite`]), so the two
+    /// halves of the sentence cannot come to be about different products.
+    ///
+    /// `reason` is the shared read-only wording for the statement that would
+    /// run ("an UPDATE statement"), so the two refusals name a statement the
+    /// same way.
+    pub fn explain_plan_would_run_the_statement(spelling: &str, reason: &str) -> String {
+        format!(
+            "Explain plan was not run: {spelling} executes the statement it explains, and \
+             that is {reason}. It would run on the connection's own DB session, which no tab \
+             owns and nothing could commit or roll back. Run it from the editor instead."
+        )
+    }
+
+    /// An Explain Plan (F6) for a statement this product's explain has no plan
+    /// to give.
+    ///
+    /// ONE sentence for two answers that used to be four server errors and an
+    /// app message. F6 always had this shape for text that holds no statement
+    /// at all ([`explain_plan_needs_a_statement`], a tool command the app runs
+    /// itself); what it did not have was the same answer for a real statement
+    /// that simply has no execution plan — a PL/SQL block, a routine call,
+    /// transaction or session control, table maintenance. Those were wrapped
+    /// into an explain and SENT, so each backend answered with its own raw
+    /// complaint and one of them answered about a different statement
+    /// altogether (`ANALYZE TABLE t` became `EXPLAIN ANALYZE TABLE t`, which
+    /// MySQL reads as an executing explain of the `TABLE t` query).
+    pub fn no_execution_plan_for(subject: &str) -> String {
+        format!("There is no execution plan for {subject}.")
+    }
+
+    /// F6's answer for text that holds no SQL statement at all — only commands
+    /// this app carries out itself (`DESC`, `EXEC`, `CONNECT`, `@script`,
+    /// `SET SERVEROUTPUT ON`, …). No server is ever asked to run them, so there
+    /// is no plan for one, and the app must not invent a statement to ask
+    /// about.
+    pub fn explain_plan_needs_a_statement() -> String {
+        no_execution_plan_for("a command this app runs itself")
+    }
+
+    /// An Explain Plan (F6) refused because building the plan would WRITE, and
+    /// writes are refused here.
+    ///
+    /// The refusal itself is the shared read-only wording every other write
+    /// path uses, and it is kept verbatim so one rule reads as one rule. What
+    /// it cannot say on its own is why an execution plan is a write at all:
+    /// the user asked about a `SELECT` and read "Oracle read-only mode blocks
+    /// non-query statements", which describes a statement they did not type.
+    ///
+    /// `plan_is_a_write` is the backend's own sentence for that
+    /// (`ExplainPlanBackend::why_building_the_plan_is_itself_a_write`), and it
+    /// is `None` wherever an explain really does only report — so the extra
+    /// sentence appears exactly where it is true instead of on every family.
+    pub fn explain_plan_write_refused(refusal: &str, plan_is_a_write: Option<&str>) -> String {
+        match plan_is_a_write {
+            Some(note) => format!("Explain plan was not run: {refusal} {note}"),
+            None => format!("Explain plan was not run: {refusal}"),
+        }
+    }
     /// An execution the app had ACCEPTED but had not started yet — it was
     /// waiting for a previous lazy fetch to be cancelled — was given up
     /// because the user cancelled or closed the tab.

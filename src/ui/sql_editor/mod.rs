@@ -2504,7 +2504,7 @@ pub(crate) enum QuickDescribeData {
 enum UiActionResult {
     ExplainPlan {
         token: QueryOperationToken,
-        result: Result<ExplainPlanData, String>,
+        result: Result<ExplainPlanData, ExplainPlanError>,
     },
     QuickDescribe {
         object_name: String,
@@ -2528,6 +2528,12 @@ enum UiActionResult {
     },
     QueryAlreadyRunning,
     ConnectionBusy,
+    /// This tab is bound to no connection at all.
+    ///
+    /// Distinct from the two above, which both say the connection is in use.
+    /// F6 used to report this one as `ConnectionBusy`, so a tab that had never
+    /// been connected was told to wait for something that did not exist.
+    NotConnected,
 }
 
 #[derive(Clone, Copy)]
@@ -2622,27 +2628,188 @@ impl Drop for MySqlQueryCancelContext {
     }
 }
 
-trait ExplainPlanBackend: Sync {
-    /// The statement this backend will actually send to build the plan.
-    ///
-    /// The tab's transaction-mode gate has to be asked about THIS, not about
-    /// the SQL the user typed: Oracle's `EXPLAIN PLAN FOR ...` inserts into
-    /// `PLAN_TABLE`, so a read-only tab must be refused even though the
-    /// statement being explained is a plain `SELECT`.
-    fn explain_statement(&self, sql: &str) -> String;
+/// One explain, prepared: the statement that will go on the wire and whatever
+/// else identifies its result.
+///
+/// Built ONCE, by the backend, and handed to both the read-only gates and the
+/// run — so the statement judged is the statement sent. Oracle's variant also
+/// carries the `STATEMENT_ID` its `PLAN_TABLE` rows will be found by, because
+/// the write and its read-back are one fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExplainStatement {
+    /// Oracle: `EXPLAIN PLAN … FOR <sql>` writes the plan, a `PLAN_TABLE` read
+    /// fetches it back, and a `ROLLBACK` takes the write away again.
+    OraclePlanTable(crate::db::query::OracleExplainStatement),
+    /// MySQL/MariaDB: `EXPLAIN <sql>` returns the plan as its own result set.
+    ServerExplain(crate::db::query::mysql_executor::MysqlExplainStatement),
+}
 
-    /// `scope` is the schema/database the requesting query tab has selected;
-    /// the plan must be built where the tab's own statements would run.
+impl ExplainStatement {
+    /// The text every gate is asked about and the wire receives.
+    pub(crate) fn sql(&self) -> &str {
+        match self {
+            Self::OraclePlanTable(plan) => plan.sql(),
+            Self::ServerExplain(plan) => plan.sql(),
+        }
+    }
+
+    /// The statement the APP decided to explain, or `None` when the user's own
+    /// explain was passed straight through.
     ///
-    /// The cancel slots travel as ONE value: an explain runs on the
-    /// connection's OWN session on every backend, and
-    /// [`SqlEditorWidget::publish_main_session_cancel_target`] is the only way
-    /// to publish one — which is what binds the withdrawal to the connection
-    /// lock instead of to what the caller does after it.
+    /// Both arms carry it beside the wire text rather than letting a gate
+    /// re-derive it, so "what will be explained" cannot come to disagree with
+    /// "what will be sent". Oracle always answers `Some`: it builds its own
+    /// `EXPLAIN PLAN` even around one the user typed, because the read-back
+    /// needs the `STATEMENT_ID` that write stamps.
+    ///
+    /// This is what [`crate::db::sql_classification::statement_without_an_execution_plan_reason`]
+    /// is asked about. Asking about [`Self::sql`] instead would answer for the
+    /// wrapper the app just built — always an explain, always "plan-only" —
+    /// which is the same shape of mistake as asking the read-only gates about
+    /// the `SELECT` rather than about the `EXPLAIN PLAN … FOR` that writes.
+    pub(crate) fn statement_the_app_chose_to_explain(&self) -> Option<&str> {
+        match self {
+            Self::OraclePlanTable(plan) => Some(plan.target()),
+            Self::ServerExplain(plan) => plan.app_chosen_target(),
+        }
+    }
+}
+
+/// Why F6 produced no plan — and the two are not the same kind of thing.
+///
+/// They used to be one `String`, so the pane prefixed every one of them with
+/// "Explain plan failed: ". A refusal is a decision the app made and its
+/// sentence already says what was not done and why, which read as
+/// `Explain plan failed: Explain plan was not run: …` — the app announcing a
+/// failure of its own rule. Nothing could tell the two apart, because nothing
+/// carried the difference.
+#[derive(Clone, Debug)]
+pub(crate) enum ExplainPlanError {
+    /// The app decided not to send the statement. The sentence stands alone.
+    Refused(String),
+    /// Reaching the plan went wrong — a driver error, a connection that
+    /// changed under the work, a panic. The sentence is EVIDENCE, so the pane
+    /// says what it is evidence of, and this is the only arm a cancel can hide
+    /// in: a refusal never travelled to a server to be cancelled.
+    Failed(String),
+}
+
+trait ExplainPlanBackend: Sync {
+    /// Prepare the statement this backend will actually send to build the plan.
+    ///
+    /// The read-only gates have to be asked about THIS, not about the SQL the
+    /// user typed: Oracle's `EXPLAIN PLAN … FOR ...` inserts into `PLAN_TABLE`,
+    /// so a read-only tab — or a read-only connection — must be refused even
+    /// though the statement being explained is a plain `SELECT`.
+    ///
+    /// `db_type` is taken for the same reason [`Self::refusal_before_sending`]
+    /// takes it: ONE backend object serves MySQL and MariaDB, and the two
+    /// spell their executing explain differently
+    /// (`EXPLAIN ANALYZE <statement>` against `ANALYZE <statement>`). A builder
+    /// that could not tell them apart wrapped MariaDB's own explain into a
+    /// statement MariaDB rejects, while the gate below — which does know —
+    /// judged the result. Same value, both halves.
+    fn statement(&self, db_type: crate::db::DatabaseType, sql: &str) -> ExplainStatement;
+
+    /// Whether the placeholder prompt has anything to contribute here.
+    ///
+    /// The MySQL family says yes: `bind_prompt::prepare` substitutes the
+    /// answers INTO the statement text, and `EXPLAIN SELECT … ?` is a syntax
+    /// error without them — the prompt is what makes the statement valid at
+    /// all. F6 never asked, so a statement `Ctrl+Enter` runs after one prompt
+    /// could not be explained.
+    ///
+    /// Oracle says no, and a live probe says why
+    /// (`oracle_explain_plan_reports_no_binds_for_the_statement_it_explains`):
+    /// `EXPLAIN PLAN` only PARSES the statement it explains and never runs it,
+    /// so its placeholders never need values. The server reports no binds for
+    /// them — there is nothing to bind them to — and runs the statement
+    /// unbound. Prompting there would collect answers with nowhere to go.
+    fn prompts_for_placeholder_values(&self) -> bool;
+
+    /// Why this prepared statement must not be SENT at all — a refusal that
+    /// owes nothing to read-only and holds on a connection nobody marked and a
+    /// tab nobody pinned.
+    ///
+    /// TWO halves, and this body is deliberately the only place the first one
+    /// is asked. A `fn` with a body cannot be forgotten by a backend the way a
+    /// required method can be answered wrongly, and the shared half is a
+    /// question about the STATEMENT rather than about any product:
+    ///
+    /// * **has this statement an execution plan at all?** F6 wraps whatever it
+    ///   is given, so a PL/SQL block, a routine call, transaction or session
+    ///   control, and this family's `ANALYZE … TABLE` maintenance statement
+    ///   were all wrapped and SENT — four backends answering one keystroke with
+    ///   four different complaints, and MySQL answering it with a real plan for
+    ///   a DIFFERENT statement (`ANALYZE TABLE t` became `EXPLAIN ANALYZE TABLE
+    ///   t`, which that server reads as an executing explain of `TABLE t`).
+    ///   Asked of [`ExplainStatement::statement_the_app_chose_to_explain`], so
+    ///   an explain the user typed themselves is still passed straight through;
+    /// * **what does THIS backend's own explain do?** —
+    ///   [`Self::refusal_from_what_this_explain_does`], below.
+    ///
+    /// The second half is why the first cannot simply be a read-only question.
+    /// An explain runs on the connection's OWN DB session, which no query tab
+    /// owns. Building a plan there is safe; CHANGING something there is not,
+    /// because nothing in the transaction model would ever commit or roll it
+    /// back, and neither read-only gate can be relied on to catch it — the
+    /// connection's flag is only set if the user set it, and the MySQL family's
+    /// READ ONLY pin is a characteristic of the TAB's session, which this
+    /// statement will not run on.
+    fn refusal_before_sending(
+        &self,
+        db_type: crate::db::DatabaseType,
+        statement: &ExplainStatement,
+    ) -> Option<String> {
+        if let Some(target) = statement.statement_the_app_chose_to_explain() {
+            if let Some(subject) =
+                crate::db::sql_classification::statement_without_an_execution_plan_reason(
+                    db_type, target,
+                )
+            {
+                return Some(crate::db::query::result_messages::no_execution_plan_for(
+                    subject,
+                ));
+            }
+        }
+        self.refusal_from_what_this_explain_does(db_type, statement)
+    }
+
+    /// The half of [`Self::refusal_before_sending`] that is this backend's own,
+    /// answered from what its explain DOES.
+    ///
+    /// Oracle writes to `PLAN_TABLE` and takes that write back in the same
+    /// call, so it refuses nothing here; the MySQL family's executing explain
+    /// runs what it explains, so it refuses anything that is not provably a
+    /// read.
+    fn refusal_from_what_this_explain_does(
+        &self,
+        db_type: crate::db::DatabaseType,
+        statement: &ExplainStatement,
+    ) -> Option<String>;
+
+    /// Why building a plan on this backend is ITSELF a write, if it is.
+    ///
+    /// One fact, said once, where three doc comments used to state it in prose
+    /// and no code could ask it. Oracle's `EXPLAIN PLAN … FOR` is an INSERT
+    /// into `PLAN_TABLE`; the MySQL family's `EXPLAIN` only reports.
+    ///
+    /// It is what lets a read-only refusal say why an execution plan was
+    /// refused for a `SELECT`. Without it the user read "Oracle read-only mode
+    /// blocks non-query statements" about a query they had just typed, and the
+    /// same keystroke simply worked on the other family with nothing saying
+    /// which fact differed.
+    fn why_building_the_plan_is_itself_a_write(&self) -> Option<&'static str>;
+
+    /// Build the plan on the connection's OWN session, which is already
+    /// scoped, published for cancel, and under the tab's query timeout by the
+    /// time this runs — see [`SqlEditorWidget::run_oracle_main_session_action`]
+    /// and [`SqlEditorWidget::run_mysql_action_with_timeout`], which is where
+    /// that ceremony lives so no backend can be missing a piece of it.
     fn get_explain_plan(
         &self,
+        statement: &ExplainStatement,
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
-        sql: &str,
         scope: Option<&str>,
         query_timeout: Option<Duration>,
         cancel_slots: &MainSessionCancelSlots,
@@ -3664,105 +3831,149 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
 }
 
 impl ExplainPlanBackend for OracleExplainPlanBackend {
-    fn explain_statement(&self, sql: &str) -> String {
-        QueryExecutor::oracle_explain_plan_sql(sql)
+    fn statement(&self, _db_type: crate::db::DatabaseType, sql: &str) -> ExplainStatement {
+        ExplainStatement::OraclePlanTable(crate::db::query::OracleExplainStatement::new(sql))
+    }
+
+    fn prompts_for_placeholder_values(&self) -> bool {
+        false
+    }
+
+    /// Nothing. `EXPLAIN PLAN` only PARSES the statement it explains — the same
+    /// fact the placeholder answer above rests on — so the only thing it
+    /// changes is the `PLAN_TABLE` row this call writes, reads back and rolls
+    /// back itself (`QueryExecutor::end_oracle_explain_plan_transaction`).
+    fn refusal_from_what_this_explain_does(
+        &self,
+        _db_type: crate::db::DatabaseType,
+        _statement: &ExplainStatement,
+    ) -> Option<String> {
+        None
+    }
+
+    /// It writes, and this is the one backend that does. The write is taken
+    /// back in the same call, which is why it is not a refusal of its own — but
+    /// it is still a write, so both read-only owners refuse it, and this is
+    /// what lets that refusal say so.
+    fn why_building_the_plan_is_itself_a_write(&self) -> Option<&'static str> {
+        Some(
+            "On Oracle the plan itself is a write: EXPLAIN PLAN inserts it into PLAN_TABLE, \
+             so no execution plan can be built while writes are refused.",
+        )
     }
 
     fn get_explain_plan(
         &self,
+        statement: &ExplainStatement,
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
-        sql: &str,
         scope: Option<&str>,
         query_timeout: Option<Duration>,
         cancel_slots: &MainSessionCancelSlots,
         cancel_flag: &Arc<Mutex<bool>>,
     ) -> Result<ExplainPlanData, String> {
-        // The same rule session acquisition uses: the tab's scope, else this
-        // connection's own schema. It resolves to a concrete name so an
-        // Explain never inherits — or leaves behind — the schema another tab
-        // put this shared session in.
-        let plan_schema = conn_guard.oracle_session_schema_for_scope(scope);
-        match conn_guard.require_live_db_connection() {
-            Ok(DbConnection::Oracle(db_conn)) => {
-                // The whole explain runs on the connection's OWN session, so
-                // that is what the cancel speaks for. Saying so is what keeps
-                // the force tier from destroying the connection every other
-                // tab is working on -- and going through the one door is what
-                // ends the target when this lock ends, rather than after it.
-                SqlEditorWidget::publish_main_session_cancel_target(
-                    conn_guard,
-                    cancel_slots.clone(),
-                    MainSessionCancelTarget::Oracle(Arc::clone(&db_conn)),
-                );
-                if load_mutex_bool(cancel_flag) {
-                    let _ = db_conn.break_execution();
-                }
-                // Explain has no messages pane of its own: a plan built in the
-                // login schema because the tab's is gone would name the wrong
-                // objects with no way to say so.
-                crate::db::DatabaseConnection::apply_tracked_oracle_current_schema_on_session(
-                    db_conn.as_ref(),
-                    plan_schema.as_deref(),
-                )?
-                .require_applied(crate::db::DatabaseType::Oracle)?;
-                SqlEditorWidget::run_oracle_action_with_timeout(
-                    db_conn,
-                    query_timeout,
-                    "Generating explain plan",
-                    |db_conn| {
-                        QueryExecutor::get_explain_plan(db_conn.as_ref(), sql)
-                            .map_err(|err| err.to_string())
-                    },
-                )
-                .map(|rows| ExplainPlanData::Tree(explain_plan::oracle_plan_nodes(&rows)))
-            }
-            Ok(DbConnection::OracleThin(db_conn)) => {
-                let mut session = db_conn
-                    .lock()
-                    .map_err(|_| "Oracle Thin connection lock was poisoned".to_string())?;
-                // Same answer as the OCI branch above.
-                crate::db::DatabaseConnection::apply_tracked_oracle_thin_current_schema(
-                    &mut session,
-                    plan_schema.as_deref(),
-                )?
-                .require_applied(crate::db::DatabaseType::Oracle)?;
-                session.reset_pending_cancel();
-                let cancel_handle = session.cancel_handle();
-                // The MAIN session, like the OCI branch above, through the
-                // same door and with the same lock taking it back.
-                SqlEditorWidget::publish_main_session_cancel_target(
-                    conn_guard,
-                    cancel_slots.clone(),
-                    MainSessionCancelTarget::OracleThin(cancel_handle.clone()),
-                );
-                if load_mutex_bool(cancel_flag) {
-                    let _ = cancel_handle.break_execution();
-                }
-                QueryExecutor::get_thin_explain_plan(&mut session, sql)
-                    .map(|rows| ExplainPlanData::Tree(explain_plan::oracle_plan_nodes(&rows)))
-            }
-            Ok(DbConnection::MySQL { .. }) => {
-                Err("Expected Oracle connection but found MySQL-family connection".to_string())
-            }
-            Err(message) => Err(message),
-        }
+        let ExplainStatement::OraclePlanTable(plan) = statement else {
+            return Err(
+                "Oracle explain was prepared for another backend's EXPLAIN statement".to_string(),
+            );
+        };
+        SqlEditorWidget::run_oracle_main_session_action(
+            conn_guard,
+            scope,
+            cancel_slots,
+            cancel_flag,
+            query_timeout,
+            "Generating explain plan",
+            // The rollback that takes the `PLAN_TABLE` write back is the NEXT
+            // call this session makes after the explain, which is exactly where
+            // a cancel of ours lands when the user pressed Cancel late. Each
+            // driver names its own residue, and BOTH name it unconditionally.
+            //
+            // Unconditionally, because "did the app send a cancel?" has two
+            // answers here and only one of them is the tab's flag: the tab's
+            // Cancel button sets it (`request_cancel_if_snapshot_matches`), and
+            // the activity view's does NOT — that road goes to the registry
+            // (`cancel_db_activity`), which reaches this session through the
+            // canceler the connection LOCK published. Asking the flag therefore
+            // left the rollback unprotected on exactly one of the two roads a
+            // user can cancel from, which is no protection at all.
+            //
+            // Nothing is risked by assuming it: the door only re-asks when the
+            // first answer really was a cancel of ours, and a second ROLLBACK
+            // takes nothing back. This work must happen whoever cancelled —
+            // that is the whole point of it.
+            |db_conn| {
+                QueryExecutor::get_explain_plan(db_conn.as_ref(), plan, || {
+                    crate::db::SessionCancelResidue::ORACLE_OCI
+                })
+                .map_err(|err| err.to_string())
+            },
+            |session| {
+                QueryExecutor::get_thin_explain_plan(session, plan, || {
+                    crate::db::SessionCancelResidue::ORACLE_THIN
+                })
+            },
+        )
+        .map(|rows| ExplainPlanData::Tree(explain_plan::oracle_plan_nodes(&rows)))
     }
 }
 
 impl ExplainPlanBackend for MysqlExplainPlanBackend {
-    fn explain_statement(&self, sql: &str) -> String {
-        crate::db::query::mysql_executor::MysqlExecutor::explain_plan_sql(sql)
+    fn statement(&self, db_type: crate::db::DatabaseType, sql: &str) -> ExplainStatement {
+        ExplainStatement::ServerExplain(
+            crate::db::query::mysql_executor::MysqlExecutor::explain_plan_statement(db_type, sql),
+        )
+    }
+
+    fn prompts_for_placeholder_values(&self) -> bool {
+        true
+    }
+
+    /// The executing explain RUNS what it explains, so this backend refuses
+    /// anything that is not provably a read — the same rule, from the same
+    /// place, the connection's read-only guard uses.
+    ///
+    /// The refusal names the statement in THIS product's spelling, carried out
+    /// of the same answer that decided it is an executing explain: MySQL writes
+    /// `EXPLAIN ANALYZE <statement>`, MariaDB writes `ANALYZE <statement>` and
+    /// rejects the other spelling outright.
+    fn refusal_from_what_this_explain_does(
+        &self,
+        db_type: crate::db::DatabaseType,
+        statement: &ExplainStatement,
+    ) -> Option<String> {
+        let write = crate::db::sql_classification::mysql_explain_executes_a_write(
+            db_type,
+            statement.sql(),
+        )?;
+        Some(
+            crate::db::query::result_messages::explain_plan_would_run_the_statement(
+                write.spelling,
+                &write.reason,
+            ),
+        )
+    }
+
+    /// Nothing: this family's `EXPLAIN` only reports. The executing explain
+    /// changes data, but that is a property of the statement it RUNS and is
+    /// refused above rather than being a write this backend performs to build
+    /// a plan.
+    fn why_building_the_plan_is_itself_a_write(&self) -> Option<&'static str> {
+        None
     }
 
     fn get_explain_plan(
         &self,
+        statement: &ExplainStatement,
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
-        sql: &str,
         scope: Option<&str>,
         query_timeout: Option<Duration>,
         cancel_slots: &MainSessionCancelSlots,
         cancel_flag: &Arc<Mutex<bool>>,
     ) -> Result<ExplainPlanData, String> {
+        // The prompt's answers are substituted into the text on this family
+        // (`bind_prompt::prepare`), so the statement below is already whole and
+        // there is nothing left to bind.
+        let explain_sql = statement.sql();
         SqlEditorWidget::run_mysql_action_with_timeout(
             conn_guard,
             scope,
@@ -3771,7 +3982,10 @@ impl ExplainPlanBackend for MysqlExplainPlanBackend {
             query_timeout,
             "Generating explain plan",
             |mysql_conn| {
-                crate::db::query::mysql_executor::MysqlExecutor::get_explain_plan(mysql_conn, sql)
+                crate::db::query::mysql_executor::MysqlExecutor::get_explain_plan(
+                    mysql_conn,
+                    explain_sql,
+                )
             },
         )
         .map(|result| ExplainPlanData::Flat {
@@ -5267,15 +5481,29 @@ impl SqlEditorWidget {
         }
     }
 
-    fn statement_at_cursor_text(&self) -> Option<String> {
+    /// `db_type` and `mysql_delimiter` are the CALLER's, read once for the
+    /// whole action rather than here.
+    ///
+    /// They used to be read here, from the caches, while the action that
+    /// judges the result read them from somewhere else — F6 takes its dialect
+    /// from the bound connection's own profile, and `current_db_type()` answers
+    /// from a cache whenever the connection mutex is busy. One action would
+    /// then FIND its statement under one dialect and JUDGE it under another,
+    /// which is the defect this pair of parameters removes rather than
+    /// documents.
+    fn statement_at_cursor_text(
+        &self,
+        db_type: DatabaseType,
+        mysql_delimiter: Option<&str>,
+    ) -> Option<String> {
         let sql = self.buffer.text();
         let (_, cursor_pos) = Self::editor_cursor_position(&self.editor, &self.buffer);
         // 실행/인텔리센스/포맷 공통 규칙으로 문장 경계를 계산합니다.
         query_text::statement_at_cursor_for_db_type_with_mysql_delimiter(
             &sql,
             cursor_pos,
-            Some(self.current_db_type()),
-            self.current_mysql_delimiter().as_deref(),
+            Some(db_type),
+            mysql_delimiter,
         )
     }
 
@@ -5317,12 +5545,16 @@ impl SqlEditorWidget {
             )
     }
 
-    fn normalize_statement_for_single_execution(&self, statement: &str) -> String {
-        query_text::normalize_single_statement(
-            statement,
-            Some(self.current_db_type()),
-            self.current_mysql_delimiter().as_deref(),
-        )
+    /// The same pair, and for the same reason, as
+    /// [`Self::statement_at_cursor_text`]: the reading that FOUND this
+    /// statement and the reading that narrows it must be one reading.
+    fn normalize_statement_for_single_execution(
+        &self,
+        db_type: DatabaseType,
+        mysql_delimiter: Option<&str>,
+        statement: &str,
+    ) -> String {
+        query_text::normalize_single_statement(statement, Some(db_type), mysql_delimiter)
     }
 
     fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
@@ -7417,24 +7649,106 @@ impl SqlEditorWidget {
                                 Ok(plan) => {
                                     let plan_result =
                                         SqlEditorWidget::build_explain_plan_result(&plan);
+                                    // The result's own sentence, so a plan that
+                                    // came back with no steps does not report
+                                    // itself as one that loaded.
+                                    let status = plan_result.message.clone();
+                                    // A plan that is about a session other than
+                                    // this tab's says so — beside the plan
+                                    // rather than instead of it, because the
+                                    // plan is still the answer to most of the
+                                    // question.
+                                    //
+                                    // BEFORE the plan, and that ordering is the
+                                    // whole of it: an Info message selects the
+                                    // Messages pane when the operation has no
+                                    // result tab of its own to keep the view on
+                                    // (`should_select_support_result_pane`), and
+                                    // F6 has none until the line below opens it.
+                                    // Sent after, the note took the user off the
+                                    // plan they had just asked for. The plan tab
+                                    // selects the Data Grid unconditionally, so
+                                    // sending it first ends on the plan whatever
+                                    // the pane rule decides.
+                                    if let Some(note) = widget.explain_plan_session_note() {
+                                        let _ = widget.progress_sender.for_operation(token).send(
+                                            QueryProgress::Message {
+                                                kind: ResultMessageKind::Info,
+                                                lines: vec![note],
+                                            },
+                                        );
+                                    }
                                     let _ = widget.progress_sender.for_operation(token).send(
                                         QueryProgress::ExplainPlanOutput {
                                             result: plan_result,
                                         },
                                     );
                                     if widget.operation_token_is_current_or_completed(token) {
-                                        widget.emit_status("Explain plan loaded");
+                                        widget.emit_status(&status);
                                     }
                                 }
                                 Err(err) => {
+                                    // A cancel is not a failure, and it is the
+                                    // app's own word on every backend: without
+                                    // this the user who pressed Cancel read
+                                    // `ORA-01013` on Oracle and `Query
+                                    // execution was interrupted` on the MySQL
+                                    // family, from a pane labelled Errors.
+                                    //
+                                    // Asked of a FAILURE only. A refusal is a
+                                    // decision this app made and never reached
+                                    // a server to be cancelled, and its
+                                    // sentence stands alone — prefixing it
+                                    // announced "Explain plan failed: Explain
+                                    // plan was not run: …", the app reporting
+                                    // a failure of its own rule.
+                                    let (cancelled, message) = match &err {
+                                        ExplainPlanError::Refused(refusal) => {
+                                            (false, refusal.clone())
+                                        }
+                                        ExplainPlanError::Failed(evidence) => {
+                                            if crate::db::session_policy::message_indicates_query_cancel(evidence) {
+                                                (
+                                                    true,
+                                                    crate::db::query::result_messages::EXPLAIN_PLAN_CANCELLED
+                                                        .to_string(),
+                                                )
+                                            } else {
+                                                (false, format!("Explain plan failed: {evidence}"))
+                                            }
+                                        }
+                                    };
+                                    // A failure the tab's own session explains —
+                                    // an object that only IT has — is the case
+                                    // the note exists for, so it goes with the
+                                    // error rather than into a pane the user is
+                                    // not looking at.
+                                    //
+                                    // A FAILURE only, and that is the whole of
+                                    // the condition. The note opens "This plan
+                                    // was built on the connection's own DB
+                                    // session", which is a fact about a plan
+                                    // that was attempted: beside a REFUSAL
+                                    // nothing was built and the sentence is
+                                    // simply untrue, and beside a CANCEL
+                                    // nothing about what the tab's session
+                                    // holds explains a plan the user stopped —
+                                    // a line about invisible temporary tables
+                                    // there reads as a reason it was stopped.
+                                    let explains_a_failure =
+                                        matches!(err, ExplainPlanError::Failed(_)) && !cancelled;
+                                    let mut lines = vec![message.clone()];
+                                    if explains_a_failure {
+                                        lines.extend(widget.explain_plan_session_note());
+                                    }
                                     let _ = widget.progress_sender.for_operation(token).send(
                                         QueryProgress::Message {
                                             kind: ResultMessageKind::Error,
-                                            lines: vec![format!("Explain plan failed: {}", err)],
+                                            lines,
                                         },
                                     );
                                     if widget.operation_token_is_current_or_completed(token) {
-                                        widget.emit_status("Explain plan failed");
+                                        widget.emit_status(&message);
                                     }
                                 }
                             },
@@ -7576,6 +7890,12 @@ impl SqlEditorWidget {
                                 widget.emit_status(&busy_message);
                                 SqlEditorWidget::show_alert_dialog(&busy_message);
                             }
+                            UiActionResult::NotConnected => {
+                                widget.emit_status(crate::db::NOT_CONNECTED_MESSAGE);
+                                SqlEditorWidget::show_alert_dialog(
+                                    crate::db::NOT_CONNECTED_MESSAGE,
+                                );
+                            }
                         }
                         if should_reset_cursor {
                             set_cursor(Cursor::Default);
@@ -7602,11 +7922,292 @@ impl SqlEditorWidget {
         schedule_poll(receiver, widget);
     }
 
+    /// What this tab's own DB session may hold that the plan cannot see, if
+    /// anything.
+    ///
+    /// Asked of the state the app already tracks for that session
+    /// (`SessionResidueState`), so the sentence names what is actually in play
+    /// on THIS tab instead of being a disclaimer on every plan. `None` — the
+    /// ordinary case — says nothing at all.
+    ///
+    /// See [`result_messages::explain_plan_excludes_tab_session_state`] for why
+    /// the plan is built elsewhere and why it cannot simply be moved.
+    fn explain_plan_session_note(&self) -> Option<String> {
+        let residue = self
+            .pooled_session_activity_snapshot()?
+            .retained_state()
+            .session_residue_state();
+        let mut items = Vec::new();
+        if residue.may_have_temporary_table() {
+            items.push("temporary tables");
+        }
+        if residue.may_have_user_variable() {
+            items.push("user variables");
+        }
+        if residue.may_have_session_setting() {
+            items.push("session settings");
+        }
+        // Named where the app knows the name, generic where it only knows there
+        // IS something. The three above are the MySQL family's — Oracle's
+        // residue model does not name them, and a note that could only fire on
+        // one family would be the asymmetry this feature exists to remove.
+        // Oracle's `may_have_unknown_session_state` is exactly the right
+        // signal and no wider: `oracle_session_residue_effects` sets it for a
+        // PL/SQL block, `CALL`/`EXEC`, `SET ROLE` and an `ALTER SESSION SET`
+        // the pool setup does not restate — every one of which leaves the
+        // tab's session holding something the plan's session does not — and for
+        // nothing routine.
+        if residue.may_have_unknown_session_state() {
+            items.push("session state");
+        }
+        if items.is_empty() {
+            return None;
+        }
+        Some(crate::db::query::result_messages::explain_plan_excludes_tab_session_state(&items))
+    }
+
+    /// The single statement F6 explains: the same text `Ctrl+Enter` would send.
+    ///
+    /// It used to be the statement at the cursor and nothing else, so a user who
+    /// selected one query and pressed F6 got the plan of a DIFFERENT statement —
+    /// the one the caret happened to sit in. Execution has always preferred the
+    /// selection, and a plan that is not about what will run is worse than no
+    /// plan.
+    ///
+    /// A selection holding more than one statement is refused rather than
+    /// narrowed to its first: execution would run all of them, and quietly
+    /// explaining one of them is a guess about which one was meant.
+    ///
+    /// `db_type` is the CALLER's, and the caller has it from the bound
+    /// connection's own profile. Asking `current_db_type()` here made F6 read
+    /// the dialect twice from two sources — and the cached one answers from a
+    /// cache whenever the connection mutex is busy, which is exactly when a
+    /// tab-initiated lookup is most likely to start, so the splitter could be
+    /// working in one dialect while everything after it worked in another.
+    /// BOTH roads are read by the same splitter, and that is the point. Only
+    /// the selection road used to be: the caret road handed its text on
+    /// unexamined, so a line the app runs ITSELF — `DESC t`, `EXEC p`,
+    /// `CONNECT user/pass@db`, `@script.sql` — was wrapped into an explain and
+    /// SENT, while the identical text SELECTED was refused and `Ctrl+Enter`
+    /// answered it from the app's own catalog. Three answers for one text, and
+    /// the app's read-only guard could not see the last of them: it knows a
+    /// `CONNECT` tool command by name, but by the time F6 asks, the command is
+    /// inside `EXPLAIN PLAN … FOR …`, which the splitter reads as one
+    /// statement.
+    fn statement_to_explain(&self, db_type: DatabaseType) -> Result<String, String> {
+        // ONE reading of the dialect and of the tab's delimiter for the whole
+        // action, handed to the source decision and used again to judge what it
+        // returns. They used to be read inside that decision, from the CACHES,
+        // while `db_type` above came from the bound connection's own profile —
+        // so F6 could find its statement under one dialect and judge it under
+        // another. `mysql_delimiter_for_db_type` is asked under the same
+        // `db_type` for the same reason: whether a custom delimiter can exist
+        // at all is a property of the product.
+        let session_mysql_delimiter = self.mysql_delimiter_for_db_type(db_type);
+        match self
+            .statement_source_for_single_action(db_type, session_mysql_delimiter.as_deref())
+            .ok_or("No SQL at cursor")?
+        {
+            // The delimiter this text was FOUND with
+            // (`statement_at_cursor_text`), so the reading that produced it and
+            // the reading that judges it are the same one.
+            execution::EditorStatementSource::AtCursor(sql) => Self::single_statement_to_explain(
+                &sql,
+                db_type,
+                session_mysql_delimiter.as_deref(),
+                "No SQL at cursor",
+            ),
+            execution::EditorStatementSource::Selection {
+                text,
+                mysql_delimiter,
+            } => Self::single_statement_to_explain(
+                &text,
+                db_type,
+                mysql_delimiter.as_deref(),
+                "No SQL selected",
+            ),
+        }
+    }
+
+    /// The one statement this text holds, or why F6 cannot explain it.
+    ///
+    /// Split with the executor's own splitter and the delimiter in force where
+    /// the text begins, so this is the same reading execution would make of the
+    /// same text.
+    ///
+    /// Three refusals, and each says a different thing:
+    ///
+    /// * nothing at all — the caller's word for it, because "at the caret" and
+    ///   "selected" are different absences;
+    /// * no STATEMENT among what is there. Every item is a command this app
+    ///   runs itself, so there is nothing a server would ever be asked to plan.
+    ///   `Ctrl+Enter` does not send it either — that is the whole contract this
+    ///   function serves — and F6 sending it anyway is how a `CONNECT` line's
+    ///   password came to travel to the server inside an `EXPLAIN`;
+    /// * a statement AND something else, or more than one statement. Refused
+    ///   rather than narrowed: execution would run all of them, and quietly
+    ///   explaining one is a guess about which was meant. Reachable only from
+    ///   the selection road — the caret road's text has already been narrowed
+    ///   to the one statement execution would send
+    ///   (`normalize_statement_for_single_execution`), which is exactly what
+    ///   that narrowing cannot do when there is no statement to narrow TO.
+    fn single_statement_to_explain(
+        text: &str,
+        db_type: DatabaseType,
+        mysql_delimiter: Option<&str>,
+        nothing_at_all: &'static str,
+    ) -> Result<String, String> {
+        let items = query_text::split_script_items_for_db_type_with_mysql_delimiter(
+            text,
+            Some(db_type),
+            mysql_delimiter,
+        );
+        match items.as_slice() {
+            [ScriptItem::Statement(statement)] => {
+                Ok(Self::statement_with_its_leading_comments(text, statement))
+            }
+            [] => Err(nothing_at_all.to_string()),
+            items
+                if !items
+                    .iter()
+                    .any(|item| matches!(item, ScriptItem::Statement(_))) =>
+            {
+                Err(crate::db::query::result_messages::explain_plan_needs_a_statement())
+            }
+            _ => Err("Select a single statement to explain.".to_string()),
+        }
+    }
+
+    /// The splitter says WHICH statement this is and where it ends; the user's
+    /// own text says what the statement IS. This puts the two back together.
+    ///
+    /// It exists so that routing the CARET road through the splitter changes
+    /// nothing about what F6 sends. The splitter strips a statement's leading
+    /// comments before handing it on (`QueryExecutor::strip_comments`, inside
+    /// `add_statement`); the caret road never used to see the splitter for a
+    /// single statement, so it sent the user's text with those comments intact.
+    /// Both roads now send the same bytes, and they are the user's.
+    ///
+    /// Deliberately NOT justified as "an optimizer hint would be lost". It
+    /// would not: both Oracle and MySQL require a hint to follow the statement
+    /// keyword (`SELECT /*+ … */ …`), which puts it INSIDE the statement where
+    /// nothing here can reach it, and MySQL's executable `/*! … */` comments
+    /// are already exempt from the stripping. The reason is the narrower and
+    /// truer one — a refactor must not quietly change the bytes on the wire,
+    /// and "I believe the difference is inert" is not a thing to ship.
+    ///
+    /// Only the LEADING run comes back. What the splitter removed at the END —
+    /// the terminator, a custom MySQL delimiter, a trailing comment — must stay
+    /// removed: `EXPLAIN PLAN FOR SELECT 1;` is rejected outright by Oracle.
+    ///
+    /// The run is measured with the SAME function the splitter used, so the two
+    /// cannot disagree about where the statement begins: it returns a suffix of
+    /// its input, and the length difference is exactly what was skipped. The
+    /// bytes are re-attached verbatim rather than joined with a space, because
+    /// a leading `-- note` needs the newline that followed it — joined with a
+    /// space it would comment the statement out.
+    fn statement_with_its_leading_comments(text: &str, statement: &str) -> String {
+        let after_leading =
+            crate::db::sql_classification::strip_leading_comments_and_whitespace(text);
+        let leading_len = text.len().saturating_sub(after_leading.len());
+        match text.get(..leading_len) {
+            Some(leading) if !leading.trim().is_empty() => format!("{leading}{statement}"),
+            _ => statement.to_string(),
+        }
+    }
+
     pub fn explain_current(&self) {
-        let Some(sql) = self.statement_at_cursor_text() else {
-            SqlEditorWidget::show_alert_dialog("No SQL at cursor");
+        // The dialect FIRST, because everything below is about it: which text
+        // the splitter reads as one statement, which backend prepares it, and
+        // which spelling of an explain that backend passes through. Taken from
+        // the bound connection's own profile where there is one; the cache is
+        // the only answer there is when this tab is bound to nothing, and then
+        // the run ends in "not connected" whatever dialect was assumed.
+        let binding_snapshot = self.connection_binding.snapshot();
+        let bound_connection_facts = Self::bound_connection_facts_from(&binding_snapshot);
+        let explain_db_type = bound_connection_facts
+            .as_ref()
+            .map_or_else(|| self.current_db_type(), |facts| facts.db_type);
+
+        let sql = match self.statement_to_explain(explain_db_type) {
+            Ok(sql) => sql,
+            Err(message) => {
+                SqlEditorWidget::show_alert_dialog(&message);
+                return;
+            }
+        };
+
+        // Everything that can refuse or fail, before an operation is announced.
+        // The cleanup an announced operation needs is spelled out three times
+        // below already (worker, worker panic, spawn failure); a fourth exit
+        // that skipped it left the tab carrying an operation that never
+        // finished.
+        //
+        // "This tab is bound to no connection" is said as that and not as
+        // "the connection is busy". They are different facts and the remedy
+        // differs — connect, against wait — and the tab's sibling action on
+        // the same session (Quick Describe) has always said the true one.
+        let (Some(connection), Some(connection_facts)) =
+            (binding_snapshot.connection(), bound_connection_facts)
+        else {
+            let _ = self.ui_action_sender.send(UiActionResult::NotConnected);
+            app::awake();
             return;
         };
+        let read_only_connection = connection_facts.read_only;
+        let explain_backend = explain_plan_backend_for(explain_db_type);
+
+        // The placeholder values, where they change what is sent: the MySQL
+        // family substitutes them into the text, and `EXPLAIN SELECT … ?` is a
+        // syntax error without them. F6 never asked, so a statement
+        // `Ctrl+Enter` runs after one prompt could not be explained at all.
+        // Oracle asks for none — see `prompts_for_placeholder_values`.
+        //
+        // Not asked when the backend has already said this text must not be
+        // sent: a modal that collects values for a statement the app is about
+        // to refuse anyway is the exact thing
+        // `execute_sql_with_mysql_delimiter_after_lazy_cancel` puts its
+        // read-only guard ahead of the prompt to prevent, and F6 was the one
+        // path that did it the other way round —
+        // `EXPLAIN ANALYZE UPDATE t SET c = ?` asked for a value and then
+        // refused the statement. The refusal itself is still DELIVERED by the
+        // worker below, through the one road every F6 refusal takes; this only
+        // decides whether to interrupt the user on the way there.
+        //
+        // ONLY the backend's half is asked here, and that is the point rather
+        // than a shortcut: it is the one refusal that is a property of the
+        // STATEMENT alone. The two read-only halves belong to the CONNECTION
+        // and to the TAB, and neither is this moment's to answer — the tab's
+        // mode is re-read from the guard under the connection lock, and the
+        // connection's flag travels as a value whose staleness that same lock
+        // catches (a replaced connection fails the generation check before any
+        // gate is asked). Placeholder answers cannot change the backend's
+        // answer either: they land in VALUE positions, and no value turns an
+        // executing explain into a plan-only one.
+        //
+        // `statement()` is a pure function of its input on the family that
+        // prompts, so preparing it here commits to nothing — the preparation
+        // the wire receives is still the one built after the prompt.
+        let sql = if explain_backend.prompts_for_placeholder_values()
+            && explain_backend
+                .refusal_before_sending(
+                    explain_db_type,
+                    &explain_backend.statement(explain_db_type, &sql),
+                )
+                .is_none()
+        {
+            match self.resolve_bind_parameter_values(explain_db_type, &sql) {
+                Some(sql) => sql,
+                None => return,
+            }
+        } else {
+            sql
+        };
+
+        // ONE preparation: the gate in the worker judges this text and the wire
+        // receives this text, down to the `STATEMENT_ID` Oracle reads its own
+        // plan rows back by.
+        let explain_statement = explain_backend.statement(explain_db_type, &sql);
 
         if !try_mark_query_running(&self.query_running) {
             let _ = self
@@ -7635,13 +8236,6 @@ impl SqlEditorWidget {
             .install_operation_cancel_handle(operation_token, operation_activity.finish_handle());
 
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
-        let Some(connection) = self.bound_connection() else {
-            Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
-            let _ = self.ui_action_sender.send(UiActionResult::ConnectionBusy);
-            app::awake();
-            return;
-        };
-        let binding_snapshot = self.connection_binding.snapshot();
         let tab_scope = binding_snapshot.scope.clone();
         // Read back when the explain is done, exactly as the execution worker
         // does: the whole explain runs on the connection's OWN session, and a
@@ -7702,36 +8296,90 @@ impl SqlEditorWidget {
                     if conn_guard.connection_generation() != operation_token.connection_generation {
                         return UiActionResult::ExplainPlan {
                             token: operation_token,
-                            result: Err("Connection changed before explain plan execution started"
-                                .to_string()),
+                            result: Err(ExplainPlanError::Failed(
+                                "Connection changed before explain plan execution started"
+                                    .to_string(),
+                            )),
                         };
                     }
 
-                    // `EXPLAIN PLAN FOR` writes into PLAN_TABLE, so a tab
-                    // pinned Read only must be refused here exactly as it is
-                    // in the batch loops — same resolver, same answer, same
-                    // message. Without this the pin meant one thing for
-                    // Ctrl+Enter and another for F6.
-                    let explain_db_type = conn_guard.db_type();
+                    // The statement was prepared for the backend this tab was
+                    // bound to. A generation that still matches cannot have
+                    // changed family — but the statement carries the family in
+                    // its own shape, so saying it costs one comparison and
+                    // turns a wrong-backend send into a message.
+                    if conn_guard.db_type() != explain_db_type {
+                        return UiActionResult::ExplainPlan {
+                            token: operation_token,
+                            result: Err(ExplainPlanError::Failed(
+                                "Connection changed before explain plan execution started"
+                                    .to_string(),
+                            )),
+                        };
+                    }
+
+                    // Every reason this statement must not be sent, asked in one
+                    // place because a gate that asks some of them is a gate the
+                    // rest walk through. This is the AUTHORITATIVE ask: only
+                    // here are the final statement text and the tab's
+                    // transaction mode both in hand.
+                    //
+                    // FIRST, what the backend says its own explain DOES: an
+                    // explain runs on the connection's OWN session, which no tab
+                    // owns, so one that would RUN what it explains (the MySQL
+                    // family's executing explain) is refused whatever the two
+                    // read-only flags say — neither of them is set on most
+                    // connections, and the MySQL family's READ ONLY pin lives on
+                    // the TAB's session, which this will not run on.
+                    //
+                    // THEN read-only: `EXPLAIN PLAN … FOR` writes into
+                    // PLAN_TABLE, so a tab pinned Read only — or a connection
+                    // the user marked read-only — must be refused here exactly
+                    // as it is in the batch loops: same resolver, same answer,
+                    // same message. Asked of the statement that will actually be
+                    // sent, and of BOTH halves of read-only, because a gate that
+                    // asks one half is a gate the other half's owner can walk
+                    // through.
                     let explain_mode = SqlEditorWidget::effective_transaction_mode(
                         explain_db_type,
                         conn_guard.transaction_mode(),
                         tab_transaction_mode_override,
                     );
-                    if let Some(message) = SqlEditorWidget::transaction_mode_refusal_for_statement(
-                        explain_db_type,
-                        explain_mode,
-                        &explain_plan_backend_for(explain_db_type).explain_statement(&sql),
-                    ) {
+                    let backend = explain_plan_backend_for(explain_db_type);
+                    if let Some(message) = backend
+                        .refusal_before_sending(explain_db_type, &explain_statement)
+                        .or_else(|| {
+                            // Said as an EXPLAIN refusal, not as a bare write
+                            // refusal. The shared read-only wording is kept
+                            // verbatim so one rule reads as one rule, and the
+                            // backend adds the sentence only it can: on Oracle
+                            // the plan itself is the write, which is why F6 is
+                            // refused for a `SELECT` here and simply works on
+                            // the other family.
+                            SqlEditorWidget::write_refusal_for_statement(
+                                explain_db_type,
+                                explain_mode,
+                                read_only_connection.as_ref(),
+                                explain_statement.sql(),
+                                None,
+                            )
+                            .map(|refusal| {
+                                crate::db::query::result_messages::explain_plan_write_refused(
+                                    &refusal,
+                                    backend.why_building_the_plan_is_itself_a_write(),
+                                )
+                            })
+                        })
+                    {
                         return UiActionResult::ExplainPlan {
                             token: operation_token,
-                            result: Err(message),
+                            result: Err(ExplainPlanError::Refused(message)),
                         };
                     }
 
                     let result = SqlEditorWidget::get_explain_plan_for_locked_connection(
                         conn_guard,
-                        &sql,
+                        &explain_statement,
                         tab_scope.as_deref(),
                         query_timeout,
                         &MainSessionCancelSlots::new(
@@ -7744,7 +8392,11 @@ impl SqlEditorWidget {
                     );
                     UiActionResult::ExplainPlan {
                         token: operation_token,
-                        result,
+                        // Everything from here down is EVIDENCE of something
+                        // that went wrong reaching the plan — a driver error, a
+                        // cancel, a timeout — never a rule this app applied.
+                        // Every refusal has already returned above.
+                        result: result.map_err(ExplainPlanError::Failed),
                     }
                 }));
 
@@ -7797,7 +8449,9 @@ impl SqlEditorWidget {
                         );
                         UiActionResult::ExplainPlan {
                             token: operation_token,
-                            result: Err(format!("Internal error: {}", panic_msg)),
+                            result: Err(ExplainPlanError::Failed(format!(
+                                "Internal error: {panic_msg}"
+                            ))),
                         }
                     }
                 };
@@ -7847,7 +8501,7 @@ impl SqlEditorWidget {
             }
             let _ = spawn_error_sender.send(UiActionResult::ExplainPlan {
                 token: operation_token,
-                result: Err(message),
+                result: Err(ExplainPlanError::Failed(message)),
             });
             app::awake();
             if app::is_ui_thread() {
@@ -7864,15 +8518,15 @@ impl SqlEditorWidget {
     /// far side of the mutex, which is the defect this shape closes.
     fn get_explain_plan_for_locked_connection(
         mut conn_guard: crate::db::ConnectionLockGuard<'_>,
-        sql: &str,
+        statement: &ExplainStatement,
         scope: Option<&str>,
         query_timeout: Option<Duration>,
         cancel_slots: &MainSessionCancelSlots,
         cancel_flag: &Arc<Mutex<bool>>,
     ) -> Result<ExplainPlanData, String> {
         explain_plan_backend_for(conn_guard.db_type()).get_explain_plan(
+            statement,
             &mut conn_guard,
-            sql,
             scope,
             query_timeout,
             cancel_slots,
@@ -8017,6 +8671,10 @@ impl SqlEditorWidget {
     /// NO call timeout (`reset_before_reuse` clears the socket timeout), so a
     /// commit/rollback issued without this blocks unboundedly — on the
     /// tab-close path that block lands on the FLTK UI thread.
+    ///
+    /// The restore also survives a PANIC in `action`, exactly as the OCI twin's
+    /// does: the session outlives this call, and one left carrying a timeout
+    /// nobody asked for would cut off whatever runs on it next.
     fn run_oracle_thin_action_with_timeout<T, F>(
         conn: &mut tns_thin::OracleThinSession,
         query_timeout: Option<Duration>,
@@ -8030,17 +8688,172 @@ impl SqlEditorWidget {
             .map_err(|err| format!("Failed to read Oracle thin call timeout: {err}"))?;
         conn.set_call_timeout(query_timeout)
             .map_err(|err| format!("Failed to apply Oracle thin call timeout: {err}"))?;
-        let result = action(conn);
+        let result = panic::catch_unwind(AssertUnwindSafe(|| action(conn)));
         let reset_result = conn
             .set_call_timeout(previous_timeout)
             .map_err(|err| format!("Failed to reset Oracle thin call timeout: {err}"));
         match result {
-            Ok(value) => reset_result.map(|_| value),
-            Err(message) => match reset_result {
+            Ok(Ok(value)) => reset_result.map(|_| value),
+            Ok(Err(message)) => match reset_result {
                 Ok(()) => Err(message),
                 Err(reset_message) => Err(format!("{message}; {reset_message}")),
             },
+            Err(payload) => {
+                if let Err(reset_message) = reset_result {
+                    crate::utils::logging::log_error("oracle thin call timeout", &reset_message);
+                }
+                panic::resume_unwind(payload);
+            }
         }
+    }
+
+    /// The Oracle twin of [`Self::run_mysql_action_with_timeout`]: ONE ceremony
+    /// for work that runs on the connection's OWN Oracle session, whichever
+    /// driver that session belongs to.
+    ///
+    /// Every piece of it is a rule the app already had, and each used to be
+    /// re-stated by each caller — so the two drivers drifted apart and thin
+    /// ended up missing two of them:
+    ///
+    /// * the tab's SCOPE, resolved to a concrete schema name, so the work never
+    ///   inherits — or leaves behind — the schema another tab put this shared
+    ///   session in;
+    /// * the cancel TARGET, published through the one door that binds its
+    ///   withdrawal to the connection lock rather than to what the caller
+    ///   remembers to do after it, and published BEFORE the first server round
+    ///   trip so that round trip is reachable by the cancel button;
+    /// * a cancel that arrived before the work started, pre-broken on the
+    ///   session so the first call answers it;
+    /// * the tab's query TIMEOUT, around every call this makes — thin had none
+    ///   at all here, and a retained thin session carries no call timeout of its
+    ///   own, so a heavy statement held the worker with nothing able to end it.
+    ///
+    /// The scope apply is INSIDE the timeout for the same reason the work is:
+    /// it is a server round trip, and one that cannot be timed out is one the
+    /// tab's timeout does not cover.
+    ///
+    /// The failure is SAID in the app's own words
+    /// ([`SqlEditorWidget::oracle_main_session_error_message`]), the twin of
+    /// what the MySQL ceremony has always said, so one event does not read as
+    /// two different things depending on which family answered it.
+    ///
+    /// What this ceremony does NOT have, and must not grow, is the MySQL
+    /// twin's tear-down when the timeout could not be put back
+    /// (`disconnect_untrusted_main_session`). The two timeouts are different
+    /// things: MySQL's is SERVER state (`SET SESSION max_execution_time`), so a
+    /// failed restore leaves a perfectly healthy session serving every later
+    /// caller with the wrong bound, and only replacing the connection is rid of
+    /// it. Oracle's is a CLIENT attribute — `OCI_ATTR_CALL_TIMEOUT` on the
+    /// handle, a socket read/write timeout on thin — so it cannot fail while
+    /// leaving a usable session behind: a failure there means the handle or the
+    /// socket is already gone, and the next call reports that through the
+    /// ordinary connection-loss road. Tearing the connection down here would
+    /// add a second, earlier answer to an event that already has one.
+    fn run_oracle_main_session_action<T, Oci, Thin>(
+        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
+        scope: Option<&str>,
+        cancel_slots: &MainSessionCancelSlots,
+        cancel_flag: &Arc<Mutex<bool>>,
+        query_timeout: Option<Duration>,
+        log_context: &str,
+        oci: Oci,
+        thin: Thin,
+    ) -> Result<T, String>
+    where
+        Oci: FnOnce(Arc<Connection>) -> Result<T, String>,
+        Thin: FnOnce(&mut tns_thin::OracleThinSession) -> Result<T, String>,
+    {
+        let session_schema = conn_guard.oracle_session_schema_for_scope(scope);
+        let outcome = match conn_guard.require_live_db_connection()? {
+            DbConnection::Oracle(db_conn) => {
+                Self::publish_main_session_cancel_target(
+                    conn_guard,
+                    cancel_slots.clone(),
+                    MainSessionCancelTarget::Oracle(Arc::clone(&db_conn)),
+                );
+                if load_mutex_bool(cancel_flag) {
+                    let _ = db_conn.break_execution();
+                }
+                Self::run_oracle_action_with_timeout(
+                    db_conn,
+                    query_timeout,
+                    log_context,
+                    |db_conn| {
+                        Self::require_oracle_main_session_scope(
+                            db_conn.as_ref(),
+                            session_schema.as_deref(),
+                        )?;
+                        oci(db_conn)
+                    },
+                )
+            }
+            DbConnection::OracleThin(db_conn) => {
+                let mut session = db_conn
+                    .lock()
+                    .map_err(|_| "Oracle Thin connection lock was poisoned".to_string())?;
+                // Before the first call, not after it: `reset_pending_cancel`
+                // clears the CLIENT flags a previous cancel left, and doing it
+                // after the scope apply let a stale break answer that apply.
+                session.reset_pending_cancel();
+                let cancel_handle = session.cancel_handle();
+                Self::publish_main_session_cancel_target(
+                    conn_guard,
+                    cancel_slots.clone(),
+                    MainSessionCancelTarget::OracleThin(cancel_handle.clone()),
+                );
+                if load_mutex_bool(cancel_flag) {
+                    let _ = cancel_handle.break_execution();
+                }
+                Self::run_oracle_thin_action_with_timeout(&mut session, query_timeout, |session| {
+                    Self::require_oracle_thin_main_session_scope(
+                        session,
+                        session_schema.as_deref(),
+                    )?;
+                    thin(session)
+                })
+            }
+            DbConnection::MySQL { .. } => {
+                Err("Expected Oracle connection but found MySQL-family connection".to_string())
+            }
+        };
+        // The cancel flag is read AFTER the work, like the MySQL twin reads it:
+        // a cancel that arrived while the call was on the wire is the reason the
+        // call failed, whatever the driver made of the break.
+        outcome.map_err(|message| {
+            Self::oracle_main_session_error_message(
+                message,
+                query_timeout,
+                load_mutex_bool(cancel_flag),
+            )
+        })
+    }
+
+    /// Put the connection's own OCI session in the schema this work must
+    /// resolve names in, and REFUSE if it could not be.
+    ///
+    /// Refused rather than tolerated because this work has no messages pane of
+    /// its own: a plan or a description built in the login schema because the
+    /// tab's is gone would name the wrong objects with no way to say so. It runs
+    /// inside the call timeout because it is a server round trip like any other,
+    /// and one the tab's timeout does not cover is one nothing can end.
+    fn require_oracle_main_session_scope(
+        db_conn: &Connection,
+        schema: Option<&str>,
+    ) -> Result<(), String> {
+        crate::db::DatabaseConnection::apply_tracked_oracle_current_schema_on_session(
+            db_conn, schema,
+        )?
+        .require_applied(crate::db::DatabaseType::Oracle)
+    }
+
+    /// The thin twin of [`Self::require_oracle_main_session_scope`], with the
+    /// same answer.
+    fn require_oracle_thin_main_session_scope(
+        session: &mut tns_thin::OracleThinSession,
+        schema: Option<&str>,
+    ) -> Result<(), String> {
+        crate::db::DatabaseConnection::apply_tracked_oracle_thin_current_schema(session, schema)?
+            .require_applied(crate::db::DatabaseType::Oracle)
     }
 
     fn run_oracle_action_with_timeout<T, F>(
@@ -10074,6 +10887,27 @@ impl SqlEditorWidget {
         self.buffer.set_text(text);
     }
 
+    /// Put the caret at `position`, and clear any selection.
+    ///
+    /// HARNESS-ONLY. The app moves the caret through FLTK events; a probe that
+    /// must prove "this action took the statement the caret is in" has to be
+    /// able to say which one that is, and one that must prove "and this one
+    /// takes the SELECTION instead" has to start from none.
+    #[doc(hidden)]
+    pub fn place_caret_for_probe(&mut self, position: i32) {
+        self.buffer.unselect();
+        self.editor.set_insert_position(position);
+    }
+
+    /// Select `[start, end)`, as a drag in the editor would.
+    ///
+    /// HARNESS-ONLY, and the twin of [`Self::place_caret_for_probe`].
+    #[doc(hidden)]
+    pub fn select_for_probe(&mut self, start: i32, end: i32) {
+        self.buffer.select(start, end);
+        self.editor.set_insert_position(end);
+    }
+
     #[allow(dead_code)]
     pub fn get_group(&self) -> &Flex {
         &self.group
@@ -10094,11 +10928,19 @@ impl SqlEditorWidget {
     }
 
     fn current_mysql_delimiter(&self) -> Option<String> {
-        if !self
-            .intellisense_runtime
-            .cached_db_type()
-            .supports_mysql_delimiter_commands()
-        {
+        self.mysql_delimiter_for_db_type(self.intellisense_runtime.cached_db_type())
+    }
+
+    /// The delimiter in force on this tab's session, judged under the dialect
+    /// the CALLER is working in.
+    ///
+    /// Whether a delimiter can exist at all is a property of the product, and
+    /// an action that has already decided which product it is talking to must
+    /// not have that decision re-made from a cache underneath it: the answer
+    /// was `None` for an Oracle-shaped cache while the connection really was
+    /// MySQL, which handed the splitter `;` where the tab had `DELIMITER $$`.
+    fn mysql_delimiter_for_db_type(&self, db_type: DatabaseType) -> Option<String> {
+        if !db_type.supports_mysql_delimiter_commands() {
             return None;
         }
         let session = self.intellisense_runtime.session_state();
@@ -10110,12 +10952,17 @@ impl SqlEditorWidget {
         delimiter
     }
 
-    fn mysql_delimiter_before_offset(&self, offset: usize) -> Option<String> {
+    fn mysql_delimiter_before_offset(
+        &self,
+        db_type: DatabaseType,
+        mysql_delimiter: Option<&str>,
+        offset: usize,
+    ) -> Option<String> {
         query_text::active_mysql_delimiter_before_offset(
             &self.buffer.text(),
             offset,
-            Some(self.current_db_type()),
-            self.current_mysql_delimiter().as_deref(),
+            Some(db_type),
+            mysql_delimiter,
         )
     }
 
@@ -12491,6 +13338,677 @@ mod explain_plan_tests {
         assert_eq!(
             SqlEditorWidget::build_explain_plan_result(&tree()).message,
             "Explain plan loaded"
+        );
+    }
+
+    /// Every backend prepares its statement through the same door, and the text
+    /// that door produces is the text the gates judge and the wire receives.
+    #[test]
+    fn every_backend_prepares_the_statement_it_will_send() {
+        for db_type in crate::db::DatabaseType::ALL {
+            let statement =
+                super::explain_plan_backend_for(db_type).statement(db_type, "SELECT 1 FROM t");
+            let sql = statement.sql().to_uppercase();
+            assert!(
+                sql.starts_with("EXPLAIN"),
+                "{db_type}: the explain statement must be the one that builds a plan: {sql}"
+            );
+            match db_type {
+                crate::db::DatabaseType::Oracle => assert!(
+                    matches!(statement, super::ExplainStatement::OraclePlanTable(_)),
+                    "Oracle writes its plan into PLAN_TABLE and reads it back"
+                ),
+                crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => assert!(
+                    matches!(statement, super::ExplainStatement::ServerExplain(_)),
+                    "{db_type}: the server returns the plan as its own result set"
+                ),
+            }
+        }
+    }
+
+    /// A statement with no execution plan is answered with ONE sentence on all
+    /// four backends, instead of being wrapped into an explain and sent.
+    ///
+    /// F6 wraps whatever it is handed. So a PL/SQL block, a routine call,
+    /// transaction control and this family's `ANALYZE … TABLE` all went to a
+    /// server, and each answered the one keystroke with its own complaint —
+    /// except MySQL, which answered `ANALYZE TABLE t` by drawing a real plan:
+    /// the wrapped `EXPLAIN ANALYZE TABLE t` is an executing explain of the
+    /// `TABLE t` QUERY there, so the user was shown a plan for a statement they
+    /// had not asked about while MariaDB answered `ERROR 1064` and Oracle a
+    /// parse error.
+    #[test]
+    fn a_statement_with_no_execution_plan_is_answered_and_not_sent() {
+        use crate::db::DatabaseType;
+
+        for db_type in DatabaseType::ALL {
+            let backend = super::explain_plan_backend_for(db_type);
+            for (sql, subject) in [
+                ("CALL p(1)", "a routine call"),
+                ("COMMIT", "a transaction control statement"),
+                ("ANALYZE TABLE t", "a table maintenance statement"),
+            ] {
+                let statement = backend.statement(db_type, sql);
+                assert_eq!(
+                    backend.refusal_before_sending(db_type, &statement),
+                    Some(crate::db::query::result_messages::no_execution_plan_for(
+                        subject
+                    )),
+                    "{db_type}: `{sql}` became `{}`",
+                    statement.sql()
+                );
+            }
+        }
+
+        // ... and an explain the USER typed is still passed straight to the
+        // server. Where the app is not choosing what gets explained, there is
+        // nothing for it to second-guess — which is why the gate is asked of
+        // `statement_the_app_chose_to_explain()` and not of the wire text.
+        for (db_type, already_an_explain) in [
+            (DatabaseType::MySQL, "EXPLAIN SELECT 1"),
+            (DatabaseType::MariaDB, "ANALYZE SELECT 1"),
+        ] {
+            let backend = super::explain_plan_backend_for(db_type);
+            let statement = backend.statement(db_type, already_an_explain);
+            assert_eq!(
+                statement.statement_the_app_chose_to_explain(),
+                None,
+                "{db_type}"
+            );
+            assert_eq!(
+                backend.refusal_before_sending(db_type, &statement),
+                None,
+                "{db_type}: `{already_an_explain}`"
+            );
+        }
+        // Oracle is the other way round and must be: it re-wraps even an
+        // `EXPLAIN PLAN` the user typed, because the read-back needs the
+        // `STATEMENT_ID` THIS call stamps — so the app IS choosing there, and
+        // the gate is asked about what it chose.
+        let oracle = super::explain_plan_backend_for(DatabaseType::Oracle);
+        let statement = oracle.statement(DatabaseType::Oracle, "EXPLAIN PLAN FOR BEGIN NULL; END;");
+        assert_eq!(
+            statement.statement_the_app_chose_to_explain(),
+            Some("BEGIN NULL; END;")
+        );
+        assert_eq!(
+            oracle.refusal_before_sending(DatabaseType::Oracle, &statement),
+            Some(crate::db::query::result_messages::no_execution_plan_for(
+                "a PL/SQL block"
+            ))
+        );
+
+        // The ordinary case stays ordinary on every backend.
+        for db_type in DatabaseType::ALL {
+            let backend = super::explain_plan_backend_for(db_type);
+            for sql in [
+                "SELECT * FROM t",
+                "UPDATE t SET c = 1",
+                "CREATE TABLE copy AS SELECT * FROM t",
+            ] {
+                let statement = backend.statement(db_type, sql);
+                assert_eq!(
+                    backend.refusal_before_sending(db_type, &statement),
+                    None,
+                    "{db_type}: `{sql}` was refused a plan it may well have"
+                );
+            }
+        }
+    }
+
+    /// A read-only refusal of F6 says why an execution plan is a write — on the
+    /// one backend where it is.
+    ///
+    /// The shared read-only wording describes the statement that was refused,
+    /// and on Oracle that statement is the `EXPLAIN PLAN … FOR` the app built,
+    /// not the `SELECT` the user typed. So the user asked for the plan of a
+    /// query and read "Oracle read-only mode blocks non-query statements",
+    /// while the same keystroke simply worked on the other family with nothing
+    /// saying which fact differed.
+    #[test]
+    fn a_read_only_explain_refusal_says_why_the_plan_is_a_write() {
+        use crate::db::DatabaseType;
+
+        let oracle_note = super::explain_plan_backend_for(DatabaseType::Oracle)
+            .why_building_the_plan_is_itself_a_write()
+            .expect("Oracle's explain writes the plan into PLAN_TABLE");
+        assert!(
+            oracle_note.contains("PLAN_TABLE"),
+            "the note must name the write: {oracle_note}"
+        );
+        let refused = crate::db::query::result_messages::explain_plan_write_refused(
+            "Error: Oracle read-only mode blocks non-query statements.",
+            Some(oracle_note),
+        );
+        assert!(
+            refused.starts_with("Explain plan was not run:")
+                && refused.contains("Error: Oracle read-only mode blocks non-query statements.")
+                && refused.contains("PLAN_TABLE"),
+            "{refused}"
+        );
+
+        // The MySQL family's explain only reports, so there is nothing extra to
+        // say and nothing extra is said. A note that fired on every family
+        // would be a claim that is false on three of the four.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(
+                super::explain_plan_backend_for(db_type).why_building_the_plan_is_itself_a_write(),
+                None,
+                "{db_type}"
+            );
+        }
+        assert_eq!(
+            crate::db::query::result_messages::explain_plan_write_refused("Refused.", None),
+            "Explain plan was not run: Refused."
+        );
+    }
+
+    /// An explain that would RUN what it explains is refused before it is sent,
+    /// on a connection nobody marked read-only and a tab nobody pinned.
+    ///
+    /// The executing explain executes the statement it explains, and an
+    /// explain runs on the connection's OWN DB session — which no query tab
+    /// owns, so nothing in the transaction model would ever commit or roll back
+    /// what it changed there. Neither read-only gate can be relied on to catch
+    /// it: the connection's flag is only set if the user set it, and this
+    /// family's READ ONLY pin is a characteristic of the TAB's session, which
+    /// this statement does not run on. So the backend that knows what its own
+    /// explain does answers for it.
+    ///
+    /// CHANGED, with its reason: the refusal used to be asserted as the literal
+    /// `EXPLAIN ANALYZE` on BOTH products, which pinned the defect instead of
+    /// the rule. MariaDB rejects that spelling outright and writes its
+    /// executing explain `ANALYZE <statement>`, so a MariaDB user was told
+    /// their statement had been refused for being a form of explain their
+    /// server does not have and they had not typed. What the rule always was —
+    /// "the refusal names the statement that would run, in THIS product's
+    /// words" — is what is asserted now, per product.
+    #[test]
+    fn an_explain_that_would_run_what_it_explains_is_never_sent() {
+        for (db_type, spelling) in [
+            (crate::db::DatabaseType::MySQL, "EXPLAIN ANALYZE"),
+            (crate::db::DatabaseType::MariaDB, "ANALYZE"),
+        ] {
+            let backend = super::explain_plan_backend_for(db_type);
+            for sql in [
+                "EXPLAIN ANALYZE UPDATE t SET c = 1",
+                "EXPLAIN ANALYZE DELETE FROM t",
+                "DESC ANALYZE INSERT INTO t VALUES (1)",
+                "EXPLAIN ANALYZE FORMAT = TREE UPDATE t SET c = 1",
+                "EXPLAIN ANALYZE SELECT * FROM t FOR UPDATE",
+                // What F6 BUILDS out of the user's text, not only what the user
+                // typed. On MySQL `ANALYZE UPDATE …` is wrapped into an
+                // `EXPLAIN` and the wrapping is what makes it executable; on
+                // MariaDB it is passed straight through because that IS that
+                // product's executing explain. Refused either way, and by the
+                // same reader.
+                "ANALYZE UPDATE t SET c = 1",
+                "ANALYZE FORMAT = JSON DELETE FROM t",
+            ] {
+                let statement = backend.statement(db_type, sql);
+                let refusal = backend
+                    .refusal_before_sending(db_type, &statement)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{db_type}: `{sql}` became `{}` and was sent",
+                            statement.sql()
+                        )
+                    });
+                assert!(
+                    refusal.contains(&format!("{spelling} executes the statement it explains")),
+                    "{db_type}: {refusal}"
+                );
+                // ... and never in the OTHER product's spelling, which is the
+                // whole of what went wrong: `EXPLAIN ANALYZE` is a substring of
+                // nothing on MariaDB, and `ANALYZE` alone must not be how MySQL
+                // names it either.
+                if spelling == "ANALYZE" {
+                    assert!(
+                        !refusal.contains("EXPLAIN ANALYZE"),
+                        "{db_type} was told about a statement it rejects: {refusal}"
+                    );
+                }
+            }
+
+            // A plan-only explain is the ordinary case and must stay ordinary,
+            // including of a statement that WOULD write if it ran.
+            for sql in [
+                "SELECT * FROM t",
+                "SELECT * FROM t FOR UPDATE",
+                "UPDATE t SET c = 1",
+                "EXPLAIN SELECT * FROM t",
+                "EXPLAIN ANALYZE SELECT * FROM t",
+                "EXPLAIN ANALYZE FORMAT = TREE SELECT * FROM t",
+                "DESCRIBE t",
+            ] {
+                let statement = backend.statement(db_type, sql);
+                assert_eq!(
+                    backend.refusal_before_sending(db_type, &statement),
+                    None,
+                    "{db_type}: `{sql}` became `{}` and was refused",
+                    statement.sql()
+                );
+            }
+        }
+
+        // Oracle's explain never runs what it explains, and the `PLAN_TABLE`
+        // row it does write is taken back in the same call — so it refuses
+        // nothing here, and the read-only gates keep answering for it.
+        let oracle = super::explain_plan_backend_for(crate::db::DatabaseType::Oracle);
+        for sql in [
+            "SELECT 1 FROM DUAL",
+            "UPDATE t SET c = 1",
+            "EXPLAIN PLAN FOR SELECT 1 FROM DUAL",
+        ] {
+            let statement = oracle.statement(crate::db::DatabaseType::Oracle, sql);
+            assert_eq!(
+                oracle.refusal_before_sending(crate::db::DatabaseType::Oracle, &statement),
+                None,
+                "{sql}"
+            );
+        }
+    }
+
+    /// An explain the user typed is PASSED THROUGH, in whichever spelling this
+    /// product uses — because `EXPLAIN EXPLAIN …` is not a statement and
+    /// neither is `EXPLAIN ANALYZE …` on MariaDB.
+    ///
+    /// The builder took no `db_type` at all, so it knew only MySQL's spelling:
+    /// MariaDB's own `ANALYZE <statement>` was wrapped into an
+    /// `EXPLAIN ANALYZE …` that MariaDB rejects as a syntax error. A MySQL user
+    /// could read a measured plan through F6 and a MariaDB user could not, for
+    /// the same keystroke — the divergence this feature exists to remove.
+    #[test]
+    fn each_family_passes_its_own_explain_spelling_through() {
+        let statement_sql = |db_type, sql| {
+            super::explain_plan_backend_for(db_type)
+                .statement(db_type, sql)
+                .sql()
+                .to_string()
+        };
+        // MariaDB's executing explain reaches the server as the user wrote it.
+        assert_eq!(
+            statement_sql(crate::db::DatabaseType::MariaDB, "ANALYZE SELECT * FROM t;"),
+            "ANALYZE SELECT * FROM t"
+        );
+        // MySQL's does too, in its own spelling.
+        assert_eq!(
+            statement_sql(
+                crate::db::DatabaseType::MySQL,
+                "EXPLAIN ANALYZE SELECT * FROM t"
+            ),
+            "EXPLAIN ANALYZE SELECT * FROM t"
+        );
+        // A statement that is not an explain is still wrapped into one, and
+        // `ANALYZE TABLE` is not an explain on either product.
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            assert_eq!(
+                statement_sql(db_type, "SELECT * FROM t"),
+                "EXPLAIN SELECT * FROM t",
+                "{db_type}"
+            );
+            assert_eq!(
+                statement_sql(db_type, "ANALYZE TABLE t"),
+                "EXPLAIN ANALYZE TABLE t",
+                "{db_type}"
+            );
+        }
+        // MySQL has no bare executing `ANALYZE`, so there the word is wrapped
+        // like any other statement.
+        assert_eq!(
+            statement_sql(crate::db::DatabaseType::MySQL, "ANALYZE SELECT * FROM t"),
+            "EXPLAIN ANALYZE SELECT * FROM t"
+        );
+    }
+
+    /// A statement typed with its terminator is the normal case in the editor,
+    /// and Oracle rejects `EXPLAIN PLAN … FOR … ;` outright. The MySQL family
+    /// has always normalized it away; Oracle built its statement by
+    /// concatenation and did not.
+    #[test]
+    fn a_trailing_terminator_never_reaches_the_explain_statement() {
+        for db_type in crate::db::DatabaseType::ALL {
+            let statement =
+                super::explain_plan_backend_for(db_type).statement(db_type, "SELECT 1 FROM t;  ");
+            assert!(
+                !statement.sql().trim_end().ends_with(';'),
+                "{db_type}: {}",
+                statement.sql()
+            );
+            assert!(
+                statement.sql().ends_with("SELECT 1 FROM t"),
+                "{db_type}: {}",
+                statement.sql()
+            );
+        }
+    }
+
+    /// The rows an explain reads back must be the rows it wrote, so no two
+    /// explains may answer to the same name.
+    #[test]
+    fn each_oracle_explain_carries_an_id_of_its_own() {
+        let backend = super::explain_plan_backend_for(crate::db::DatabaseType::Oracle);
+        let ids: Vec<String> = (0..8)
+            .map(|_| {
+                match backend.statement(crate::db::DatabaseType::Oracle, "SELECT 1 FROM DUAL") {
+                    super::ExplainStatement::OraclePlanTable(plan) => {
+                        plan.statement_id().to_string()
+                    }
+                    other => panic!("Oracle prepared {other:?}"),
+                }
+            })
+            .collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "ids repeated: {ids:?}");
+        for id in &ids {
+            // PLAN_TABLE.STATEMENT_ID is VARCHAR2(30), and the id is embedded
+            // as a literal, so it must also carry nothing that ends the quote.
+            assert!(id.len() <= 30, "{id} is longer than STATEMENT_ID allows");
+            assert!(
+                id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+                "{id} is not a bare identifier"
+            );
+        }
+    }
+
+    /// Only the family whose statement is INVALID without the answers prompts
+    /// for them.
+    ///
+    /// The MySQL family substitutes them into the text, and `EXPLAIN SELECT … ?`
+    /// is a syntax error without them. Oracle's `EXPLAIN PLAN` only parses the
+    /// statement it explains, so its placeholders never need values — the live
+    /// probe `oracle_explain_plan_reports_no_binds_for_the_statement_it_explains`
+    /// is what settles that, and prompting there would collect answers with
+    /// nowhere to go.
+    #[test]
+    fn only_the_backend_whose_statement_needs_the_answers_prompts_for_them() {
+        assert!(
+            !super::explain_plan_backend_for(crate::db::DatabaseType::Oracle)
+                .prompts_for_placeholder_values()
+        );
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            assert!(
+                super::explain_plan_backend_for(db_type).prompts_for_placeholder_values(),
+                "{db_type}: EXPLAIN of a statement with a placeholder is a syntax error \
+                 until the answers are substituted in"
+            );
+        }
+    }
+
+    /// The plan is built on the connection's own session, so state that only
+    /// the TAB's session has is invisible to it — and the app says which of
+    /// that state is in play rather than disclaiming on every plan.
+    #[test]
+    fn a_plan_says_what_this_tabs_session_holds_that_it_cannot_see() {
+        use crate::db::query::result_messages::explain_plan_excludes_tab_session_state as note;
+
+        // Nothing in play, nothing said. This is the ordinary case, and a
+        // sentence on every plan would be noise the user learns to skip.
+        assert_eq!(note(&[]), "");
+
+        let one = note(&["temporary tables"]);
+        assert!(
+            one.contains("temporary tables")
+                && one.contains("connection's own DB session")
+                && !one.contains(" and "),
+            "{one}"
+        );
+        let two = note(&["temporary tables", "session settings"]);
+        assert!(
+            two.contains("temporary tables and session settings"),
+            "{two}"
+        );
+        let three = note(&["temporary tables", "user variables", "session settings"]);
+        assert!(
+            three.contains("temporary tables, user variables and session settings"),
+            "{three}"
+        );
+        // Oracle's residue model does not NAME what its session holds, only
+        // that it holds something a pool setup would not restate. The note has
+        // to be sayable from that too, or it could only ever fire on the MySQL
+        // family — the asymmetry this feature exists to remove.
+        let unnamed = note(&["session state"]);
+        assert!(
+            unnamed.contains("session state") && unnamed.contains("connection's own DB session"),
+            "{unnamed}"
+        );
+    }
+
+    /// A selection is explained only when it holds exactly one statement.
+    ///
+    /// Execution runs a selection as it stands, however many statements it
+    /// holds; Explain has one plan to show, so anything else is refused rather
+    /// than narrowed — picking one would be a guess about which was meant.
+    #[test]
+    fn a_selection_is_explained_only_when_it_holds_one_statement() {
+        use crate::db::DatabaseType;
+
+        for db_type in DatabaseType::ALL {
+            assert_eq!(
+                SqlEditorWidget::single_statement_to_explain(
+                    "SELECT 1 FROM t",
+                    db_type,
+                    None,
+                    "No SQL selected"
+                ),
+                Ok("SELECT 1 FROM t".to_string()),
+                "{db_type}"
+            );
+            // A terminator does not make it two.
+            assert_eq!(
+                SqlEditorWidget::single_statement_to_explain(
+                    "SELECT 1 FROM t;",
+                    db_type,
+                    None,
+                    "No SQL selected"
+                ),
+                Ok("SELECT 1 FROM t".to_string()),
+                "{db_type}"
+            );
+            assert_eq!(
+                SqlEditorWidget::single_statement_to_explain(
+                    "SELECT 1 FROM t; SELECT 2 FROM t",
+                    db_type,
+                    None,
+                    "No SQL selected"
+                ),
+                Err("Select a single statement to explain.".to_string()),
+                "{db_type}: execution would run both"
+            );
+            for empty in ["", "   \n  "] {
+                assert_eq!(
+                    SqlEditorWidget::single_statement_to_explain(
+                        empty,
+                        db_type,
+                        None,
+                        "No SQL selected"
+                    ),
+                    Err("No SQL selected".to_string()),
+                    "{db_type}"
+                );
+                // The absence is the CALLER's word, because "nothing at the
+                // caret" and "nothing selected" are different absences.
+                assert_eq!(
+                    SqlEditorWidget::single_statement_to_explain(
+                        empty,
+                        db_type,
+                        None,
+                        "No SQL at cursor"
+                    ),
+                    Err("No SQL at cursor".to_string()),
+                    "{db_type}"
+                );
+            }
+        }
+        // A custom MySQL delimiter is honoured, so a body full of `;` is still
+        // ONE statement — the same reading execution makes of the same text.
+        assert!(SqlEditorWidget::single_statement_to_explain(
+            "CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END$$",
+            crate::db::DatabaseType::MySQL,
+            Some("$$"),
+            "No SQL selected",
+        )
+        .is_ok());
+
+        // The text comes back WHOLE. Routing the CARET road through the
+        // splitter must not change the bytes F6 sends, and the splitter strips
+        // a statement's leading comments — which that road never used to see.
+        // (Not about optimizer hints: both products require a hint to follow
+        // the statement keyword, so it lives inside the statement.)
+        for db_type in DatabaseType::ALL {
+            let commented = "/* why this one */ SELECT * FROM t";
+            assert_eq!(
+                SqlEditorWidget::single_statement_to_explain(
+                    commented,
+                    db_type,
+                    None,
+                    "No SQL at cursor"
+                ),
+                Ok(commented.to_string()),
+                "{db_type}: F6 must send the statement the user wrote"
+            );
+            // A LINE comment carries its newline back with it. Re-attached with
+            // a space instead, it would comment the statement out — and the
+            // explain would be of nothing at all.
+            let line_commented = "-- why this one\nSELECT * FROM t";
+            assert_eq!(
+                SqlEditorWidget::single_statement_to_explain(
+                    line_commented,
+                    db_type,
+                    None,
+                    "No SQL at cursor"
+                ),
+                Ok(line_commented.to_string()),
+                "{db_type}"
+            );
+            // ... and what the splitter removed at the END stays removed: an
+            // embedded terminator is what Oracle rejects `EXPLAIN PLAN FOR
+            // SELECT 1;` for.
+            assert_eq!(
+                SqlEditorWidget::single_statement_to_explain(
+                    "SELECT * FROM t;\n-- afterwards",
+                    db_type,
+                    None,
+                    "No SQL at cursor"
+                ),
+                Ok("SELECT * FROM t".to_string()),
+                "{db_type}"
+            );
+        }
+    }
+
+    /// A command this app carries out ITSELF has no execution plan, and F6 must
+    /// say so rather than send it.
+    ///
+    /// The caret road used to hand its text on unexamined while the selection
+    /// road split it, so one text had three answers: `Ctrl+Enter` ran the app's
+    /// own describe, F6-on-a-selection refused, and F6-at-the-caret wrapped the
+    /// line into an explain and SENT it. On the MySQL family the send even
+    /// succeeded — `explain_plan_sql` passes a `DESC` through, so the server
+    /// answered with a TABLE DESCRIPTION shown under the label "Explain Plan".
+    /// On Oracle it failed, having first put the line — a `CONNECT`'s password
+    /// included — on the wire.
+    ///
+    /// The read-only guard cannot cover this: it knows `CONNECT` and `@file` as
+    /// TOOL COMMANDS, and by the time F6 asks, the command sits inside
+    /// `EXPLAIN PLAN … FOR …`, which the splitter reads as one statement.
+    #[test]
+    fn a_command_this_app_runs_itself_is_never_explained() {
+        use crate::db::DatabaseType;
+
+        for db_type in DatabaseType::ALL {
+            // Only the ones the SPLITTER really keeps for the app. `EXEC` is
+            // deliberately absent: Oracle's `EXEC p(1)` is SQL*Plus shorthand
+            // the app turns into a statement it SENDS, so `Ctrl+Enter` reaches
+            // a server with it and F6 is right to ask about it. This test is
+            // about the items no server ever sees.
+            for command in [
+                "DESC employees",
+                "DESCRIBE employees",
+                "@setup.sql",
+                "CONNECT scott/tiger@db",
+                "PROMPT hello",
+            ] {
+                for nothing_at_all in ["No SQL at cursor", "No SQL selected"] {
+                    assert_eq!(
+                        SqlEditorWidget::single_statement_to_explain(
+                            command,
+                            db_type,
+                            None,
+                            nothing_at_all
+                        ),
+                        Err(crate::db::query::result_messages::explain_plan_needs_a_statement()),
+                        "{db_type}: `{command}` reached the explain path"
+                    );
+                }
+            }
+            // ... and a real statement is still explained, which is what keeps
+            // this from being a refusal that swallowed the feature.
+            assert!(SqlEditorWidget::single_statement_to_explain(
+                "SELECT * FROM employees",
+                db_type,
+                None,
+                "No SQL at cursor",
+            )
+            .is_ok());
+        }
+
+        // The one spelling this deliberately takes away, and the one that
+        // replaces it. `DESC ANALYZE <statement>` is the MySQL family's
+        // executing explain, but the app's own splitter reads any line opening
+        // with `DESC` as its catalog describe (`describe_target_names_an_object`
+        // looks only at the first character after it), so `Ctrl+Enter` has
+        // never sent it and F6 must not either. `EXPLAIN ANALYZE <statement>`
+        // is the same server statement and is not a tool command, so the
+        // capability is not lost.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(
+                SqlEditorWidget::single_statement_to_explain(
+                    "DESC ANALYZE SELECT 1",
+                    db_type,
+                    None,
+                    "No SQL at cursor"
+                ),
+                Err(crate::db::query::result_messages::explain_plan_needs_a_statement()),
+                "{db_type}"
+            );
+            assert!(SqlEditorWidget::single_statement_to_explain(
+                "EXPLAIN ANALYZE SELECT 1",
+                db_type,
+                None,
+                "No SQL at cursor",
+            )
+            .is_ok());
+        }
+    }
+
+    /// The `STATEMENT_ID` the Oracle statement stamps on itself is a quoted
+    /// literal, so it must not read as one of the user's placeholders — the
+    /// classification and the read-back both scan this text.
+    #[test]
+    fn the_oracle_explain_statement_carries_the_users_placeholders_and_nothing_else() {
+        let statement = super::explain_plan_backend_for(crate::db::DatabaseType::Oracle).statement(
+            crate::db::DatabaseType::Oracle,
+            "SELECT * FROM emp WHERE empno = :id AND ename = :name",
+        );
+        assert_eq!(
+            super::QueryExecutor::extract_bind_names(statement.sql()),
+            vec!["ID".to_string(), "NAME".to_string()],
+            "{}",
+            statement.sql()
+        );
+        let none = super::explain_plan_backend_for(crate::db::DatabaseType::Oracle)
+            .statement(crate::db::DatabaseType::Oracle, "SELECT 1 FROM DUAL");
+        assert!(
+            super::QueryExecutor::extract_bind_names(none.sql()).is_empty(),
+            "{}",
+            none.sql()
         );
     }
 }

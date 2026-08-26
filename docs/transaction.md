@@ -394,11 +394,40 @@ because it has to be the same whichever button was pressed. It asks the backend
 whether the mode is a property of the TRANSACTION here
 (`DatabaseType::transaction_mode_requires_first_statement`) and then the
 statement classifier (`oracle_read_only_allows_statement`). F6 Explain Plan is
-the path that showed why: `EXPLAIN PLAN FOR` inserts into `PLAN_TABLE`, and it
+the path that showed why: `EXPLAIN PLAN … FOR` inserts into `PLAN_TABLE`, and it
 ran without asking, so a Read only tab could still write through it. Every
 caller asks about the statement that will actually be sent, which for Explain is
-`ExplainPlanBackend::explain_statement()` rather than the `SELECT` being
-explained.
+`ExplainStatement::sql()` rather than the `SELECT` being explained.
+
+read-only has a second owner, though — the connection's own flag — and a path
+that SENDS must ask both. `SqlEditorWidget::write_refusal_for_statement` is that
+one answer, and F6 is why it exists: it had learned to ask the tab's pin and
+still never asked the connection's, so a connection marked read-only kept
+writing to `PLAN_TABLE`. The connection's half is asked first, because it is the
+wider guard: it refuses on every backend and for statements no transaction mode
+judges (`@file`, `CONNECT`).
+
+Read-only is not the only reason a statement must not be sent, though, and the
+explain path is where that shows too. Its statement runs on the connection's own
+session, which no tab owns and which carries no tab's transaction mode — so on
+the MySQL family the READ ONLY pin, which delegates the data question to the
+session's own `SET SESSION TRANSACTION READ ONLY`, has nothing to delegate to
+there. That is why `ExplainPlanBackend::refusal_before_sending` is asked ahead of
+both read-only halves and holds whatever they say: this family's executing
+explain runs what it explains, and a change made on that session is one nothing
+here would ever commit or roll back. It is also asked BEFORE the placeholder
+prompt, so a statement the app is going to refuse does not first open a modal
+asking for values — the rule the execution path already followed. See
+`docs/session.md` for the measurements.
+
+An executing explain COMMITS nothing and leaves whatever it ran, and both facts
+are read from the statement it runs rather than from the word in front of it
+(`mysql_explain_executed_statement`). MariaDB's spelling is the one that bit:
+`ANALYZE <statement>` shares its first word with `ANALYZE TABLE`, which really
+is implicitly-committing maintenance, so the executing form was claimed to
+commit — clearing a decision the tab still needed — and to leave nothing, while
+`ANALYZE UPDATE …` measurably writes. The maintenance form keeps its own
+answer on both products.
 
 The object browser's menus stop OFFERING what that gate would refuse, and the
 answer they ask has two sources with different owners: the connection's

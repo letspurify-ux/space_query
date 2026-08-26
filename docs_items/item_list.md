@@ -689,7 +689,7 @@ README와 `docs/session.md`에 적었다.
 
 | 조각 | 위치 |
 | --- | --- |
-| 계획 모델·연결선·비용 몫 (순수 함수, 테스트 31개) | `src/ui/explain_plan.rs` |
+| 계획 모델·연결선·비용 몫 (순수 함수) | `src/ui/explain_plan.rs` |
 | Oracle `PLAN_TABLE` 조회 (OCI / thin) | `QueryExecutor::get_explain_plan` / `get_thin_explain_plan` |
 | MySQL/MariaDB `EXPLAIN` 원본 결과 | `MysqlExecutor::get_explain_plan` |
 | 백엔드 분기 | `trait ExplainPlanBackend` (`sql_editor/mod.rs`) |
@@ -734,6 +734,231 @@ Oracle은 predicate와 cost 몫이 실려 오는지·MySQL 계열은 서버 컬�
 **남은 것**: `DBMS_XPLAN`의 Note 각주(동적 통계 사용 등)는 `PLAN_TABLE`에 없으므로
 표시하지 않는다. MySQL `EXPLAIN FORMAT=JSON` 기반의 진짜 트리는 버전별 구조 차이가
 커서 범위 밖으로 뒀다(사용자가 직접 친 `EXPLAIN FORMAT=JSON`은 지금도 그냥 실행된다).
+
+#### 이후 (2026-08-26) — 정밀 검토 라운드
+
+위 항목은 **그리기**를 끝냈고, 이 라운드는 **무엇을 어디서 어떻게 보내는가**를
+끝냈다. 자세한 근거는 `docs/session.md`·`docs/transaction.md`·`docs/result_ui.md`.
+
+- **read-only의 두 주인을 한 답으로.** 탭의 READ ONLY 핀만 묻고 커넥션의
+  `read_only` 플래그는 묻지 않아, 사용자가 read-only로 표시한 커넥션에서도 F6가
+  `PLAN_TABLE`에 썼다 — 분류기와 문서는 이미 안 된다고 말하고 있었고 묻는 사람만
+  없었다. `SqlEditorWidget::write_refusal_for_statement`가 두 반쪽을 합친 하나의
+  답이다.
+- **한 번만 준비되는 문장.** `ExplainStatement` / `OracleExplainStatement`가 보낼
+  텍스트와 Oracle `STATEMENT_ID`를 한 값으로 들고 있어, 게이트가 판단한 문장과
+  전선에 나가는 문장이 갈라질 수 없다. 되읽기가 `MAX(plan_id)`(영구
+  `PLAN_TABLE`에서 남의 계획을 그렸다)에서 **자기 id**로 바뀌었다.
+- **드라이버별로 다시 쓰이던 의식을 하나로.** `run_oracle_main_session_action`이
+  스코프·취소 대상 게시·선-break·타임아웃을 한 곳에서 한다. thin은 타임아웃이 아예
+  없었고 취소 대상을 첫 왕복 뒤에 게시했다.
+- **F6는 `Ctrl+Enter`가 보낼 텍스트를 설명한다.** 선택 영역 우선,
+  `statement_source_for_single_action` 한 결정을 두 호출자가 함께 쓴다.
+- **placeholder**: MySQL 계열은 프롬프트가 값을 텍스트에 넣어야 문장이 성립하고,
+  Oracle `EXPLAIN PLAN`은 파싱만 하므로 바인드가 아예 필요 없다(라이브 프로브로
+  확정). 이미 `EXPLAIN PLAN`인 문장은 다시 감싸지 않고 **읽어서** 안쪽을 설명한다.
+- **계획이 못 보는 것을 말한다.** 계획은 커넥션 자신의 세션에서 만들어지므로 탭
+  세션에만 있는 임시 테이블·사용자 변수·세션 설정은 보이지 않는다. 탭 세션으로
+  옮기는 것은 **측정 결과 불가**(MySQL `EXPLAIN`은 `autocommit=0`에서 트랜잭션을
+  연다 — 앱의 첫 dirty 프로브가 ACTIVE로 보고). 그래서 앱이 이미 추적 중인 상태로
+  **무엇이 안 보이는지 말한다**.
+- **취소는 오류가 아니다**: `result_messages::EXPLAIN_PLAN_CANCELLED`로 4개 백엔드
+  동일. 빈 계획은 "loaded"라 하지 않는다.
+
+#### 이후 (2026-08-26) — 적대적 재검토 라운드
+
+앞 라운드는 **어떤 문장을 보내는가**를 끝냈고, 이 라운드는 그 문장이 **무엇을
+하는가**를 끝냈다. 3건 모두 라이브로 확인했다.
+
+- **설명(explain)이 데이터를 바꾸면 안 된다.** MySQL 계열의
+  `EXPLAIN ANALYZE <문장>`은 설명 대상을 **실행**한다. 분류기는 모든 EXPLAIN을
+  묻지도 않고 읽기로 보고 있었으므로 `EXPLAIN ANALYZE UPDATE …`가 read-only
+  커넥션을 통과했고, 세션에 작업 기록도 남기지 않았다. 이제 분류기가 **실행되는
+  문장**을 읽고(`mysql_explain_executed_statement`, `DESCRIBE`/`DESC` 철자 포함),
+  F6는 read-only와 무관한 자기 게이트를 따로 가진다
+  (`ExplainPlanBackend::refusal_before_sending`) — 설명은 **탭이 소유하지 않는**
+  커넥션 자신의 세션에서 돌기 때문에, 거기서 바뀐 것은 앱의 어떤 커밋/롤백도
+  책임지지 않고 MySQL 계열의 READ ONLY 핀은 그 세션에 걸려 있지도 않다.
+  측정: MySQL 8.0.46은 DML을 `<not executable by iterator executor>`로 돌려보내고
+  아무것도 쓰지 않지만 8.3부터 실행한다. MariaDB 12.2.2는 `EXPLAIN ANALYZE`를
+  문법 오류로 거절하고, 자기 철자인 `ANALYZE UPDATE …`는 **실제로 쓴다**.
+  그래서 앱은 서버 버전이 아니라 **문장**을 보고 답한다.
+- **타임아웃은 취소가 아니다.** 측정: MySQL 8.0.46의 `max_execution_time` 오류는
+  `Query execution was interrupted, maximum statement execution time exceeded` —
+  `KILL QUERY`와 같은 문장으로 시작한다. 그래서 시간 초과된 F6가 "Explain plan
+  cancelled"로 보고되고 타임아웃 정보는 사라졌다. `message_indicates_query_cancel`이
+  이제 ①앱 자신의 취소 문장 ②타임아웃 보고 ③드라이버 취소 마커 순으로 묻는다 —
+  드라이버 계층(`is_cancel_error`)이 원래 쓰던 우선순위와 같다. Oracle 쪽도 같은
+  어휘로 정규화(`oracle_main_session_error_message`).
+- **MySQL 의식(ceremony)의 순서.** 스코프 적용(`USE`+`SET NAMES`, 서버 왕복 2회)이
+  취소 대상 게시·타임아웃 설치보다 **먼저** 실행되어 취소도 타임아웃도 닿지 않았다.
+  Oracle 쌍둥이와 같은 순서로 맞췄다.
+
+#### 적대적 재검토가 더 찾은 2건 (같은 날)
+
+- **취소가 `PLAN_TABLE` 롤백을 삼켰다.** 앱이 보낸 취소는 **실행 중인 호출**을
+  끊으므로, 사용자가 늦게 Cancel을 누르면 break가 그 다음 호출 — 바로 이 롤백 —
+  에 떨어진다. 두 Oracle 드라이버 모두 이 잔여물을 가질 수 있어서(측정됨) 롤백이
+  `ORA-01013`으로 실패하고 경고 로그만 남았으며, **쓰기는 공유 세션에 열린 채로**
+  커넥션 수명 내내 남았다 — 롤백이 막으려던 바로 그 상태에 Cancel 한 번으로 도달.
+  앱의 기존 late-cancel 문(`answer_not_taken_from_our_own_cancel_when`)을 통해
+  묻도록 고쳤다(두 번째 ROLLBACK은 되돌릴 것이 없으므로 안전).
+- **내 수정이 만들 뻔한 회귀.** 취소 분류기를 고치자, 이미 스트리밍된 행을 가진
+  SELECT가 **타임아웃**되었을 때 그리드가 행을 버리게 됐다(전에는 MySQL 문구가
+  취소와 같아서 우연히 유지됐고 Oracle에서는 원래 버려졌다). 그리드가 묻는 질문을
+  "취소인가"에서 **"중단되었는가(취소 또는 타임아웃)"**로 바로잡아, 4개 백엔드가
+  같은 사건에 같게 답하고 부분 결과를 지킨다.
+- **취소 경로는 둘, 그리고 플래그는 "아직 탭이 통보받았는가"만 답한다.** 탭의 Cancel
+  버튼은 break보다 **먼저** `cancel_flag`를 세우지만, 활동 뷰는 레지스트리
+  (`cancel_db_activity`)로 **먼저 세션을 끊고** 플래그는 나중 UI 틱에서야 세운다
+  (`registry_cancel_hook_for` → `apply_pending_registry_cancel`) — 그 작업이 이미
+  끝난 뒤였다면 **아예 세우지 않는다**(`cancel_current`가 현재 작업을 스냅샷하는데
+  일치하는 것이 없으므로). 그래서 롤백의 late-cancel 잔여물을 그 플래그로 게이팅한
+  내 앞 라운드 수정은 한 경로에서만, 그리고 어떤 창에서는 **양쪽 모두에서** 보호하지
+  못했다. 이제 드라이버 상수를 **무조건** 쓴다: 문이 재요청하는 것은 첫 답이 정말
+  우리 취소일 때뿐이고, 두 번째 ROLLBACK은 되돌릴 것이 없다. **규칙: 누가 취소했든
+  반드시 일어나야 하는 작업(COMMIT/ROLLBACK/정리)은 탭 플래그로 게이팅하지 않는다.**
+- **같은 세션을 쓰는 이웃: Quick describe에 타임아웃이 없었다.** F6와 같은 탭에서
+  같은 **커넥션 자신의 세션**(모든 탭의 작업이 그 뒤에 줄 서는 세션)에 닿는데 어떤
+  백엔드에서도 시간 제한이 없었다 — 유지된 thin 세션은 자체 call timeout이 아예
+  없어 최악. 이제 **탭의 타임아웃**을 각 백엔드 래퍼로 적용한다(고정 메타데이터
+  타임아웃이 아니라 탭의 값인 이유: 결과 탭을 여는 사용자 의도 동작이라 F6와 같다.
+  사용자가 요청하지 않은 signature hint는 기존 고정 5초 유지). MySQL 계열은
+  `run_mysql_action_with_timeout`을 **문장 절반 / 세션 절반**으로 쪼개
+  (`run_mysql_main_connection_action`) 세션 절반만 공유한다 — describe는 세션의
+  데이터베이스를 바꾸면 안 되고(캐시된 `DATABASE()` 문제), 취소 대상은 **커넥션
+  락이 이미 게시**하므로 문장 절반이 필요 없다.
+
+#### 이후 (2026-08-26) — 정밀 재검토 라운드 (라운드 1-5의 사각지대)
+
+앞 라운드들이 지나간 자리를 봤다. 4건 수정, 전부 fail-before / pass-after.
+
+- **thin만 F6마다 서버 커서를 1개씩 흘렸다.** `OracleThinSession`은 커서를
+  결과 안에 담아 돌려주고 스스로 닫지 않는다 — 결과를 버리면 커서를 버리는 것이다.
+  `EXPLAIN PLAN`이 그 형태였고, 하필 **풀이 아닌** 커넥션 자기 세션이라
+  `reset_before_reuse`의 청소도 닿지 않아 커넥션 수명 내내 쌓였다(→ `ORA-01000`).
+  OCI는 `Statement`가 drop되며 닫히므로 애초에 없던 결함 — 즉 **두 드라이버의
+  분기**였다. 측정: 12회 explain에 수정 전 **+12 커서**, 수정 후 **0**, OCI는 양쪽 다 0.
+  재발 방지는 소스 가드
+  (`a_thin_statement_result_is_never_dropped_with_its_server_cursor_inside`):
+  `src/` 어디서도 thin 문장 실행의 결과를 버릴 수 없다. 같은 형태였던
+  `apply_oracle_thin_transaction_mode`도 함께 고쳤다.
+- **MariaDB 자기 철자 `ANALYZE <문장>`을 아무도 explain으로 읽지 않았다.**
+  MySQL은 `EXPLAIN ANALYZE <문장>`, MariaDB는 `ANALYZE <문장>`. 후자를 모르는 바람에
+  `ANALYZE TABLE`과 첫 단어가 같다는 이유로 **유지보수 문장**으로 읽혔고, 그래서
+  ①`Ddl`로 분류되어 **암시적 커밋**을 주장했고(측정: MariaDB 12.2.2에서
+  `ANALYZE UPDATE`는 실제로 쓰고 트랜잭션을 **열어둔다**; `ANALYZE SELECT`도 커밋하지
+  않는다 — 탭이 갖고 있던 커밋 결정을 지웠다), ②"미커밋 작업을 남기는가"에 **아니오**로
+  답했으며(MySQL의 `EXPLAIN ANALYZE UPDATE`도 같은 사각), ③F6가 MariaDB가 거절하는
+  `EXPLAIN ANALYZE …`로 감싸버려 **MariaDB 사용자만 측정 계획을 볼 수 없었다**.
+  이제 `db_type`을 받는 **리더 하나**(`mysql_explain_executed_statement`)가 두 철자를
+  모두 알고, 분류기·read-only·암시적 커밋·미커밋 작업·F6 문장 생성기가 **그 하나**를 묻는다.
+  `ANALYZE [modifiers] TABLE`은 양쪽 다 유지보수로 남는다(측정: 실제로 커밋한다).
+  덤으로 `EXPLAIN … FOR SCHEMA|DATABASE <name>` 절을 건너뛴다 — 앱의 IntelliSense는
+  이미 아는 문법인데 explain 리더만 몰라서 **순수 읽기를 오거절**하고 있었다.
+- **F6가 거절보다 먼저 값을 물었다.** 실행 경로가 명시해 둔 규칙("read-only 커넥션은
+  placeholder 값을 묻고 나서 거절하면 안 된다")을 F6만 거꾸로 하고 있어
+  `EXPLAIN ANALYZE UPDATE t SET c = ?`가 모달을 띄운 뒤 거절했다. 프롬프트 앞에서는
+  **백엔드의 반쪽만** 묻는다 — 그것만이 커넥션도 탭도 아닌 **문장 자체의 속성**이고,
+  read-only 두 반쪽은 워커가 커넥션 락 아래에서 다시 읽는 값이기 때문이다.
+- **F6 안에서 방언을 두 번 물었다.** 선택 영역 분리는 캐시로 답하는
+  `current_db_type()`을, 나머지는 커넥션 프로필을 쓰고 있었다. 이제 한 답을 넘겨 쓴다.
+
+#### 이후 (2026-08-26) — 라운드 7
+
+- **F6의 두 경로가 "이게 문장이긴 한가"를 한쪽만 물었다.** 선택 영역 경로는 늘
+  스플리터로 쪼개 판정했지만, 캐럿 경로는 텍스트를 **검사 없이** 넘겼다. 그래서
+  앱이 **자기가 수행하는 명령**(`DESC t`, `CONNECT user/pass@db`, `@script.sql`,
+  `PROMPT …`)이 explain으로 감싸져 **서버로 전송**됐다 — 같은 텍스트를 **선택**하면
+  거절되고 `Ctrl+Enter`는 앱 카탈로그로 답하는데, 캐럿에서만 세 번째 답이 나왔다.
+  MySQL 계열에서는 전송이 **성공**까지 했다: `explain_plan_sql`이 `DESC`를 통과시켜
+  서버가 **테이블 기술**(측정: `Field/Type/Null/Key/Default/Extra`)을 돌려주고, 그것이
+  "Explain Plan" 이름표를 달고 표시됐다. read-only 가드는 이걸 볼 수 없다 — `CONNECT`를
+  툴 명령으로 알고 거절하지만, F6가 물을 때는 이미 `EXPLAIN PLAN … FOR …` **안에**
+  들어 있어 스플리터가 단일 문장으로 읽는다(= `CONNECT` 줄의 비밀번호가 전선을 탄다).
+  이제 두 경로 모두 `single_statement_to_explain` 하나를 통과한다.
+  잃는 철자는 `DESC ANALYZE <문장>` 하나뿐이고, 같은 서버 문장인
+  `EXPLAIN ANALYZE <문장>`은 그대로 쓸 수 있다.
+- **그 수정이 만들 뻔한 회귀를, 적대적 리뷰가 잡았다.** 스플리터의 문장 텍스트는
+  **선행 주석을 제거**한다. 캐럿 경로를 스플리터에 태우면 전선에 나가는 바이트가
+  조용히 바뀐다. `statement_with_its_leading_comments`가 "스플리터는 어느 문장인지와
+  어디서 끝나는지를, 사용자 텍스트는 문장이 무엇인지를 말한다"로 되돌린다.
+  (옵티마이저 힌트 때문이 아니다 — 두 제품 모두 힌트는 `SELECT` **뒤**에 와야 하므로
+  문장 안에 있다. 이유는 더 좁고 참인 쪽이다: 리팩터링이 전선의 바이트를 조용히
+  바꾸면 안 된다.)
+
+**철회한 지적 1건**: "취소 플래그가 타임아웃보다 먼저 물어진다"는 결함이 아니다.
+플래그가 서 있다는 것은 사람이 실제로 Cancel을 눌렀다는 뜻이고(라운드 5의 타이밍
+분석), 라운드 2가 고친 것은 그 반대 — **아무도 누르지 않았는데** 앱이 취소라고 말한
+경우다. 게다가 순서를 바꾸면 진짜 취소에 딸려오는 `Failed to reset ... call timeout`
+문구를 타임아웃으로 읽게 되어(그래서 `session_policy`의 타임아웃 마커가 좁다) 새 버그가
+된다.
+
+**바꾸지 않은 것 1건**: Oracle `PLAN_TABLE` 되돌리기의 세션 전체 `ROLLBACK`.
+`SAVEPOINT`/`ROLLBACK TO SAVEPOINT`는 되돌린 뒤에도 **빈 트랜잭션을 열어둔 채** 남기므로
+공유 세션에는 오히려 나쁘다. 지금의 blanket rollback이 트랜잭션을 끝낸다.
+
+#### 이후 (2026-08-27) — 라운드 8: 4개 백엔드가 한 문장으로 답하게
+
+라운드 1–7은 **어느 문장을 보내는가**와 **그것이 무엇을 하는가**를 끝냈다. 이 라운드는
+**답이 백엔드마다 달랐던 자리**를 없앴다. 라이브 4/4, 전부 fail-before / pass-after.
+
+- **계획이 없는 문장을 감싸서 보냈다.** F6는 받은 것을 무조건 감싸므로 PL/SQL 블록,
+  루틴 호출, 트랜잭션·세션 제어, 이 계열의 `ANALYZE … TABLE` 유지보수 문장이 전부
+  서버로 갔고, 백엔드마다 다른 원문 오류가 나왔다(측정: Oracle 23c는 `CALL p(1)`·블록·
+  `COMMIT`·`ANALYZE TABLE … COMPUTE STATISTICS`에 `ORA-00905`, `ALTER SESSION SET …`에
+  `ORA-00900`; MySQL 8.0.46은 `EXPLAIN CALL p(1)`·`EXPLAIN DO …`에 `ERROR 1064`).
+  `ANALYZE TABLE t`는 오류보다 나빴다 — MySQL은 감싼 `EXPLAIN ANALYZE TABLE t`를
+  **`TABLE t` 질의의 실행형 explain**으로 읽어 **다른 문장의 실측 계획**(그 테이블
+  전체 스캔)을 그려 줬고, MariaDB는 `ERROR 1064`, Oracle은 파싱 오류였다. 한 번의
+  키 입력, 세 가지 다른 오답. 이제 `statement_without_an_execution_plan_reason`
+  하나가 답하고, **fail-open**이다: 증명할 수 있는 것만 이름 붙이므로 DDL은 통째로
+  빠져 있다(Oracle은 `CREATE TABLE … AS SELECT`·`CREATE INDEX`를 설명한다).
+  묻는 자리는 `ExplainPlanBackend::refusal_before_sending`의 **본문**(그 트레이트의
+  유일한 기본 구현)이라 백엔드가 건너뛸 수 없고, 묻는 대상은 전선 텍스트가 아니라
+  `ExplainStatement::statement_the_app_chose_to_explain()`이다 — 사용자가 직접 친
+  explain은 앱이 고른 것이 아니므로 그대로 통과한다.
+- **MariaDB에 없는 문장을 말하는 거절.** `explain_plan_would_run_the_statement`가
+  `EXPLAIN ANALYZE`를 하드코딩하고 있었다. MariaDB는 그 철자를 거부하고
+  `ANALYZE <문장>`을 쓴다. 이제 철자는 "이것이 실행형 explain이다"를 판정한 그 답에서
+  같이 나온다(`ExecutingExplainWrite::spelling`). **가드 테스트가 결함을 고정하고
+  있었으므로** 두 제품 각자의 철자를 단언하도록 바꿨다.
+- **Oracle private temporary table을 노트가 못 봤다.** `oracle_session_residue_effects`가
+  아무 필드도 세우지 않아, 그 테이블을 만든 탭은 F6가 `ORA-00942`로 답할 때 **아무 말도
+  듣지 못했다** — MySQL 쪽 반쪽은 늘 동작했는데. 이제 **같은 필드**를 세우므로 네 백엔드가
+  같은 단어로 말하고, 세션도 유지된다(private temp table은 세션과 함께 죽으므로 옳다).
+  `GLOBAL`은 일부러 제외 — 그건 모든 세션이 이름을 푸는 영구 스키마 객체다.
+- **거절과 실패가 한 문자열이었다.** 그래서 결과 창이 모든 거절에 접두어를 붙여
+  `Explain plan failed: Explain plan was not run: …`라고 말했다. `ExplainPlanError`가
+  둘을 나눈다: `Refused`는 제 문장 그대로, `Failed`만 접두어와 취소 판정을 받고,
+  "계획이 못 보는 것" 노트도 `Failed`에만 붙는다(노트는 "이 계획은 …에서 만들어졌다"로
+  시작하므로 거절 옆에서는 참이 아니다).
+- **read-only 거절이 이유를 말하지 않았다.** 공유 문구는 **거절된 문장**을 설명하는데
+  Oracle에서 그 문장은 앱이 만든 `EXPLAIN PLAN … FOR`다. 그래서 `SELECT`의 계획을
+  요청한 사용자가 "비질의 문장이라 막혔다"를 읽었고, 같은 키가 다른 계열에서는 그냥
+  됐는데 무엇이 다른지 아무도 말하지 않았다. `explain_plan_write_refused`가 공유 문구를
+  그대로 두고 `why_building_the_plan_is_itself_a_write`(Oracle만 `Some`)를 덧붙인다.
+- **서버가 그린 계획이 셀 하나에 갇혔다.** MySQL `EXPLAIN ANALYZE`/`FORMAT = TREE`,
+  양쪽 `FORMAT = JSON`은 **한 컬럼에 개행 포함 한 문자열**로 답한다. 그리드는 행을 한 줄
+  높이로 잡으므로 첫 줄만 보였고, 같은 키가 MariaDB의 표 형식 `ANALYZE SELECT`에서는
+  읽히는 표를 만들었다. 이제 줄마다 한 행으로 나눈다(컬럼명·각 줄 원문 그대로).
+- **연결 안 된 탭에 "커넥션이 바쁘다"고 답했다.** `UiActionResult::NotConnected`.
+- **F6가 아직 방언을 두 번 읽었다.** 라운드 6은 `statement_to_explain`만 고쳤고, 그
+  함수가 판정할 텍스트를 만들어 오는 `statement_source_for_single_action`·
+  `resolve_bind_parameter_values`는 여전히 캐시(`current_db_type()`)를 읽었다. 이제
+  값을 **받는다**; 가드가 그 안에서의 캐시 읽기를 금지한다.
+
+**철회한 지적 1건**: "Oracle은 타임아웃 복원 실패에 teardown이 없다". 결함이 아니다.
+MySQL 쪽 타임아웃은 **서버 상태**(`SET SESSION max_execution_time`)라 복원 실패가
+멀쩡한 세션에 잘못된 값을 남기므로 커넥션 교체 말고는 방법이 없다. Oracle 쪽은
+**클라이언트 속성**(OCI 핸들 / thin 소켓 타임아웃)이라 실패했다는 것은 핸들·소켓이 이미
+죽었다는 뜻이고, 다음 호출이 평소의 커넥션 손실 경로로 보고한다.
+
+**측정으로 기각한 위험 1건**: "MySQL `MAX_EXECUTION_TIME`이 `EXPLAIN ANALYZE`에는 적용
+안 될 수 있다". MySQL 8.0.46에서 측정: `SET SESSION MAX_EXECUTION_TIME=500` 아래
+`EXPLAIN ANALYZE SELECT SLEEP(3)`은 513ms, 무거운 조인은 503ms에서 끊겼다. 적용된다.
+(덤으로 관찰: 끊긴 `EXPLAIN ANALYZE`는 오류가 아니라 **부분 계획**을 돌려준다. 서버의
+설계이고 클라이언트가 알 방법이 없어 그대로 둔다.)
 
 ### 13. 외래키 기반 관련 데이터 이동 (Go to Referenced Data)
 

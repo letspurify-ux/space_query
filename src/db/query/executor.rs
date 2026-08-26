@@ -81,19 +81,144 @@ RETURN generated; \
 END; \
 SELECT scoped_object_ddl(:1, :2, :3) FROM DUAL";
 
-/// Reads back the plan `EXPLAIN PLAN FOR` just wrote.
+/// Reads back the plan `EXPLAIN PLAN FOR` just wrote, named by the
+/// `STATEMENT_ID` that write stamped on it (bind `:1`).
 ///
 /// `DBMS_XPLAN.DISPLAY` is deliberately not used: it returns the plan already
 /// drawn as ASCII, which throws away the parent links, the per-row estimates and
 /// the predicates as separate values. Reading `PLAN_TABLE` keeps them.
 /// Every column comes back as text so the OCI and thin paths parse identically.
-const ORACLE_EXPLAIN_PLAN_SQL: &str = "SELECT TO_CHAR(id), TO_CHAR(parent_id), operation, \
-options, object_owner, object_name, TO_CHAR(cardinality), TO_CHAR(bytes), TO_CHAR(cost), \
-access_predicates, filter_predicates FROM plan_table \
-WHERE plan_id = (SELECT MAX(plan_id) FROM plan_table) ORDER BY id";
+///
+/// The read-back names the rows THIS call wrote. It used to take "the row set
+/// with the highest `plan_id`", which is only this call's plan while
+/// `PLAN_TABLE` is the session-private `SYS.PLAN_TABLE$`. A schema that ran
+/// `utlxplan.sql` has a PERMANENT `PLAN_TABLE` shared by every session of that
+/// user: our own INSERT is invisible to them until it commits (it never does —
+/// it is rolled back), but anything they COMMITTED between our INSERT and this
+/// SELECT is visible to us and carries a higher `plan_id`, so F6 drew someone
+/// else's plan. The `plan_id` clause stays, scoped to our own id, so a previous
+/// call whose rollback failed cannot answer for this one either.
+const ORACLE_EXPLAIN_PLAN_SQL: &str = "SELECT TO_CHAR(p.id), TO_CHAR(p.parent_id), p.operation, \
+p.options, p.object_owner, p.object_name, TO_CHAR(p.cardinality), TO_CHAR(p.bytes), \
+TO_CHAR(p.cost), p.access_predicates, p.filter_predicates FROM plan_table p \
+WHERE p.statement_id = :1 \
+AND p.plan_id = (SELECT MAX(q.plan_id) FROM plan_table q WHERE q.statement_id = p.statement_id) \
+ORDER BY p.id";
 
-/// Number of columns `ORACLE_EXPLAIN_PLAN_SQL` selects.
+/// Number of columns `ORACLE_EXPLAIN_PLAN_SQL` selects, and therefore the width
+/// both drivers hand back and `explain_plan::oracle_plan_nodes` reads apart.
+///
+/// It lives here, beside the SELECT it counts, and
+/// `oracle_explain_plan_select_matches_the_column_count` checks the two against
+/// each other — a second copy of the number somewhere else could only drift.
 const ORACLE_EXPLAIN_PLAN_COLUMNS: usize = 11;
+
+/// One Oracle explain: the statement that will go on the wire, and the
+/// `STATEMENT_ID` its `PLAN_TABLE` rows will carry.
+///
+/// The two are ONE value because they are one fact. The text is what the
+/// read-only gates judge — `EXPLAIN PLAN … FOR <select>` is an INSERT into
+/// `PLAN_TABLE`, so asking about the user's `SELECT` would answer "this is a
+/// read" and let the write through — and the id is how the rows that INSERT
+/// wrote are found again. Building either one separately is what let the
+/// question and the answer come to be about different statements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleExplainStatement {
+    sql: String,
+    statement_id: String,
+    target: String,
+}
+
+impl OracleExplainStatement {
+    /// Prepare an explain of `sql`.
+    ///
+    /// The statement is normalized exactly as an execution would normalize it
+    /// (`normalize_sql_for_execute`, the same call the MySQL family's
+    /// `explain_plan_sql` makes): Oracle rejects `EXPLAIN PLAN FOR … ;`
+    /// outright, and a statement typed with its terminator is the normal case
+    /// in the editor.
+    ///
+    /// A statement that is ALREADY an `EXPLAIN PLAN` is read for what IT
+    /// explains rather than wrapped again — see
+    /// [`crate::db::sql_classification::oracle_explain_plan_target`] for why
+    /// Oracle reads it where the MySQL family passes its own `EXPLAIN`
+    /// through. The loop unwraps a statement written that way more than once;
+    /// each turn is strictly shorter than the last, and the length check says
+    /// so rather than trusting it.
+    pub fn new(sql: &str) -> Self {
+        let mut target = QueryExecutor::normalize_sql_for_execute(sql);
+        loop {
+            let Some(inner) = crate::db::sql_classification::oracle_explain_plan_target(&target)
+                .map(str::to_string)
+            else {
+                break;
+            };
+            if inner.len() >= target.len() {
+                break;
+            }
+            target = inner;
+        }
+
+        let statement_id = oracle_plan_statement_id();
+        let sql = format!("EXPLAIN PLAN SET STATEMENT_ID = '{statement_id}' FOR {target}");
+        Self {
+            sql,
+            statement_id,
+            target,
+        }
+    }
+
+    /// The statement that goes on the wire, and the text every gate is asked
+    /// about.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// The id this call's `PLAN_TABLE` rows carry.
+    pub fn statement_id(&self) -> &str {
+        &self.statement_id
+    }
+
+    /// The statement this explain is ABOUT — the third fact of the same value,
+    /// for the same reason the first two are one value.
+    ///
+    /// Oracle always builds its own `EXPLAIN PLAN` around it, even when the
+    /// user typed one (the read-back needs the `STATEMENT_ID` THIS call
+    /// stamps), so the app is always the one choosing what gets explained here
+    /// — and the gate that asks "does this statement have a plan at all?" must
+    /// be asked about what will be explained, not about the wrapper the app
+    /// just put around it.
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+}
+
+/// The residue a probe states: nothing of this app's was sent, so the explain's
+/// rollback must not ask the session twice.
+///
+/// One helper rather than a closure per call site, because the value is a claim
+/// about the road — "no cancel was sent here" — and a probe that quietly said
+/// the opposite would be paying for a re-ask it cannot need.
+#[cfg(test)]
+fn no_cancel_sent() -> crate::db::SessionCancelResidue {
+    crate::db::SessionCancelResidue::NothingLeftToLand
+}
+
+/// A `STATEMENT_ID` no other explain will answer for.
+///
+/// Process id and a counter, because the sharing that broke the old read-back
+/// is across SESSIONS of one Oracle user (a permanent `PLAN_TABLE` from
+/// `utlxplan.sql`), and two of those sessions can be two runs of this program.
+/// `PLAN_TABLE.STATEMENT_ID` is `VARCHAR2(30)`; this is at most 27 characters.
+fn oracle_plan_statement_id() -> String {
+    static NEXT_PLAN_STATEMENT_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "SQ{:X}_{:X}",
+        std::process::id(),
+        NEXT_PLAN_STATEMENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct NestedCursorDisplay {
@@ -4231,14 +4356,19 @@ impl QueryExecutor {
         Ok(rows)
     }
 
-    /// Explain `sql` and read the resulting plan back as text rows.
+    /// Explain the statement `plan` names and read the resulting plan back as
+    /// text rows.
     ///
     /// Rows come back in `ID` order, which is the same order `DBMS_XPLAN`
     /// displays, so the caller can draw connectors without re-sorting.
-    pub fn get_explain_plan(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, OracleError> {
-        let plan = Self::read_oracle_explain_plan(conn, sql);
-        Self::end_oracle_explain_plan_transaction(conn.rollback());
-        plan
+    pub fn get_explain_plan(
+        conn: &Connection,
+        plan: &OracleExplainStatement,
+        residue: impl Fn() -> crate::db::SessionCancelResidue,
+    ) -> Result<Vec<Vec<String>>, OracleError> {
+        let rows = Self::read_oracle_explain_plan(conn, plan);
+        Self::end_oracle_explain_plan_transaction(residue, || conn.rollback());
+        rows
     }
 
     /// Take back what `EXPLAIN PLAN FOR` wrote.
@@ -4253,8 +4383,32 @@ impl QueryExecutor {
     /// therefore the one that takes it back, in the function that issues it, so
     /// no call site can forget. The plan rows are already materialized by then,
     /// and a failure to roll back must not fail an otherwise correct plan.
-    fn end_oracle_explain_plan_transaction(result: Result<(), impl std::fmt::Display>) {
-        if let Err(err) = result {
+    ///
+    /// Asked through the app's late-cancel door, because the road that most
+    /// needs this rollback is the one most likely to lose it. A cancel this app
+    /// SENT interrupts the call that is RUNNING — and when the user cancels an
+    /// F6, the break can land after the explain itself is over, on the very
+    /// next call the session makes: this rollback. Both Oracle drivers can
+    /// carry that residue (`SessionCancelResidue::ORACLE_OCI` /
+    /// `ORACLE_THIN`, both measured), so without the door the rollback failed
+    /// with `ORA-01013`, this logged a warning, and the write stayed open on a
+    /// shared session for the life of the connection — exactly the state the
+    /// rollback exists to prevent, reachable by pressing Cancel. A second
+    /// `ROLLBACK` is safe for the reason the door's own callers rely on: it
+    /// takes nothing back.
+    ///
+    /// The residue is a CLOSURE, evaluated when the answer came, because this
+    /// road's cancel flag can be set WHILE the rollback is on the wire — the
+    /// explain publishes a cancel target for this very session.
+    fn end_oracle_explain_plan_transaction<E: std::fmt::Display>(
+        residue: impl Fn() -> crate::db::SessionCancelResidue,
+        rollback: impl FnMut() -> Result<(), E>,
+    ) {
+        if let Err(err) = crate::db::session_policy::answer_not_taken_from_our_own_cancel_when(
+            residue,
+            "explain plan rollback",
+            rollback,
+        ) {
             logging::log_warning(
                 "executor",
                 &format!("Failed to roll back the EXPLAIN PLAN write on the live session: {err}"),
@@ -4262,21 +4416,15 @@ impl QueryExecutor {
         }
     }
 
-    /// The statement the Oracle explain path will send.
-    ///
-    /// One spelling, because the tab's transaction-mode gate is asked about it
-    /// before it runs: it is an INSERT into `PLAN_TABLE`, so a read-only tab
-    /// must be refused even though what is being explained is a `SELECT`.
-    pub fn oracle_explain_plan_sql(sql: &str) -> String {
-        format!("EXPLAIN PLAN FOR {}", sql)
-    }
-
     fn read_oracle_explain_plan(
         conn: &Connection,
-        sql: &str,
+        plan: &OracleExplainStatement,
     ) -> Result<Vec<Vec<String>>, OracleError> {
-        let explain_sql = Self::oracle_explain_plan_sql(sql);
-        match conn.execute(&explain_sql, &[]) {
+        // No binds: `EXPLAIN PLAN` only PARSES the statement it explains, so
+        // its placeholders never need values and the server reports none to
+        // give them to. See
+        // `oracle_explain_plan_reports_no_binds_for_the_statement_it_explains`.
+        match conn.execute(plan.sql(), &[]) {
             Ok(_stmt) => {}
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -4291,7 +4439,8 @@ impl QueryExecutor {
                 return Err(err);
             }
         };
-        let rows = match stmt.query(&[]) {
+        let statement_id = plan.statement_id().to_string();
+        let rows = match stmt.query(&[&statement_id]) {
             Ok(rows) => rows,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -4330,28 +4479,41 @@ impl QueryExecutor {
 
     pub fn get_thin_explain_plan(
         conn: &mut OracleThinSession,
-        sql: &str,
+        plan: &OracleExplainStatement,
+        residue: impl Fn() -> crate::db::SessionCancelResidue,
     ) -> Result<Vec<Vec<String>>, String> {
-        let plan = Self::read_oracle_thin_explain_plan(conn, sql);
-        // The thin twin of the OCI path: see
-        // `end_oracle_explain_plan_transaction`.
-        Self::end_oracle_explain_plan_transaction(conn.rollback());
-        plan
+        let rows = Self::read_oracle_thin_explain_plan(conn, plan);
+        // The thin twin of the OCI path, late-cancel door included: thin clears
+        // a cancel it QUEUED and never sent, which is not the same fact as a
+        // break already on the wire — see `SessionCancelResidue::ORACLE_THIN`,
+        // which is `MayLandOnTheNextCall` because a live probe said so.
+        Self::end_oracle_explain_plan_transaction(residue, || conn.rollback());
+        rows
     }
 
     fn read_oracle_thin_explain_plan(
         conn: &mut OracleThinSession,
-        sql: &str,
+        plan: &OracleExplainStatement,
     ) -> Result<Vec<Vec<String>>, String> {
-        let explain_sql = Self::oracle_explain_plan_sql(sql);
-        conn.execute_typed(&OracleThinStatementRequest::statement(explain_sql), &[])
-            .map_err(|err| err.to_string())?;
+        // The OCI twin's reasoning, and the same wire shape: no binds.
+        //
+        // `query_drop`, not `execute_typed`: the thin driver hands the server
+        // CURSOR back inside the result and closes nothing itself, so a call
+        // that drops the result drops the cursor with it. The OCI twin's
+        // `Connection::execute` returns a `Statement` that closes when it goes
+        // out of scope, so only this side leaked — one server cursor per F6,
+        // on the connection's own session, which is NOT pooled and therefore
+        // never sees `reset_before_reuse`'s sweep. It accumulated for the life
+        // of the connection and ended in `ORA-01000`. The close costs no round
+        // trip of its own: it rides along on the read-back below, whose
+        // `describe_request` flushes what is queued.
+        conn.query_drop(plan.sql()).map_err(|err| err.to_string())?;
 
         ObjectBrowser::thin_query_text_rows(
             conn,
             ORACLE_EXPLAIN_PLAN_SQL,
             ORACLE_EXPLAIN_PLAN_COLUMNS,
-            Vec::new(),
+            vec![OracleThinBindValue::Text(plan.statement_id().to_string())],
         )
     }
 
@@ -8225,6 +8387,226 @@ mod select_execution_sql_tests {
 }
 
 #[cfg(test)]
+mod oracle_explain_statement_tests {
+    use super::{OracleExplainStatement, ORACLE_EXPLAIN_PLAN_COLUMNS, ORACLE_EXPLAIN_PLAN_SQL};
+    use crate::db::SessionCancelResidue;
+
+    /// The rollback that takes the `PLAN_TABLE` write back is asked AGAIN when
+    /// the app's own cancel answered it instead of the session.
+    ///
+    /// This is the road that most needs the rollback and was most likely to
+    /// lose it: a cancel interrupts the call that is RUNNING, so a user who
+    /// presses Cancel late has the break land on the very next call the session
+    /// makes — this rollback. Without the re-ask it failed with `ORA-01013`,
+    /// the failure was logged as a warning, and the write stayed open on a
+    /// session shared by every tab for the life of the connection.
+    #[test]
+    fn a_rollback_our_own_cancel_answered_is_asked_again() {
+        let mut attempts = 0u32;
+        super::QueryExecutor::end_oracle_explain_plan_transaction(
+            || SessionCancelResidue::MayLandOnTheNextCall,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err("ORA-01013: user requested cancel of current operation")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(
+            attempts, 2,
+            "the rollback must be asked again when our own cancel answered the first one"
+        );
+
+        // With no cancel of ours outstanding, one failure is the session's
+        // answer and asking twice would be asking past it.
+        let mut attempts = 0u32;
+        super::QueryExecutor::end_oracle_explain_plan_transaction(
+            || SessionCancelResidue::NothingLeftToLand,
+            || {
+                attempts += 1;
+                Err("ORA-01013: user requested cancel of current operation")
+            },
+        );
+        assert_eq!(attempts, 1);
+
+        // And a failure that is NOT our cancel is never re-asked either, even
+        // while residue is outstanding: a real error asked twice is a second
+        // statement nobody wanted.
+        let mut attempts = 0u32;
+        super::QueryExecutor::end_oracle_explain_plan_transaction(
+            || SessionCancelResidue::MayLandOnTheNextCall,
+            || {
+                attempts += 1;
+                Err("ORA-00600: internal error code")
+            },
+        );
+        assert_eq!(attempts, 1);
+
+        // A rollback that succeeds is asked once.
+        let mut attempts = 0u32;
+        super::QueryExecutor::end_oracle_explain_plan_transaction(
+            || SessionCancelResidue::MayLandOnTheNextCall,
+            || {
+                attempts += 1;
+                Ok::<(), &str>(())
+            },
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    /// The write stamps an id and the read-back asks for that id. Two halves of
+    /// one fact, so they are checked against each other rather than each on its
+    /// own.
+    #[test]
+    fn the_read_back_asks_for_the_id_the_write_stamped() {
+        let plan = OracleExplainStatement::new("SELECT 1 FROM DUAL");
+        assert!(
+            plan.sql().starts_with(&format!(
+                "EXPLAIN PLAN SET STATEMENT_ID = '{}' FOR ",
+                plan.statement_id()
+            )),
+            "{}",
+            plan.sql()
+        );
+        assert!(
+            ORACLE_EXPLAIN_PLAN_SQL.contains("p.statement_id = :1"),
+            "the read-back must name the rows this call wrote: {ORACLE_EXPLAIN_PLAN_SQL}"
+        );
+        // ... and still take only the newest plan carrying it, so a previous
+        // call whose rollback failed cannot answer for this one.
+        assert!(
+            ORACLE_EXPLAIN_PLAN_SQL
+                .contains("MAX(q.plan_id) FROM plan_table q WHERE q.statement_id = p.statement_id"),
+            "{ORACLE_EXPLAIN_PLAN_SQL}"
+        );
+    }
+
+    /// Both drivers hand this query's rows to one parser that reads fixed
+    /// positions out of them, so the SELECT and the count must agree.
+    #[test]
+    fn oracle_explain_plan_select_matches_the_column_count() {
+        // One comma per gap between selected columns, counted before FROM.
+        let select_list = ORACLE_EXPLAIN_PLAN_SQL
+            .split(" FROM plan_table p ")
+            .next()
+            .expect("the read-back selects from plan_table");
+        assert_eq!(
+            select_list.matches(',').count() + 1,
+            ORACLE_EXPLAIN_PLAN_COLUMNS,
+            "{select_list}"
+        );
+    }
+
+    #[test]
+    fn a_statement_typed_with_its_terminator_is_normalized_before_it_is_explained() {
+        let plan = OracleExplainStatement::new("  SELECT 1 FROM DUAL;  ");
+        assert!(
+            plan.sql().ends_with("FOR SELECT 1 FROM DUAL"),
+            "{}",
+            plan.sql()
+        );
+    }
+
+    /// A statement that is already an `EXPLAIN PLAN` is read for what it
+    /// explains, not wrapped again — the MySQL family has always passed its own
+    /// `EXPLAIN` through, and Oracle rejected the double wrap outright.
+    #[test]
+    fn a_statement_that_is_already_an_explain_plan_is_not_wrapped_again() {
+        for already in [
+            "EXPLAIN PLAN FOR SELECT 1 FROM DUAL",
+            "explain plan for select 1 from dual",
+            "EXPLAIN PLAN SET STATEMENT_ID = 'mine' FOR SELECT 1 FROM DUAL",
+            "EXPLAIN PLAN INTO MY_PLANS FOR SELECT 1 FROM DUAL",
+            "EXPLAIN PLAN SET STATEMENT_ID = 'mine' INTO ME.MY_PLANS FOR SELECT 1 FROM DUAL",
+            // Written twice: each turn of the unwrap is strictly shorter.
+            "EXPLAIN PLAN FOR EXPLAIN PLAN FOR SELECT 1 FROM DUAL",
+        ] {
+            let plan = OracleExplainStatement::new(already);
+            assert!(
+                plan.sql()
+                    .to_uppercase()
+                    .ends_with("FOR SELECT 1 FROM DUAL"),
+                "{already} became {}",
+                plan.sql()
+            );
+            assert_eq!(
+                plan.sql().to_uppercase().matches("EXPLAIN PLAN").count(),
+                1,
+                "{already} became {}",
+                plan.sql()
+            );
+        }
+
+        // A `FOR` that is not the separator must not be taken for one: the
+        // first is inside the id literal, the second inside a quoted table
+        // name, and the third belongs to the statement being explained.
+        let literal =
+            OracleExplainStatement::new("EXPLAIN PLAN SET STATEMENT_ID = 'FOR' FOR SELECT 1");
+        assert!(literal.sql().ends_with("FOR SELECT 1"), "{}", literal.sql());
+        let quoted = OracleExplainStatement::new("EXPLAIN PLAN INTO \"FOR\" FOR SELECT 2");
+        assert!(quoted.sql().ends_with("FOR SELECT 2"), "{}", quoted.sql());
+        let locking = OracleExplainStatement::new("EXPLAIN PLAN FOR SELECT 3 FROM t FOR UPDATE");
+        assert!(
+            locking.sql().ends_with("FOR SELECT 3 FROM t FOR UPDATE"),
+            "{}",
+            locking.sql()
+        );
+
+        // A MySQL-shaped `EXPLAIN` typed on an Oracle connection is NOT an
+        // `EXPLAIN PLAN`, so nothing is unwrapped and the server answers about
+        // the statement the user actually wrote.
+        let mysql_shaped = OracleExplainStatement::new("EXPLAIN SELECT 1 FROM DUAL");
+        assert!(
+            mysql_shaped
+                .sql()
+                .ends_with("FOR EXPLAIN SELECT 1 FROM DUAL"),
+            "{}",
+            mysql_shaped.sql()
+        );
+
+        // Non-ASCII identifiers are scanned byte-wise by the shared word
+        // reader; a continuation byte must not read as a quote or a paren.
+        let unicode = OracleExplainStatement::new("EXPLAIN PLAN FOR SELECT \"이름\" FROM \"사원\"");
+        assert!(
+            unicode.sql().ends_with("FOR SELECT \"이름\" FROM \"사원\""),
+            "{}",
+            unicode.sql()
+        );
+
+        // ... and an ordinary statement is still wrapped exactly once.
+        let plain = OracleExplainStatement::new("SELECT 1 FROM DUAL");
+        assert!(
+            plain.sql().ends_with("FOR SELECT 1 FROM DUAL"),
+            "{}",
+            plain.sql()
+        );
+        assert_eq!(plain.sql().matches("EXPLAIN PLAN").count(), 1);
+        // An `EXPLAIN PLAN` with nothing to explain is left alone, so the
+        // server answers about the statement the user actually wrote.
+        let empty = OracleExplainStatement::new("EXPLAIN PLAN FOR");
+        assert!(
+            empty.sql().ends_with("FOR EXPLAIN PLAN FOR"),
+            "{}",
+            empty.sql()
+        );
+    }
+
+    #[test]
+    fn the_statement_id_fits_the_column_it_is_written_to() {
+        for _ in 0..64 {
+            let plan = OracleExplainStatement::new("SELECT 1 FROM DUAL");
+            assert!(
+                plan.statement_id().len() <= 30,
+                "STATEMENT_ID is VARCHAR2(30): {}",
+                plan.statement_id()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod dba_feature_tests {
     use super::QueryExecutor;
     use oracle::Error as OracleError;
@@ -8855,10 +9237,18 @@ impl ObjectBrowser {
         }
     }
 
+    /// Read `sql` as text rows, every row at least `column_count` cells wide.
+    ///
+    /// The width is honoured rather than ignored: callers index fixed positions
+    /// in the row, and the OCI twins of these reads build their rows by looping
+    /// over the declared count, so a driver that hands back a short row would
+    /// make the two paths disagree about the same query. Widening only — a row
+    /// is never truncated, so a caller that asked for fewer columns than the
+    /// SELECT returns still sees all of them.
     fn thin_query_text_rows(
         conn: &mut OracleThinSession,
         sql: &str,
-        _column_count: usize,
+        column_count: usize,
         binds: Vec<OracleThinBindValue>,
     ) -> Result<Vec<Vec<String>>, String> {
         let mut request = OracleThinStatementRequest::query(sql, 500);
@@ -8872,9 +9262,14 @@ impl ObjectBrowser {
                     .rows
                     .into_iter()
                     .map(|row| {
-                        row.into_iter()
+                        let mut row: Vec<String> = row
+                            .into_iter()
                             .map(Self::thin_metadata_value_to_text)
-                            .collect()
+                            .collect();
+                        if row.len() < column_count {
+                            row.resize(column_count, String::new());
+                        }
+                        row
                     })
                     .collect()
             })
@@ -12433,8 +12828,13 @@ mod oracle_thin_object_metadata_live_tests {
             direct_body_ddl.contains("PACKAGE BODY") && direct_body_ddl.contains("P_180"),
             "direct package body CLOB-as-LONG DDL fetch should include the body text"
         );
-        let plan = QueryExecutor::get_thin_explain_plan(&mut session, "SELECT * FROM dual")
-            .expect("thin explain plan");
+        let explain = super::OracleExplainStatement::new("SELECT * FROM dual");
+        // No cancel was sent here, and saying so is the point: the rollback
+        // takes the late-cancel door, and a probe that claimed residue would be
+        // asking the session twice for no reason.
+        let plan =
+            QueryExecutor::get_thin_explain_plan(&mut session, &explain, super::no_cancel_sent)
+                .expect("thin explain plan");
         assert!(
             plan.iter()
                 .any(|row| row.iter().any(|value| value.contains("SELECT STATEMENT"))),
@@ -12444,6 +12844,23 @@ mod oracle_thin_object_metadata_live_tests {
             plan.iter()
                 .all(|row| row.len() == super::ORACLE_EXPLAIN_PLAN_COLUMNS),
             "Every plan row should carry every selected column: {plan:?}"
+        );
+        // The read-back names the rows THIS call wrote: a second explain of a
+        // different statement, read back with the FIRST call's id, must find
+        // nothing. Without the `STATEMENT_ID` this asked "the newest plan in
+        // the table" and would have answered with the second one's rows.
+        let second = super::OracleExplainStatement::new("SELECT 1 FROM dual");
+        let second_plan =
+            QueryExecutor::get_thin_explain_plan(&mut session, &second, super::no_cancel_sent)
+                .expect("second thin explain plan");
+        assert!(
+            !second_plan.is_empty(),
+            "the second explain should have produced its own plan"
+        );
+        assert_ne!(
+            explain.statement_id(),
+            second.statement_id(),
+            "each explain must carry an id of its own"
         );
 
         let status = ObjectBrowser::get_thin_object_status(&mut session, &package, "PACKAGE")
@@ -12628,6 +13045,70 @@ mod oracle_lazy_fetch_integration_tests {
     use super::QueryExecutor;
     use crate::db::{ConnectionInfo, DatabaseConnection, DatabaseType};
     use oracle::Connection;
+
+    fn oracle_test_connection() -> Connection {
+        let username =
+            std::env::var("ORACLE_TEST_USERNAME").expect("ORACLE_TEST_USERNAME must be set");
+        let password =
+            std::env::var("ORACLE_TEST_PASSWORD").expect("ORACLE_TEST_PASSWORD must be set");
+        let host = std::env::var("ORACLE_TEST_HOST").expect("ORACLE_TEST_HOST must be set");
+        let port = std::env::var("ORACLE_TEST_PORT").expect("ORACLE_TEST_PORT must be set");
+        let service = std::env::var("ORACLE_TEST_SERVICE_NAME")
+            .expect("ORACLE_TEST_SERVICE_NAME must be set");
+        let info = ConnectionInfo::new_with_type(
+            "local",
+            &username,
+            &password,
+            &host,
+            port.parse::<u16>()
+                .expect("ORACLE_TEST_PORT must be a valid port"),
+            &service,
+            DatabaseType::Oracle,
+        );
+        DatabaseConnection::test_connection(&info).expect("Oracle client should initialize");
+        Connection::connect(&username, &password, info.connection_string())
+            .expect("Oracle connection should succeed")
+    }
+
+    /// What Oracle says about the placeholders inside an `EXPLAIN PLAN … FOR`.
+    ///
+    /// `EXPLAIN PLAN` only PARSES the statement it explains; it never executes
+    /// it, so the placeholders never need values — and the server does not
+    /// report them as binds of the `EXPLAIN PLAN` statement either. This is why
+    /// the explain path binds nothing on Oracle: there is nothing to bind to.
+    /// The check is here rather than in a comment because "the server reports
+    /// no binds" is the sort of claim that quietly stops being true.
+    #[test]
+    #[ignore = "requires local Oracle reachable via ORACLE_TEST_* env vars"]
+    fn oracle_explain_plan_reports_no_binds_for_the_statement_it_explains() {
+        let conn = oracle_test_connection();
+        let explain = super::OracleExplainStatement::new(
+            "SELECT * FROM dual WHERE 1 = :probe_one AND 2 = :probe_two",
+        );
+
+        let stmt = conn
+            .statement(explain.sql())
+            .build()
+            .expect("EXPLAIN PLAN statement should prepare");
+        assert_eq!(
+            stmt.bind_count(),
+            0,
+            "Oracle reported binds for an EXPLAIN PLAN: {:?}",
+            stmt.bind_names()
+        );
+
+        // ... and it runs with none supplied, which is what the explain path
+        // relies on.
+        conn.execute(explain.sql(), &[])
+            .expect("EXPLAIN PLAN of a statement with placeholders should run unbound");
+        let rows = QueryExecutor::get_explain_plan(&conn, &explain, super::no_cancel_sent)
+            .expect("the plan of a statement with placeholders should read back");
+        assert!(
+            !rows.is_empty(),
+            "the plan of a statement with placeholders had no rows"
+        );
+        let _ = conn.rollback();
+    }
 
     #[test]
     #[ignore = "requires local Oracle XE reachable via ORACLE_TEST_* env vars"]
@@ -13124,12 +13605,17 @@ mod routine_definition_tests {
 
         // Every backend's own cancel wording, from
         // `session_policy::query_cancel_markers_for_db_type`. A browser card's
-        // cancel timeout raises exactly these.
+        // cancel — the break tier, and the force tier that follows it — raises
+        // exactly these, whatever the app wraps them in: the third is a real
+        // cancel that landed on a preparation statement
+        // (`SqlEditorWidget::session_preparation_failure`), which is what the
+        // prefix is here to show.
         for stop in [
             "ORA-01013: user requested cancel of current operation",
-            "DPI-1067: user requested cancel of current operation",
-            "Query execution was interrupted",
             "ERROR 1317 (70100): Query execution was interrupted",
+            "Failed to apply Oracle current schema before execution: \
+             ORA-01013: user requested cancel of current operation",
+            "Query execution was interrupted",
             crate::db::query::result_messages::QUERY_CANCELLED,
         ] {
             assert!(
@@ -13145,10 +13631,26 @@ mod routine_definition_tests {
         // connection allowed to read ALL_ARGUMENTS and not ALL_PROCEDURES, and
         // a release without the newer invocation columns, must still get a
         // script.
+        //
+        // A TIMEOUT is on this road too, and it is the one entry worth saying
+        // out loud, because it used to be on the other one. A call timeout is
+        // the app failing to ask, not the user telling it to stop — nobody
+        // pressed anything — so it takes the road every other unanswered read
+        // takes. It only ever reached the STOP road because ODPI-C reports the
+        // break it makes to enforce the timeout, so the timeout error carries
+        // the cancel error inside it (the composite below is the driver's own
+        // wording, from `oracle_select_cancel_reuse_policy_allows_only_plain_cancel`).
+        // The session-reuse policy has always read that composite as a timeout
+        // rather than a plain cancel; `message_indicates_query_cancel` now
+        // reads it the same way, which is the whole point of there being one
+        // reader.
         for fail_open in [
             "ORA-00942: table or view does not exist",
             "ORA-00904: \"P\".\"SQL_MACRO\": invalid identifier",
             "ORA-03113: end-of-file on communication channel",
+            "DPI-1067: call timeout of 5000 ms exceeded with ORA-01013",
+            "ERROR 3024 (HY000): Query execution was interrupted, \
+             maximum statement execution time exceeded",
         ] {
             assert!(
                 matches!(

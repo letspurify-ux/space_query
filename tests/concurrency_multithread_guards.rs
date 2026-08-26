@@ -8059,16 +8059,42 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
     // statement must pass (the option-change rule) — which the thin loop never
     // did. Both now ask `oracle_statement_preflight_refusal`, which asks this
     // one, so the count moved from 5 to 4 and the two loops are pinned by
-    // `both_oracle_batch_loops_ask_one_statement_preflight` instead. What this
-    // still holds is the same fact: every path that runs a statement asks.
+    // `both_oracle_batch_loops_ask_one_statement_preflight` instead.
+    //
+    // CHANGED again, with its reason: read-only has a SECOND owner — the
+    // connection's own flag — and F6 Explain Plan asked the tab's half and
+    // never the connection's, so `EXPLAIN PLAN … FOR` kept writing to
+    // PLAN_TABLE on a connection the user had marked read-only.
+    // `write_refusal_for_statement` is the one answer that joins the two, and
+    // it asks this one for the tab's half, so the count moved from 4 to 5.
+    // What this still holds is the same fact: every path that runs a statement
+    // asks.
     assert_eq!(
         execution_production
             .matches("transaction_mode_refusal_for_statement(")
             .count(),
-        4,
+        5,
         "the entry point itself, the Oracle preflight both batch loops ask, the Oracle thin \
          LAZY select (the one Oracle path that runs a statement without the batch loop), \
-         and the MySQL family's session acquisition"
+         the MySQL family's session acquisition, and the joined read-only answer the \
+         explain path asks"
+    );
+    // The join itself: both halves, and the connection's asked first because it
+    // is the wider guard — it refuses on every backend and for statements no
+    // transaction mode judges.
+    let joined = execution_production
+        .find("pub(super) fn write_refusal_for_statement(")
+        .map(|at| slice_to_end_of_fn(&execution_production, at))
+        .expect("the joined read-only answer should exist");
+    let connection_half = joined
+        .find("connection.refusal(")
+        .expect("the joined answer must ask the connection's read-only flag");
+    let tab_half = joined
+        .find("Self::transaction_mode_refusal_for_statement(")
+        .expect("the joined answer must ask the tab's READ ONLY pin");
+    assert!(
+        connection_half < tab_half,
+        "the connection's flag is the wider guard and must be asked first: {joined}"
     );
     for (asker, marker) in [
         (
@@ -8118,9 +8144,410 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
              the others without it ({executor_fn})"
         );
     }
+    // F6 Explain Plan must ask the same question before it writes to
+    // PLAN_TABLE — and BOTH halves of it. It asked the tab's pin and never the
+    // connection's read-only flag, so `EXPLAIN PLAN … FOR` kept writing on a
+    // connection the user had marked read-only. Scoped to the one entry point,
+    // because "somewhere in this file" was what let the half-answer stand.
+    let explain = editor
+        .find("pub fn explain_current(&self) {")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("F6 should have one entry point");
     assert!(
-        editor.contains("SqlEditorWidget::transaction_mode_refusal_for_statement("),
-        "F6 Explain Plan must ask the same question before it writes to PLAN_TABLE"
+        explain.contains("SqlEditorWidget::write_refusal_for_statement("),
+        "F6 must ask the joined read-only answer, about the statement it will send: {explain}"
+    );
+    assert!(
+        !explain.contains("transaction_mode_refusal_for_statement("),
+        "and it must not ask one half directly, which is how the connection's half went \
+         unasked: {explain}"
+    );
+    // ... and read-only is not the only reason an explain must not be sent.
+    // An explain runs on the connection's OWN session, which no tab owns, so
+    // one that would RUN what it explains (`EXPLAIN ANALYZE` on the MySQL
+    // family) changes data nothing in the transaction model would ever commit
+    // or roll back. Neither read-only flag catches that on its own — most
+    // connections have neither set, and this family's READ ONLY pin lives on
+    // the TAB's session, which the explain does not run on — so the backend
+    // that knows what its own explain DOES is asked too, at the same gate.
+    assert!(
+        explain.contains(".refusal_before_sending("),
+        "F6 must ask the backend what its own explain statement does, not only what \
+         read-only says: {explain}"
+    );
+    // `rfind`, because the backend's refusal is asked TWICE now and only the
+    // LAST ask is the gate this ordering is about: the earlier one stands in
+    // front of the placeholder prompt (see below) and would otherwise satisfy
+    // this assertion on its own, leaving the gate itself unpinned.
+    let backend_half = explain
+        .rfind(".refusal_before_sending(")
+        .expect("the backend's own refusal must be asked");
+    let read_only_half = explain
+        .find("SqlEditorWidget::write_refusal_for_statement(")
+        .expect("the joined read-only answer must be asked");
+    assert!(
+        backend_half < read_only_half,
+        "the refusal that holds whatever the flags say is asked first: {explain}"
+    );
+    // ... and that read-only answer is DELIVERED as an explain refusal, with
+    // the sentence only the backend can add. The shared wording describes the
+    // statement that was refused, and on Oracle that statement is the
+    // `EXPLAIN PLAN … FOR` the app built — so a user who asked for the plan of
+    // a `SELECT` read "Oracle read-only mode blocks non-query statements",
+    // about a statement they had not typed, while the same keystroke simply
+    // worked on the other family with nothing saying which fact differed.
+    assert!(
+        explain.contains("explain_plan_write_refused(")
+            && explain.contains("why_building_the_plan_is_itself_a_write()"),
+        "a read-only refusal of F6 must say why an execution plan is a write here: {explain}"
+    );
+    // "This tab is bound to no connection" is not "the connection is busy".
+    // F6 reported the first as the second, so a tab that had never connected
+    // was told to wait for something that did not exist; its sibling action on
+    // the same session (Quick Describe) has always said the true one.
+    assert!(
+        explain.contains("UiActionResult::NotConnected")
+            && !explain.contains("binding_snapshot.connection(), bound_connection_facts)\n        else {\n            let _ = self.ui_action_sender.send(UiActionResult::ConnectionBusy);"),
+        "F6 must say when the tab is connected to nothing: {explain}"
+    );
+    // Every backend must ANSWER it, which is what keeps a new backend from
+    // inheriting the question by omission. Read to the next top-level `impl`,
+    // because the answer is one method among several rather than the first.
+    //
+    // RE-POINTED, with its reason: `refusal_before_sending` now has TWO halves
+    // and only one of them is a backend's own. The other — "has this statement
+    // an execution plan at all?" — is a question about the STATEMENT, asked
+    // once in the trait's own body for every backend, because F6 wraps
+    // whatever it is given and a PL/SQL block, a routine call, transaction or
+    // session control and this family's `ANALYZE … TABLE` were all wrapped and
+    // SENT, each server answering the one keystroke with its own complaint.
+    // The intent of this loop is unchanged and now covers more: each backend
+    // must still answer its own half, must say whether building a plan is
+    // itself a write, and — the new one — must NOT override the method that
+    // asks the shared half, since overriding it is exactly how a backend could
+    // go back to skipping it.
+    for backend in [
+        "impl ExplainPlanBackend for OracleExplainPlanBackend {",
+        "impl ExplainPlanBackend for MysqlExplainPlanBackend {",
+    ] {
+        let at = editor
+            .find(backend)
+            .unwrap_or_else(|| panic!("{backend} should exist"));
+        let rest = &editor[at..];
+        let end = rest[1..]
+            .find("\nimpl ")
+            .map_or(rest.len(), |offset| offset + 1);
+        let body = &rest[..end];
+        assert!(
+            body.contains("fn refusal_from_what_this_explain_does("),
+            "{backend} must say what its own explain statement does"
+        );
+        assert!(
+            body.contains("fn why_building_the_plan_is_itself_a_write("),
+            "{backend} must say whether building a plan is itself a write"
+        );
+        assert!(
+            !body.contains("fn refusal_before_sending("),
+            "{backend} overrides the gate that asks the shared half, which is how a backend \
+             stops asking it"
+        );
+    }
+    // ... and the shared half really is asked there, from the one reader that
+    // knows it, about the statement the APP chose to explain rather than about
+    // the wrapper the app just built around it.
+    let shared_half = editor
+        .find("fn refusal_before_sending(\n        &self,")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the trait's own body should hold the shared half");
+    assert!(
+        shared_half.contains("statement_the_app_chose_to_explain()")
+            && shared_half.contains("statement_without_an_execution_plan_reason(")
+            && shared_half.contains("self.refusal_from_what_this_explain_does("),
+        "the shared half must ask the one reader about the app's own target, then hand over to \
+         the backend: {shared_half}"
+    );
+    // ... and the placeholder prompt must not stand in front of a refusal.
+    // `execute_sql_with_mysql_delimiter_after_lazy_cancel` states the rule for
+    // execution — "a connection marked read-only must never ask for
+    // placeholder values and then refuse the statement anyway" — and F6 was
+    // the one path that did it the other way round, so
+    // `EXPLAIN ANALYZE UPDATE t SET c = ?` opened a modal, collected a value,
+    // and then refused. The BACKEND's half is the one asked early, and
+    // deliberately only that one: it is the sole refusal that is a property of
+    // the STATEMENT rather than of the connection or the tab, both of which
+    // the worker re-reads under the connection lock.
+    let prompt = explain
+        .find("self.resolve_bind_parameter_values(")
+        .expect("F6 must ask for the placeholder values the MySQL family needs");
+    let pre_prompt_gate = explain
+        .find(".refusal_before_sending(")
+        .expect("F6 must ask the backend before it prompts");
+    assert!(
+        pre_prompt_gate < prompt,
+        "the backend's refusal must be asked before the prompt, not after it: {explain}"
+    );
+    // The note that says what a plan cannot see must be sent BEFORE the plan.
+    // An Info message selects the Messages pane when the operation has no
+    // result tab of its own to keep the view on, and F6 has none until the plan
+    // output opens one — so a note sent after it took the user off the plan they
+    // had just asked for. The plan tab selects the Data Grid unconditionally,
+    // which is what makes the earlier send the deterministic order rather than
+    // a race.
+    let handler = editor
+        .find("fn setup_ui_action_handler(")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the editor's UI action handler should exist");
+    let note_send = handler
+        .find("explain_plan_session_note()")
+        .expect("a plan must say what it cannot see");
+    let plan_send = handler
+        .find("QueryProgress::ExplainPlanOutput")
+        .expect("a plan must reach the Data Grid");
+    assert!(
+        note_send < plan_send,
+        "the note must be sent before the plan, or it takes the pane the plan opens: {handler}"
+    );
+    // ... and beside an ERROR it goes only with a FAILURE. The note opens
+    // "This plan was built on the connection's own DB session", a fact about a
+    // plan that was attempted: beside a refusal nothing was built and the
+    // sentence is simply untrue, and beside a cancel a line about invisible
+    // temporary tables reads as a reason the user's plan was stopped.
+    assert!(
+        handler.contains("matches!(err, ExplainPlanError::Failed(_)) && !cancelled"),
+        "the note must go only with a failure the tab's own session could explain: {handler}"
+    );
+    // And a refusal is not a failure: the pane must not announce one. Both
+    // used to be a bare `String`, so every refusal was prefixed and read
+    // `Explain plan failed: Explain plan was not run: …` — the app reporting a
+    // failure of its own rule.
+    assert!(
+        handler.contains("ExplainPlanError::Refused(refusal) => (false, refusal.clone())")
+            || handler.contains("ExplainPlanError::Refused(refusal) => {"),
+        "a refusal must reach the pane as its own sentence: {handler}"
+    );
+    let failure_prefix = handler
+        .find("format!(\"Explain plan failed: {evidence}\")")
+        .expect("a failure must say what it is evidence of");
+    let refusal_arm = handler
+        .find("ExplainPlanError::Refused(")
+        .expect("a refusal must have its own arm");
+    assert!(
+        refusal_arm < failure_prefix,
+        "the refusal is answered before the failure prefix is ever reached: {handler}"
+    );
+    // Every call the app makes on the connection's own Oracle session runs
+    // under the tab's query timeout, on BOTH drivers. Thin had none at all —
+    // its explain re-stated the ceremony for itself and left that piece out,
+    // and a retained thin session carries no call timeout of its own, so a
+    // heavy statement held the worker with nothing able to end it. One
+    // ceremony now, and each arm must still be wrapped: a driver that reaches
+    // its own work without the wrapper is the same defect wearing the other
+    // driver's name.
+    let ceremony = editor
+        .find("fn run_oracle_main_session_action<T, Oci, Thin>(")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the one Oracle main-session ceremony should exist");
+    for (driver, wrapper, work) in [
+        (
+            "OCI",
+            "Self::run_oracle_action_with_timeout(",
+            "oci(db_conn)",
+        ),
+        (
+            "thin",
+            "Self::run_oracle_thin_action_with_timeout(",
+            "thin(session)",
+        ),
+    ] {
+        let wrapped = ceremony
+            .find(wrapper)
+            .unwrap_or_else(|| panic!("{driver} must run its work under the tab's timeout"));
+        let called = ceremony
+            .find(work)
+            .unwrap_or_else(|| panic!("{driver} must reach the caller's work"));
+        assert!(
+            wrapped < called,
+            "{driver} reaches its work outside the timeout wrapper: {ceremony}"
+        );
+    }
+    // ... and the cancel target is published BEFORE the first round trip, so
+    // the scope apply inside the wrapper is reachable by the cancel button.
+    let publish = ceremony
+        .match_indices("publish_main_session_cancel_target(")
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        publish.len(),
+        2,
+        "each driver publishes its own kind of target: {ceremony}"
+    );
+    let first_round_trip = ceremony
+        .find("run_oracle_action_with_timeout(")
+        .expect("the OCI arm should run under the timeout");
+    assert!(
+        publish[0] < first_round_trip,
+        "a target published after the first round trip leaves that trip unreachable: {ceremony}"
+    );
+    // The MySQL twin owes the same order, and owed it while calling itself a
+    // twin: it applied the tab's SCOPE — a `USE` and a `SET NAMES`, two server
+    // round trips — before publishing anything, so those trips were reachable
+    // by no cancel and bounded by no timeout, and a cancel that landed in that
+    // window was reported as a driver complaint about the app's own
+    // preparation statement rather than as the cancel it was.
+    // The ceremony is in two halves — the STATEMENT half publishes the cancel
+    // target and hands the tab's scope and the caller's work to the SESSION
+    // half, which applies the tab's timeout around whatever it is given. So the
+    // order is read across both: publish before handing over, and the timeout
+    // applied before the work runs. What the scope apply gets out of that is
+    // what it was missing — a cancel that reaches it and a timeout that bounds
+    // it.
+    let mysql_ceremony = execution
+        .find("pub(super) fn run_mysql_action_with_timeout<T, F>(")
+        .map(|at| slice_to_end_of_fn(&execution, at))
+        .expect("the MySQL main-session execution road should exist");
+    let mysql_publish = mysql_ceremony
+        .find("Self::publish_main_session_cancel_target(")
+        .expect("the MySQL ceremony must publish a cancel target");
+    let mysql_handover = mysql_ceremony
+        .find("Self::run_mysql_main_connection_action(")
+        .expect("the execution road must hand its session care to the one ceremony");
+    let mysql_scope = mysql_ceremony
+        .find("apply_mysql_current_database_for_scope(")
+        .expect("the MySQL ceremony must put the tab's scope on the session");
+    assert!(
+        mysql_publish < mysql_handover && mysql_handover < mysql_scope,
+        "the scope apply must be inside the guarded window, which begins at the publish: \
+         {mysql_ceremony}"
+    );
+    assert_eq!(
+        mysql_ceremony
+            .matches("apply_mysql_current_database_for_scope(")
+            .count(),
+        1,
+        "the scope is applied once, inside the guarded window: {mysql_ceremony}"
+    );
+    let mysql_session_half = execution
+        .find("pub(super) fn run_mysql_main_connection_action<T, F>(")
+        .map(|at| slice_to_end_of_fn(&execution, at))
+        .expect("the MySQL main-session ceremony should exist");
+    let mysql_timeout = mysql_session_half
+        .find("apply_session_timeout_with_restore_for_db(")
+        .expect("the MySQL ceremony must apply the tab's timeout");
+    let mysql_work = mysql_session_half
+        .find("action(conn_guard)")
+        .expect("the MySQL ceremony must reach the caller's work");
+    assert!(
+        mysql_timeout < mysql_work,
+        "everything the caller does — the scope apply included — must be bounded by the \
+         tab's timeout: {mysql_session_half}"
+    );
+    // ... and it must be about the SAME text `Ctrl+Enter` would send. F6 used to
+    // decide for itself and ignored the selection, so a user who selected one
+    // query got the plan of whichever statement the caret sat in. Two
+    // conditions for one question is also how the two came to disagree about
+    // the empty case (`selection_text().is_empty()` versus `selected()`, which
+    // is true for a collapsed selection carrying no text), so the decision has
+    // one home and both callers take it whole.
+    assert_eq!(
+        execution
+            .matches("let selected_text = self.buffer.selection_text();")
+            .count(),
+        1,
+        "which text a single-statement action takes must be decided in one place"
+    );
+    let source_of_truth = execution
+        .find("pub(super) fn statement_source_for_single_action(")
+        .map(|at| slice_to_end_of_fn(&execution, at))
+        .expect("the one statement-source decision should exist");
+    assert!(
+        source_of_truth.contains("EditorStatementSource::Selection")
+            && source_of_truth.contains("EditorStatementSource::AtCursor"),
+        "both roads must come out of it: {source_of_truth}"
+    );
+    for (name, body) in [
+        (
+            "execute_statement_at_cursor",
+            execution
+                .find("pub fn execute_statement_at_cursor(&self) {")
+                .map(|at| slice_to_end_of_fn(&execution, at))
+                .expect("Ctrl+Enter should have one entry point"),
+        ),
+        (
+            // The anchor carries a `&self, ` because F6's text source now takes
+            // the dialect from its caller instead of asking
+            // `current_db_type()` for it. That was a SECOND reading of one
+            // question — and the cached one, which answers from a cache
+            // whenever the connection mutex is busy, so the splitter could be
+            // working in one dialect while the backend that prepared the
+            // statement worked in another. What this guard holds is unchanged:
+            // WHICH TEXT the action is about is still decided in one place.
+            "statement_to_explain",
+            editor
+                .find("fn statement_to_explain(&self, ")
+                .map(|at| slice_to_end_of_fn(&editor, at))
+                .expect("F6's text source should have one entry point"),
+        ),
+    ] {
+        assert!(
+            body.contains("statement_source_for_single_action("),
+            "{name} must take the shared decision rather than repeat it: {body}"
+        );
+        assert!(
+            !body.contains("buffer.selection_text()") && !body.contains("buffer.selected()"),
+            "{name} must not re-derive which text it is about: {body}"
+        );
+    }
+    // ... and ONE action reads the dialect ONCE. The shared decision used to
+    // read it — and the tab's delimiter — from the editor's CACHES while F6
+    // had already taken its own from the bound connection's profile, so one
+    // action could find its statement under one dialect and judge it under
+    // another. `current_db_type()` answers from a cache whenever the
+    // connection mutex is busy, which is exactly when a tab-initiated lookup
+    // is most likely to start.
+    assert!(
+        !source_of_truth.contains("current_db_type()")
+            && !source_of_truth.contains("current_mysql_delimiter()")
+            && !source_of_truth.contains("cached_db_type()"),
+        "the shared decision must take the dialect from its caller, not from a cache: \
+         {source_of_truth}"
+    );
+    let explain_text_source = editor
+        .find("fn statement_to_explain(&self, ")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("F6's text source should have one entry point");
+    assert!(
+        !explain_text_source.contains("current_db_type()")
+            && !explain_text_source.contains("current_mysql_delimiter()"),
+        "F6 already has its dialect from the bound connection's profile and must not read a \
+         second one: {explain_text_source}"
+    );
+
+    // Which text, and then WHETHER IT IS A STATEMENT AT ALL — and both roads
+    // must ask the second question too, not only the first. The selection road
+    // always split its text with the executor's own splitter; the caret road
+    // handed its text on unexamined, so a line the app runs ITSELF (`DESC t`,
+    // `CONNECT user/pass@db`, `@script.sql`) was wrapped into an explain and
+    // SENT, while the identical text selected was refused and `Ctrl+Enter`
+    // answered it from the app's own catalog. On the MySQL family the send
+    // succeeded and a TABLE DESCRIPTION appeared under the label "Explain
+    // Plan"; on Oracle it failed after putting the line — a password included —
+    // on the wire, where no read-only guard could see it: by then the command
+    // sits inside `EXPLAIN PLAN … FOR …`, which the splitter reads as one
+    // statement.
+    //
+    // Counted rather than merely present: one call would satisfy "contains"
+    // while the other road went back to handing its text straight through.
+    let explain_source = editor
+        .find("fn statement_to_explain(&self, ")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("F6's text source should have one entry point");
+    assert_eq!(
+        explain_source
+            .matches("Self::single_statement_to_explain(")
+            .count(),
+        2,
+        "both of F6's roads must ask the splitter whether their text is a statement: \
+         {explain_source}"
     );
 
     // The app's DDL transform params ride on a metadata HANDLE, never on the
@@ -8395,6 +8822,14 @@ fn both_oracle_drivers_state_serveroutput_on_the_session_they_run_on() {
 /// life of the connection and growing with every F6 (live-reproduced on both
 /// drivers). The function that issues the statement takes it back, so no call
 /// site can forget.
+///
+/// ... and it takes it back through the app's LATE-CANCEL door, which is the
+/// half a cancel used to walk through. A cancel this app sent interrupts the
+/// call that is RUNNING, so a user who presses Cancel late has the break land
+/// on the next call the session makes — this very rollback. Both Oracle
+/// drivers can carry that residue, so the rollback failed with `ORA-01013`,
+/// the failure was logged as a warning, and the write stayed open exactly as
+/// if no rollback had been issued at all.
 #[test]
 fn oracle_explain_plan_resolves_the_write_it_leaves_on_the_shared_session() {
     let executor = read_source("src/db/query/executor.rs");
@@ -8409,10 +8844,63 @@ fn oracle_explain_plan_resolves_the_write_it_leaves_on_the_shared_session() {
             .unwrap_or_else(|| panic!("{entry_point} should end"));
         let body = &executor[start..end];
         assert!(
-            body.contains("end_oracle_explain_plan_transaction(conn.rollback())"),
-            "{entry_point} must take back the PLAN_TABLE write it leaves on the shared live session: {body}"
+            body.contains("end_oracle_explain_plan_transaction(residue, || conn.rollback())"),
+            "{entry_point} must take back the PLAN_TABLE write it leaves on the shared live \
+             session, and hand its caller's residue to the door that re-asks: {body}"
         );
     }
+
+    // The residue the explain hands that door names its DRIVER and nothing
+    // else. It must not be gated on the tab's cancel flag, because that flag
+    // answers a narrower question than it looks: the tab's Cancel button sets
+    // it before the break, while the activity view goes to the registry, which
+    // BREAKS FIRST and only reaches the flag on a later UI tick
+    // (`registry_cancel_hook_for` → `apply_pending_registry_cancel`) — never at
+    // all if the operation had already finished. A gate on the flag therefore
+    // protected the rollback on one road and, for a window, on neither. This
+    // work must happen whoever cancelled.
+    let editor_source = read_source("src/ui/sql_editor/mod.rs");
+    let oracle_explain_backend = editor_source
+        .find("impl ExplainPlanBackend for OracleExplainPlanBackend {")
+        .map(|at| {
+            let rest = &editor_source[at..];
+            let end = rest[1..]
+                .find("\nimpl ")
+                .map_or(rest.len(), |offset| offset + 1);
+            rest[..end].to_string()
+        })
+        .expect("the Oracle explain backend should exist");
+    for driver in [
+        "SessionCancelResidue::ORACLE_OCI",
+        "SessionCancelResidue::ORACLE_THIN",
+    ] {
+        assert!(
+            oracle_explain_backend.contains(driver),
+            "each driver must name its own residue for the rollback: {oracle_explain_backend}"
+        );
+    }
+    assert!(
+        !oracle_explain_backend.contains("after_a_cancel_this_app_sent("),
+        "the rollback's residue must not be gated on a flag only one of the two cancel roads \
+         sets: {oracle_explain_backend}"
+    );
+
+    // The door itself, so the re-ask cannot be quietly replaced by a log line
+    // again. `a_rollback_our_own_cancel_answered_is_asked_again` pins the
+    // behaviour; this pins that it is the SHARED rule being used rather than a
+    // second copy of it.
+    let start = executor
+        .find("fn end_oracle_explain_plan_transaction<")
+        .expect("the rollback should have one home");
+    let end = executor[start..]
+        .find("\n    }\n")
+        .map(|offset| start + offset)
+        .expect("the rollback function should end");
+    assert!(
+        executor[start..end].contains("answer_not_taken_from_our_own_cancel_when("),
+        "the rollback must go through the app's one late-cancel rule: {}",
+        &executor[start..end]
+    );
 }
 
 /// A batch that adopts a NEW connection mid-script must forget the scope it was
@@ -11706,10 +12194,14 @@ fn every_force_tier_asks_one_rule_before_it_destroys_a_session() {
     // And the MAIN-connection publishers must go through the ONE door. All
     // three explain-plan branches run on the connection's own session, and the
     // door is what states the kind — so a new backend cannot publish a main
-    // session without saying it is one.
+    // session without saying it is one. The two Oracle drivers now share one
+    // ceremony (`run_oracle_main_session_action`) instead of restating it each,
+    // which is why the first marker no longer carries an `Ok(...)`: the match
+    // is on `require_live_db_connection()?`. Both arms are still checked, one
+    // each, because each publishes its own kind of target.
     let execution = read_source("src/ui/sql_editor/execution.rs");
     for (source, marker) in [
-        (&editor, "Ok(DbConnection::Oracle(db_conn)) => {"),
+        (&editor, "DbConnection::Oracle(db_conn) => {"),
         (&editor, "session.reset_pending_cancel();\n                let cancel_handle = session.cancel_handle();"),
         (&execution, "let connection_info = match conn_guard.runtime_connection_info() {"),
     ] {
@@ -12098,10 +12590,16 @@ fn a_worker_ends_a_connection_only_through_the_door_that_reports_it() {
         "and that answer must be `#[must_use]`"
     );
 
+    // The three untrusted-session paths live in the SESSION half of the
+    // MySQL-family main-connection ceremony — the half that applies the tab's
+    // timeout and puts it back. It was inlined in the execution road until
+    // quick describe needed the same session care without the statement care,
+    // so the road to look at is the half that owns those paths rather than the
+    // caller that happens to use it.
     let execution = read_source("src/ui/sql_editor/execution.rs");
     let action = execution
-        .find("pub(super) fn run_mysql_action_with_timeout<T, F>(")
-        .expect("the MySQL family's main-connection action should exist");
+        .find("pub(super) fn run_mysql_main_connection_action<T, F>(")
+        .expect("the MySQL family's main-connection session ceremony should exist");
     let action_body = compact_for_pattern(slice_from(&execution, action, 5200));
     assert!(
         !action_body.contains("conn_guard.disconnect();"),
@@ -12116,6 +12614,16 @@ fn a_worker_ends_a_connection_only_through_the_door_that_reports_it() {
                 .count(),
         3,
         "all three of its untrusted-session paths must go through the door: {action_body}"
+    );
+    // ... and the road that WRAPS it must not have grown a fourth of its own.
+    let caller = execution
+        .find("pub(super) fn run_mysql_action_with_timeout<T, F>(")
+        .map(|at| slice_to_end_of_fn(&execution, at))
+        .expect("the MySQL family's main-connection execution road should exist");
+    assert!(
+        !caller.contains("conn_guard.disconnect()")
+            && !caller.contains("disconnect_untrusted_main_session("),
+        "the execution road hands its session care to one place: {caller}"
     );
     assert!(
         execution.contains("fn with_main_session_teardown("),
@@ -16073,6 +16581,67 @@ fn a_lazy_fetch_session_survives_a_break_it_recovered_from() {
 
 /// An editor API that only a HARNESS calls must say so.
 ///
+/// Every road that runs work on the connection's OWN session bounds it with the
+/// tab's timeout — on all four backends.
+///
+/// That session is the one every tab's work on the connection queues behind, so
+/// an unbounded call there is not one slow tab: it is the connection stopped
+/// until someone finds the activity view. F6 was given the bound in an earlier
+/// round; quick describe (Ctrl+click / Go to Declaration), which reaches the
+/// same session from the same tab, had none on any backend — Oracle thin worst
+/// of all, since a retained thin session carries no call timeout of its own.
+///
+/// Asked of each backend's own describe arm, because "the tab's timeout is
+/// applied somewhere in this file" is what let one arm keep going without it.
+#[test]
+fn quick_describe_runs_under_the_tabs_timeout_on_every_backend() {
+    let popup = read_source("src/ui/sql_editor/intellisense/popup.rs");
+
+    let entry = popup
+        .find("pub fn quick_describe_at_cursor(&self) {")
+        .map(|at| slice_to_end_of_fn(&popup, at))
+        .expect("quick describe should have one entry point");
+    assert!(
+        entry.contains("Self::parse_timeout(&self.timeout_input.value())"),
+        "quick describe must read the tab's timeout on the UI thread, where the input \
+         lives: {entry}"
+    );
+
+    for (backend, wrapper) in [
+        (
+            "impl QuickDescribeBackend for OracleQuickDescribeBackend {",
+            // Both Oracle drivers, each through its own timeout wrapper.
+            vec![
+                "SqlEditorWidget::run_oracle_action_with_timeout(",
+                "SqlEditorWidget::run_oracle_thin_action_with_timeout(",
+            ],
+        ),
+        (
+            "impl QuickDescribeBackend for MysqlQuickDescribeBackend {",
+            vec!["SqlEditorWidget::run_mysql_main_connection_action("],
+        ),
+    ] {
+        let at = popup
+            .find(backend)
+            .unwrap_or_else(|| panic!("{backend} should exist"));
+        let rest = &popup[at..];
+        let end = rest[1..]
+            .find("\nimpl ")
+            .map_or(rest.len(), |offset| offset + 1);
+        let body = &rest[..end];
+        for expected in wrapper {
+            assert!(
+                body.contains(expected),
+                "{backend} must run its describe under the tab's timeout ({expected}): {body}"
+            );
+        }
+        assert!(
+            body.contains("query_timeout"),
+            "{backend} must take the tab's timeout rather than inventing one: {body}"
+        );
+    }
+}
+
 /// This is the class that let live TM S9 go on passing about a rule the toolbar
 /// had stopped asking: once a production road is unified or renamed, the
 /// function the harness still drives becomes a road nothing takes, and nothing

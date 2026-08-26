@@ -301,16 +301,69 @@ because MySQL 8 and MariaDB fold `DATABASE()` into a prepared
 `INFORMATION_SCHEMA` statement at prepare time and a cached one would keep
 answering for the database the session was in then.
 
-Oracle's Explain also *writes* there: `EXPLAIN PLAN FOR` is an INSERT into
-`PLAN_TABLE`. A tab pinned **Read only** therefore refuses F6 exactly as it
-refuses a write from the editor — the explain path asks the same
-`SqlEditorWidget::transaction_mode_refusal_for_statement` both Oracle batch
-loops ask, about the statement the backend will actually send
-(`ExplainPlanBackend::explain_statement`), not about the `SELECT` being
-explained. Asking with the user's text would answer "this is a read" and let
-the write through, which is what it used to do. MySQL/MariaDB `EXPLAIN` is a
-read and their mode lives on the session, so the same call answers `None` there
-and the pin does not block it. No query tab owns the live session, so nothing in the transaction
+The whole ceremony around that — resolve the scope to a concrete schema,
+publish the cancel target before the first round trip, pre-break a cancel that
+already arrived, and run every call under the tab's query timeout — lives in
+`SqlEditorWidget::run_oracle_main_session_action`, the Oracle twin of
+`run_mysql_action_with_timeout`. It is one function because it used to be
+re-stated per driver, and thin drifted: it applied its scope with no cancel
+target published and no timeout at all, and reset the session's pending-cancel
+flags only *after* that round trip, so a stale in-band break answered the scope
+change instead of the statement. A backend now supplies only the SQL work.
+
+The MySQL twin owed the same order and did not keep it: it applied the tab's
+scope — a `USE` and a `SET NAMES`, two server round trips — *before* publishing
+its cancel target and *before* installing the timeout, so those trips were
+reachable by no cancel and bounded by nothing, and a cancel that landed in that
+window was reported as a driver complaint about the app's own preparation
+statement rather than as the cancel it was. Both ceremonies now do the same
+things in the same order, guarded by
+`every_write_path_asks_the_tab_whether_its_mode_allows_the_statement`.
+
+Everything that runs on that session is bounded by the tab's timeout, not only
+the explain. Quick describe (Ctrl+click / Go to Declaration) reaches the same
+session from the same tab and had no bound on any backend — Oracle thin worst
+of all, since a retained thin session carries no call timeout of its own — so a
+describe against a stalled server held the connection mutex, and with it every
+other tab's work on that connection, until someone found the activity view. It
+now takes the tab's timeout through each backend's own wrapper: the two Oracle
+ones, and `SqlEditorWidget::run_mysql_main_connection_action` for the MySQL
+family. That last one is the SESSION half of `run_mysql_action_with_timeout`,
+split out rather than copied, because describe must not have the statement half:
+it names its database in the lookup instead of switching the session to it, and
+it publishes no cancel target because the connection LOCK already publishes one
+for whatever holds it. Guard
+`quick_describe_runs_under_the_tabs_timeout_on_every_backend`; live on all four
+through `tab_scope_governs_describe_and_explain`.
+
+A failure of that work is also said in the app's own words on all four
+backends (`SqlEditorWidget::oracle_main_session_error_message`, the twin of
+`mysql_error_message`): a cancel becomes `result_messages::QUERY_CANCELLED` and
+a timeout becomes the shared timeout sentence with the driver's evidence kept
+after it. Oracle used to report the driver verbatim, so one operation answered
+one event with `ORA-01013`/`DPI-1067` on one family and the shared sentences on
+the other.
+
+Oracle's Explain also *writes* there: `EXPLAIN PLAN … FOR` is an INSERT into
+`PLAN_TABLE`. Both halves of read-only therefore refuse F6 exactly as they
+refuse a write from the editor — the explain path asks
+`SqlEditorWidget::write_refusal_for_statement`, which joins the connection's
+own read-only flag with the tab's READ ONLY pin
+(`transaction_mode_refusal_for_statement`, the same call both Oracle batch loops
+make). It is asked about the statement the backend will actually send
+(`ExplainStatement::sql()`), not about the `SELECT` being explained. Asking with
+the user's text would answer "this is a read" and let the write through, which
+is what it used to do; asking only the tab's half let a read-only CONNECTION
+write through, which it also used to do. MySQL/MariaDB `EXPLAIN` is a read and
+their mode lives on the session, so the same call answers `None` there and
+neither half blocks it. Guards
+`a_read_only_tab_refuses_the_explain_statement_but_not_the_query_it_explains`,
+`a_read_only_connection_refuses_the_explain_statement_on_oracle_only` and
+`the_write_gate_answers_for_both_halves_of_read_only`; live check in
+`verify_explain_plan_live`, which pins a tab and then connects a second,
+read-only connection and presses F6 on both.
+
+No query tab owns the live session, so nothing in the transaction
 model would ever resolve that write — a tab's auto-commit governs its own pooled
 session, and Commit/Rollback act on the tab's retained session by design — and
 it stayed an open transaction holding its rows and their locks for the life of
@@ -322,6 +375,172 @@ on this session, so there is nothing else for that rollback to reach. Guard
 check in `verify_explain_plan_live` (both Oracle drivers), which reads
 `v$transaction` on that very session after an F6.
 
+**A server CURSOR is the other thing that must not stay behind there, and thin
+is where it did.** `OracleThinSession` hands the cursor back inside the
+statement's result and closes nothing itself, so a call that DROPS the result
+drops the cursor with it — `query_drop` exists for exactly the statements run
+for their side effect, and is `execute_typed` plus `close_cursor_later`. The
+explain's `EXPLAIN PLAN` used the bare form, on the connection's own session,
+which is NOT pooled and therefore never sees `reset_before_reuse`'s sweep: one
+cursor per F6 for the life of the connection, ending in `ORA-01000`. Measured
+in `verify_explain_plan_live` on both drivers: 12 explains, +12 open cursors
+before the fix, 0 after, and 0 on OCI either way — its `Statement` closes when
+it goes out of scope, so a difference here is a divergence between the two
+drivers. The leaked cursors carry no `sql_text`, so the probe reads
+`v$sesstat`'s `opened cursors current` rather than `v$open_cursor`. What keeps
+the next one out is the source guard
+`a_thin_statement_result_is_never_dropped_with_its_server_cursor_inside`: no
+thin statement execution anywhere in `src/` may have its result discarded.
+
+That rollback is issued through the app's late-cancel door
+(`session_policy::answer_not_taken_from_our_own_cancel_when`), and the road it
+protects is the one that needs it most. A cancel this app sent interrupts the
+call that is RUNNING, so a user who presses Cancel late has the break land on
+the next call the session makes — this rollback. Both Oracle drivers can carry
+that residue (`SessionCancelResidue::ORACLE_OCI` / `ORACLE_THIN`, both
+measured), so without the door the rollback failed with `ORA-01013`, the
+failure became a log line, and the write stayed open exactly as if no rollback
+had been issued — reachable by pressing Cancel. A second `ROLLBACK` is safe for
+the reason every other caller of that door relies on: it takes nothing back.
+
+The residue it hands that door is its DRIVER's, unconditionally — never "did
+the tab's cancel flag get set?". That flag answers a narrower question than it
+looks: the tab's Cancel button sets it directly
+(`request_cancel_if_snapshot_matches`), while the activity view goes to the
+registry (`cancel_db_activity`), which BREAKS THE SESSION FIRST — through the
+canceler the connection LOCK published — and only reaches the flag afterwards,
+on a later UI tick (`registry_cancel_hook_for` → `registry_cancel_pending` →
+`apply_pending_registry_cancel` → `cancel_current`). So on that road the break
+lands while the flag still reads false, and if the operation has already
+finished the flag is never set for it at all: `cancel_current` snapshots the
+CURRENT operation and matches nothing. Gating cleanup on the flag therefore
+protected the rollback on one road and, for a window on the other, on neither.
+Nothing is risked by assuming the residue instead, because the door re-asks only
+when the first answer really was a cancel of ours.
+Guards `a_rollback_our_own_cancel_answered_is_asked_again` and
+`oracle_explain_plan_resolves_the_write_it_leaves_on_the_shared_session`.
+
+**An explain must only ever build a plan.** Read-only is not the question here,
+and that is why it is asked separately
+(`ExplainPlanBackend::refusal_before_sending`, which every backend must answer):
+an explain runs on the connection's own session, which no query tab owns, so a
+statement that CHANGES something there is one nothing in the transaction model
+would ever commit or roll back. Neither read-only gate can be relied on to catch
+it — most connections have neither flag set, and on the MySQL family the READ
+ONLY pin is a characteristic of the TAB's session, which the explain does not
+run on. Oracle answers "nothing": `EXPLAIN PLAN` only parses, and the
+`PLAN_TABLE` row it writes is taken back above. The MySQL family answers with
+its executing spelling, which runs what it explains, so it is refused unless
+that statement is provably a read — the same rule, from the same place, the
+connection's read-only guard uses.
+
+**The two MySQL-family products spell that executing explain differently, and
+one reader knows both.** MySQL writes `EXPLAIN ANALYZE <statement>` (and the
+same in its `DESCRIBE`/`DESC` spellings); MariaDB rejects that outright and
+writes `ANALYZE <statement>`. `mysql_explain_executed_statement` takes the
+`db_type` for exactly that reason, and everything that has to know asks it:
+the classifier, the read-only reasons, the implicit-commit table, whether a
+statement may leave uncommitted work, and the builder that decides what F6
+sends. Reading only MySQL's spelling had cost three separate things:
+
+* MariaDB's own executing explain was taken for the table maintenance it shares
+  a first word with — classified `Ddl`, and therefore claimed to COMMIT
+  IMPLICITLY. Measured on MariaDB 12.2.2: `ANALYZE UPDATE …` really writes and
+  leaves the transaction OPEN (`INNODB_TRX` = 1 afterwards, and a `ROLLBACK`
+  takes the row back), and `ANALYZE SELECT …` does not commit either — so the
+  claim cleared a commit decision the tab really had. `ANALYZE [modifiers]
+  TABLE …` is the maintenance statement and does commit (measured the same
+  way), so it keeps its own answer on both products;
+* "does this leave uncommitted work" was answered from the word in front, so
+  BOTH families' executing explains of a write answered "nothing" for a
+  statement that writes;
+* F6 wrapped MariaDB's spelling into an `EXPLAIN ANALYZE …` MariaDB refuses, so
+  a MySQL user could read a measured plan and a MariaDB user could not. An
+  explain the user typed is now passed through in whichever spelling this
+  product uses (`MysqlExecutor::explain_plan_sql`, which also takes the
+  `db_type`), and `ANALYZE TABLE` — an explain on neither product — is not.
+
+Which statements a server will actually run this way changes with the version —
+measured on MySQL 8.0.46, DML comes back `<not executable by iterator executor>`
+and writes nothing, while MySQL 8.3 runs it — so the app answers from the
+statement rather than from the server version, exactly as
+`statement_reconfigures_the_server_for_analysis` does. `EXPLAIN`'s own option
+clauses belong to the explain and not to what it runs: `FORMAT = …` and the
+`FOR SCHEMA|DATABASE <name>` clause this app's completion grammar already knows
+are stepped over, while an option whose VALUE is missing is NOT — the malformed
+remainder becomes the target, which nothing can prove is a read, because
+answering "plan-only" for text the app could not parse is the wrong direction.
+Live checks in `verify_explain_plan_live` on both MySQL-family backends.
+
+A statement that is ALREADY an `EXPLAIN PLAN … FOR X` is read for the `X` it
+explains rather than wrapped again (`sql_classification::oracle_explain_plan_target`,
+which scans top-level words only, so a `FOR` inside `SET STATEMENT_ID = 'FOR'`
+or `INTO "FOR"` is not the separator). The MySQL family has always passed an
+`EXPLAIN` the user typed straight through; Oracle wrapped it and the server
+rejected the result. Oracle cannot pass one through — this call's read-back
+needs the `STATEMENT_ID` it stamps, and the user's own statement may name a
+different `PLAN_TABLE` with `INTO` — so it reads it instead.
+
+The rows it reads back are the rows it wrote, named by a `STATEMENT_ID` the
+statement stamps on itself (`OracleExplainStatement`, which carries the text and
+the id as one value). The read-back used to take "the row set with the highest
+`plan_id`", which is only this call's plan while `PLAN_TABLE` is the
+session-private `SYS.PLAN_TABLE$`; a schema that ran `utlxplan.sql` has a
+PERMANENT one shared by every session of that user, and anything another session
+committed between this call's INSERT and its SELECT carried a higher `plan_id`,
+so F6 drew someone else's plan.
+
+**What this session is not, and why it cannot simply be the tab's.** The plan is
+built on the connection's OWN session, never on the tab's. Two reasons, and the
+second is measured:
+
+* a plan must not queue behind the tab's own statement; and
+* on the MySQL family, building one on the TAB's session would leave that tab
+  looking like it is carrying a transaction. `EXPLAIN` under `autocommit = 0`
+  opens one — `performance_schema.events_transactions_current` goes from 0 to 1
+  `ACTIVE` rows across a bare `EXPLAIN SELECT`, and that probe is the FIRST and
+  unfiltered link in the app's own dirty chain
+  (`mysql_performance_schema_transaction_probe_sql`). That is exactly the defect
+  round 31 removed: the app's own read making the tab look dirty, so the user's
+  next `SET SESSION autocommit = 1` is refused about a transaction that is
+  entirely the app's. Nor could the app end it — it cannot tell that transaction
+  apart from one the user really had, and a `ROLLBACK` to be rid of it would
+  take the user's work with it.
+
+Oracle alone could be moved safely (`DBMS_TRANSACTION.LOCAL_TRANSACTION_ID`
+says exactly whether a transaction was already open, so `SAVEPOINT` +
+`ROLLBACK TO SAVEPOINT` would take back only the `PLAN_TABLE` write) — but a
+feature that moves on one family and not the other is the divergence this
+subsystem keeps paying for.
+
+The consequence is that anything living only in the TAB's session is invisible
+to the plan: a MySQL `CREATE TEMPORARY TABLE` or a `@variable` set in the tab, an
+Oracle private temporary table or an `ALTER SESSION SET optimizer_*`. So the app
+SAYS so, from the state it already tracks for that session
+(`SessionResidueState` → `SqlEditorWidget::explain_plan_session_note` →
+`result_messages::explain_plan_excludes_tab_session_state`): the note names what
+is in play on this tab — temporary tables, user variables, session settings —
+beside a plan that came back and with the error when one did not. A tab whose
+session holds none of it is told nothing, because a disclaimer on every plan is
+one the user learns to skip. It goes with a plan or with a FAILURE only: it
+opens "This plan was built on the connection's own DB session", which is a fact
+about a plan that was attempted, so beside a refusal (nothing was built) or a
+cancel it would be untrue or read as the reason the user's plan was stopped.
+
+**Oracle's half of that sentence had nothing to say.** The note reads
+`SessionResidueState`, and `oracle_session_residue_effects` set NO field for a
+`CREATE PRIVATE TEMPORARY TABLE` — so a tab that made one was told nothing at
+all when F6 answered `ORA-00942` for a table only that tab has, while the MySQL
+half has always named its `CREATE TEMPORARY TABLE`. Oracle now sets the SAME
+field (`creates_temporary_table`), so both families name it with the same words,
+and the tab's session is retained for it as the MySQL family's already was —
+which it must be, since a private temporary table dies with the session.
+`CREATE GLOBAL TEMPORARY TABLE` deliberately sets nothing: that one is a
+permanent schema object whose ROWS are session-private, so every session — the
+plan's included — resolves the name, and calling it residue would pin the tab's
+session for a table that outlives it. Live-gated on all four backends by the
+same probe (`verify_a_plan_says_what_it_cannot_see`), each in its own spelling.
+
 ## Read-only connections
 
 `ConnectionInfo::read_only` is a guard inside this process, not a server-side
@@ -330,7 +549,19 @@ lock. Note that two statement shapes classify as writes despite reading:
 locking select) and Oracle `EXPLAIN PLAN FOR` (`classify_explain_sql_for_db_type`
 returns `Dml`, because it inserts into `PLAN_TABLE`). Both are therefore refused
 on a read-only connection, which also means F6 Explain Plan is unavailable there
-on Oracle. `sql_classification::read_only_block_reason` splits the text with the same
+on Oracle — asked by `write_refusal_for_statement` on the explain path and by
+`SqlEditorWidget::read_only_refusal` on the execution path, both through the one
+wording in `ReadOnlyConnection::refusal`. F6 says WHY, because that wording
+alone cannot: it describes the statement that was refused, and on Oracle that
+statement is the `EXPLAIN PLAN … FOR` the app built, so a user who asked for the
+plan of a `SELECT` read "Oracle read-only mode blocks non-query statements"
+about a statement they had not typed — while the same keystroke simply worked on
+the other family with nothing saying which fact differed.
+`result_messages::explain_plan_write_refused` keeps the shared wording verbatim
+and adds `ExplainPlanBackend::why_building_the_plan_is_itself_a_write`, which is
+`Some` on Oracle and `None` on the MySQL family, so the extra sentence appears
+exactly where it is true.
+`sql_classification::read_only_block_reason` splits the text with the same
 splitter and MySQL delimiter the executor will use, classifies each statement on
 its own, and refuses anything that is not provably a read — including a
 statement it cannot classify. `SelectLike` and `TransactionControl` pass, and so
