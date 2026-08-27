@@ -2797,6 +2797,7 @@ impl MysqlObjectBrowser {
                     default_value,
                     is_primary_key: column_key == "PRI",
                     is_generated: mysql_extra_marks_generated_column(extra.as_deref()),
+                    is_invisible: mysql_extra_marks_invisible_column(extra.as_deref()),
                 },
             )
             .collect())
@@ -3375,6 +3376,17 @@ pub(crate) fn mysql_extra_marks_generated_column(extra: Option<&str>) -> bool {
     .any(|marker| extra.contains(marker))
 }
 
+/// Whether the same `EXTRA` says `SELECT *` leaves this column out.
+///
+/// A different fact from the one above and read from the same word, so the two
+/// sit together: an INVISIBLE column (MySQL 8.0.23+, MariaDB 10.3+) is one a
+/// statement may still name, and one no `SELECT *` returns — measured on MySQL
+/// 8.0 and MariaDB 12.2, both spelling it exactly `INVISIBLE`, both keeping the
+/// column's `ORDINAL_POSITION` so it sits in the middle of the catalog list.
+pub(crate) fn mysql_extra_marks_invisible_column(extra: Option<&str>) -> bool {
+    extra.is_some_and(|extra| extra.to_ascii_uppercase().contains("INVISIBLE"))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3410,6 +3422,32 @@ mod tests {
             );
         }
         assert!(!super::mysql_extra_marks_generated_column(None));
+    }
+
+    /// The same word answers a SECOND question, and the two must not be
+    /// confused: an invisible column may be written into, it is simply not in
+    /// a `SELECT *`. Measured on MySQL 8.0 and MariaDB 12.2, both of which
+    /// spell it exactly `INVISIBLE`.
+    #[test]
+    fn mysql_extra_marks_the_columns_select_star_leaves_out() {
+        for extra in ["INVISIBLE", "invisible", "DEFAULT_GENERATED INVISIBLE"] {
+            assert!(
+                super::mysql_extra_marks_invisible_column(Some(extra)),
+                "{extra}"
+            );
+            // And an invisible column is still one a statement may name.
+            assert!(
+                !super::mysql_extra_marks_generated_column(Some(extra)),
+                "{extra} is not a computed column"
+            );
+        }
+        for extra in ["", "auto_increment", "VIRTUAL GENERATED"] {
+            assert!(
+                !super::mysql_extra_marks_invisible_column(Some(extra)),
+                "{extra}"
+            );
+        }
+        assert!(!super::mysql_extra_marks_invisible_column(None));
     }
     use super::{
         MysqlExecutor, MysqlObjectBrowser, MysqlResultSetSnapshot, MysqlSessionTimeoutRestore,

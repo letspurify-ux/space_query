@@ -70,7 +70,12 @@ pub struct TargetColumn {
 /// column. Indexes point into the target column list.
 pub type ColumnMapping = Vec<Option<usize>>;
 
-/// One column of the table being loaded, writable or not.
+/// One column of the table being loaded, and the two facts that decide what it
+/// means to a file.
+///
+/// They are genuinely different questions and a column can answer them in any
+/// combination: a generated column IS in every export and may not be written
+/// into; an invisible column may be written into and is in no export.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ImportColumn {
     name: String,
@@ -80,6 +85,12 @@ struct ImportColumn {
     /// or `GENERATED ALWAYS AS IDENTITY`, or a MySQL-family generated column,
     /// says no — and the server refuses the whole script for naming one.
     writable: bool,
+    /// Whether a `SELECT *` file carries a value for it. An INVISIBLE column
+    /// does not appear in one, so it claims no POSITION — measured on MySQL 8.0
+    /// and MariaDB 12.2, where it keeps its `ORDINAL_POSITION` in the catalog
+    /// and therefore sat in the middle of this list, shifting every later value
+    /// one column left.
+    in_select_star: bool,
 }
 
 /// The table's columns as an import sees them: EVERY column, in the table's own
@@ -116,6 +127,7 @@ impl ImportTargets {
                     kind: SqlValueKind::for_declared_type(db_type, &column.data_type),
                     nullable: column.nullable,
                     writable: !column.is_generated,
+                    in_select_star: !column.is_invisible,
                 })
                 .collect(),
         }
@@ -136,6 +148,7 @@ impl ImportTargets {
                     kind: target.kind,
                     nullable: target.nullable,
                     writable: true,
+                    in_select_star: true,
                 })
                 .collect(),
         }
@@ -171,26 +184,40 @@ impl ImportTargets {
             .collect()
     }
 
-    /// The mapping a file with no header means: its columns are the TABLE's
-    /// columns, in the table's order.
+    /// The mapping a file with no header means: its columns are the columns a
+    /// `SELECT *` of this table returns, in that order.
     ///
-    /// A file position that lands on a column no value may be written into is
-    /// SKIPPED, not consumed by the next writable one — the file carries a
-    /// value for it (this app's data-format exports write every column), and
-    /// letting it slide over would put it in the wrong column.
+    /// Two different skips, because the two facts are different:
+    ///
+    /// * a GENERATED column is in the file (every data-format export of this
+    ///   table writes it) and may take no value, so it consumes a file position
+    ///   and maps to nothing. Letting the next value slide over it would put
+    ///   that value in the wrong column;
+    /// * an INVISIBLE column is NOT in the file, so it consumes no position at
+    ///   all — while still keeping its place among the targets, which a
+    ///   statement may name.
     ///
     /// Indexes are into [`Self::writable`], which is what a
     /// [`ColumnMapping`] points at.
     pub fn positional_mapping(&self, source_count: usize) -> ColumnMapping {
         let mut writable_index = 0usize;
         let mut mapping: ColumnMapping = Vec::with_capacity(source_count);
-        for column in self.columns.iter().take(source_count) {
-            if column.writable {
-                mapping.push(Some(writable_index));
+        for column in &self.columns {
+            // Counted for EVERY writable column, in the order `writable()`
+            // builds them — the index has to point at the same entry whether
+            // or not a file position ever reaches it.
+            let target = column.writable.then(|| {
+                let index = writable_index;
                 writable_index += 1;
-            } else {
-                mapping.push(None);
+                index
+            });
+            if !column.in_select_star {
+                continue;
             }
+            if mapping.len() == source_count {
+                break;
+            }
+            mapping.push(target);
         }
         // A file wider than the table has nothing left to feed.
         mapping.resize(source_count, None);
@@ -441,17 +468,31 @@ mod tests {
             kind,
             nullable: true,
             writable: true,
+            in_select_star: true,
         }
     }
 
     /// A column the server computes: offered to nothing, and counted by
-    /// position all the same.
+    /// position all the same — every data-format export writes its value.
     fn computed_column(name: &str) -> ImportColumn {
         ImportColumn {
             name: name.to_string(),
             kind: SqlValueKind::Unknown,
             nullable: true,
             writable: false,
+            in_select_star: true,
+        }
+    }
+
+    /// A column `SELECT *` leaves out: still a target a statement may name, but
+    /// no file position feeds it.
+    fn invisible_column(name: &str, kind: SqlValueKind) -> ImportColumn {
+        ImportColumn {
+            name: name.to_string(),
+            kind,
+            nullable: true,
+            writable: true,
+            in_select_star: false,
         }
     }
 
@@ -687,6 +728,71 @@ mod tests {
         // And a table with nothing computed maps one to one, as it always did.
         let plain = ImportTargets::all_writable(targets());
         assert_eq!(plain.positional_mapping(2), vec![Some(0), Some(1)]);
+    }
+
+    /// A column `SELECT *` leaves out claims no position in the file.
+    ///
+    /// The other half of the same root. An INVISIBLE column (MySQL 8.0.23+,
+    /// MariaDB 10.3+, Oracle 12c+) is a target a statement may name and a
+    /// column no export writes, so counting it as a position shifted every
+    /// later value one column left — measured live on MySQL 8.0 and MariaDB
+    /// 12.2, where the catalog keeps it in the MIDDLE of the list.
+    #[test]
+    fn positional_mapping_gives_no_position_to_a_column_select_star_omits() {
+        let table = ImportTargets {
+            columns: vec![
+                writable_column("A", SqlValueKind::Number),
+                invisible_column("B", SqlValueKind::Number),
+                writable_column("C", SqlValueKind::String),
+            ],
+        };
+        // Every column is still a target: an explicit INSERT into an invisible
+        // column is legal on both families.
+        assert_eq!(
+            table
+                .writable()
+                .iter()
+                .map(|target| target.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+        );
+        // A `SELECT *` file of this table has TWO columns, and the second is C.
+        assert_eq!(
+            table.positional_mapping(2),
+            vec![Some(0), Some(2)],
+            "the file's second column must reach C, not the invisible B"
+        );
+
+        // Oracle sorts an invisible column last (its COLUMN_ID is NULL), which
+        // lines up by itself — and must keep lining up.
+        let oracle_order = ImportTargets {
+            columns: vec![
+                writable_column("A", SqlValueKind::Number),
+                writable_column("C", SqlValueKind::String),
+                invisible_column("B", SqlValueKind::Number),
+            ],
+        };
+        assert_eq!(oracle_order.positional_mapping(2), vec![Some(0), Some(1)]);
+
+        // And the two facts compose: computed AND invisible in one table.
+        let both = ImportTargets {
+            columns: vec![
+                writable_column("A", SqlValueKind::Number),
+                invisible_column("HIDDEN", SqlValueKind::Number),
+                computed_column("TOTAL"),
+                writable_column("C", SqlValueKind::String),
+            ],
+        };
+        // `SELECT *` returns A, TOTAL, C — three columns, and only A and C
+        // take a value.
+        assert_eq!(both.positional_mapping(3), vec![Some(0), None, Some(2)]);
+        assert_eq!(
+            both.writable()
+                .iter()
+                .map(|target| target.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["A".to_string(), "HIDDEN".to_string(), "C".to_string()]
+        );
     }
 
     /// The whole point of the shift: the values land in the right columns.

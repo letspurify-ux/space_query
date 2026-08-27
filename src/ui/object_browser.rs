@@ -1500,6 +1500,7 @@ impl ObjectBrowserWidget {
             default_value: None,
             is_primary_key,
             is_generated: false,
+            is_invisible: false,
         }
     }
 
@@ -13854,6 +13855,7 @@ mod tests {
             default_value: None,
             is_primary_key: false,
             is_generated: false,
+            is_invisible: false,
         }
     }
 
@@ -14147,6 +14149,7 @@ mod tests {
             default_value: None,
             is_primary_key: true,
             is_generated: false,
+            is_invisible: false,
         };
         let mut computed = plain.clone();
         computed.name = "TOTAL".to_string();

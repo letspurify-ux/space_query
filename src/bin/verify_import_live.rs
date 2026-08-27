@@ -924,6 +924,150 @@ fn verify(target: Target) -> Result<(), String> {
     println!("\n----- round 8: the NULL text, blank lines, and a value no literal holds -----");
     verify_null_text_and_blank_lines(target, &mut h)?;
     verify_a_value_no_literal_can_hold(target, &mut h)?;
+
+    println!("\n----- round 9: a column `SELECT *` leaves out -----");
+    verify_invisible_columns(target, &mut h)?;
+    Ok(())
+}
+
+/// A table with an INVISIBLE column in the middle.
+const INVISIBLE_TABLE: &str = "OQT_IMPORT_INVIS";
+
+/// A column no `SELECT *` returns claims no position in a file.
+///
+/// The other half of the root round 8 fixed. A headerless file means "the
+/// table's columns, in order" — but the file is a `SELECT *`, and an INVISIBLE
+/// column (Oracle 12c+, MySQL 8.0.23+, MariaDB 10.3+) is a column a statement
+/// may name and no `SELECT *` returns.
+///
+/// Measured before the fix: MySQL 8.0 and MariaDB 12.2 keep the column's
+/// `ORDINAL_POSITION`, so the catalog listed `A, B, C` where the file held
+/// `A, C` — and the file's second value went into B. Oracle sorts it last
+/// (`COLUMN_ID` is NULL) and happened to line up; this checks that it still
+/// does, for the same reason the other two now do.
+fn verify_invisible_columns(target: Target, h: &mut Harness) -> Result<(), String> {
+    let _ = h.run(&target.drop_sql(INVISIBLE_TABLE));
+    let create = if target.is_oracle() {
+        format!("CREATE TABLE {INVISIBLE_TABLE} (A NUMBER, B NUMBER INVISIBLE, C NUMBER)")
+    } else {
+        format!("CREATE TABLE {INVISIBLE_TABLE} (A INT, B INT INVISIBLE, C INT)")
+    };
+    h.run(&create)
+        .map_err(|e| format!("create a table with an invisible column: {e}"))?;
+    let _ = h.run("COMMIT");
+
+    // What the file will hold: whatever `SELECT *` returns.
+    let star = read_table_rows(target, &format!("SELECT * FROM {INVISIBLE_TABLE}"))?;
+    let star_columns: Vec<String> = star
+        .columns
+        .iter()
+        .map(|column| column.name.trim().to_ascii_uppercase())
+        .collect();
+    println!("  SELECT * returns {star_columns:?}");
+    if star_columns != ["A", "C"] {
+        let _ = h.run(&target.drop_sql(INVISIBLE_TABLE));
+        return Err(format!(
+            "this server does not hide an INVISIBLE column from SELECT *: {star_columns:?}"
+        ));
+    }
+
+    let columns = read_table_structure(target, INVISIBLE_TABLE)?;
+    let db_type = target.connection_info().db_type;
+    let table_columns = ObjectBrowserWidget::import_targets(db_type, &columns);
+    let targets = table_columns.writable();
+    println!(
+        "  catalog reports {:?}, targets {:?}",
+        columns
+            .iter()
+            .map(|column| (column.name.clone(), column.is_invisible))
+            .collect::<Vec<_>>(),
+        targets
+            .iter()
+            .map(|target| target.name.clone())
+            .collect::<Vec<_>>()
+    );
+    // An invisible column is still a target: a statement may name it.
+    if !targets
+        .iter()
+        .any(|target| target.name.eq_ignore_ascii_case("B"))
+    {
+        let _ = h.run(&target.drop_sql(INVISIBLE_TABLE));
+        return Err("an invisible column must stay an import target".to_string());
+    }
+
+    // A headerless file of the SELECT * columns: two values, and the second
+    // one is C's.
+    let data = ImportedTable {
+        columns: vec!["COLUMN_1".to_string(), "COLUMN_2".to_string()],
+        rows: vec![vec![Some("100".to_string()), Some("300".to_string())]],
+    };
+    let mapping = table_columns.positional_mapping(data.columns.len());
+    let script = build_insert_script(&ImportRequest {
+        dialect: SqlWriteDialect::for_connection(&target.connection_info()),
+        table: INVISIBLE_TABLE,
+        targets: &targets,
+        mapping: &mapping,
+        data: &data,
+        batch_rows: BATCH_ROWS,
+    })
+    .map_err(|e| format!("build the headerless import script: {e}"))?;
+    println!("  {}", script.trim());
+    h.run_script(&script)
+        .map_err(|e| format!("the headerless import failed: {e}"))?;
+    let _ = h.run("COMMIT");
+
+    let counted = h.run(&format!(
+        "SELECT COUNT(*) AS N FROM {INVISIBLE_TABLE} WHERE A = 100 AND C = 300 AND B IS NULL"
+    ))?;
+    if single_count(&counted).as_deref() != Some("1") {
+        let rows = h.run(&format!("SELECT A, B, C FROM {INVISIBLE_TABLE}"))?;
+        let landed = grid_view(&rows).map(|(_, _, rows)| rows);
+        let _ = h.run(&target.drop_sql(INVISIBLE_TABLE));
+        return Err(format!(
+            "the file's second value did not reach C — the row landed as {landed:?}"
+        ));
+    }
+    println!("PASS: a column SELECT * omits takes no file position, and stays a target");
+
+    // The premise behind keeping it on offer: naming it explicitly works.
+    h.run(&format!(
+        "INSERT INTO {INVISIBLE_TABLE} (A, B, C) VALUES (1, 2, 3)"
+    ))
+    .map_err(|e| format!("an explicit INSERT into an invisible column failed: {e}"))?;
+    let _ = h.run("COMMIT");
+    let counted = h.run(&format!(
+        "SELECT COUNT(*) AS N FROM {INVISIBLE_TABLE} WHERE B = 2"
+    ))?;
+    if single_count(&counted).as_deref() != Some("1") {
+        let _ = h.run(&target.drop_sql(INVISIBLE_TABLE));
+        return Err("an explicit value did not reach the invisible column".to_string());
+    }
+    println!("PASS: an invisible column really is writable by name");
+
+    // The catalog fact is read by THREE Oracle statements — OCI's structure
+    // read, thin's, and `DESCRIBE` — and only the first two are on the path
+    // above. `DESC` is how the third one runs.
+    if target.is_oracle() {
+        let described = h
+            .run(&format!("DESC {INVISIBLE_TABLE}"))
+            .map_err(|e| format!("DESCRIBE reads the same catalog columns: {e}"))?;
+        let names: Vec<String> = grid_view(&described)
+            .map(|(_, _, rows)| {
+                rows.iter()
+                    .filter_map(|row| row.first().cloned())
+                    .map(|name| name.trim().to_ascii_uppercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !names.iter().any(|name| name == "A") {
+            let _ = h.run(&target.drop_sql(INVISIBLE_TABLE));
+            return Err(format!("DESCRIBE returned {names:?}"));
+        }
+        println!("PASS: DESCRIBE reads the same catalog columns ({names:?})");
+    }
+
+    let _ = h.run(&target.drop_sql(INVISIBLE_TABLE));
+    let _ = h.run("COMMIT");
     Ok(())
 }
 

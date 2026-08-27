@@ -4286,13 +4286,16 @@ impl QueryExecutor {
                    AND cc.table_name = c.table_name
                    AND cc.column_name = c.column_name
                    AND ROWNUM = 1) as is_pk,
-                {generated} as is_generated
+                {generated} as is_generated,
+                {invisible} as is_invisible
             FROM all_tab_columns c
             WHERE c.owner = :1
               AND c.table_name = :2
             ORDER BY c.column_id
         "#;
-        let sql = sql.replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR);
+        let sql = sql
+            .replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR)
+            .replace("{invisible}", ORACLE_INVISIBLE_COLUMN_EXPR);
 
         let mut stmt = match conn.statement(&sql).build() {
             Ok(stmt) => stmt,
@@ -4382,6 +4385,13 @@ impl QueryExecutor {
                     return Err(err);
                 }
             };
+            let is_invisible = match row.get::<_, Option<String>>(9) {
+                Ok(value) => value.as_deref().map(str::trim) == Some("Y"),
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
             columns.push(TableColumnDetail {
                 name,
                 data_type,
@@ -4392,6 +4402,7 @@ impl QueryExecutor {
                 default_value,
                 is_primary_key,
                 is_generated,
+                is_invisible,
             });
         }
 
@@ -11718,13 +11729,16 @@ impl ObjectBrowser {
                    AND cc.table_name = c.table_name
                    AND cc.column_name = c.column_name
                    AND ROWNUM = 1) as is_pk,
-                {generated} as is_generated
+                {generated} as is_generated,
+                {invisible} as is_invisible
             FROM all_tab_columns c
             WHERE c.owner = :1
               AND c.table_name = :2
             ORDER BY c.column_id
         "#;
-        let sql = sql.replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR);
+        let sql = sql
+            .replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR)
+            .replace("{invisible}", ORACLE_INVISIBLE_COLUMN_EXPR);
 
         let mut stmt = match conn.statement(&sql).build() {
             Ok(stmt) => stmt,
@@ -11814,6 +11828,13 @@ impl ObjectBrowser {
                     return Err(err);
                 }
             };
+            let is_invisible = match row.get::<_, Option<String>>(9) {
+                Ok(value) => value.as_deref().map(str::trim) == Some("Y"),
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
             columns.push(TableColumnDetail {
                 name,
                 data_type,
@@ -11824,6 +11845,7 @@ impl ObjectBrowser {
                 default_value,
                 is_primary_key,
                 is_generated,
+                is_invisible,
             });
         }
 
@@ -11854,18 +11876,21 @@ impl ObjectBrowser {
                    AND cc.table_name = c.table_name
                    AND cc.column_name = c.column_name
                    AND ROWNUM = 1) as is_pk,
-                {generated} as is_generated
+                {generated} as is_generated,
+                {invisible} as is_invisible
             FROM all_tab_columns c
             WHERE c.owner = :1
               AND c.table_name = :2
             ORDER BY c.column_id
         "#;
-        let sql = sql.replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR);
+        let sql = sql
+            .replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR)
+            .replace("{invisible}", ORACLE_INVISIBLE_COLUMN_EXPR);
 
         let rows = Self::thin_query_text_rows(
             conn,
             &sql,
-            9,
+            10,
             vec![
                 OracleThinBindValue::Text(owner),
                 OracleThinBindValue::Text(table_name),
@@ -11886,6 +11911,7 @@ impl ObjectBrowser {
                 default_value: row.get(6).and_then(|value| Self::thin_optional_text(value)),
                 is_primary_key: row.get(7).map(|value| !value.is_empty()).unwrap_or(false),
                 is_generated: row.get(8).map(|value| value.trim() == "Y").unwrap_or(false),
+                is_invisible: row.get(9).map(|value| value.trim() == "Y").unwrap_or(false),
             });
         }
 
@@ -12634,6 +12660,18 @@ pub(crate) const ORACLE_GENERATED_COLUMN_EXPR: &str = r#"
                               AND ic.column_name = c.column_name) = 'ALWAYS'
                      THEN 'Y' ELSE 'N' END"#;
 
+/// The catalog expression that answers "does `SELECT *` return this column?"
+/// for Oracle, as `'Y'`/`'N'` for INVISIBLE.
+///
+/// ONE const, for the same reason as [`ORACLE_GENERATED_COLUMN_EXPR`]: the two
+/// drivers must not be able to describe the same table differently. An
+/// invisible column keeps its place in the table and loses its `COLUMN_ID`
+/// — measured on 23ai, where `USER_TAB_COLS` reports `COLUMN_ID = NULL` and
+/// `HIDDEN_COLUMN = 'YES'` for it while `ALL_TAB_COLUMNS` still lists it, and
+/// `ORDER BY column_id` therefore sorts it last.
+pub(crate) const ORACLE_INVISIBLE_COLUMN_EXPR: &str =
+    "CASE WHEN c.column_id IS NULL THEN 'Y' ELSE 'N' END";
+
 /// Detailed column information for table structure
 #[derive(Debug, Clone)]
 pub struct TableColumnDetail {
@@ -12655,6 +12693,18 @@ pub struct TableColumnDetail {
     /// all — has to be able to leave such a column out instead of watching the
     /// server reject the whole script.
     pub is_generated: bool,
+    /// Whether `SELECT *` leaves this column out: an INVISIBLE column (Oracle
+    /// 12c+, MySQL 8.0.23+, MariaDB 10.3+).
+    ///
+    /// A different fact from [`Self::is_generated`], and the two are the only
+    /// reason a table's columns and a FILE's columns can fail to line up. A
+    /// statement may name an invisible column, so it stays an import target;
+    /// what it may not do is claim a POSITION in a file, because every export
+    /// of this table is a `SELECT *` and that is exactly what `SELECT *` left
+    /// out. Measured: MySQL and MariaDB report `EXTRA = 'INVISIBLE'` and keep
+    /// the column's `ORDINAL_POSITION`, so it sits in the MIDDLE of the catalog
+    /// list and shifted every later value one column left.
+    pub is_invisible: bool,
 }
 
 impl TableColumnDetail {

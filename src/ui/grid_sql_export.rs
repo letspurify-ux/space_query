@@ -761,11 +761,16 @@ fn oracle_text_literal(
     value: &str,
     dialect: SqlWriteDialect,
 ) -> Result<String, ValueTooLongForLiteral> {
+    // `TO_CLOB` is Oracle's, so the family that has no per-literal limit leaves
+    // before the chunking exists — by returning, not by an assertion that a
+    // release build would walk straight past into invalid SQL.
+    if dialect.is_mysql_or_mariadb() {
+        return quoted_string(value, dialect);
+    }
     // Asked of the writer itself rather than measured a second time here: one
     // rule about what fits in a literal, stated where a literal is written.
-    match quoted_string(value, dialect) {
-        Ok(single) => return Ok(single),
-        Err(_) => debug_assert!(!dialect.is_mysql_or_mariadb()),
+    if let Ok(single) = quoted_string(value, dialect) {
+        return Ok(single);
     }
 
     let mut parts: Vec<String> = Vec::new();
@@ -1022,14 +1027,23 @@ fn oracle_temporal_literal(
         // format model exactly. The drivers render the offset without one, and
         // Oracle then reads `TZH` off a value whose sign is where the space
         // should be — silently turning `-05:30` into `+05:30`.
-        (Some(fraction), Some(zone)) if is_all_digits(fraction) => format!(
-            "TO_TIMESTAMP_TZ('{} {zone}','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')",
-            spliced_literal_content(datetime)?
-        ),
-        (None, Some(zone)) => format!(
-            "TO_TIMESTAMP_TZ('{} {zone}','YYYY-MM-DD HH24:MI:SS TZH:TZM')",
-            spliced_literal_content(datetime)?
-        ),
+        // The zone is part of the literal's content, so it is part of what is
+        // measured — the datetime alone would let a value seven bytes over
+        // the limit through.
+        (Some(fraction), Some(zone)) if is_all_digits(fraction) => {
+            let content = format!("{datetime} {zone}");
+            format!(
+                "TO_TIMESTAMP_TZ('{}','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')",
+                spliced_literal_content(&content)?
+            )
+        }
+        (None, Some(zone)) => {
+            let content = format!("{datetime} {zone}");
+            format!(
+                "TO_TIMESTAMP_TZ('{}','YYYY-MM-DD HH24:MI:SS TZH:TZM')",
+                spliced_literal_content(&content)?
+            )
+        }
         _ => return quoted_string(value, dialect),
     })
 }
@@ -2118,6 +2132,22 @@ mod tests {
         // second a FILE carries; the drivers write at most nine.
         let long_fraction = format!("2024-01-01 00:00:00.{}", "1".repeat(5000));
         assert!(sql_literal_for_value(oracle, SqlValueKind::Temporal, &long_fraction).is_err());
+        // The zone rides inside the same literal, so it counts toward the same
+        // limit: measuring the datetime alone let a value through by seven.
+        let at_limit_fraction = format!(
+            "2024-01-01 00:00:00.{}",
+            "1".repeat(ORACLE_MAX_LITERAL_BYTES - "2024-01-01 00:00:00.".len())
+        );
+        assert!(sql_literal_for_value(oracle, SqlValueKind::Temporal, &at_limit_fraction).is_ok());
+        assert!(
+            sql_literal_for_value(
+                oracle,
+                SqlValueKind::Temporal,
+                &format!("{at_limit_fraction}+09:00")
+            )
+            .is_err(),
+            "the zone pushes the same value past the limit"
+        );
         assert_eq!(
             sql_literal_for_value(oracle, SqlValueKind::Temporal, "2024-01-01 00:00:00.123456"),
             Ok("TO_TIMESTAMP('2024-01-01 00:00:00.123456','YYYY-MM-DD HH24:MI:SS.FF')".to_string())

@@ -82,6 +82,7 @@ fn detail(name: &str, data_type: &str, nullable: bool) -> TableColumnDetail {
         default_value: None,
         is_primary_key: false,
         is_generated: false,
+        is_invisible: false,
     }
 }
 
