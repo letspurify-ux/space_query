@@ -85,9 +85,13 @@ pub fn detect_format(path: &Path) -> Option<ExportFormat> {
     ExportFormat::ALL
         .into_iter()
         .find(|format| format.extension() == extension)
+        // Extensions no format claims outright. `.text` sits beside `.txt`
+        // rather than beside `.markdown`: both name plain text, and having one
+        // preselect Markdown while the other preselected CSV was a difference
+        // with no reason behind it.
         .or(match extension.as_str() {
-            "txt" => Some(ExportFormat::Csv),
-            "text" | "markdown" => Some(ExportFormat::Markdown),
+            "txt" | "text" => Some(ExportFormat::Csv),
+            "markdown" => Some(ExportFormat::Markdown),
             "htm" => Some(ExportFormat::Html),
             _ => None,
         })
@@ -154,12 +158,40 @@ fn header_or_generated(
 // CSV / TSV
 // ---------------------------------------------------------------------------
 
+/// One field of a delimited record, and whether the file QUOTED it.
+///
+/// The quoting is data, not decoration. It is the only thing a delimited file
+/// has left to tell SQL NULL from a value that spells the NULL text the same
+/// way — the writer quotes the value and leaves the NULL bare
+/// ([`crate::ui::result_export::ExportGrid::display_cell`]) — and dropping it
+/// at the door is what made this app's own export → import turn a `VARCHAR`
+/// holding the four letters `NULL` into a real NULL.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DelimitedField {
+    text: String,
+    quoted: bool,
+}
+
 /// Read RFC 4180 records: quoted fields may hold the separator, a line break,
 /// or a doubled quote. Records end at LF, CRLF, or a lone CR.
-fn split_delimited_records(text: &str, separator: char) -> Vec<Vec<String>> {
-    let mut records = Vec::new();
-    let mut record: Vec<String> = Vec::new();
+///
+/// A BLANK LINE is not a record. It used to be one field of empty text, which
+/// `validate` then padded out to the file's full width — so a file with a
+/// trailing empty line imported one extra row of NULLs, or lost the whole
+/// import to a NOT NULL column. Every other reader agrees: Python's `csv`
+/// yields nothing for it and pandas skips it. A line that really does hold one
+/// empty value writes it as `""`, which is quoted and therefore still a record.
+///
+/// The honest limit: with the NULL text set to empty, a row of ONE column
+/// holding NULL is written as an empty line, and an empty line is what a blank
+/// one is. Nothing in the file separates them, so such a row reads as absent.
+/// Every other shape — a second column, or any non-empty NULL text — carries
+/// enough to say which it is.
+fn split_delimited_records(text: &str, separator: char) -> Vec<Vec<DelimitedField>> {
+    let mut records: Vec<Vec<DelimitedField>> = Vec::new();
+    let mut record: Vec<DelimitedField> = Vec::new();
     let mut field = String::new();
+    let mut field_quoted = false;
     let mut in_quotes = false;
     // Whether anything of the current field has been read yet. A quote only
     // opens a quoted field at the very start of one: `ab"cd` is the literal
@@ -186,10 +218,14 @@ fn split_delimited_records(text: &str, separator: char) -> Vec<Vec<String>> {
             '"' if !field_started => {
                 field_started = true;
                 record_started = true;
+                field_quoted = true;
                 in_quotes = true;
             }
             _ if ch == separator => {
-                record.push(std::mem::take(&mut field));
+                record.push(DelimitedField {
+                    text: std::mem::take(&mut field),
+                    quoted: std::mem::take(&mut field_quoted),
+                });
                 field_started = false;
                 record_started = true;
             }
@@ -197,8 +233,17 @@ fn split_delimited_records(text: &str, separator: char) -> Vec<Vec<String>> {
                 if ch == '\r' && chars.peek() == Some(&'\n') {
                     chars.next();
                 }
-                record.push(std::mem::take(&mut field));
-                records.push(std::mem::take(&mut record));
+                // Nothing started this line — no character, no quote, no
+                // separator — so there is no record here to end. Anything that
+                // could have filled `field` or `record` sets `record_started`
+                // in the same breath, which is why this one flag answers it.
+                if record_started {
+                    record.push(DelimitedField {
+                        text: std::mem::take(&mut field),
+                        quoted: std::mem::take(&mut field_quoted),
+                    });
+                    records.push(std::mem::take(&mut record));
+                }
                 field_started = false;
                 record_started = false;
             }
@@ -209,11 +254,29 @@ fn split_delimited_records(text: &str, separator: char) -> Vec<Vec<String>> {
             }
         }
     }
-    if record_started || !field.is_empty() {
-        record.push(field);
+    if record_started {
+        record.push(DelimitedField {
+            text: field,
+            quoted: field_quoted,
+        });
         records.push(record);
     }
     records
+}
+
+/// Whether quoting can tell a NULL from a value that spells the NULL text.
+///
+/// The writer leaves a NULL bare and quotes the value, so the two are only
+/// distinguishable while the NULL text needs no quotes of its own. One that
+/// holds the separator, a quote, or a line break must be quoted whichever it
+/// means, and then the signal is spent — the reader falls back to matching the
+/// text, exactly as it did before the signal existed.
+///
+/// Asked of [`crate::ui::result_export::delimited_field_needs_quotes`], the
+/// writer's own rule, so the two sides cannot come to disagree about which
+/// texts carry the signal.
+fn null_text_quoting_is_a_signal(null_text: &str, separator: char) -> bool {
+    !crate::ui::result_export::delimited_field_needs_quotes(null_text, separator)
 }
 
 fn parse_separated(
@@ -226,14 +289,22 @@ fn parse_separated(
     let Some(first) = records.next() else {
         return Err("The file is empty.".to_string());
     };
-    let to_cells = |record: Vec<String>| -> Vec<ImportCell> {
+    let quoting_is_a_signal = null_text_quoting_is_a_signal(&options.null_text, separator);
+    let to_cells = |record: Vec<DelimitedField>| -> Vec<ImportCell> {
         record
             .into_iter()
-            .map(|value| {
-                if value == options.null_text {
+            .map(|field| {
+                // The writer's exact inverse: a NULL is the NULL text written
+                // bare, and the same text QUOTED is a value that spells it.
+                // Where the NULL text needs quotes of its own the signal does
+                // not exist, and the text alone decides — which is what this
+                // has always done, so no file loses a NULL it used to keep.
+                let is_null =
+                    field.text == options.null_text && (!field.quoted || !quoting_is_a_signal);
+                if is_null {
                     None
                 } else {
-                    Some(value)
+                    Some(field.text)
                 }
             })
             .collect()
@@ -241,7 +312,7 @@ fn parse_separated(
 
     // The header line is text even when it happens to equal the NULL text.
     let first_cells: Vec<ImportCell> = if options.has_header {
-        first.into_iter().map(Some).collect()
+        first.into_iter().map(|field| Some(field.text)).collect()
     } else {
         to_cells(first)
     };
@@ -274,9 +345,15 @@ fn parse_json(text: &str) -> Result<ImportedTable, String> {
             columns
                 .iter()
                 .map(|column| {
+                    // The LAST entry wins when one object repeats a key, which
+                    // is what `serde_json` itself does and what a reader that
+                    // built a map would end up with. Taking the first meant this
+                    // reader and the rest of the app disagreed about the same
+                    // document.
                     record
                         .0
                         .iter()
+                        .rev()
                         .find(|(key, _)| key == column)
                         .and_then(|(_, value)| json_cell(value))
                 })
@@ -356,6 +433,10 @@ enum MarkupContent {
 #[derive(Clone, Debug, Default)]
 struct MarkupNode {
     name: String,
+    /// The tag's text after its name, kept raw. Only the HTML reader looks at
+    /// it, and only for `colspan`/`rowspan`: a cell that spans is the one place
+    /// where an attribute decides which COLUMN a value belongs to.
+    attributes: String,
     /// Written `<name/>`, which is how the XML export spells NULL.
     self_closing: bool,
     /// Text and child elements in document order, so a value split around a
@@ -407,6 +488,59 @@ impl MarkupNode {
     fn children_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a MarkupNode> {
         self.elements().filter(move |child| child.is(name))
     }
+
+    /// A positive integer attribute, clamped to what HTML itself allows.
+    ///
+    /// A missing, unreadable, or zero value means "one", which is the span a
+    /// cell has when it says nothing. The clamp is the spec's own: without it a
+    /// `colspan="99999999"` in a file would be an allocation this reader made on
+    /// the file's say-so.
+    fn span_attribute(&self, name: &str, limit: usize) -> usize {
+        attribute_value(&self.attributes, name)
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, limit)
+    }
+}
+
+/// The value of `name` in a tag's attribute text, quoted or bare.
+fn attribute_value(attributes: &str, name: &str) -> Option<String> {
+    let lowered = attributes.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(offset) = lowered[from..].find(name) {
+        let at = from + offset;
+        from = at + name.len();
+        // A whole attribute name, not the tail of another one.
+        if at > 0 && {
+            let before = lowered.as_bytes()[at - 1];
+            before.is_ascii_alphanumeric() || before == b'-' || before == b'_'
+        } {
+            continue;
+        }
+        let rest = lowered[from..].trim_start();
+        if !rest.starts_with('=') {
+            continue;
+        }
+        let value_at = attributes.len() - rest.len() + 1;
+        let value = attributes[value_at..].trim_start();
+        let quoted = value
+            .strip_prefix('"')
+            .and_then(|inner| inner.split('"').next())
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|inner| inner.split('\'').next())
+            });
+        return Some(match quoted {
+            Some(inner) => inner.to_string(),
+            None => value
+                .split(|ch: char| ch.is_whitespace() || ch == '/' || ch == '>')
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    None
 }
 
 /// HTML elements that never have a closing tag. Only the ones that can appear
@@ -493,15 +627,24 @@ fn parse_markup(text: &str) -> Vec<MarkupNode> {
             .iter()
             .find(|(tag, _)| name.eq_ignore_ascii_case(tag))
         {
-            if let Some(position) = stack
+            // A `<table>` opens a scope these rules do not reach across: a row
+            // of an INNER table is not a sibling of a row of the outer one, and
+            // treating it as one closed the outer row and promoted the inner
+            // one beside it.
+            let floor = stack
+                .iter()
+                .rposition(|node| node.is("table"))
+                .map_or(0, |at| at + 1);
+            if let Some(position) = stack[floor..]
                 .iter()
                 .rposition(|node| closes.iter().any(|tag| node.is(tag)))
             {
-                close_to(&mut stack, &mut roots, position);
+                close_to(&mut stack, &mut roots, floor + position);
             }
         }
         let node = MarkupNode {
             self_closing,
+            attributes: tag_attributes(&inner),
             name,
             ..MarkupNode::default()
         };
@@ -571,6 +714,45 @@ fn tag_name(inner: &str) -> String {
         .collect()
 }
 
+/// Everything in a tag after its name, with the self-closing slash dropped.
+fn tag_attributes(inner: &str) -> String {
+    let inner = inner.trim_start().trim_start_matches('/');
+    let name_len = inner
+        .chars()
+        .take_while(|ch| !ch.is_whitespace() && *ch != '/' && *ch != '>')
+        .map(char::len_utf8)
+        .sum::<usize>();
+    inner[name_len..].trim().trim_end_matches('/').to_string()
+}
+
+/// The longest entity body this resolves: `#x10FFFF` is eight characters, and
+/// ten leaves room for a named one no shorter than the numeric forms.
+const MAX_ENTITY_BODY: usize = 10;
+
+/// The byte offset of the `;` that closes the entity starting at `text[0] == '&'`,
+/// or `None` when there is none within reach.
+///
+/// The bound gates the SEARCH, not the result. It used to be a filter applied
+/// after `find(';')` had already scanned the whole remaining text — so text that
+/// is dense in `&` and holds no `;` made every one of them scan to the end of
+/// the file, which is quadratic. Measured on an XML import: 40 KB of bare `&`
+/// took 50 ms, 80 KB took 131 ms, 160 KB took 517 ms and 320 KB took 2069 ms —
+/// a clean ×4 per doubling, extrapolating to minutes for a few megabytes, on the
+/// UI thread inside the import dialog. The same byte count written as `&amp;` —
+/// five times the text — is linear and finishes in 81 ms, because each `;` is
+/// found immediately.
+///
+/// A `;` at byte `MAX_ENTITY_BODY` is preceded by at most that many bytes and so
+/// by at most that many characters, which is why looking at one character more
+/// than the bound is enough to find every terminator the old filter accepted.
+fn entity_terminator(text: &str) -> Option<usize> {
+    text.char_indices()
+        .take(MAX_ENTITY_BODY + 1)
+        .find(|(_, ch)| *ch == ';')
+        .map(|(index, _)| index)
+        .filter(|end| *end <= MAX_ENTITY_BODY)
+}
+
 /// Resolve the entities the exporter writes, plus the numeric forms and the
 /// handful of named ones a hand-written file is likely to carry.
 fn decode_entities(text: &str) -> String {
@@ -582,7 +764,7 @@ fn decode_entities(text: &str) -> String {
     while let Some(start) = rest.find('&') {
         out.push_str(&rest[..start]);
         let tail = &rest[start..];
-        let Some(end) = tail.find(';').filter(|end| *end <= 10) else {
+        let Some(end) = entity_terminator(tail) else {
             out.push('&');
             rest = &tail[1..];
             continue;
@@ -679,7 +861,7 @@ fn parse_html(text: &str, has_header: bool) -> Result<ImportedTable, String> {
         find_html_table(roots.iter()).ok_or_else(|| "The HTML has no <table>.".to_string())?;
 
     let mut rows: Vec<(bool, Vec<ImportCell>)> = Vec::new();
-    collect_html_rows(table, &mut rows);
+    collect_html_rows(table, &mut HtmlRowBuilder::default(), &mut rows);
     if rows.is_empty() {
         return Err("The HTML table has no rows.".to_string());
     }
@@ -712,27 +894,101 @@ fn find_html_table<'a>(nodes: impl Iterator<Item = &'a MarkupNode>) -> Option<&'
     None
 }
 
+/// HTML's own ceilings on how far one cell may span. Applied so a number in a
+/// file cannot ask this reader for an arbitrary amount of memory.
+const MAX_COLSPAN: usize = 1000;
+const MAX_ROWSPAN: usize = 65534;
+
+/// Turns `<tr>` elements into rows that all address the same columns.
+///
+/// A cell is not a column: `colspan` makes one cell fill several, and `rowspan`
+/// makes it re-appear in the rows below. Reading one cell as one column shifted
+/// every later cell of a spanned row one place to the left and left the rows
+/// under a `rowspan` short — silently, into the wrong column of the target
+/// table. Owning both rules in one place is what keeps a row's width a property
+/// of the TABLE rather than of the row that happened to be read last.
+#[derive(Default)]
+struct HtmlRowBuilder {
+    /// Per column, a value a `rowspan` still owes to later rows, and how many.
+    carry: Vec<Option<(usize, ImportCell)>>,
+}
+
+impl HtmlRowBuilder {
+    /// One `<tr>` as cells, or `None` when it contributes nothing at all.
+    /// The flag says whether the row was written with `<th>` cells.
+    ///
+    /// A `<tr>` with no cells of its own is still a row when a `rowspan` above
+    /// it owes this row a value: skipping it outright would hand that value to
+    /// the NEXT row instead, one row too early.
+    fn row(&mut self, tr: &MarkupNode) -> Option<(bool, Vec<ImportCell>)> {
+        let mut header = false;
+        let mut cells = tr
+            .elements()
+            .filter(|cell| cell.is("td") || cell.is("th"))
+            .inspect(|cell| header |= cell.is("th"))
+            .peekable();
+        let has_cells = cells.peek().is_some();
+
+        let mut out: Vec<ImportCell> = Vec::new();
+        let mut column = 0usize;
+        loop {
+            if let Some(value) = self.take_carried(column) {
+                out.push(value);
+                column += 1;
+                continue;
+            }
+            let Some(cell) = cells.next() else { break };
+            let text = cell.all_text();
+            // The exporter writes NULL as an empty cell.
+            let value = (!text.is_empty()).then_some(text);
+            let colspan = cell.span_attribute("colspan", MAX_COLSPAN);
+            let rowspan = cell.span_attribute("rowspan", MAX_ROWSPAN);
+            for _ in 0..colspan {
+                if self.carry.len() <= column {
+                    self.carry.resize(column + 1, None);
+                }
+                out.push(value.clone());
+                self.carry[column] = (rowspan > 1).then(|| (rowspan - 1, value.clone()));
+                column += 1;
+            }
+        }
+        // Columns past the last cell that a `rowspan` still owes this row.
+        while column < self.carry.len() {
+            let Some(value) = self.take_carried(column) else {
+                break;
+            };
+            out.push(value);
+            column += 1;
+        }
+        (has_cells || !out.is_empty()).then_some((header, out))
+    }
+
+    /// The value a `rowspan` owes `column` in the row being built, if any.
+    fn take_carried(&mut self, column: usize) -> Option<ImportCell> {
+        let slot = self.carry.get_mut(column)?;
+        let (remaining, value) = slot.as_mut()?;
+        let value = value.clone();
+        *remaining -= 1;
+        if *remaining == 0 {
+            *slot = None;
+        }
+        Some(value)
+    }
+}
+
 /// Gather `<tr>` rows from a table, descending through `<thead>`/`<tbody>`.
-/// The flag says whether the row was written with `<th>` cells.
-fn collect_html_rows(node: &MarkupNode, rows: &mut Vec<(bool, Vec<ImportCell>)>) {
+fn collect_html_rows(
+    node: &MarkupNode,
+    builder: &mut HtmlRowBuilder,
+    rows: &mut Vec<(bool, Vec<ImportCell>)>,
+) {
     for child in node.elements() {
         if child.is("tr") {
-            let mut header = false;
-            let mut cells: Vec<ImportCell> = Vec::new();
-            for cell in child.elements() {
-                if !cell.is("td") && !cell.is("th") {
-                    continue;
-                }
-                header |= cell.is("th");
-                let text = cell.all_text();
-                // The exporter writes NULL as an empty cell.
-                cells.push((!text.is_empty()).then_some(text));
-            }
-            if !cells.is_empty() {
-                rows.push((header, cells));
+            if let Some(row) = builder.row(child) {
+                rows.push(row);
             }
         } else if !child.is("table") {
-            collect_html_rows(child, rows);
+            collect_html_rows(child, builder, rows);
         }
     }
 }
@@ -782,6 +1038,12 @@ fn is_markdown_separator(line: &str) -> bool {
 }
 
 /// Split one `| a | b |` line, undoing `escape_markdown_cell`.
+///
+/// One scan, in the reverse order the writer applied its rules: `\\`, `\|` and
+/// `\<` give back the character that follows, and only a `<br>` whose `<` was
+/// NOT escaped is the line break the writer inserted. Substituting `<br>` in a
+/// separate pass afterwards — as this did — turned a `<br>` that was in the data
+/// into a newline, because by then the two were spelled the same.
 fn split_markdown_row(line: &str) -> Vec<ImportCell> {
     let line = line.trim();
     let inner = line
@@ -792,34 +1054,58 @@ fn split_markdown_row(line: &str) -> Vec<ImportCell> {
 
     let mut cells = Vec::new();
     let mut cell = String::new();
-    let mut chars = inner.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            // `\\` and `\|` are what the exporter writes for a literal
-            // backslash and pipe; any other backslash is itself.
-            '\\' => match chars.next() {
-                Some(next @ ('\\' | '|')) => cell.push(next),
+    let mut index = 0usize;
+    while index < inner.len() {
+        let rest = &inner[index..];
+        let Some(ch) = rest.chars().next() else { break };
+        if ch == '\\' {
+            index += ch.len_utf8();
+            match inner[index..].chars().next() {
+                // What the exporter writes for a literal backslash, pipe or
+                // less-than sign.
+                Some(next @ ('\\' | '|' | '<')) => {
+                    cell.push(next);
+                    index += next.len_utf8();
+                }
+                // Any other backslash is itself, so a hand-written file keeps
+                // its text.
                 Some(next) => {
                     cell.push('\\');
                     cell.push(next);
+                    index += next.len_utf8();
                 }
                 None => cell.push('\\'),
-            },
-            '|' => cells.push(std::mem::take(&mut cell)),
-            _ => cell.push(ch),
+            }
+            continue;
         }
+        if ch == '|' {
+            cells.push(std::mem::take(&mut cell));
+            index += ch.len_utf8();
+            continue;
+        }
+        if rest.starts_with(MARKDOWN_LINE_BREAK) {
+            cell.push('\n');
+            index += MARKDOWN_LINE_BREAK.len();
+            continue;
+        }
+        cell.push(ch);
+        index += ch.len_utf8();
     }
     cells.push(cell);
 
     cells
         .into_iter()
         .map(|cell| {
-            let cell = cell.trim().replace("<br>", "\n");
+            let cell = cell.trim().to_string();
             // The exporter writes NULL as an empty cell.
             (!cell.is_empty()).then_some(cell)
         })
         .collect()
 }
+
+/// The markup a Markdown cell spells a line break with — the one piece of it
+/// that is structure rather than data, which is why every other `<` is escaped.
+const MARKDOWN_LINE_BREAK: &str = "<br>";
 
 // ---------------------------------------------------------------------------
 // SQL Inserts
@@ -839,34 +1125,40 @@ fn split_markdown_row(line: &str) -> Vec<ImportCell> {
 /// nobody else's — so a file exported from either backend reads back exactly,
 /// whichever backend it is being imported into.
 fn parse_sql_inserts(text: &str) -> Result<ImportedTable, String> {
-    let statements = split_sql_statements(text);
+    // One file, one writer, one answer — asked before the first split, because
+    // the split itself depends on it.
+    let dialect = detect_sql_file_dialect(text);
+    let statements = split_sql_statements(text, dialect);
     let mut columns: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<ImportCell>> = Vec::new();
 
     for statement in statements {
-        let Some((statement_columns, values, backslash_escapes)) =
-            split_insert_statement(&statement)?
-        else {
+        let Some(insert) = split_insert_statement(&statement, dialect)? else {
             continue;
         };
         if columns.is_empty() {
-            columns = statement_columns;
-        } else if columns != statement_columns {
-            return Err("The INSERT statements do not all use the same column list.".to_string());
+            columns = insert.columns.clone();
         }
-        if values.len() != columns.len() {
-            return Err(format!(
-                "An INSERT lists {} columns but {} values.",
-                columns.len(),
-                values.len()
-            ));
+        // The same columns in another ORDER name the same row; only a
+        // different SET of columns is a file this cannot read as one table.
+        let order = column_order_against(&columns, &insert.columns).ok_or_else(|| {
+            "The INSERT statements do not all use the same column list.".to_string()
+        })?;
+        for values in &insert.rows {
+            if values.len() != insert.columns.len() {
+                return Err(format!(
+                    "An INSERT lists {} columns but {} values.",
+                    insert.columns.len(),
+                    values.len()
+                ));
+            }
+            rows.push(
+                order
+                    .iter()
+                    .map(|source| sql_value_text(&values[*source], dialect))
+                    .collect::<Result<Vec<_>, String>>()?,
+            );
         }
-        rows.push(
-            values
-                .iter()
-                .map(|value| sql_value_text(value, backslash_escapes))
-                .collect::<Result<Vec<_>, String>>()?,
-        );
     }
 
     if columns.is_empty() {
@@ -875,63 +1167,170 @@ fn parse_sql_inserts(text: &str) -> Result<ImportedTable, String> {
     Ok(ImportedTable { columns, rows })
 }
 
-/// Split on `;` outside string literals, comments, and parentheses.
-fn split_sql_statements(text: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut chars = text.chars().peekable();
-    let mut depth = 0i32;
+/// Which escape rules a file's string literals follow.
+///
+/// The two dialects disagree about ONE thing, and it is the thing that decides
+/// where a literal ENDS: MySQL and MariaDB read `\` as an escape, Oracle reads
+/// it as an ordinary character. `'C:\path\'` is therefore a complete Oracle
+/// literal and an unterminated MySQL one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlFileDialect {
+    Oracle,
+    MysqlFamily,
+}
 
-    while let Some(ch) = chars.next() {
+impl SqlFileDialect {
+    fn backslash_escapes(self) -> bool {
+        matches!(self, SqlFileDialect::MysqlFamily)
+    }
+}
+
+/// Which dialect a file of `INSERT` statements is written in.
+///
+/// Decided ONCE, for the whole file, and BEFORE anything is split. It used to be
+/// decided per statement, from the backticks in that statement's column list —
+/// which is only readable after the file has already been split, so the splitter
+/// ran with one answer and the value decoder with another. An Oracle file
+/// holding `'C:\path\'` then lost every statement after it, and one holding
+/// `'a\''b'` decoded to `a\`. One file has one writer, so one answer.
+///
+/// The signal is a backtick-quoted identifier: only the MySQL family writes one,
+/// and this app's `SQL Inserts` export always writes one for that family. The
+/// pre-pass scans with Oracle's rule because that rule ends BOTH dialects'
+/// literals correctly for the forms this app writes — its MySQL literals double
+/// every backslash and spell a quote `''`, so an odd run of backslashes can
+/// never precede a closing quote.
+fn detect_sql_file_dialect(text: &str) -> SqlFileDialect {
+    let mut index = 0usize;
+    while index < text.len() {
+        let rest = &text[index..];
+        let Some(ch) = rest.chars().next() else { break };
         match ch {
             '\'' => {
-                current.push(ch);
-                while let Some(inner) = chars.next() {
-                    current.push(inner);
-                    if inner == '\\' {
-                        if let Some(escaped) = chars.next() {
-                            current.push(escaped);
-                        }
-                    } else if inner == '\'' {
-                        if chars.peek() == Some(&'\'') {
-                            if let Some(doubled) = chars.next() {
-                                current.push(doubled);
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                }
+                index = string_literal_end(text, index, SqlFileDialect::Oracle);
+                continue;
+            }
+            '"' => {
+                index = quoted_identifier_end(text, index, '"');
+                continue;
+            }
+            '`' => return SqlFileDialect::MysqlFamily,
+            '-' if rest.starts_with("--") => {
+                index = rest.find('\n').map_or(text.len(), |at| index + at + 1);
+                continue;
+            }
+            '/' if rest.starts_with("/*") => {
+                index = block_comment_end(text, index);
+                continue;
+            }
+            _ => {}
+        }
+        index += ch.len_utf8();
+    }
+    SqlFileDialect::Oracle
+}
+
+/// The byte index just past the string literal whose opening `'` is at `open`.
+///
+/// The ONE place a literal's end is decided. Statement splitting, paren
+/// matching, list splitting and value decoding all ask it, so none of them can
+/// hold a different opinion about where a value stops — which is exactly the
+/// disagreement that used to swallow statements.
+///
+/// An unterminated literal ends at end of input rather than reporting: this
+/// reader is deliberately forgiving, and the caller reports the shape it could
+/// not make sense of.
+fn string_literal_end(text: &str, open: usize, dialect: SqlFileDialect) -> usize {
+    let mut index = open + '\''.len_utf8();
+    while index < text.len() {
+        let rest = &text[index..];
+        let Some(ch) = rest.chars().next() else { break };
+        if ch == '\\' && dialect.backslash_escapes() {
+            index += ch.len_utf8();
+            if let Some(escaped) = text[index..].chars().next() {
+                index += escaped.len_utf8();
+            }
+            continue;
+        }
+        index += ch.len_utf8();
+        if ch == '\'' {
+            // A doubled quote is one character of the value in every dialect.
+            if text[index..].starts_with('\'') {
+                index += '\''.len_utf8();
+                continue;
+            }
+            return index;
+        }
+    }
+    text.len()
+}
+
+/// The byte index just past the quoted identifier opened at `open`.
+///
+/// A doubled delimiter is one character of the NAME, so it does not close it —
+/// `` `zr``tick` `` is one identifier, not two.
+fn quoted_identifier_end(text: &str, open: usize, quote: char) -> usize {
+    let mut index = open + quote.len_utf8();
+    while index < text.len() {
+        let Some(ch) = text[index..].chars().next() else {
+            break;
+        };
+        index += ch.len_utf8();
+        if ch == quote {
+            if text[index..].starts_with(quote) {
+                index += quote.len_utf8();
+                continue;
+            }
+            return index;
+        }
+    }
+    text.len()
+}
+
+/// The byte index just past the `/* … */` comment opened at `index`.
+fn block_comment_end(text: &str, index: usize) -> usize {
+    text[index + 2..]
+        .find("*/")
+        .map_or(text.len(), |at| index + 2 + at + 2)
+}
+
+/// Split on `;` outside string literals, comments, and parentheses.
+///
+/// Comments are dropped rather than carried into the statement, because what
+/// follows reads the statement by its first word and by its first `(`.
+fn split_sql_statements(text: &str, dialect: SqlFileDialect) -> Vec<String> {
+    let mut statements: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    let mut index = 0usize;
+
+    while index < text.len() {
+        let rest = &text[index..];
+        let Some(ch) = rest.chars().next() else { break };
+        match ch {
+            '\'' => {
+                let end = string_literal_end(text, index, dialect);
+                current.push_str(&text[index..end]);
+                index = end;
+                continue;
             }
             '"' | '`' => {
                 // A quoted identifier can hold a `;` or a paren just as a
                 // string can.
-                current.push(ch);
-                for inner in chars.by_ref() {
-                    current.push(inner);
-                    if inner == ch {
-                        break;
-                    }
-                }
+                let end = quoted_identifier_end(text, index, ch);
+                current.push_str(&text[index..end]);
+                index = end;
+                continue;
             }
-            '-' if chars.peek() == Some(&'-') => {
-                for inner in chars.by_ref() {
-                    if inner == '\n' {
-                        break;
-                    }
-                }
+            '-' if rest.starts_with("--") => {
+                index = rest.find('\n').map_or(text.len(), |at| index + at + 1);
                 current.push('\n');
+                continue;
             }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut previous = ' ';
-                for inner in chars.by_ref() {
-                    if previous == '*' && inner == '/' {
-                        break;
-                    }
-                    previous = inner;
-                }
+            '/' if rest.starts_with("/*") => {
+                index = block_comment_end(text, index);
                 current.push(' ');
+                continue;
             }
             '(' => {
                 depth += 1;
@@ -946,6 +1345,7 @@ fn split_sql_statements(text: &str) -> Vec<String> {
             }
             _ => current.push(ch),
         }
+        index += ch.len_utf8();
     }
     if !current.trim().is_empty() {
         statements.push(current);
@@ -956,12 +1356,33 @@ fn split_sql_statements(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Pull the column list, the value list, and whether the statement is written
-/// in the MySQL family's dialect out of one INSERT. `Ok(None)` means the
-/// statement is not an INSERT and should be ignored.
-type InsertParts = Option<(Vec<String>, Vec<String>, bool)>;
+/// One INSERT statement's payload: the columns it names and EVERY row of values
+/// it carries.
+///
+/// A statement carries MANY rows, not one. It used to be read as one — the first
+/// `(…)` after `VALUES` and nothing else — so a multi-row `VALUES (…),(…)` and an
+/// Oracle `INSERT ALL` both gave back their first row and dropped the rest with
+/// no error at all. Both shapes are what this app's own import script builder
+/// writes, and the multi-row `VALUES` list is what `mysqldump` writes.
+struct InsertRows {
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
 
-fn split_insert_statement(statement: &str) -> Result<InsertParts, String> {
+/// The driving query an `INSERT ALL` of literal rows ends with.
+///
+/// It supplies exactly one row, which is what makes each `INTO` contribute
+/// exactly one. Any other query means the statement inserts one row per row it
+/// returns — a count this reader cannot know — so such a file is refused by name
+/// rather than read as if the query returned one row.
+const ORACLE_MULTI_INSERT_DRIVER: &str = "SELECT * FROM DUAL";
+
+/// Pull the columns and every row of values out of one INSERT. `Ok(None)` means
+/// the statement is not an INSERT and should be ignored.
+fn split_insert_statement(
+    statement: &str,
+    dialect: SqlFileDialect,
+) -> Result<Option<InsertRows>, String> {
     let trimmed = statement.trim();
     let mut words = trimmed.split_whitespace();
     if !words
@@ -970,7 +1391,27 @@ fn split_insert_statement(statement: &str) -> Result<InsertParts, String> {
     {
         return Ok(None);
     }
-    let Some(columns_open) = find_open_paren(trimmed) else {
+    match words.next() {
+        // `INSERT FIRST` routes each row by its `WHEN` clauses, so which target
+        // a row lands in is not a property of the row. Say so.
+        Some(word) if word.eq_ignore_ascii_case("first") => Err(
+            "An INSERT FIRST statement sends its rows to different targets, so this import \
+             cannot read them as one table."
+                .to_string(),
+        ),
+        Some(word) if word.eq_ignore_ascii_case("all") => {
+            split_oracle_multi_insert(trimmed, dialect).map(Some)
+        }
+        _ => split_single_target_insert(trimmed, dialect).map(Some),
+    }
+}
+
+/// `INSERT [INTO] t (a, b) VALUES (…), (…), …`
+fn split_single_target_insert(
+    trimmed: &str,
+    dialect: SqlFileDialect,
+) -> Result<InsertRows, String> {
+    let Some(columns_open) = find_open_paren(trimmed, dialect) else {
         return Err("An INSERT statement has no column list.".to_string());
     };
     // `INSERT INTO t VALUES (…)` has no column list, so there is nothing to map
@@ -985,61 +1426,222 @@ fn split_insert_statement(statement: &str) -> Result<InsertParts, String> {
                 .to_string(),
         );
     }
-    let columns_close = matching_paren(trimmed, columns_open)
+    let columns_close = matching_paren(trimmed, columns_open, dialect)
         .ok_or_else(|| "An INSERT column list is not closed.".to_string())?;
-    let raw_columns = split_top_level(&trimmed[columns_open + 1..columns_close]);
-    let backslash_escapes = raw_columns
-        .iter()
-        .any(|column| column.trim().starts_with('`'));
-    let columns = raw_columns
-        .into_iter()
-        .map(|column| unquote_identifier(column.trim()))
-        .collect::<Vec<_>>();
+    let columns = read_column_list(&trimmed[columns_open + 1..columns_close], dialect);
 
     let tail = &trimmed[columns_close + 1..];
-    let values_at = find_keyword(tail, "values")
+    let values_at = find_keyword(tail, "values", dialect)
         .ok_or_else(|| "An INSERT statement has no VALUES list.".to_string())?;
-    let values_open = tail[values_at..]
-        .find('(')
-        .map(|offset| values_at + offset)
-        .ok_or_else(|| "An INSERT VALUES list is missing.".to_string())?;
-    let values_close = matching_paren(tail, values_open)
-        .ok_or_else(|| "An INSERT VALUES list is not closed.".to_string())?;
-    let values = split_top_level(&tail[values_open + 1..values_close])
+    let (rows, _) = read_value_groups(tail, values_at + "values".len(), dialect)?;
+    Ok(InsertRows { columns, rows })
+}
+
+/// `INSERT ALL INTO t (a) VALUES (…) INTO t (a) VALUES (…) SELECT * FROM DUAL`
+fn split_oracle_multi_insert(trimmed: &str, dialect: SqlFileDialect) -> Result<InsertRows, String> {
+    let mut columns: Option<Vec<String>> = None;
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut at = 0usize;
+
+    while let Some(offset) = find_keyword(&trimmed[at..], "into", dialect) {
+        let into_at = at + offset;
+        let target = &trimmed[into_at..];
+        let Some(columns_open) = find_open_paren(target, dialect) else {
+            return Err("An INSERT ALL target has no column list.".to_string());
+        };
+        // The same reading as the single-target path: a `(` straight after
+        // VALUES is the row, not the column list, so the target names no
+        // columns to map its values onto.
+        if target[..columns_open]
+            .split_whitespace()
+            .next_back()
+            .is_some_and(|word| word.eq_ignore_ascii_case("values"))
+        {
+            return Err(
+                "An INSERT ALL target has no column list, so its values cannot be mapped to \
+                 columns."
+                    .to_string(),
+            );
+        }
+        let columns_close = matching_paren(target, columns_open, dialect)
+            .ok_or_else(|| "An INSERT ALL column list is not closed.".to_string())?;
+        let target_columns = read_column_list(&target[columns_open + 1..columns_close], dialect);
+        // Every target keeps its values in ITS OWN column order, and this
+        // statement yields ONE column list, so each target's rows are lifted
+        // into the first target's order here.
+        let first_columns = columns.get_or_insert_with(|| target_columns.clone());
+        let order = column_order_against(first_columns, &target_columns).ok_or_else(|| {
+            "The targets of one INSERT ALL do not all use the same column list.".to_string()
+        })?;
+        let values_at =
+            find_keyword(&target[columns_close + 1..], "values", dialect).ok_or_else(|| {
+                "An INSERT ALL target has no VALUES list, so it carries no row to read.".to_string()
+            })?;
+        let (target_rows, consumed) = read_value_groups(
+            target,
+            columns_close + 1 + values_at + "values".len(),
+            dialect,
+        )?;
+        for values in target_rows {
+            if values.len() != target_columns.len() {
+                return Err(format!(
+                    "An INSERT ALL target lists {} columns but {} values.",
+                    target_columns.len(),
+                    values.len()
+                ));
+            }
+            rows.push(order.iter().map(|source| values[*source].clone()).collect());
+        }
+        at = into_at + consumed;
+    }
+
+    let columns = columns
+        .ok_or_else(|| "An INSERT ALL statement names no target to read rows from.".to_string())?;
+    // What follows the last target is the driving query, and only a one-row one
+    // leaves each target contributing exactly one row.
+    let driver = collapse_whitespace(&trimmed[at..]);
+    if driver.is_empty() {
+        return Err(
+            "An INSERT ALL statement has no driving query, so it is not a statement this import \
+             can read rows from."
+                .to_string(),
+        );
+    }
+    if !driver.eq_ignore_ascii_case(ORACLE_MULTI_INSERT_DRIVER) {
+        return Err(format!(
+            "An INSERT ALL is driven by a query this import cannot count rows for: {driver}"
+        ));
+    }
+    Ok(InsertRows { columns, rows })
+}
+
+/// Read `(…), (…), …` starting at `from`, and how much of `text` was consumed.
+///
+/// Groups are separated by top-level commas. Anything else ends the list, so a
+/// trailing clause the statement may carry — `ON DUPLICATE KEY UPDATE`,
+/// `RETURNING`, the driving query of an `INSERT ALL` — stops it without being
+/// read as a row. A comma that is NOT followed by a group is refused rather than
+/// dropped: that is text this reader did not understand.
+fn read_value_groups(
+    text: &str,
+    from: usize,
+    dialect: SqlFileDialect,
+) -> Result<(Vec<Vec<String>>, usize), String> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut index = from;
+    loop {
+        let after_space = index + text[index..].len() - text[index..].trim_start().len();
+        if !text[after_space..].starts_with('(') {
+            if rows.is_empty() {
+                return Err("An INSERT VALUES list is missing.".to_string());
+            }
+            return Ok((rows, index));
+        }
+        let close = matching_paren(text, after_space, dialect)
+            .ok_or_else(|| "An INSERT VALUES list is not closed.".to_string())?;
+        let group = &text[after_space + 1..close];
+        if group.trim().is_empty() {
+            return Err("An INSERT VALUES list holds no values.".to_string());
+        }
+        rows.push(
+            split_top_level(group, dialect)
+                .into_iter()
+                .map(|value| value.trim().to_string())
+                .collect(),
+        );
+        index = close + 1;
+
+        let rest = text[index..].trim_start();
+        if !rest.starts_with(',') {
+            return Ok((rows, index));
+        }
+        let comma_at = index + text[index..].len() - rest.len();
+        let after_comma = &text[comma_at + 1..];
+        if !after_comma.trim_start().starts_with('(') {
+            return Err(
+                "An INSERT VALUES list has a comma that is not followed by another row."
+                    .to_string(),
+            );
+        }
+        index = comma_at + 1;
+    }
+}
+
+fn read_column_list(text: &str, dialect: SqlFileDialect) -> Vec<String> {
+    split_top_level(text, dialect)
         .into_iter()
-        .map(|value| value.trim().to_string())
-        .collect();
-    Ok(Some((columns, values, backslash_escapes)))
+        .map(|column| unquote_identifier(column.trim()))
+        .collect()
+}
+
+/// How `columns` map onto `wanted`, or `None` when they are not the same set.
+///
+/// The same columns in another ORDER name the same row, and a file that says so
+/// used to be refused outright. Names are matched the way SQL resolves an
+/// unquoted identifier, which is also how the import dialog matches a file
+/// column to a table column.
+fn column_order_against(wanted: &[String], columns: &[String]) -> Option<Vec<usize>> {
+    if wanted.len() != columns.len() {
+        return None;
+    }
+    let mut taken = vec![false; columns.len()];
+    let mut order = Vec::with_capacity(wanted.len());
+    for name in wanted {
+        let found = columns
+            .iter()
+            .enumerate()
+            .position(|(index, candidate)| !taken[index] && candidate.eq_ignore_ascii_case(name))?;
+        taken[found] = true;
+        order.push(found);
+    }
+    Some(order)
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The first `(` that is not inside a string literal or a quoted identifier —
 /// a schema like `"SC(H)EMA"` must not be mistaken for the column list.
-fn find_open_paren(text: &str) -> Option<usize> {
-    let mut quote: Option<char> = None;
-    for (index, ch) in text.char_indices() {
-        match (quote, ch) {
-            (Some(open), ch) if ch == open => quote = None,
-            (Some(_), _) => {}
-            (None, '\'' | '"' | '`') => quote = Some(ch),
-            (None, '(') => return Some(index),
-            (None, _) => {}
+fn find_open_paren(text: &str, dialect: SqlFileDialect) -> Option<usize> {
+    let mut index = 0usize;
+    while index < text.len() {
+        let Some(ch) = text[index..].chars().next() else {
+            break;
+        };
+        match ch {
+            '\'' => {
+                index = string_literal_end(text, index, dialect);
+                continue;
+            }
+            '"' | '`' => {
+                index = quoted_identifier_end(text, index, ch);
+                continue;
+            }
+            '(' => return Some(index),
+            _ => {}
         }
+        index += ch.len_utf8();
     }
     None
 }
 
-fn matching_paren(text: &str, open: usize) -> Option<usize> {
+fn matching_paren(text: &str, open: usize, dialect: SqlFileDialect) -> Option<usize> {
     let mut depth = 0i32;
-    let mut in_string = false;
-    for (index, ch) in text.char_indices().skip(open) {
-        if in_string {
-            if ch == '\'' {
-                in_string = false;
-            }
-            continue;
-        }
+    let mut index = open;
+    while index < text.len() {
+        let Some(ch) = text[index..].chars().next() else {
+            break;
+        };
         match ch {
-            '\'' => in_string = true,
+            '\'' => {
+                index = string_literal_end(text, index, dialect);
+                continue;
+            }
+            '"' | '`' => {
+                index = quoted_identifier_end(text, index, ch);
+                continue;
+            }
             '(' => depth += 1,
             ')' => {
                 depth -= 1;
@@ -1049,26 +1651,31 @@ fn matching_paren(text: &str, open: usize) -> Option<usize> {
             }
             _ => {}
         }
+        index += ch.len_utf8();
     }
     None
 }
 
-/// Split a comma-separated list, ignoring commas inside strings or nested
-/// parentheses.
-fn split_top_level(text: &str) -> Vec<&str> {
+/// Split a comma-separated list, ignoring commas inside strings, quoted
+/// identifiers, or nested parentheses.
+fn split_top_level(text: &str, dialect: SqlFileDialect) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
-    let mut in_string = false;
     let mut start = 0usize;
-    for (index, ch) in text.char_indices() {
-        if in_string {
-            if ch == '\'' {
-                in_string = false;
-            }
-            continue;
-        }
+    let mut index = 0usize;
+    while index < text.len() {
+        let Some(ch) = text[index..].chars().next() else {
+            break;
+        };
         match ch {
-            '\'' => in_string = true,
+            '\'' => {
+                index = string_literal_end(text, index, dialect);
+                continue;
+            }
+            '"' | '`' => {
+                index = quoted_identifier_end(text, index, ch);
+                continue;
+            }
             '(' => depth += 1,
             ')' => depth -= 1,
             ',' if depth == 0 => {
@@ -1077,26 +1684,82 @@ fn split_top_level(text: &str) -> Vec<&str> {
             }
             _ => {}
         }
+        index += ch.len_utf8();
     }
     parts.push(&text[start..]);
     parts
 }
 
-/// Find `keyword` as a whole word outside string literals.
-fn find_keyword(text: &str, keyword: &str) -> Option<usize> {
-    let lowered = text.to_ascii_lowercase();
-    let bytes = lowered.as_bytes();
-    let mut from = 0usize;
-    while let Some(offset) = lowered[from..].find(keyword) {
-        let at = from + offset;
-        let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_';
-        let after = at + keyword.len();
-        let after_ok =
-            after >= bytes.len() || !bytes[after].is_ascii_alphanumeric() && bytes[after] != b'_';
-        if before_ok && after_ok {
-            return Some(at);
+/// Split on the top-level `||` an Oracle concatenation is written with.
+fn split_concatenation(text: &str, dialect: SqlFileDialect) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < text.len() {
+        let rest = &text[index..];
+        let Some(ch) = rest.chars().next() else { break };
+        match ch {
+            '\'' => {
+                index = string_literal_end(text, index, dialect);
+                continue;
+            }
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '|' if depth == 0 && rest.starts_with("||") => {
+                parts.push(&text[start..index]);
+                index += 2;
+                start = index;
+                continue;
+            }
+            _ => {}
         }
-        from = at + keyword.len();
+        index += ch.len_utf8();
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// Find `keyword` as a whole word outside string literals and quoted
+/// identifiers.
+///
+/// The scan walks the text through the same readers everything else here uses,
+/// so a value or a column name that happens to spell the keyword cannot be
+/// mistaken for it. `keyword` must be lower-case ASCII.
+fn find_keyword(text: &str, keyword: &str, dialect: SqlFileDialect) -> Option<usize> {
+    // Compared in place rather than against a lower-cased copy: this is called
+    // once per target of an `INSERT ALL`, and a copy of the remaining text per
+    // call would make reading one statement quadratic in its length.
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index < text.len() {
+        let rest = &text[index..];
+        let ch = rest.chars().next()?;
+        match ch {
+            '\'' => {
+                index = string_literal_end(text, index, dialect);
+                continue;
+            }
+            '"' | '`' => {
+                index = quoted_identifier_end(text, index, ch);
+                continue;
+            }
+            _ => {}
+        }
+        if text
+            .get(index..index + keyword.len())
+            .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
+        {
+            let before_ok =
+                index == 0 || !bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'_';
+            let after = index + keyword.len();
+            let after_ok = after >= bytes.len()
+                || !bytes[after].is_ascii_alphanumeric() && bytes[after] != b'_';
+            if before_ok && after_ok {
+                return Some(index);
+            }
+        }
+        index += ch.len_utf8();
     }
     None
 }
@@ -1113,12 +1776,12 @@ fn unquote_identifier(name: &str) -> String {
 }
 
 /// Turn one SQL value expression back into cell text.
-fn sql_value_text(value: &str, backslash_escapes: bool) -> Result<ImportCell, String> {
+fn sql_value_text(value: &str, dialect: SqlFileDialect) -> Result<ImportCell, String> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("null") {
         return Ok(None);
     }
-    if let Some(text) = sql_string_literal_text(value, backslash_escapes) {
+    if let Some(text) = sql_string_literal_text(value, dialect) {
         return Ok(Some(text));
     }
     if is_sql_numeric_literal(value) {
@@ -1129,7 +1792,10 @@ fn sql_value_text(value: &str, backslash_escapes: bool) -> Result<ImportCell, St
     if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") {
         return Ok(Some(value.to_string()));
     }
-    if let Some(text) = unwrap_conversion_call(value, backslash_escapes)? {
+    if let Some(text) = concatenated_literal_text(value, dialect) {
+        return Ok(Some(text));
+    }
+    if let Some(text) = unwrap_conversion_call(value, dialect)? {
         return Ok(Some(text));
     }
     Err(format!(
@@ -1137,9 +1803,100 @@ fn sql_value_text(value: &str, backslash_escapes: bool) -> Result<ImportCell, St
     ))
 }
 
-/// Decode `'…'`, undoing the doubled quote every dialect uses and, when the
-/// statement is MySQL-flavoured, the backslash escapes too.
-fn sql_string_literal_text(value: &str, backslash_escapes: bool) -> Option<String> {
+/// Decode `'a'||CHR(38)||'b'` — the shape the Oracle literal writer produces so
+/// an `&` in the data cannot be read as a substitution variable.
+///
+/// The writer's exact inverse. Without it, the `SQL Inserts` export of any value
+/// holding an `&` would no longer read back into the importer that produced it.
+/// Only for an Oracle-dialect file: the MySQL family has no substitution to
+/// defuse, so the writer never emits this shape for it, and `||` means something
+/// else there.
+fn concatenated_literal_text(value: &str, dialect: SqlFileDialect) -> Option<String> {
+    if dialect != SqlFileDialect::Oracle {
+        return None;
+    }
+    // No minimum part count: a value that is nothing but `&` is written as the
+    // single expression `CHR(38)`. A one-part expression that is a plain literal
+    // never reaches here — `sql_value_text` reads that first — so the only
+    // one-part shape left is a `CHR` call.
+    let mut out = String::new();
+    for part in split_concatenation(value, dialect) {
+        let part = part.trim();
+        // The other shape the writer joins with `||`: a value longer than one
+        // Oracle literal is written as `TO_CLOB('…')||TO_CLOB('…')`, because
+        // `ORA-01704` is what a single literal past 4000 bytes gets. Reading it
+        // back is what keeps that export re-importable. Its argument is a
+        // concatenation of its own when the piece held an `&`, and nothing
+        // deeper than that, so this does not recurse.
+        let text = match to_clob_argument(part) {
+            Some(inner) => simple_concatenation_text(inner, dialect)?,
+            None => concatenation_piece_text(part, dialect)?,
+        };
+        out.push_str(&text);
+    }
+    Some(out)
+}
+
+/// The text inside a `TO_CLOB(…)` call, or `None` when this is not one.
+///
+/// The writer's wrapper for one piece of a value too long for a single Oracle
+/// literal. Only the outermost call is stripped: what it holds is a plain
+/// literal, or the `'a'||CHR(38)||'b'` a defused `&` makes of one, and never
+/// another `TO_CLOB` — so reading it needs no recursion and cannot be made to.
+///
+/// Matched the way every other call name here is, without regard to case.
+fn to_clob_argument(text: &str) -> Option<&str> {
+    let open = text.find('(')?;
+    if !text[..open].trim().eq_ignore_ascii_case("TO_CLOB") {
+        return None;
+    }
+    text.strip_suffix(')').map(|rest| &rest[open + 1..])
+}
+
+/// One piece of a concatenation: a plain literal, or a `CHR(n)` call.
+///
+/// The ONE piece-reader, so the top-level chain and whatever a `TO_CLOB` wraps
+/// cannot come to disagree about what a piece is.
+fn concatenation_piece_text(part: &str, dialect: SqlFileDialect) -> Option<String> {
+    if let Some(text) = sql_string_literal_text(part, dialect) {
+        return Some(text);
+    }
+    chr_call_character(part).map(String::from)
+}
+
+/// The text of a `||` chain of plain literals and `CHR(n)` calls.
+fn simple_concatenation_text(value: &str, dialect: SqlFileDialect) -> Option<String> {
+    split_concatenation(value, dialect)
+        .into_iter()
+        .map(|part| concatenation_piece_text(part.trim(), dialect))
+        .collect::<Option<Vec<_>>>()
+        .map(|parts| parts.concat())
+}
+
+/// The character a `CHR(<code>)` call produces, for the concatenation reader.
+fn chr_call_character(text: &str) -> Option<char> {
+    let head = text.get(..4)?;
+    if !head.eq_ignore_ascii_case("CHR(") {
+        return None;
+    }
+    let code: u32 = text[4..].strip_suffix(')')?.trim().parse().ok()?;
+    char::from_u32(code)
+}
+
+/// Decode `'…'`, undoing the doubled quote every dialect uses and, in a
+/// MySQL-family file, the backslash escapes too.
+///
+/// `None` unless the literal is the WHOLE expression, asked of the same scanner
+/// everything else uses. Stripping the first and last quote is not enough:
+/// `'a'||CHR(38)||'b'` also begins and ends with one, and reading it as a single
+/// literal produced text that was neither the value nor an error.
+fn sql_string_literal_text(value: &str, dialect: SqlFileDialect) -> Option<String> {
+    if value.len() < 2 || !value.starts_with('\'') || !value.ends_with('\'') {
+        return None;
+    }
+    if string_literal_end(value, 0, dialect) != value.len() {
+        return None;
+    }
     let inner = value.strip_prefix('\'')?.strip_suffix('\'')?;
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars().peekable();
@@ -1151,11 +1908,26 @@ fn sql_string_literal_text(value: &str, backslash_escapes: bool) -> Option<Strin
                 chars.next()?;
                 out.push('\'');
             }
-            '\\' if backslash_escapes => match chars.next() {
+            // MySQL's own escape table, whole. It used to hold four of the
+            // ten rows and drop the backslash from everything else, which
+            // turned `\Z` into the letter `Z` and `\%` into a bare `%` — a
+            // silent rewrite of any file this app did not write itself, and
+            // `SQL Inserts` import advertises reading a mysqldump.
+            '\\' if dialect.backslash_escapes() => match chars.next() {
                 Some('n') => out.push('\n'),
                 Some('r') => out.push('\r'),
                 Some('t') => out.push('\t'),
                 Some('0') => out.push('\0'),
+                Some('b') => out.push('\u{8}'),
+                // `\Z` is Ctrl-Z, which Windows reads as end-of-file; MySQL
+                // escapes it for that reason and stores the character itself.
+                Some('Z') => out.push('\u{1A}'),
+                // The two the server does NOT unescape: inside `LIKE` they are
+                // the literal wildcards, so the backslash is part of the value.
+                Some(next @ ('%' | '_')) => {
+                    out.push('\\');
+                    out.push(next);
+                }
                 Some(next) => out.push(next),
                 None => return None,
             },
@@ -1188,24 +1960,30 @@ fn is_sql_numeric_literal(value: &str) -> bool {
 
 /// Unwrap the conversion calls the SQL export wraps Oracle values in, giving
 /// back the text the grid displayed. `Ok(None)` means it is not one of them.
-fn unwrap_conversion_call(value: &str, backslash_escapes: bool) -> Result<Option<String>, String> {
+fn unwrap_conversion_call(value: &str, dialect: SqlFileDialect) -> Result<Option<String>, String> {
     let Some(open) = value.find('(') else {
         return Ok(None);
     };
     let name = value[..open].trim();
-    let known = ["to_date", "to_timestamp", "to_timestamp_tz", "hextoraw"]
-        .iter()
-        .any(|candidate| name.eq_ignore_ascii_case(candidate));
+    let known = [
+        "to_date",
+        "to_timestamp",
+        "to_timestamp_tz",
+        "hextoraw",
+        "to_clob",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate));
     if !known {
         return Ok(None);
     }
-    let close = matching_paren(value, open)
+    let close = matching_paren(value, open, dialect)
         .ok_or_else(|| format!("A conversion call is not closed: {value}"))?;
     if value[close + 1..].trim().is_empty() {
         // The first argument is the value; a format model, if present, is the
         // one the exporter chose and carries no data.
-        if let Some(first) = split_top_level(&value[open + 1..close]).first() {
-            if let Some(text) = sql_string_literal_text(first.trim(), backslash_escapes) {
+        if let Some(first) = split_top_level(&value[open + 1..close], dialect).first() {
+            if let Some(text) = sql_string_literal_text(first.trim(), dialect) {
                 return Ok(Some(text));
             }
         }
@@ -1220,7 +1998,18 @@ mod tests {
     use super::*;
     use crate::db::{DatabaseType, SqlValueKind};
     use crate::ui::grid_sql_export::{build_sql_inserts, GridSqlSelection};
-    use crate::ui::result_export::{render, ExportGrid};
+    use crate::ui::result_export::{render, ExportCell, ExportContent, ExportGrid};
+
+    /// The SQL a builder wrote, for a fixture it must not refuse.
+    ///
+    /// Every selection here is one this app can write; a refusal would be a
+    /// defect in the writer, and its sentence is what to fail with.
+    fn written(built: ExportContent) -> String {
+        match built.into_parts() {
+            Ok((text, _)) => text,
+            Err(reason) => panic!("the SQL Inserts builder refused a fixture: {reason}"),
+        }
+    }
 
     const NULL_TEXT: &str = "NULL";
 
@@ -1235,13 +2024,17 @@ mod tests {
                 SqlValueKind::String,
                 SqlValueKind::String,
             ],
+            // The second row's CODE is SQL NULL. The fixture used to spell
+            // that as the TEXT `NULL`, which is how the grid DISPLAYS one; the
+            // snapshot the grid hands the serializers states it as an absent
+            // value, and so does this.
             rows: vec![
                 vec![
-                    "1".to_string(),
-                    "a,b\t\"c\"\nd\re|f\\g<h>&i".to_string(),
-                    "00123".to_string(),
+                    Some("1".to_string()),
+                    Some("a,b\t\"c\"\nd\re|f\\g<h>&i".to_string()),
+                    Some("00123".to_string()),
                 ],
-                vec!["2".to_string(), "한글".to_string(), NULL_TEXT.to_string()],
+                vec![Some("2".to_string()), Some("한글".to_string()), None],
             ],
             null_text: NULL_TEXT.to_string(),
         }
@@ -1340,19 +2133,18 @@ mod tests {
     fn selection(db_type: DatabaseType) -> GridSqlSelection {
         let grid = hostile_grid();
         GridSqlSelection {
-            db_type,
+            dialect: crate::ui::grid_sql_export::SqlWriteDialect::family_default(db_type),
             table: Some("T".to_string()),
             all_columns: grid.columns.clone(),
             column_kinds: grid.column_kinds.clone(),
             selected_columns: (0..grid.columns.len()).collect(),
             rows: grid.rows.clone(),
-            null_text: grid.null_text.clone(),
         }
     }
 
     #[test]
     fn sql_inserts_round_trip_on_oracle() {
-        let sql = build_sql_inserts(&selection(DatabaseType::Oracle));
+        let sql = written(build_sql_inserts(&selection(DatabaseType::Oracle)));
         assert_eq!(
             parse(&sql, &options(ExportFormat::SqlInserts)).expect("parses"),
             expected("a,b\t\"c\"\nd\re|f\\g<h>&i")
@@ -1362,7 +2154,7 @@ mod tests {
     #[test]
     fn sql_inserts_round_trip_on_mysql() {
         // MySQL literals carry backslash escapes and backtick-quoted columns.
-        let sql = build_sql_inserts(&selection(DatabaseType::MySQL));
+        let sql = written(build_sql_inserts(&selection(DatabaseType::MySQL)));
         assert_eq!(
             parse(&sql, &options(ExportFormat::SqlInserts)).expect("parses"),
             expected("a,b\t\"c\"\nd\re|f\\g<h>&i")
@@ -1470,6 +2262,89 @@ mod tests {
         }
     }
 
+    /// A BLANK LINE is not a row.
+    ///
+    /// It used to be a record of one empty field, which `validate` then padded
+    /// out to the file's full width — so a file with a trailing empty line, or
+    /// one left behind by an editor, imported an extra row of NULLs. On a table
+    /// with a NOT NULL column that row failed and took the whole import with
+    /// it; on one without, it landed silently.
+    #[test]
+    fn a_blank_line_is_not_a_row() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let text = format!("A,B{ending}1,2{ending}{ending}");
+            let table = parse(&text, &options(ExportFormat::Csv))
+                .unwrap_or_else(|error| panic!("{ending:?}: {error}"));
+            assert_eq!(
+                table.rows,
+                vec![vec![Some("1".to_string()), Some("2".to_string())]],
+                "a trailing blank line ({ending:?}) became a row"
+            );
+
+            // And one in the MIDDLE is not a row either.
+            let text = format!("A,B{ending}{ending}1,2{ending}");
+            let table = parse(&text, &options(ExportFormat::Csv))
+                .unwrap_or_else(|error| panic!("{ending:?}: {error}"));
+            assert_eq!(
+                table.rows.len(),
+                1,
+                "a blank line ({ending:?}) became a row"
+            );
+        }
+
+        // A line that really holds one empty VALUE says so by quoting it, and
+        // that is still a row.
+        let table = parse("A\n\"\"\n", &options(ExportFormat::Csv)).expect("parses");
+        assert_eq!(table.rows, vec![vec![Some(String::new())]]);
+
+        // So is a line of empty fields: the separator says how many there are.
+        let table = parse("A,B\n,\n", &options(ExportFormat::Csv)).expect("parses");
+        assert_eq!(
+            table.rows,
+            vec![vec![Some(String::new()), Some(String::new())]]
+        );
+    }
+
+    /// The NULL text QUOTED is a value; bare, it is SQL NULL.
+    ///
+    /// The writer's exact inverse ([`crate::ui::result_export::ExportGrid`]
+    /// quotes a value that spells the NULL text). Before this, both spellings
+    /// read as NULL, so a `VARCHAR` holding the four letters `NULL` could not
+    /// survive this app's own export → import at all.
+    #[test]
+    fn a_quoted_null_text_is_a_value_and_a_bare_one_is_null() {
+        let table = parse("A\nNULL\n\"NULL\"\n", &options(ExportFormat::Csv)).expect("parses");
+        assert_eq!(table.rows, vec![vec![None], vec![Some("NULL".to_string())]]);
+
+        // An empty NULL text works the same way: bare is NULL, `""` is the
+        // empty string — which is the only way a delimited file can say it.
+        //
+        // Two columns, because a ONE-column row of nothing but an empty
+        // unquoted field is a blank line byte for byte, and no reader can tell
+        // those apart — see `split_delimited_records`.
+        let empty_means_null = ImportOptions {
+            format: ExportFormat::Csv,
+            has_header: true,
+            null_text: String::new(),
+        };
+        let table = parse("A,B\n,\"\"\n", &empty_means_null).expect("parses");
+        assert_eq!(table.rows, vec![vec![None, Some(String::new())]]);
+    }
+
+    /// A NULL text that needs quotes of its own spends the signal, and the
+    /// reader falls back to matching the text — which is what it always did,
+    /// so no file loses a NULL it used to keep.
+    #[test]
+    fn a_null_text_that_must_be_quoted_still_reads_as_null() {
+        let comma_null = ImportOptions {
+            format: ExportFormat::Csv,
+            has_header: true,
+            null_text: "a,b".to_string(),
+        };
+        let table = parse("A\n\"a,b\"\n", &comma_null).expect("parses");
+        assert_eq!(table.rows, vec![vec![None]]);
+    }
+
     #[test]
     fn a_short_row_is_padded_with_nulls() {
         let table = parse("A,B,C\n1\n", &options(ExportFormat::Csv)).expect("parses");
@@ -1561,6 +2436,14 @@ mod tests {
 
     #[test]
     fn detect_format_reads_the_extension() {
+        // `.text` names plain text, like `.txt`; it used to preselect Markdown
+        // while `.txt` preselected CSV, which was a difference with no reason.
+        assert_eq!(detect_format(Path::new("a.text")), Some(ExportFormat::Csv));
+        assert_eq!(detect_format(Path::new("a.txt")), Some(ExportFormat::Csv));
+        assert_eq!(
+            detect_format(Path::new("a.markdown")),
+            Some(ExportFormat::Markdown)
+        );
         for (name, format) in [
             ("rows.csv", ExportFormat::Csv),
             ("rows.TSV", ExportFormat::Tsv),
@@ -1663,12 +2546,12 @@ mod tests {
                 SqlValueKind::String,
             ],
             rows: vec![vec![
-                "1".to_string(),
-                "comma, and \"quotes\"".to_string(),
-                "00123".to_string(),
-                "1".to_string(),
-                "-12.5".to_string(),
-                "line1\nline2".to_string(),
+                Some("1".to_string()),
+                Some("comma, and \"quotes\"".to_string()),
+                Some("00123".to_string()),
+                Some("1".to_string()),
+                Some("-12.5".to_string()),
+                Some("line1\nline2".to_string()),
             ]],
             null_text: NULL_TEXT.to_string(),
         }
@@ -1681,11 +2564,22 @@ mod tests {
             &options(ExportFormat::Csv),
         )
         .expect("parses");
+        // CSV addresses a column by POSITION, so a repeated name is not a
+        // collision and nothing has to be renamed.
         assert_eq!(table.columns, hostile_columns());
         assert_eq!(table.rows[0][1], Some("comma, and \"quotes\"".to_string()));
         assert_eq!(table.rows[0][5], Some("line1\nline2".to_string()));
     }
 
+    /// A repeated column name is made unique by the writer, so no column is
+    /// lost.
+    ///
+    /// This used to assert the opposite — that the second `ID` collapsed into
+    /// the first, leaving five columns for six — because a JSON object really
+    /// does have one value per name and the writer emitted the name twice.
+    /// Duplicate result column names are ordinary (`SELECT a.id, b.id …`), and
+    /// silently dropping a column of the user's data is not an acceptable
+    /// reading of "export"; the writer now suffixes the repeat instead.
     #[test]
     fn json_carries_hostile_column_names_through_unchanged() {
         let table = parse(
@@ -1693,24 +2587,39 @@ mod tests {
             &options(ExportFormat::Json),
         )
         .expect("parses");
-        // A duplicate key collapses: JSON objects have one value per name.
         assert_eq!(
             table.columns,
             vec![
                 "ID".to_string(),
                 "FULL NAME".to_string(),
                 "COUNT(*)".to_string(),
+                "ID_2".to_string(),
                 "2024_TOTAL".to_string(),
                 "NOTE".to_string(),
             ]
         );
+        // Every value is still there, in its own column.
+        assert_eq!(
+            table.rows[0],
+            vec![
+                Some("1".to_string()),
+                Some("comma, and \"quotes\"".to_string()),
+                Some("00123".to_string()),
+                Some("1".to_string()),
+                Some("-12.5".to_string()),
+                Some("line1\nline2".to_string()),
+            ]
+        );
     }
 
+    /// XML cannot carry `COUNT(*)` or a name starting with a digit, so the
+    /// export rewrote them, and that is what comes back.
+    ///
+    /// Sanitizing can also CREATE a repeat out of two different names, so the
+    /// same uniqueness rule runs after it — this used to lose the duplicate
+    /// `ID` for the same reason JSON did.
     #[test]
     fn xml_reports_the_element_names_the_export_had_to_invent() {
-        // XML cannot carry `COUNT(*)` or a name starting with a digit, so the
-        // export rewrote them, and that is what comes back. The duplicate `ID`
-        // collapses because an element name is looked up by name.
         let table = parse(
             &render(ExportFormat::Xml, &hostile_name_grid()),
             &options(ExportFormat::Xml),
@@ -1722,12 +2631,665 @@ mod tests {
                 "ID".to_string(),
                 "FULL_NAME".to_string(),
                 "COUNT___".to_string(),
+                "ID_2".to_string(),
                 "column_5".to_string(),
                 "NOTE".to_string(),
             ]
         );
         assert_eq!(table.rows[0][2], Some("00123".to_string()));
-        assert_eq!(table.rows[0][4], Some("line1\nline2".to_string()));
+        assert_eq!(table.rows[0][5], Some("line1\nline2".to_string()));
+    }
+
+    /// An Oracle-dialect file keeps every row when a value ends in a
+    /// backslash.
+    ///
+    /// Oracle reads `\` as an ordinary character, so `'C:\path\'` is a
+    /// complete literal. The reader used to apply the MySQL escape rule while
+    /// SPLITTING (it only chose the dialect afterwards, per statement), so the
+    /// closing quote was swallowed as an escaped one and the rest of the file
+    /// became part of that value: two statements parsed as one row, with no
+    /// error. `'a\''b'` was worse — it parsed, and gave `a\`.
+    #[test]
+    fn an_oracle_backslash_does_not_swallow_the_statements_after_it() {
+        for (value, sql) in [
+            (
+                "C:\\path\\",
+                "INSERT INTO T (ID, N) VALUES (1, 'C:\\path\\');\n\
+                 INSERT INTO T (ID, N) VALUES (2, 'second');\n",
+            ),
+            (
+                "a\\'b",
+                "INSERT INTO T (ID, N) VALUES (1, 'a\\''b');\n\
+                 INSERT INTO T (ID, N) VALUES (2, 'second');\n",
+            ),
+            (
+                "trailing\\",
+                "INSERT INTO T (ID, N) VALUES (1, 'trailing\\');\n\
+                 INSERT INTO T (ID, N) VALUES (2, 'second');\n",
+            ),
+        ] {
+            let table = parse(sql, &options(ExportFormat::SqlInserts))
+                .unwrap_or_else(|error| panic!("{value:?}: {error}"));
+            assert_eq!(
+                table.rows,
+                vec![
+                    vec![Some("1".to_string()), Some(value.to_string())],
+                    vec![Some("2".to_string()), Some("second".to_string())],
+                ],
+                "{value:?}"
+            );
+        }
+    }
+
+    /// The same values in the MySQL family's spelling, which is a different
+    /// spelling of the same data — the backticks are what say so.
+    #[test]
+    fn a_mysql_file_still_reads_its_own_backslash_escapes() {
+        for (value, sql) in [
+            (
+                "C:\\path\\",
+                "INSERT INTO `T` (`ID`, `N`) VALUES (1, 'C:\\\\path\\\\');\n\
+                 INSERT INTO `T` (`ID`, `N`) VALUES (2, 'second');\n",
+            ),
+            (
+                "a\\'b",
+                "INSERT INTO `T` (`ID`, `N`) VALUES (1, 'a\\\\''b');\n\
+                 INSERT INTO `T` (`ID`, `N`) VALUES (2, 'second');\n",
+            ),
+        ] {
+            let table = parse(sql, &options(ExportFormat::SqlInserts))
+                .unwrap_or_else(|error| panic!("{value:?}: {error}"));
+            assert_eq!(
+                table.rows,
+                vec![
+                    vec![Some("1".to_string()), Some(value.to_string())],
+                    vec![Some("2".to_string()), Some("second".to_string())],
+                ],
+                "{value:?}"
+            );
+        }
+    }
+
+    /// The entity bound gates the SEARCH, not the result.
+    ///
+    /// The values are unchanged by the fix — this pins the shapes the reader
+    /// must still resolve, and the shapes it must still leave alone — while
+    /// `an_ampersand_run_without_a_terminator_stays_linear` pins the cost.
+    #[test]
+    fn an_entity_is_read_only_within_reach_of_its_ampersand() {
+        // Real entities, the longest numeric form included.
+        assert_eq!(decode_entities("a&amp;b"), "a&b");
+        assert_eq!(decode_entities("&lt;&gt;&quot;&apos;&nbsp;"), "<>\"'\u{A0}");
+        assert_eq!(decode_entities("&#65;&#x41;&#x10FFFF;"), "AA\u{10FFFF}");
+        // A `;` further away than any entity body is not a terminator, and the
+        // `&` is data.
+        assert_eq!(
+            decode_entities("&not_an_entity_at_all;"),
+            "&not_an_entity_at_all;"
+        );
+        // A bare `&` with no `;` anywhere is data.
+        assert_eq!(decode_entities("a & b && c"), "a & b && c");
+        assert_eq!(decode_entities("&&&"), "&&&");
+        // Text with no `&` at all is returned untouched.
+        assert_eq!(decode_entities("plain"), "plain");
+    }
+
+    /// A file this app did not write can be dense in bare `&`, and reading it
+    /// must not be quadratic.
+    ///
+    /// The bound was applied AFTER `find(';')` had scanned the whole remaining
+    /// text, so every `&` in a run scanned to the end of the file: 40 KB took
+    /// 50 ms, 80 KB 131 ms, 160 KB 517 ms, 320 KB 2069 ms — ×4 per doubling, on
+    /// the UI thread inside the import dialog.
+    ///
+    /// Timed rather than counted because the cost is the defect. The ratio is
+    /// what is asserted, not a duration: doubling the input may not halve the
+    /// per-byte cost on a loaded machine, but it may not QUADRUPLE the total
+    /// either. The threshold is deliberately loose — quadratic growth is ×4 and
+    /// this refuses at ×2.5 — so the test measures the shape and not the box.
+    #[test]
+    fn an_ampersand_run_without_a_terminator_stays_linear() {
+        let time = |n: usize| {
+            let text = "&".repeat(n);
+            let start = std::time::Instant::now();
+            let decoded = decode_entities(&text);
+            assert_eq!(decoded.len(), n, "every bare ampersand is data");
+            start.elapsed().as_secs_f64()
+        };
+        // Warm the allocator so the first measurement is not the odd one.
+        let _ = time(200_000);
+        let small = time(200_000);
+        let large = time(400_000);
+        assert!(
+            large < small * 2.5 + 0.002,
+            "twice the input took {large:.4}s against {small:.4}s for half — \
+             that is the quadratic scan, not linear work"
+        );
+    }
+
+    /// The reader is the writer's inverse for a value longer than one literal.
+    ///
+    /// A value past Oracle's 4000-byte literal limit is exported as
+    /// `TO_CLOB('…')||TO_CLOB('…')`; if the reader did not know that shape, the
+    /// app could write a `SQL Inserts` file it could not read back.
+    #[test]
+    fn a_long_value_round_trips_through_the_concatenated_form() {
+        use crate::ui::grid_sql_export::{sql_literal_for_value, SqlWriteDialect};
+
+        let dialect = SqlWriteDialect::family_default(DatabaseType::Oracle);
+        for value in [
+            "y".repeat(10_000),
+            format!("{}&T", "z".repeat(5_000)),
+            format!("it{}s", "'".repeat(4_100)),
+            "한국어".repeat(2_000),
+        ] {
+            let literal = sql_literal_for_value(dialect, SqlValueKind::String, &value)
+                .expect("text is written as a concatenation, however long it is");
+            assert!(
+                literal.contains("TO_CLOB("),
+                "not chunked: {}",
+                &literal[..30]
+            );
+            let sql = format!("INSERT INTO T (V) VALUES ({literal});\n");
+            let table = parse(&sql, &options(ExportFormat::SqlInserts))
+                .unwrap_or_else(|error| panic!("{}: {error}", &value[..20]));
+            assert_eq!(
+                table.rows,
+                vec![vec![Some(value.clone())]],
+                "a value of {} chars did not come back",
+                value.chars().count()
+            );
+        }
+    }
+
+    /// The whole of MySQL's escape table, not the four rows it used to hold.
+    ///
+    /// `SQL Inserts` import advertises reading a MySQL-family file, and a file
+    /// this app did not write — a `mysqldump` — carries the other six. The
+    /// server's own values are what these are measured against:
+    /// `HEX('a\Zb')` is `611A62`, `HEX('a\bb')` is `610862`, and
+    /// `HEX('a\%b')` is `615C2562` — the backslash SURVIVES before `%` and
+    /// `_`, because inside `LIKE` those are the wildcards.
+    #[test]
+    fn a_mysql_file_reads_every_escape_the_server_defines() {
+        for (escaped, expected) in [
+            ("a\\0b", "a\0b"),
+            ("a\\bb", "a\u{8}b"),
+            ("a\\nb", "a\nb"),
+            ("a\\rb", "a\rb"),
+            ("a\\tb", "a\tb"),
+            ("a\\Zb", "a\u{1A}b"),
+            ("a\\\\b", "a\\b"),
+            ("a\\%b", "a\\%b"),
+            ("a\\_b", "a\\_b"),
+            // Anything else is the character itself, which is also the
+            // server's rule.
+            ("a\\qb", "aqb"),
+        ] {
+            let sql = format!("INSERT INTO `T` (`ID`, `N`) VALUES (1, '{escaped}');\n");
+            let table = parse(&sql, &options(ExportFormat::SqlInserts))
+                .unwrap_or_else(|error| panic!("{escaped:?}: {error}"));
+            assert_eq!(
+                table.rows,
+                vec![vec![Some("1".to_string()), Some(expected.to_string())]],
+                "{escaped:?}"
+            );
+        }
+    }
+
+    /// An Oracle file reads a backslash as itself, every one of those rows
+    /// included: only the MySQL family has the escape table at all.
+    #[test]
+    fn an_oracle_file_reads_no_backslash_escape() {
+        let sql = "INSERT INTO T (ID, N) VALUES (1, 'a\\Zb\\nc');\n";
+        let table = parse(sql, &options(ExportFormat::SqlInserts)).expect("parses");
+        assert_eq!(
+            table.rows,
+            vec![vec![Some("1".to_string()), Some("a\\Zb\\nc".to_string())]]
+        );
+    }
+
+    /// A `SQL Inserts` export of an Oracle grid is safe to RUN as well as to
+    /// re-import.
+    ///
+    /// This app substitutes `&name` inside string literals the way SQL*Plus
+    /// does, and `DEFINE` is on by default, so a plain `'R&D'` in the exported
+    /// file stops the run and asks the user to enter a value. The writer lifts
+    /// the `&` out; this pins that the reader still gets the value back.
+    #[test]
+    fn an_ampersand_survives_the_oracle_sql_export_and_import_round_trip() {
+        let grid = ExportGrid {
+            columns: vec!["N".to_string()],
+            column_kinds: vec![SqlValueKind::String],
+            rows: vec![
+                vec![Some("R&D".to_string())],
+                vec![Some("&start".to_string())],
+                vec![Some("end&".to_string())],
+                vec![Some("a&&b".to_string())],
+                vec![Some("&".to_string())],
+            ],
+            null_text: NULL_TEXT.to_string(),
+        };
+        let selection = GridSqlSelection {
+            dialect: crate::ui::grid_sql_export::SqlWriteDialect::family_default(
+                DatabaseType::Oracle,
+            ),
+            table: Some("T".to_string()),
+            all_columns: grid.columns.clone(),
+            column_kinds: grid.column_kinds.clone(),
+            selected_columns: vec![0],
+            rows: grid.rows.clone(),
+        };
+        let sql = written(build_sql_inserts(&selection));
+        assert!(
+            !sql.contains('&'),
+            "an exported Oracle literal may not carry a bare &: {sql}"
+        );
+        assert_eq!(
+            parse(&sql, &options(ExportFormat::SqlInserts))
+                .expect("parses")
+                .rows,
+            grid.rows
+        );
+    }
+
+    /// The four letters `NULL` survive this app's own CSV round trip.
+    ///
+    /// Writer and reader held together: the export quotes a value that spells
+    /// the NULL text, and the import reads the quoting. Before, both were the
+    /// same bytes and the value came back as SQL NULL — on every backend, from
+    /// the app's own file.
+    #[test]
+    fn a_value_spelling_the_null_text_survives_the_csv_round_trip() {
+        for format in [ExportFormat::Csv, ExportFormat::Tsv] {
+            let grid = ExportGrid {
+                columns: vec!["V".to_string(), "W".to_string()],
+                column_kinds: vec![SqlValueKind::String, SqlValueKind::String],
+                rows: vec![
+                    vec![None, Some("keep".to_string())],
+                    vec![Some(NULL_TEXT.to_string()), Some(String::new())],
+                ],
+                null_text: NULL_TEXT.to_string(),
+            };
+            let text = render(format, &grid);
+            let table = parse(&text, &options(format))
+                .unwrap_or_else(|error| panic!("{}: {error}", format.label()));
+            assert_eq!(
+                table.rows,
+                vec![
+                    vec![None, Some("keep".to_string())],
+                    vec![Some(NULL_TEXT.to_string()), Some(String::new())],
+                ],
+                "{} did not round trip",
+                format.label()
+            );
+        }
+    }
+
+    /// A row of ONE column holding the empty string survives the round trip.
+    ///
+    /// The blank-line rule and the empty string meet here: written bare, such a
+    /// row IS a blank line, and dropping blank lines would drop it. The writer
+    /// quotes an empty value for exactly that reason, and this holds the two
+    /// halves together.
+    #[test]
+    fn a_single_column_row_of_the_empty_string_is_not_a_blank_line() {
+        for format in [ExportFormat::Csv, ExportFormat::Tsv] {
+            let grid = ExportGrid {
+                columns: vec!["V".to_string()],
+                column_kinds: vec![SqlValueKind::String],
+                rows: vec![
+                    vec![Some(String::new())],
+                    vec![Some("x".to_string())],
+                    vec![None],
+                ],
+                null_text: NULL_TEXT.to_string(),
+            };
+            let table = parse(&render(format, &grid), &options(format))
+                .unwrap_or_else(|error| panic!("{}: {error}", format.label()));
+            assert_eq!(
+                table.rows,
+                vec![
+                    vec![Some(String::new())],
+                    vec![Some("x".to_string())],
+                    vec![None],
+                ],
+                "{} lost the empty-string row",
+                format.label()
+            );
+        }
+    }
+
+    /// One statement carries MANY rows, and every one of them has to arrive.
+    ///
+    /// The reader used to take the first `(…)` after `VALUES` and drop the rest
+    /// with no error — so a `mysqldump` file, and the very script this app's own
+    /// import builder writes, came back holding one row per statement.
+    #[test]
+    fn every_row_of_a_multi_row_statement_is_read() {
+        for (label, sql, expected) in [
+            (
+                "a multi-row VALUES list",
+                "INSERT INTO `t` (`id`,`v`) VALUES (1,'a'),(2,'b'),(3,'c');",
+                3,
+            ),
+            (
+                "an Oracle INSERT ALL",
+                "INSERT ALL INTO t (id, v) VALUES (1,'a') INTO t (id, v) VALUES (2,'b') \
+                 INTO t (id, v) VALUES (3,'c') SELECT * FROM DUAL;",
+                3,
+            ),
+            (
+                // A trailing clause changes what the statement DOES, not which
+                // rows it carries, so the rows are still read.
+                "a trailing ON DUPLICATE KEY UPDATE",
+                "INSERT INTO `t` (`id`,`v`) VALUES (1,'a'),(2,'b') \
+                 ON DUPLICATE KEY UPDATE v = 'x';",
+                2,
+            ),
+            (
+                "a trailing RETURNING",
+                "INSERT INTO t (id, v) VALUES (1,'a'),(2,'b') RETURNING id;",
+                2,
+            ),
+        ] {
+            let table = parse(sql, &options(ExportFormat::SqlInserts))
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert_eq!(table.rows.len(), expected, "{label}");
+        }
+    }
+
+    /// The script this app writes for an import reads back as the rows it was
+    /// built from — at any batch size, on every dialect.
+    #[test]
+    fn the_import_script_this_app_writes_reads_back_whole() {
+        use crate::db::DatabaseType;
+        use crate::ui::grid_sql_export::SqlWriteDialect;
+        use crate::ui::table_import::{
+            build_insert_script, default_mapping, ImportRequest, TargetColumn,
+        };
+
+        let targets = vec![
+            TargetColumn {
+                name: "ID".to_string(),
+                kind: SqlValueKind::Number,
+                nullable: true,
+            },
+            TargetColumn {
+                name: "V".to_string(),
+                kind: SqlValueKind::String,
+                nullable: true,
+            },
+        ];
+        let data = ImportedTable {
+            columns: vec!["ID".to_string(), "V".to_string()],
+            rows: (1..=5)
+                .map(|index| vec![Some(index.to_string()), Some(format!("row {index}"))])
+                .collect(),
+        };
+        let mapping = default_mapping(&data.columns, &targets);
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+        ] {
+            for batch_rows in [100, 2, 1] {
+                let script = build_insert_script(&ImportRequest {
+                    dialect: SqlWriteDialect::family_default(db_type),
+                    table: "T",
+                    targets: &targets,
+                    mapping: &mapping,
+                    data: &data,
+                    batch_rows,
+                })
+                .expect("builds");
+                let back = parse(&script, &options(ExportFormat::SqlInserts))
+                    .unwrap_or_else(|error| panic!("{db_type} batch {batch_rows}: {error}"));
+                assert_eq!(back.rows, data.rows, "{db_type} batch {batch_rows}");
+            }
+        }
+    }
+
+    /// A shape whose row count this reader cannot know is refused BY NAME, not
+    /// read as if it carried one row.
+    #[test]
+    fn a_statement_this_reader_cannot_count_is_refused() {
+        for (label, sql, needle) in [
+            (
+                "INSERT FIRST routes rows by its WHEN clauses",
+                "INSERT FIRST WHEN a > 1 THEN INTO t (a) VALUES (1) SELECT * FROM DUAL;",
+                "INSERT FIRST",
+            ),
+            (
+                "an INSERT ALL driven by a real query",
+                "INSERT ALL INTO t (a) VALUES (1) SELECT id FROM src;",
+                "cannot count rows for",
+            ),
+            (
+                "a comma that leads nowhere",
+                "INSERT INTO t (a) VALUES (1), x;",
+                "not followed by another row",
+            ),
+            (
+                "targets that name different columns",
+                "INSERT ALL INTO t (a) VALUES (1) INTO t (b) VALUES (2) SELECT * FROM DUAL;",
+                "same column list",
+            ),
+        ] {
+            let error = parse(sql, &options(ExportFormat::SqlInserts))
+                .expect_err(&format!("{label} must be refused"));
+            assert!(error.contains(needle), "{label}: {error}");
+        }
+    }
+
+    /// The same columns in another ORDER name the same row.
+    ///
+    /// Such a file used to be refused outright. It is read now, and each
+    /// statement's values are lifted into the first statement's column order —
+    /// the assertion that matters, because getting the ORDER wrong would put
+    /// every value in the wrong column instead of refusing.
+    #[test]
+    fn statements_may_name_the_same_columns_in_another_order() {
+        let table = parse(
+            "INSERT INTO T (A,B) VALUES (1,2);\n\
+             INSERT INTO T (B,A) VALUES (30,40);\n\
+             INSERT ALL INTO T (B,A) VALUES (50,60) SELECT * FROM DUAL;",
+            &options(ExportFormat::SqlInserts),
+        )
+        .expect("parses");
+        assert_eq!(table.columns, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(
+            table.rows,
+            vec![
+                vec![Some("1".to_string()), Some("2".to_string())],
+                vec![Some("40".to_string()), Some("30".to_string())],
+                vec![Some("60".to_string()), Some("50".to_string())],
+            ]
+        );
+        // A different SET of columns is still a file this cannot read as one
+        // table.
+        assert!(parse(
+            "INSERT INTO T (A,B) VALUES (1,2);\nINSERT INTO T (A,C) VALUES (3,4);",
+            &options(ExportFormat::SqlInserts)
+        )
+        .is_err());
+    }
+
+    /// A keyword spelled inside a value or a name is not a keyword.
+    #[test]
+    fn a_literal_that_spells_a_keyword_is_still_a_value() {
+        let table = parse(
+            "INSERT ALL INTO t (a) VALUES ('x INTO y') INTO t (a) VALUES ('has VALUES (9)') \
+             SELECT * FROM DUAL;",
+            &options(ExportFormat::SqlInserts),
+        )
+        .expect("parses");
+        assert_eq!(
+            table.rows,
+            vec![
+                vec![Some("x INTO y".to_string())],
+                vec![Some("has VALUES (9)".to_string())],
+            ]
+        );
+    }
+
+    /// A cell that spans columns fills every one of them, and a cell that spans
+    /// rows re-appears in the rows below.
+    ///
+    /// Reading one cell as one column shifted every later cell of a spanned row
+    /// one place to the left, silently, into the wrong column of the table being
+    /// loaded.
+    #[test]
+    fn html_spans_keep_every_value_in_its_own_column() {
+        for (label, html, expected) in [
+            (
+                "colspan fills the columns it covers",
+                "<table><tr><th>A</th><th>B</th><th>C</th></tr>\
+                 <tr><td colspan='2'>x</td><td>y</td></tr></table>",
+                vec![vec![
+                    Some("x".to_string()),
+                    Some("x".to_string()),
+                    Some("y".to_string()),
+                ]],
+            ),
+            (
+                "rowspan re-appears in the row below",
+                "<table><tr><th>A</th><th>B</th></tr>\
+                 <tr><td rowspan=\"2\">x</td><td>y</td></tr><tr><td>z</td></tr></table>",
+                vec![
+                    vec![Some("x".to_string()), Some("y".to_string())],
+                    vec![Some("x".to_string()), Some("z".to_string())],
+                ],
+            ),
+            (
+                // A `<tr>` with no cells of its own is still a row when a
+                // rowspan owes it a value; skipping it handed that value to the
+                // NEXT row, one row too early.
+                "an empty row still consumes a row of the span",
+                "<table><tr><th>A</th><th>B</th></tr>\
+                 <tr><td rowspan=3>x</td><td>1</td></tr><tr></tr><tr><td>3</td></tr></table>",
+                vec![
+                    vec![Some("x".to_string()), Some("1".to_string())],
+                    vec![Some("x".to_string()), None],
+                    vec![Some("x".to_string()), Some("3".to_string())],
+                ],
+            ),
+            (
+                "a rowspan in the LAST column still lands there",
+                "<table><tr><th>A</th><th>B</th></tr>\
+                 <tr><td>y</td><td rowspan=2>x</td></tr><tr><td>z</td></tr></table>",
+                vec![
+                    vec![Some("y".to_string()), Some("x".to_string())],
+                    vec![Some("z".to_string()), Some("x".to_string())],
+                ],
+            ),
+        ] {
+            let table = parse(html, &options(ExportFormat::Html))
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert_eq!(table.rows, expected, "{label}");
+        }
+    }
+
+    /// A `<table>` opens a scope the implicit-close rules do not cross.
+    ///
+    /// `<tr>` closes a previous `<tr>` — but only a SIBLING one. Without the
+    /// scope, the row of a nested table closed the outer row and was promoted
+    /// beside it, leaving the outer cell empty.
+    #[test]
+    fn a_nested_html_table_is_the_text_of_its_cell() {
+        let table = parse(
+            "<table><tr><th>A</th></tr>\
+             <tr><td><table><tr><td>inner</td></tr></table></td></tr></table>",
+            &options(ExportFormat::Html),
+        )
+        .expect("parses");
+        assert_eq!(table.columns, vec!["A".to_string()]);
+        assert_eq!(table.rows, vec![vec![Some("inner".to_string())]]);
+    }
+
+    /// A span a file asks for is clamped to what HTML itself allows, so a
+    /// number in a file cannot ask this reader for an arbitrary allocation.
+    #[test]
+    fn an_absurd_span_is_clamped_and_then_reported() {
+        let error = parse(
+            "<table><tr><th>A</th></tr><tr><td colspan=99999999>x</td></tr></table>",
+            &options(ExportFormat::Html),
+        )
+        .expect_err("refused");
+        assert!(error.contains("1000 values"), "{error}");
+        // A span of zero or none is one column, and an attribute whose name
+        // merely ENDS in `colspan` is not one.
+        for html in [
+            "<table><tr><th>A</th><th>B</th></tr><tr><td colspan=0>1</td><td>2</td></tr></table>",
+            "<table><tr><th>A</th><th>B</th></tr>\
+             <tr><td data-colspan=2>1</td><td>2</td></tr></table>",
+        ] {
+            let table = parse(html, &options(ExportFormat::Html)).expect("parses");
+            assert_eq!(
+                table.rows,
+                vec![vec![Some("1".to_string()), Some("2".to_string())]],
+                "{html}"
+            );
+        }
+    }
+
+    /// The LAST entry wins when one JSON object repeats a key, which is what
+    /// `serde_json` — the parser the rest of this app uses — does with the same
+    /// document.
+    #[test]
+    fn a_repeated_json_key_reads_as_its_last_value() {
+        let table = parse("[{\"A\":1,\"A\":2}]", &options(ExportFormat::Json)).expect("parses");
+        assert_eq!(table.rows, vec![vec![Some("2".to_string())]]);
+    }
+
+    /// A `<br>` that was in the DATA is not a line break.
+    ///
+    /// The writer escapes every `<`, so only the marker it added itself has a
+    /// bare one. The reader used to substitute `<br>` in a pass of its own,
+    /// after unescaping, by which point the two were spelled the same.
+    #[test]
+    fn markdown_keeps_a_literal_br_out_of_the_line_breaks() {
+        let grid = ExportGrid {
+            columns: vec!["V".to_string()],
+            column_kinds: vec![SqlValueKind::String],
+            rows: vec![
+                vec![Some("a<br>b".to_string())],
+                vec![Some("a\nb".to_string())],
+                vec![Some("<tag> & \\pipe\\ |".to_string())],
+            ],
+            null_text: NULL_TEXT.to_string(),
+        };
+        assert_eq!(
+            parse(
+                &render(ExportFormat::Markdown, &grid),
+                &options(ExportFormat::Markdown)
+            )
+            .expect("parses")
+            .rows,
+            grid.rows
+        );
+    }
+
+    /// Two columns whose names only COLLIDE after XML sanitizing still come
+    /// back as two columns.
+    #[test]
+    fn xml_separates_names_that_only_collide_once_sanitized() {
+        let grid = ExportGrid {
+            columns: vec!["A(B".to_string(), "A)B".to_string()],
+            column_kinds: vec![SqlValueKind::String, SqlValueKind::String],
+            rows: vec![vec![Some("one".to_string()), Some("two".to_string())]],
+            null_text: NULL_TEXT.to_string(),
+        };
+        let table = parse(
+            &render(ExportFormat::Xml, &grid),
+            &options(ExportFormat::Xml),
+        )
+        .expect("parses");
+        assert_eq!(table.columns, vec!["A_B".to_string(), "A_B_2".to_string()]);
+        assert_eq!(
+            table.rows,
+            vec![vec![Some("one".to_string()), Some("two".to_string())]]
+        );
     }
 
     #[test]
@@ -1736,7 +3298,10 @@ mod tests {
         let grid = ExportGrid {
             columns: vec!["N".to_string(), "M".to_string()],
             column_kinds: vec![SqlValueKind::Number, SqlValueKind::Number],
-            rows: vec![vec!["1.2E+10".to_string(), "-0.000001".to_string()]],
+            rows: vec![vec![
+                Some("1.2E+10".to_string()),
+                Some("-0.000001".to_string()),
+            ]],
             null_text: NULL_TEXT.to_string(),
         };
         let table = parse(
@@ -2021,8 +3586,8 @@ mod tests {
     fn a_mysql_backslash_escape_survives_a_round_trip_into_oracle() {
         // The file says which dialect wrote it by how it quotes columns, so a
         // MySQL export reads back exactly even though the target is Oracle.
-        let mysql = build_sql_inserts(&selection(DatabaseType::MySQL));
-        let oracle = build_sql_inserts(&selection(DatabaseType::Oracle));
+        let mysql = written(build_sql_inserts(&selection(DatabaseType::MySQL)));
+        let oracle = written(build_sql_inserts(&selection(DatabaseType::Oracle)));
         assert!(mysql.contains('`') && !oracle.contains('`'));
         let from_mysql = parse(&mysql, &options(ExportFormat::SqlInserts)).expect("parses");
         let from_oracle = parse(&oracle, &options(ExportFormat::SqlInserts)).expect("parses");
@@ -2056,16 +3621,13 @@ mod tests {
 
     #[test]
     fn a_thousand_rows_round_trip_through_every_format() {
-        let rows: Vec<Vec<String>> = (0..1000)
+        let rows: Vec<Vec<ExportCell>> = (0..1000)
             .map(|index| {
                 vec![
-                    index.to_string(),
-                    format!("name |{index}, \"q\"\n{index}"),
-                    if index % 7 == 0 {
-                        NULL_TEXT.to_string()
-                    } else {
-                        format!("{index:08}")
-                    },
+                    Some(index.to_string()),
+                    Some(format!("name |{index}, \"q\"\n{index}")),
+                    // Every seventh CODE is SQL NULL.
+                    (index % 7 != 0).then(|| format!("{index:08}")),
                 ]
             })
             .collect();
@@ -2081,15 +3643,16 @@ mod tests {
         };
         for format in ExportFormat::ALL {
             let text = if format == ExportFormat::SqlInserts {
-                build_sql_inserts(&GridSqlSelection {
-                    db_type: DatabaseType::Oracle,
+                written(build_sql_inserts(&GridSqlSelection {
+                    dialect: crate::ui::grid_sql_export::SqlWriteDialect::family_default(
+                        DatabaseType::Oracle,
+                    ),
                     table: Some("T".to_string()),
                     all_columns: grid.columns.clone(),
                     column_kinds: grid.column_kinds.clone(),
                     selected_columns: (0..grid.columns.len()).collect(),
                     rows: grid.rows.clone(),
-                    null_text: grid.null_text.clone(),
-                })
+                }))
             } else {
                 render(format, &grid)
             };

@@ -57,7 +57,33 @@ pub(crate) fn next_order_by_for_header_sort(current: &str, column: &str) -> Stri
 /// something the user ran. Such a statement bypasses lazy fetch, reserves
 /// result-grid routing, and is never itself a relation to filter or re-page.
 pub(crate) fn is_materialized_grid_statement(sql: &str) -> bool {
-    sql.contains(TABLE_BROWSE_MATERIALIZE_MARKER)
+    carries_mark(sql, TABLE_BROWSE_MATERIALIZE_MARKER)
+}
+
+/// Whether `sql` carries `marker` WHERE [`marked_sql`] puts it.
+///
+/// Where, not whether. This asked `sql.contains(marker)`, which is a question
+/// about the whole statement TEXT — and a statement's text includes its values.
+/// A query selecting the marker as a string, or an import whose file held it in
+/// a cell, was then read as a statement this app had written: its result got no
+/// filter bar, the grids the user was looking at were not cleared for it, its
+/// routing was reserved as an internal refill, and lazy fetch was turned off.
+///
+/// The mark is a COMMENT, and a value can never be one. Reading it back exactly
+/// where the writer puts it is what makes it unforgeable — the two are an
+/// inverse pair, and `a_value_cannot_forge_a_mark` holds them to it.
+fn carries_mark(sql: &str, marker: &str) -> bool {
+    let comment = format!("/* {marker} */");
+    let trimmed = sql.trim_start();
+    // `<KEYWORD> /* MARKER */ …`, which is where the writer puts it.
+    let word = trimmed
+        .find(|ch: char| ch.is_whitespace() || ch == '(')
+        .unwrap_or(trimmed.len());
+    if word > 0 && trimmed[word..].trim_start().starts_with(&comment) {
+        return true;
+    }
+    // And the shape a statement with no leading word would get.
+    trimmed.starts_with(&comment)
 }
 
 /// Whether this statement was written by this feature rather than by the user
@@ -68,7 +94,7 @@ pub(crate) fn is_materialized_grid_statement(sql: &str) -> bool {
 /// apply would nest one level deeper. The mark travels in the statement text so
 /// the answer holds however the result is routed.
 pub(crate) fn is_generated_grid_statement(sql: &str) -> bool {
-    is_materialized_grid_statement(sql) || sql.contains(RESULT_FILTER_MARKER)
+    is_materialized_grid_statement(sql) || carries_mark(sql, RESULT_FILTER_MARKER)
 }
 
 /// The same statement, marked as one this feature wrote for a filtered result.
@@ -253,25 +279,37 @@ pub(crate) fn invoke_table_browse_execute_callback(
     }
 }
 
-fn marked_materialized_sql(sql: &str) -> String {
+/// The same statement, marked as a table page this feature materialized.
+///
+/// Public only so `verify_derived_table_wrap` can build the SQL it sends to a
+/// real server with the SAME writer the app uses; it used to mirror this by
+/// hand, which is a copy of a rule that has already drifted once. Not part of
+/// the supported surface.
+#[doc(hidden)]
+pub fn marked_materialized_sql(sql: &str) -> String {
     marked_sql(sql, TABLE_BROWSE_MATERIALIZE_MARKER)
 }
 
 fn marked_sql(sql: &str, marker: &str) -> String {
     let trimmed_start = sql.len().saturating_sub(sql.trim_start().len());
     let trimmed = sql.trim_start();
-    if trimmed
-        .get(..6)
-        .is_some_and(|head| head.eq_ignore_ascii_case("SELECT"))
-    {
-        format!(
-            "{}SELECT /* {marker} */{}",
-            &sql[..trimmed_start],
-            &trimmed[6..]
-        )
-    } else {
-        format!("/* {marker} */\n{sql}")
+    // After the leading KEYWORD, not in front of the statement. A comment that
+    // opens a statement is one the executor's own splitter drops on the way to
+    // execution — measured — so a mark written there was gone by the time
+    // anything asked for it. Inside, it survives, and `WITH /* … */ x AS (…)`
+    // is as valid as `SELECT /* … */ *`.
+    let word = trimmed
+        .find(|ch: char| ch.is_whitespace() || ch == '(')
+        .unwrap_or(trimmed.len());
+    if word == 0 {
+        return format!("/* {marker} */\n{sql}");
     }
+    format!(
+        "{}{} /* {marker} */{}",
+        &sql[..trimmed_start],
+        &trimmed[..word],
+        &trimmed[word..]
+    )
 }
 
 /// Refuse a filter whose clauses would end the statement they are spliced
@@ -1340,6 +1378,89 @@ impl TableBrowseFilterBar {
 
 #[cfg(test)]
 mod tests {
+    /// The mark survives the road between being written and being read.
+    ///
+    /// The reader is positional now, so anything that reshapes the statement
+    /// between the two would turn a page of this feature's own into a user
+    /// query — no reservation, the grids cleared under it, lazy fetch back on.
+    /// The executor's own splitter is that road, so it is the one asked.
+    #[test]
+    fn a_mark_survives_the_splitter_that_carries_it() {
+        use crate::db::query::{QueryExecutor, ScriptItem};
+
+        for sql in [
+            "SELECT * FROM (SELECT a FROM t) WHERE ROWNUM <= 500",
+            "  select a from t",
+            "WITH x AS (SELECT 1 FROM DUAL) SELECT * FROM x",
+            "SELECT * FROM t;",
+        ] {
+            for marker in [
+                super::TABLE_BROWSE_MATERIALIZE_MARKER,
+                super::RESULT_FILTER_MARKER,
+            ] {
+                let marked = super::marked_sql(sql, marker);
+                assert!(
+                    super::carries_mark(&marked, marker),
+                    "the writer and the reader disagree about {marked}"
+                );
+                let items = QueryExecutor::split_script_items(&marked);
+                assert_eq!(items.len(), 1, "{marked} split into {} items", items.len());
+                let ScriptItem::Statement(statement) = &items[0] else {
+                    panic!("{marked} did not come back as a statement");
+                };
+                assert!(
+                    super::carries_mark(statement, marker),
+                    "the splitter lost the mark: {statement}"
+                );
+            }
+        }
+    }
+
+    /// A value cannot forge a mark this app writes for itself.
+    ///
+    /// The mark is a COMMENT at the head of the statement. Reading it with
+    /// `contains` asked about the whole TEXT — values included — so a query
+    /// that merely SELECTED the marker, or an import whose file held it in a
+    /// cell, was read as one of this feature's own statements: its result got
+    /// no filter bar, the grids on screen were not cleared for it, its routing
+    /// was reserved as an internal refill, and lazy fetch was turned off.
+    #[test]
+    fn a_value_cannot_forge_a_mark() {
+        // The writer's two shapes both read back.
+        let page = super::marked_sql("SELECT * FROM EMP", super::TABLE_BROWSE_MATERIALIZE_MARKER);
+        assert!(super::is_materialized_grid_statement(&page), "{page}");
+        assert!(super::is_generated_grid_statement(&page));
+        let non_select = super::marked_sql(
+            "WITH t AS (SELECT 1) SELECT * FROM t",
+            super::TABLE_BROWSE_MATERIALIZE_MARKER,
+        );
+        assert!(
+            super::is_materialized_grid_statement(&non_select),
+            "{non_select}"
+        );
+        let filtered = super::marked_result_filter_sql("SELECT * FROM (SELECT 1) WHERE 1 = 1");
+        assert!(super::is_generated_grid_statement(&filtered), "{filtered}");
+        assert!(!super::is_materialized_grid_statement(&filtered));
+
+        // And a value cannot.
+        for forged in [
+            "SELECT 'SQ_INTERNAL_TABLE_BROWSE' FROM DUAL",
+            "SELECT 'SQ_INTERNAL_RESULT_FILTER' FROM DUAL",
+            "INSERT INTO NOTES (BODY) VALUES ('/* SQ_INTERNAL_TABLE_BROWSE */')",
+            "SELECT * FROM EMP WHERE NAME = '/* SQ_INTERNAL_RESULT_FILTER */'",
+            "SELECT * FROM SQ_INTERNAL_TABLE_BROWSE",
+        ] {
+            assert!(
+                !super::is_generated_grid_statement(forged),
+                "a value forged the mark: {forged}"
+            );
+        }
+
+        // An ordinary user query is not marked either.
+        assert!(!super::is_generated_grid_statement("SELECT * FROM EMP"));
+        assert!(!super::is_generated_grid_statement("  select 1 from dual"));
+    }
+
     use super::*;
 
     #[test]

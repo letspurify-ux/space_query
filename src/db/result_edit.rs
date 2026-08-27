@@ -1041,6 +1041,81 @@ pub(crate) fn quote_mysql_identifier(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
 
+/// Quote a possibly dot-qualified, possibly ALREADY quoted MySQL-family name.
+///
+/// The one reader for "turn a name the catalog or another quoter produced into
+/// a fully quoted one". It has to be one, because a name may arrive raw
+/// (`app.orders`), partly quoted (``app.`zr``tick` ``), or fully quoted
+/// (`` `sales.ops`.`order.items` ``) depending on which quoter ran first, and a
+/// naive `split('.')` re-quotes an already quoted segment into a DIFFERENT
+/// name: ``app.`zr``tick` `` became ``` `app`.```zr````tick``` ```, which names
+/// no table. Dots inside a quoted segment are part of the name and must not
+/// split it.
+///
+/// Idempotent: quoting an already quoted path yields the same path.
+pub(crate) fn quote_mysql_qualified_name(name: &str) -> String {
+    mysql_qualified_name_segments(name)
+        .into_iter()
+        .map(|segment| quote_mysql_identifier(&segment))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Split a MySQL-family qualified name on the dots that separate it, unquoting
+/// each segment. A dot inside a backtick-quoted segment is data.
+fn mysql_qualified_name_segments(name: &str) -> Vec<String> {
+    let trimmed = name.trim();
+    let mut segments: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let mut chars = trimmed.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '`' if in_quotes => {
+                // A doubled backtick is one character of the name, not the end.
+                if chars.peek().is_some_and(|(_, next)| *next == '`') {
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            }
+            '`' => in_quotes = true,
+            '.' if !in_quotes => {
+                if let Some(segment) = trimmed.get(start..index) {
+                    segments.push(unquote_mysql_segment(segment));
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if let Some(segment) = trimmed.get(start..) {
+        segments.push(unquote_mysql_segment(segment));
+    }
+    // An empty segment names nothing; dropping it is what keeps a trailing dot
+    // or a blank scope from producing `` `` `` in the middle of a path.
+    segments.retain(|segment| !segment.trim().is_empty());
+    segments
+}
+
+/// Undo BACKTICK quoting only.
+///
+/// Deliberately not `sql_text::strip_identifier_quotes`, which also strips `"`
+/// and `[...]`: in the MySQL family a double quote is a legal character of an
+/// unquoted-by-us name (only `ANSI_QUOTES` makes it a delimiter, and this app
+/// always writes backticks), so eating it would rename the object.
+fn unquote_mysql_segment(segment: &str) -> String {
+    let trimmed = segment.trim();
+    match trimmed
+        .strip_prefix('`')
+        .and_then(|inner| inner.strip_suffix('`'))
+    {
+        Some(inner) => inner.replace("``", "`"),
+        None => trimmed.to_string(),
+    }
+}
+
 fn mysql_edit_error(message: &str) -> MysqlError {
     MysqlError::MySqlError(MySqlError {
         state: "45000".to_string(),
@@ -1309,6 +1384,40 @@ fn is_identifier_byte(byte: u8) -> bool {
 mod tests {
     use super::*;
     use mysql::{Opts, Pool};
+
+    /// Quoting an already quoted MySQL-family path must NAME THE SAME OBJECT.
+    ///
+    /// The object browser quotes a segment only when it has to (a dot or a
+    /// backtick in the name), so a qualified name reaches the generated-SQL
+    /// writer and the import script builder partly quoted. Those two used to
+    /// re-quote it with `split('.')` + wrap, which turned ``app.`zr``tick` ``
+    /// into ``` `app`.```zr````tick``` ``` — a name with backticks IN it — and
+    /// tore `` `sales.ops`.`order.items` `` into four segments.
+    #[test]
+    fn quoting_a_mysql_qualified_name_is_idempotent_and_dot_aware() {
+        for (input, expected) in [
+            ("app.orders", "`app`.`orders`"),
+            ("`app`.`orders`", "`app`.`orders`"),
+            ("orders", "`orders`"),
+            ("app.my table", "`app`.`my table`"),
+            // A backtick is legal inside a MySQL-family name; the catalog
+            // reports it raw and the browser doubles it once.
+            ("app.`zr``tick`", "`app`.`zr``tick`"),
+            ("`app`.`zr``tick`", "`app`.`zr``tick`"),
+            // A dot inside a quoted segment is part of the name.
+            ("`sales.ops`.`order.items`", "`sales.ops`.`order.items`"),
+            // A double quote is an ordinary character here, not a delimiter.
+            (r#"app."odd""#, r#"`app`.`"odd"`"#),
+        ] {
+            let once = quote_mysql_qualified_name(input);
+            assert_eq!(once, expected, "{input}");
+            assert_eq!(
+                quote_mysql_qualified_name(&once),
+                expected,
+                "{input}: quoting twice must not change the name"
+            );
+        }
+    }
 
     fn index_column(
         index_name: &str,

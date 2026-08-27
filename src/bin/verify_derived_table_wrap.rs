@@ -37,25 +37,16 @@ use tns_thin::{ConnectTarget, OracleThinConfig, OracleThinSession};
 // SQL shapes mirrored from src/ui/table_browse.rs
 // ---------------------------------------------------------------------------
 
-const MARKER: &str = "SQ_INTERNAL_TABLE_BROWSE";
 const PAGE_COL: &str = "SQ_INTERNAL_PAGE_ROW";
 
-/// Mirrors `marked_materialized_sql` (`table_browse.rs:199`).
+/// The production writer, not a copy of it.
+///
+/// This mirrored `marked_materialized_sql` by hand, and the copy drifted the
+/// first time the real one moved: the mark now goes after the leading KEYWORD
+/// rather than in front of a statement, because a comment that OPENS a
+/// statement is one the executor's splitter drops.
 fn marked(sql: &str) -> String {
-    let trimmed_start = sql.len().saturating_sub(sql.trim_start().len());
-    let trimmed = sql.trim_start();
-    if trimmed
-        .get(..6)
-        .is_some_and(|head| head.eq_ignore_ascii_case("SELECT"))
-    {
-        format!(
-            "{}SELECT /* {MARKER} */{}",
-            &sql[..trimmed_start],
-            &trimmed[6..]
-        )
-    } else {
-        format!("/* {MARKER} */\n{sql}")
-    }
+    space_query::ui::table_browse::marked_materialized_sql(sql)
 }
 
 /// Mirrors `build_logical_sql` (`table_browse.rs:226`).

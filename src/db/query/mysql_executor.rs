@@ -2762,9 +2762,10 @@ impl MysqlObjectBrowser {
             String,
             Option<String>,
             String,
+            Option<String>,
         )> = conn.exec(
             "SELECT COLUMN_NAME, COLUMN_TYPE, CHARACTER_MAXIMUM_LENGTH, \
-             NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY \
+             NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA \
              FROM INFORMATION_SCHEMA.COLUMNS \
              WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
              ORDER BY ORDINAL_POSITION",
@@ -2783,6 +2784,7 @@ impl MysqlObjectBrowser {
                     nullable,
                     default_value,
                     column_key,
+                    extra,
                 )| TableColumnDetail {
                     name,
                     data_type,
@@ -2794,6 +2796,7 @@ impl MysqlObjectBrowser {
                     nullable: nullable == "YES",
                     default_value,
                     is_primary_key: column_key == "PRI",
+                    is_generated: mysql_extra_marks_generated_column(extra.as_deref()),
                 },
             )
             .collect())
@@ -3351,8 +3354,63 @@ type MysqlRoutineParameterRow = (
 );
 type MysqlRoutineParameterRows = Vec<MysqlRoutineParameterRow>;
 
+/// Whether `INFORMATION_SCHEMA.COLUMNS.EXTRA` says the server computes this
+/// column, so no statement may supply a value for it.
+///
+/// Matched on the specific spellings rather than on the word `GENERATED` alone:
+/// MySQL 8 also writes `DEFAULT_GENERATED` for a column with an expression
+/// default, and such a column IS writable. MariaDB spells the stored form
+/// `STORED GENERATED` and, in older releases, `PERSISTENT GENERATED`.
+pub(crate) fn mysql_extra_marks_generated_column(extra: Option<&str>) -> bool {
+    let Some(extra) = extra else {
+        return false;
+    };
+    let extra = extra.to_ascii_uppercase();
+    [
+        "VIRTUAL GENERATED",
+        "STORED GENERATED",
+        "PERSISTENT GENERATED",
+    ]
+    .iter()
+    .any(|marker| extra.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// `EXTRA` says which columns the server computes — and which it does not.
+    ///
+    /// Matched on the specific spellings: MySQL 8 also writes
+    /// `DEFAULT_GENERATED` for an expression default, and such a column IS
+    /// writable, so keying on the word `GENERATED` alone would refuse an
+    /// import that is perfectly legal.
+    #[test]
+    fn mysql_extra_marks_only_the_columns_a_statement_may_not_write() {
+        for extra in [
+            "VIRTUAL GENERATED",
+            "STORED GENERATED",
+            "PERSISTENT GENERATED",
+            "virtual generated",
+        ] {
+            assert!(
+                super::mysql_extra_marks_generated_column(Some(extra)),
+                "{extra}"
+            );
+        }
+        for extra in [
+            "",
+            "auto_increment",
+            "on update CURRENT_TIMESTAMP",
+            "DEFAULT_GENERATED",
+            "DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
+        ] {
+            assert!(
+                !super::mysql_extra_marks_generated_column(Some(extra)),
+                "{extra}"
+            );
+        }
+        assert!(!super::mysql_extra_marks_generated_column(None));
+    }
     use super::{
         MysqlExecutor, MysqlObjectBrowser, MysqlResultSetSnapshot, MysqlSessionTimeoutRestore,
     };

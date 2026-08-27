@@ -48,6 +48,9 @@ struct ModalPlan {
     null_text: Option<String>,
     /// `(mapping row, item label)` overrides applied after the reload.
     remap: Vec<(usize, String)>,
+    /// A NULL text typed AFTER the remap, to prove a hand-made mapping is not
+    /// thrown away by a keystroke that cannot change the file's columns.
+    null_text_after_remap: Option<String>,
     cancel: bool,
 
     /// Filled in by the timeout, for the assertions.
@@ -78,6 +81,7 @@ fn detail(name: &str, data_type: &str, nullable: bool) -> TableColumnDetail {
         nullable,
         default_value: None,
         is_primary_key: false,
+        is_generated: false,
     }
 }
 
@@ -220,6 +224,34 @@ fn main() {
         Err(err) => failures.push(format!("header-less CSV: {err}")),
     }
 
+    // (5b) A hand-made mapping survives a keystroke in the NULL text.
+    //
+    // Every reload rebuilt the mapping rows from the DEFAULT mapping, and a
+    // reload runs on every keystroke in that field — so typing there silently
+    // undid every target the user had chosen. The columns of the file do not
+    // change when only the NULL text does.
+    match run(
+        CSV,
+        ExportFormat::Csv,
+        ModalPlan {
+            remap: vec![(1, "(skip)".to_string())],
+            null_text_after_remap: Some("\\N".to_string()),
+            ..ModalPlan::default()
+        },
+    ) {
+        Ok(Some((sql, _))) => {
+            if sql.contains("(EMPNO, HIREDATE, SAL)") && !sql.contains("SMITH") {
+                say("PASS: a hand-made mapping survives typing in the NULL text");
+            } else {
+                failures.push(format!(
+                    "the NULL text reset the mapping; the script was {sql:?}"
+                ));
+            }
+        }
+        Ok(None) => failures.push("the mapping-preserving import produced nothing".to_string()),
+        Err(err) => failures.push(err),
+    }
+
     // (5) A column the user sends to (skip) must not appear in the script.
     match run(
         CSV,
@@ -295,6 +327,118 @@ fn main() {
         Err(err) => failures.push(format!("unreadable file: {err}")),
     }
 
+    // A column name is not a menu grammar. FLTK parses `/` as a submenu and
+    // fltk-rs splits `add_choice` on `|` before any escape can reach it, so a
+    // target whose name held either used to become TWO entries — and the
+    // mapping this modal returns is the item INDEX, so every later column
+    // pointed at its neighbour. Driven through the production modal: what is
+    // read back is the text of the item each mapping selector is SHOWING.
+    let hostile_columns = vec![
+        detail("A|B", "NUMBER", true),
+        detail("C/D", "VARCHAR2", true),
+        detail("E&F_G", "VARCHAR2", true),
+        detail("PLAIN", "NUMBER", true),
+    ];
+    let hostile_csv = "A|B,C/D,E&F_G,PLAIN\n1,x,y,2\n";
+    let hostile_names: Vec<String> = hostile_columns.iter().map(|c| c.name.clone()).collect();
+
+    // (1) Every selector offers one entry per target and starts on its own.
+    match run_against(
+        hostile_csv,
+        ExportFormat::Csv,
+        ModalPlan::default(),
+        hostile_columns.clone(),
+    ) {
+        Ok(Some((sql, _))) => {
+            let labels = state_mapping();
+            let mismatched: Vec<String> = labels
+                .iter()
+                .zip(hostile_names.iter())
+                .filter(|(label, name)| !label.starts_with(name.as_str()))
+                .map(|(label, name)| format!("{name} shows as {label:?}"))
+                .collect();
+            if labels.len() != hostile_names.len() {
+                failures.push(format!(
+                    "expected {} mapping selectors, the modal built {}: {labels:?}",
+                    hostile_names.len(),
+                    labels.len()
+                ));
+            } else if !mismatched.is_empty() {
+                failures.push(format!(
+                    "a mapping selector points at the wrong column: {}",
+                    mismatched.join("; ")
+                ));
+            } else if !hostile_names.iter().all(|name| sql.contains(name.as_str())) {
+                failures.push(format!("the script does not name every column: {sql:?}"));
+            } else {
+                say("PASS: a column named with `|`, `/`, `&` or `_` is ONE entry, showing itself");
+            }
+        }
+        Ok(None) => failures.push("the hostile-name case produced no script".to_string()),
+        Err(err) => failures.push(format!("hostile column names: {err}")),
+    }
+
+    // (2) And the user picks by what they SEE: send `PLAIN`'s values into the
+    // column called `A|B`, choosing it by that label, and free `A|B`'s own row
+    // so the mapping stays legal. If a name became two entries the label is not
+    // there to pick — or picking it lands on its neighbour.
+    match run_against(
+        hostile_csv,
+        ExportFormat::Csv,
+        ModalPlan {
+            remap: vec![
+                (0, "(skip)".to_string()),
+                (3, "A|B  ·  null ok".to_string()),
+            ],
+            ..ModalPlan::default()
+        },
+        hostile_columns.clone(),
+    ) {
+        Ok(Some((sql, _))) => {
+            if sql.contains("(\"A|B\", \"C/D\", \"E&F_G\") VALUES (2, 'x', 'y')") {
+                say("PASS: picking a hostile name by its label lands on that column");
+            } else {
+                failures.push(format!(
+                    "picking `A|B` by its label did not land on that column: {sql:?}"
+                ));
+            }
+        }
+        Ok(None) => failures.push("the remapped hostile-name case produced no script".to_string()),
+        Err(err) => failures.push(format!("hostile column remap: {err}")),
+    }
+
+    // The helper installs a per-item callback, because `MenuExt::add` always
+    // does. FLTK dispatches a pick as
+    // `if (value_->callback_) value_->do_callback(this); else do_callback();`
+    // (`Fl_Menu_.cxx`), so an item callback SUPPRESSES the widget's — and every
+    // picker here sets its callback on the widget. `MenuItem::do_callback` is
+    // that same branch, so this drives what a real pick drives.
+    {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let fired = Rc::new(RefCell::new(0usize));
+        let fired_for_widget = fired.clone();
+        let mut choice = Choice::new(0, 0, 10, 10, None);
+        space_query::ui::widget_label::add_menu_item(&mut choice, "A|B");
+        space_query::ui::widget_label::add_menu_item(&mut choice, "PLAIN");
+        choice.set_callback(move |_| *fired_for_widget.borrow_mut() += 1);
+        for index in 0..2 {
+            if let Some(mut item) = choice.at(index) {
+                item.do_callback(&choice);
+            }
+        }
+        let count = *fired.borrow();
+        if count == 2 {
+            say("PASS: picking an item still runs the picker's own callback");
+        } else {
+            failures.push(format!(
+                "a menu item added by the helper ran the widget callback {count} times, not 2 \
+                 — an item callback is swallowing the picker's"
+            ));
+        }
+    }
+
     if failures.is_empty() {
         say("\nImport verified end to end through the production modal.");
     } else {
@@ -311,7 +455,17 @@ fn main() {
 fn run(
     text: &str,
     format: ExportFormat,
+    wanted: ModalPlan,
+) -> Result<Option<(String, String)>, String> {
+    run_against(text, format, wanted, catalog())
+}
+
+/// The same, against a catalog the caller chooses.
+fn run_against(
+    text: &str,
+    format: ExportFormat,
     mut wanted: ModalPlan,
+    columns: Vec<TableColumnDetail>,
 ) -> Result<Option<(String, String)>, String> {
     wanted.driven = false;
     wanted.refused = false;
@@ -334,8 +488,8 @@ fn run(
         "sample",
         text,
         TABLE,
-        DatabaseType::Oracle,
-        &catalog(),
+        space_query::ui::grid_sql_export::SqlWriteDialect::family_default(DatabaseType::Oracle),
+        &columns,
         format,
     );
     pump(200);
@@ -441,6 +595,21 @@ fn drive_modal() {
                 choice.set_value(index);
                 choice.do_callback();
             }
+        }
+    }
+
+    // Typed AFTER the mapping was set by hand: the file's columns do not change
+    // when only the NULL text does, so the rows on screen — and the targets the
+    // user chose in them — have to survive it.
+    let null_text_after_remap = plan()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .null_text_after_remap
+        .clone();
+    if let Some(null_text) = null_text_after_remap {
+        if let Some(mut input) = first_widget::<Input>(&dialog) {
+            input.set_value(&null_text);
+            input.do_callback();
         }
     }
 

@@ -204,15 +204,14 @@ impl MenuBarBuilder {
         Some(slot - 1)
     }
 
+    /// The one escaper, reached by the name this module has always used for it.
+    ///
+    /// This road was already right — it escapes what FLTK's menu parser
+    /// consumes and adds its items with `add`, which does not split on `|`.
+    /// The rule moved to [`crate::ui::widget_label`] because three other places
+    /// were handing names to `add_choice`, which does.
     fn escape_menu_label(label: &str) -> String {
-        let mut escaped = String::with_capacity(label.len());
-        for ch in label.chars() {
-            if matches!(ch, '&' | '/' | '\\' | '_') {
-                escaped.push('\\');
-            }
-            escaped.push(ch);
-        }
-        escaped
+        crate::ui::widget_label::menu_item_label(label)
     }
 
     fn recent_sql_file_display_name(path: &std::path::Path) -> String {

@@ -10,7 +10,15 @@
 //! something wrong.
 
 use crate::db::SqlValueKind;
-use crate::ui::result_table::ResultTableWidget;
+
+/// What one cell of an export holds: the text the grid shows, or SQL NULL.
+///
+/// The mirror of [`crate::ui::result_import::ImportCell`], and for the same
+/// reason: "is this NULL?" is a question with one answer, decided once where it
+/// is still knowable, not re-derived from text by every serializer. Text that
+/// merely READS like a NULL — an empty string, the four letters `NULL` — is
+/// `Some`, and each format then spells the two apart in its own vocabulary.
+pub type ExportCell = Option<String>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExportFormat {
@@ -83,6 +91,85 @@ impl ExportFormat {
     }
 }
 
+/// What a render or a SQL build produced: the text, and how many rows of the
+/// source it covers — or the sentence saying why nothing was written.
+///
+/// One value, because the two are one fact. The row count used to be read off
+/// the builder's INPUT ([`render_export_content`] returned
+/// `selection.rows.len()` whatever came back), and every early return in
+/// [`crate::ui::grid_sql_export::build_sql_inserts`] writes nothing — so an
+/// empty file was announced as "N rows exported" and an empty clipboard as
+/// "Copied N INSERT statements".
+///
+/// `Refused` is the third thing a build can be. It used to be spelled as an
+/// empty string, which a caller cannot tell from an empty result, so every
+/// refusal had to be asked by a separate gate that a caller could forget. The
+/// gate now lives inside the builder and its answer comes back with the rest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExportContent {
+    /// `rows` is what the text actually covers, not what it was offered.
+    Written { text: String, rows: usize },
+    /// Nothing was written, and this is what to tell the user.
+    Refused(String),
+}
+
+impl ExportContent {
+    pub fn written(text: String, rows: usize) -> Self {
+        ExportContent::Written { text, rows }
+    }
+
+    /// A build that had nothing to write and nothing to complain about.
+    pub fn nothing() -> Self {
+        ExportContent::Written {
+            text: String::new(),
+            rows: 0,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        match self {
+            ExportContent::Written { text, .. } => text.as_str(),
+            ExportContent::Refused(_) => "",
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        match self {
+            ExportContent::Written { rows, .. } => *rows,
+            ExportContent::Refused(_) => 0,
+        }
+    }
+
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            ExportContent::Written { .. } => None,
+            ExportContent::Refused(reason) => Some(reason.as_str()),
+        }
+    }
+
+    /// Rewrite the text that was written, leaving a refusal alone.
+    ///
+    /// A refusal has no text to decorate: putting a byte-order mark in front of
+    /// one would turn "nothing was written" into a one-character file.
+    pub fn map_text(self, rewrite: impl FnOnce(String) -> String) -> Self {
+        match self {
+            ExportContent::Written { text, rows } => ExportContent::Written {
+                text: rewrite(text),
+                rows,
+            },
+            refused => refused,
+        }
+    }
+
+    /// The text and its row count, or the refusal to report.
+    pub fn into_parts(self) -> Result<(String, usize), String> {
+        match self {
+            ExportContent::Written { text, rows } => Ok((text, rows)),
+            ExportContent::Refused(reason) => Err(reason),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExportScope {
     All,
@@ -102,18 +189,58 @@ pub struct ExportGrid {
     /// Per-column literal kind. Shorter than `columns` means "unknown", which
     /// only costs JSON its unquoted numbers.
     pub column_kinds: Vec<SqlValueKind>,
-    pub rows: Vec<Vec<String>>,
-    /// Display text the grid uses for SQL NULL.
+    /// Rows aligned to `columns`. SQL NULL is [`None`]; `Some("")` is the empty
+    /// string, which is a different value everywhere but Oracle.
+    pub rows: Vec<Vec<ExportCell>>,
+    /// Display text the grid uses for SQL NULL. Only the spreadsheet formats
+    /// read it: CSV and TSV are literal dumps of what the grid shows, so a NULL
+    /// has to reach the file wearing the same text the user sees.
     pub null_text: String,
 }
 
 impl ExportGrid {
-    fn cell<'a>(&self, row: &'a [String], index: usize) -> &'a str {
-        row.get(index).map_or("", String::as_str)
+    /// The cell at `index`. A column the row does not reach has no value at
+    /// all, which is SQL NULL.
+    fn cell<'a>(&self, row: &'a [ExportCell], index: usize) -> &'a ExportCell {
+        row.get(index).unwrap_or(&None)
     }
 
-    fn is_null(&self, row: &[String], index: usize) -> bool {
-        ResultTableWidget::value_represents_null(self.cell(row, index), &self.null_text)
+    /// What CSV and TSV write for one cell: the text, and whether it must be
+    /// quoted even where the escaping rules would not ask for it.
+    ///
+    /// A NULL is written as the grid's NULL display text, because a delimited
+    /// file is a dump of what the grid shows. A VALUE whose text happens to BE
+    /// that display text is written QUOTED — the one signal a delimited file
+    /// has left to tell the two apart, and the one
+    /// [`crate::ui::result_import::parse`] reads. Without it this app's own
+    /// export → import turned a `VARCHAR` holding the four letters `NULL` into
+    /// SQL NULL, silently, on every backend.
+    ///
+    /// An EMPTY value is quoted for the same reason. A row of one column
+    /// holding the empty string would otherwise be an empty line, and an empty
+    /// line is a blank one — which no reader takes for a record, this app's
+    /// included. `""` is a record, and every reader gives back the same string
+    /// for it.
+    ///
+    /// The signal is only free while the NULL text needs no quotes of its own.
+    /// One that holds the separator, a quote, or a line break is quoted
+    /// whatever this says, so both spellings look alike and the reader falls
+    /// back to matching the text — see
+    /// [`crate::ui::result_import::null_text_quoting_is_a_signal`], which is
+    /// the same question asked from the other side.
+    ///
+    /// A NULL is never force-quoted: bare is what says it is one. The honest
+    /// limit that leaves is a NULL text set to EMPTY in a result of one column,
+    /// where a NULL really is an empty line and nothing can tell it from a
+    /// blank one.
+    fn display_cell<'a>(&'a self, row: &'a [ExportCell], index: usize) -> (&'a str, bool) {
+        match self.cell(row, index) {
+            Some(value) => (
+                value.as_str(),
+                value.is_empty() || value.as_str() == self.null_text,
+            ),
+            None => (self.null_text.as_str(), false),
+        }
     }
 
     fn kind(&self, index: usize) -> SqlValueKind {
@@ -131,8 +258,8 @@ impl ExportGrid {
 /// structured formats have their own way to say "no value" and use it.
 pub fn render(format: ExportFormat, grid: &ExportGrid) -> String {
     match format {
-        ExportFormat::Csv => render_separated(grid, ',', escape_csv_field),
-        ExportFormat::Tsv => render_separated(grid, '\t', escape_tab_separated_field),
+        ExportFormat::Csv => render_separated(grid, ','),
+        ExportFormat::Tsv => render_separated(grid, '\t'),
         ExportFormat::Json => render_json(grid),
         ExportFormat::Xml => render_xml(grid),
         ExportFormat::Html => render_html(grid),
@@ -153,20 +280,22 @@ pub fn render(format: ExportFormat, grid: &ExportGrid) -> String {
 ///
 /// `sql_selection` is only read for `SqlInserts`; passing `None` for that format
 /// yields nothing rather than wrong SQL.
+///
+/// The row count comes from what was WRITTEN, never from what was offered:
+/// `SqlInserts` has three ways to write nothing (a repeated column name, no
+/// nameable column, a value no literal can carry) and each used to be reported
+/// as a full export of an empty file.
 pub fn render_export_content(
     format: ExportFormat,
     grid: &ExportGrid,
     sql_selection: Option<&crate::ui::grid_sql_export::GridSqlSelection>,
-) -> (String, usize) {
+) -> ExportContent {
     match format {
         ExportFormat::SqlInserts => match sql_selection {
-            Some(selection) => (
-                crate::ui::grid_sql_export::build_sql_inserts(selection),
-                selection.rows.len(),
-            ),
-            None => (String::new(), 0),
+            Some(selection) => crate::ui::grid_sql_export::build_sql_inserts(selection),
+            None => ExportContent::nothing(),
         },
-        format => (render(format, grid), grid.rows.len()),
+        format => ExportContent::written(render(format, grid), grid.rows.len()),
     }
 }
 
@@ -197,14 +326,15 @@ pub fn with_destination_prelude(
 /// spreadsheet opens. The UTF-8 BOM Excel needs is not here: it belongs to a
 /// file, not to the text, and [`ExportFormat::file_byte_order_mark`] adds it on
 /// the way to disk.
-fn render_separated(grid: &ExportGrid, separator: char, escape: fn(&str) -> String) -> String {
+fn render_separated(grid: &ExportGrid, separator: char) -> String {
     let line_ending = csv_line_ending();
     let mut out = String::with_capacity(grid.rows.len() * 20 + grid.columns.len() * 16 + 4);
     for (index, column) in grid.columns.iter().enumerate() {
         if index > 0 {
             out.push(separator);
         }
-        out.push_str(&escape(column));
+        // The header is names, never values, so it carries no NULL signal.
+        out.push_str(&escape_delimited_field(column, separator, false));
     }
     out.push_str(line_ending);
 
@@ -213,7 +343,8 @@ fn render_separated(grid: &ExportGrid, separator: char, escape: fn(&str) -> Stri
             if index > 0 {
                 out.push(separator);
             }
-            out.push_str(&escape(grid.cell(row, index)));
+            let (text, force_quotes) = grid.display_cell(row, index);
+            out.push_str(&escape_delimited_field(text, separator, force_quotes));
         }
         out.push_str(line_ending);
     }
@@ -228,8 +359,24 @@ pub(crate) fn csv_line_ending() -> &'static str {
     }
 }
 
-pub(crate) fn escape_csv_field(field: &str) -> String {
-    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+/// Whether `field` cannot be written bare in a delimited file.
+///
+/// The ONE statement of that rule. CSV and TSV differ only in their separator,
+/// and the reader has to ask the same question the writer did — a NULL text
+/// that must be quoted anyway carries no signal — so the two sides share this
+/// rather than each spelling out a list of characters.
+pub(crate) fn delimited_field_needs_quotes(field: &str, separator: char) -> bool {
+    field.contains(separator) || field.contains('"') || field.contains('\n') || field.contains('\r')
+}
+
+/// Escape one field for a delimited file.
+///
+/// `force_quotes` writes quotes the grammar does not require, which is how a
+/// value that spells the NULL text is kept apart from a NULL — see
+/// [`ExportGrid::display_cell`]. Every reader treats `"x"` and `x` as the same
+/// string, so nothing outside this app sees a difference.
+pub(crate) fn escape_delimited_field(field: &str, separator: char, force_quotes: bool) -> String {
+    if force_quotes || delimited_field_needs_quotes(field, separator) {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {
         field.to_string()
@@ -242,26 +389,25 @@ pub(crate) fn escape_csv_field(field: &str) -> String {
 /// embedded quotes doubled, matching the convention those apps use when parsing
 /// pasted TSV text.
 pub(crate) fn escape_tab_separated_field(field: &str) -> String {
-    if field.contains('\t') || field.contains('\n') || field.contains('\r') || field.contains('"') {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.to_string()
-    }
+    escape_delimited_field(field, '\t', false)
 }
 
 fn render_json(grid: &ExportGrid) -> String {
     if grid.rows.is_empty() {
         return "[]\n".to_string();
     }
+    // Two object keys with one name are one key to every reader, this app's own
+    // importer included, so the writer makes them unique.
+    let names = unique_field_names(grid.columns.clone());
     let mut out = String::from("[\n");
     for (row_index, row) in grid.rows.iter().enumerate() {
         out.push_str("  {\n");
-        for (index, column) in grid.columns.iter().enumerate() {
+        for (index, column) in names.iter().enumerate() {
             out.push_str("    ");
             out.push_str(&json_string(column));
             out.push_str(": ");
             out.push_str(&json_value(grid, row, index));
-            if index + 1 < grid.columns.len() {
+            if index + 1 < names.len() {
                 out.push(',');
             }
             out.push('\n');
@@ -282,11 +428,11 @@ fn render_json(grid: &ExportGrid) -> String {
 /// and only when its text is already valid JSON — that keeps a zero-padded code
 /// like `00123` a string and never produces invalid JSON from an unexpected
 /// rendering (an Oracle `NUMBER` shown in scientific notation, say).
-fn json_value(grid: &ExportGrid, row: &[String], index: usize) -> String {
-    if grid.is_null(row, index) {
+fn json_value(grid: &ExportGrid, row: &[ExportCell], index: usize) -> String {
+    let Some(value) = grid.cell(row, index) else {
         return "null".to_string();
-    }
-    let value = grid.cell(row, index);
+    };
+    let value = value.as_str();
     let trimmed = value.trim();
     match grid.kind(index) {
         SqlValueKind::Boolean => {
@@ -363,30 +509,63 @@ fn json_string(value: &str) -> String {
 }
 
 fn render_xml(grid: &ExportGrid) -> String {
-    let names: Vec<String> = grid
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| xml_element_name(column, index))
-        .collect();
+    // Sanitize first, then make unique: sanitizing CREATES collisions of its
+    // own (`A(B` and `A)B` both become `A_B`), and an element name that repeats
+    // inside one row is a column no reader can address.
+    let names = unique_field_names(
+        grid.columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| xml_element_name(column, index))
+            .collect(),
+    );
 
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<results>\n");
     for row in &grid.rows {
         out.push_str("  <row>\n");
         for (index, name) in names.iter().enumerate() {
-            if grid.is_null(row, index) {
-                out.push_str(&format!("    <{name}/>\n"));
-            } else {
-                out.push_str(&format!(
+            match grid.cell(row, index) {
+                None => out.push_str(&format!("    <{name}/>\n")),
+                Some(value) => out.push_str(&format!(
                     "    <{name}>{}</{name}>\n",
-                    escape_xml_text(grid.cell(row, index))
-                ));
+                    escape_xml_text(value)
+                )),
             }
         }
         out.push_str("  </row>\n");
     }
     out.push_str("</results>\n");
     out
+}
+
+/// Make emitted field names unique.
+///
+/// XML elements and JSON object keys are addressed BY NAME, so two columns that
+/// end up sharing one are one column to every reader — this app's own importer
+/// silently kept the first and dropped the rest. Duplicate result column names
+/// are ordinary (`SELECT a.id, b.id FROM …`), so uniqueness is the writer's job
+/// and belongs in one place both formats go through.
+///
+/// The first use of a name keeps it; every later one takes the lowest free
+/// `_<n>` suffix, counting from 2.
+fn unique_field_names(names: Vec<String>) -> Vec<String> {
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .map(|name| {
+            if taken.insert(name.clone()) {
+                return name;
+            }
+            let mut suffix = 2usize;
+            loop {
+                let candidate = format!("{name}_{suffix}");
+                if taken.insert(candidate.clone()) {
+                    return candidate;
+                }
+                suffix += 1;
+            }
+        })
+        .collect()
 }
 
 /// Turn a column name into a legal XML element name.
@@ -464,10 +643,12 @@ fn render_html(grid: &ExportGrid) -> String {
     for row in &grid.rows {
         out.push_str("<tr>");
         for index in 0..grid.columns.len() {
-            let cell = if grid.is_null(row, index) {
-                String::new()
-            } else {
-                escape_html_text(grid.cell(row, index))
+            // An HTML table cell has no way to say "no value", so NULL and the
+            // empty string are both an empty cell here — the one place this
+            // format cannot keep them apart.
+            let cell = match grid.cell(row, index) {
+                None => String::new(),
+                Some(value) => escape_html_text(value),
             };
             out.push_str(&format!("<td>{cell}</td>"));
         }
@@ -499,12 +680,11 @@ fn render_markdown(grid: &ExportGrid) -> String {
     for row in &grid.rows {
         out.push_str("| ");
         let cells: Vec<String> = (0..grid.columns.len())
-            .map(|index| {
-                if grid.is_null(row, index) {
-                    String::new()
-                } else {
-                    escape_markdown_cell(grid.cell(row, index))
-                }
+            .map(|index| match grid.cell(row, index) {
+                // As in HTML, an empty cell is the only spelling Markdown has
+                // for "no value", and the empty string shares it.
+                None => String::new(),
+                Some(value) => escape_markdown_cell(value),
             })
             .collect();
         out.push_str(&cells.join(" | "));
@@ -515,10 +695,18 @@ fn render_markdown(grid: &ExportGrid) -> String {
 
 /// A Markdown table cell cannot contain a raw `|` or a line break, so the pipe
 /// is escaped and every line break becomes `<br>`.
+///
+/// `<` is escaped too, and that is what makes the reader an exact inverse: the
+/// line break marker is written with a BARE `<`, so a `<br>` that was already in
+/// the data (`\<br>`) can no longer be mistaken for one this function added.
+/// Escaping runs first and the marker is introduced last, in that order, because
+/// the marker must survive it. A `\<` is also how CommonMark spells a literal
+/// `<`, so the rendered table shows the data rather than an HTML tag.
 fn escape_markdown_cell(value: &str) -> String {
     value
         .replace('\\', "\\\\")
         .replace('|', "\\|")
+        .replace('<', "\\<")
         .replace("\r\n", "<br>")
         .replace(['\n', '\r'], "<br>")
 }
@@ -527,16 +715,29 @@ fn escape_markdown_cell(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A grid whose second row's NAME is SQL NULL.
+    ///
+    /// The fixture used to spell that as the TEXT `NULL` and let each
+    /// serializer re-derive it. It is `None` now — the same fact, stated once
+    /// where it is known — and CSV still writes the NULL display text for it,
+    /// because CSV is a dump of what the grid shows.
     fn grid() -> ExportGrid {
         ExportGrid {
             columns: vec!["ID".to_string(), "NAME".to_string()],
             column_kinds: vec![SqlValueKind::Number, SqlValueKind::String],
             rows: vec![
-                vec!["1".to_string(), "alpha".to_string()],
-                vec!["2".to_string(), "NULL".to_string()],
+                vec![Some("1".to_string()), Some("alpha".to_string())],
+                vec![Some("2".to_string()), None],
             ],
             null_text: "NULL".to_string(),
         }
+    }
+
+    /// Rows of plain values, for the tests that never involve a NULL.
+    fn cells(rows: &[&[&str]]) -> Vec<Vec<ExportCell>> {
+        rows.iter()
+            .map(|row| row.iter().map(|value| Some((*value).to_string())).collect())
+            .collect()
     }
 
     #[test]
@@ -578,16 +779,72 @@ mod tests {
 
     #[test]
     fn csv_quotes_separators_quotes_and_line_breaks() {
-        assert_eq!(escape_csv_field("a,b"), "\"a,b\"");
-        assert_eq!(escape_csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
-        assert_eq!(escape_csv_field("line1\rline2"), "\"line1\rline2\"");
-        assert_eq!(escape_csv_field("plain\ttext"), "plain\ttext");
+        let csv = |field| escape_delimited_field(field, ',', false);
+        assert_eq!(csv("a,b"), "\"a,b\"");
+        assert_eq!(csv("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv("line1\rline2"), "\"line1\rline2\"");
+        assert_eq!(csv("plain\ttext"), "plain\ttext");
     }
 
     #[test]
     fn tsv_quotes_tabs_but_not_commas() {
         assert_eq!(escape_tab_separated_field("a,b"), "a,b");
         assert_eq!(escape_tab_separated_field("a\tb"), "\"a\tb\"");
+    }
+
+    /// A VALUE that spells the NULL text is quoted; a NULL is not.
+    ///
+    /// The one signal a delimited file has for the difference. Without it this
+    /// app's own export wrote the same bytes for both, and the importer — which
+    /// can only read the bytes — turned the string into SQL NULL.
+    #[test]
+    fn a_value_that_spells_the_null_text_is_quoted_and_a_null_is_not() {
+        let grid = ExportGrid {
+            columns: vec!["V".to_string()],
+            column_kinds: vec![SqlValueKind::String],
+            rows: vec![
+                vec![None],
+                vec![Some("NULL".to_string())],
+                vec![Some("plain".to_string())],
+                vec![Some(String::new())],
+            ],
+            null_text: "NULL".to_string(),
+        };
+        // The empty value is quoted too: one column of it would otherwise be a
+        // line with nothing on it, which no reader counts as a row.
+        let line_ending = csv_line_ending();
+        let expected = format!(
+            "V{line_ending}NULL{line_ending}\"NULL\"{line_ending}plain{line_ending}\"\"{line_ending}"
+        );
+        assert_eq!(render(ExportFormat::Csv, &grid), expected);
+        // TSV asks the same question with its own separator.
+        assert_eq!(render(ExportFormat::Tsv, &grid), expected);
+    }
+
+    /// The signal costs nothing when the NULL text needs no quotes, and does
+    /// not exist when it does — a NULL text holding the separator is quoted
+    /// whichever it means, so neither spelling is free to mean the other.
+    #[test]
+    fn a_null_text_that_needs_quotes_carries_no_signal() {
+        assert!(!delimited_field_needs_quotes("NULL", ','));
+        assert!(!delimited_field_needs_quotes("", ','));
+        assert!(delimited_field_needs_quotes("a,b", ','));
+        assert!(!delimited_field_needs_quotes("a,b", '\t'));
+        assert!(delimited_field_needs_quotes("a\tb", '\t'));
+
+        let grid = ExportGrid {
+            columns: vec!["V".to_string()],
+            column_kinds: vec![SqlValueKind::String],
+            rows: vec![vec![None], vec![Some("a,b".to_string())]],
+            null_text: "a,b".to_string(),
+        };
+        let line_ending = csv_line_ending();
+        assert_eq!(
+            render(ExportFormat::Csv, &grid),
+            format!("V{line_ending}\"a,b\"{line_ending}\"a,b\"{line_ending}"),
+            "both are quoted, so the file cannot tell them apart — and says so \
+             by reading both as NULL"
+        );
     }
 
     #[test]
@@ -638,11 +895,7 @@ mod tests {
             // A zero-padded code and Oracle's leading-dot rendering of 0.5;
             // `1.2E+10` is deliberately alongside them because exponent notation
             // *is* a JSON number and must stay unquoted.
-            rows: vec![
-                vec!["00123".to_string()],
-                vec![".5".to_string()],
-                vec!["1.2E+10".to_string()],
-            ],
+            rows: cells(&[&["00123"], &[".5"], &["1.2E+10"]]),
             null_text: "NULL".to_string(),
         };
         assert_eq!(
@@ -666,7 +919,7 @@ mod tests {
     fn json_escapes_control_characters() {
         let control = ExportGrid {
             columns: vec!["V".to_string()],
-            rows: vec![vec!["a\tb\u{1}".to_string()]],
+            rows: cells(&[&["a\tb\u{1}"]]),
             ..ExportGrid::default()
         };
         assert!(render(ExportFormat::Json, &control).contains("\"a\\tb\\u0001\""));
@@ -676,7 +929,8 @@ mod tests {
     fn xml_uses_an_empty_element_for_null_and_escapes_markup() {
         let markup = ExportGrid {
             columns: vec!["A".to_string(), "B".to_string()],
-            rows: vec![vec!["x & <y>".to_string(), "NULL".to_string()]],
+            // `B` is SQL NULL; `A` is a value that happens to hold markup.
+            rows: vec![vec![Some("x & <y>".to_string()), None]],
             null_text: "NULL".to_string(),
             ..ExportGrid::default()
         };
@@ -733,7 +987,7 @@ mod tests {
     fn html_escapes_markup_and_leaves_null_cells_empty() {
         let markup = ExportGrid {
             columns: vec!["A<b>".to_string()],
-            rows: vec![vec!["1 & 2".to_string()], vec!["NULL".to_string()]],
+            rows: vec![vec![Some("1 & 2".to_string())], vec![None]],
             null_text: "NULL".to_string(),
             ..ExportGrid::default()
         };
@@ -758,6 +1012,120 @@ mod tests {
         assert_eq!(escape_markdown_cell("a\r\nb"), "a<br>b");
         assert_eq!(escape_markdown_cell("a\nb"), "a<br>b");
         assert_eq!(escape_markdown_cell("c:\\dir"), "c:\\\\dir");
+    }
+
+    /// The empty string is a value, and so is the text `NULL`.
+    ///
+    /// Every structured writer used to ask the grid's cell-EDITOR question —
+    /// "would a user typing this mean NULL?" — which is generously true for an
+    /// empty box and for every spelling of `null`. On the MySQL family both are
+    /// real values, and folding them into SQL NULL rewrote the data on its way
+    /// out. NULL is carried as an absent cell now, so no text is examined.
+    #[test]
+    fn text_that_reads_like_a_null_is_not_one() {
+        let grid = ExportGrid {
+            columns: vec!["V".to_string()],
+            column_kinds: vec![SqlValueKind::String],
+            rows: vec![
+                vec![None],
+                vec![Some(String::new())],
+                vec![Some("NULL".to_string())],
+                vec![Some("null".to_string())],
+            ],
+            null_text: "NULL".to_string(),
+        };
+
+        // JSON: only the absent cell is `null`.
+        let json = render(ExportFormat::Json, &grid);
+        assert_eq!(json.matches(": null").count(), 1, "{json}");
+        assert!(json.contains("\"V\": \"\""), "{json}");
+        assert!(json.contains("\"V\": \"NULL\""), "{json}");
+        assert!(json.contains("\"V\": \"null\""), "{json}");
+
+        // XML: `<V/>` is NULL, `<V></V>` is the empty string.
+        let xml = render(ExportFormat::Xml, &grid);
+        assert_eq!(xml.matches("<V/>").count(), 1, "{xml}");
+        assert_eq!(xml.matches("<V></V>").count(), 1, "{xml}");
+        assert!(xml.contains("<V>NULL</V>"), "{xml}");
+
+        // CSV is a dump of what the grid SHOWS, so a NULL wears its display
+        // text there. A VALUE that happens to spell that same text is QUOTED,
+        // which is what keeps this format's promise too: it used to write the
+        // identical bytes for both, and the reader could only guess — it chose
+        // NULL, so the string was lost on the app's own round trip.
+        let line_ending = csv_line_ending();
+        assert_eq!(
+            render(ExportFormat::Csv, &grid),
+            format!(
+                "V{line_ending}NULL{line_ending}\"\"{line_ending}\"NULL\"{line_ending}null{line_ending}"
+            )
+        );
+    }
+
+    /// An export reports the rows it WROTE, never the rows it was offered.
+    ///
+    /// `SQL Inserts` has three ways to write nothing, and the count used to
+    /// come from the input — so an empty file was announced as a full export
+    /// and an empty clipboard as "Copied N INSERT statements".
+    #[test]
+    fn an_export_reports_the_rows_it_wrote() {
+        use crate::ui::grid_sql_export::{GridSqlSelection, SqlWriteDialect};
+
+        let grid = ExportGrid {
+            columns: vec!["A".to_string()],
+            column_kinds: vec![SqlValueKind::Number],
+            rows: vec![vec![Some("1".to_string())], vec![Some("2".to_string())]],
+            null_text: "NULL".to_string(),
+        };
+        let selection = |selected_columns: Vec<usize>| GridSqlSelection {
+            dialect: SqlWriteDialect::family_default(crate::db::DatabaseType::Oracle),
+            table: Some("T".to_string()),
+            all_columns: grid.columns.clone(),
+            column_kinds: grid.column_kinds.clone(),
+            selected_columns,
+            rows: grid.rows.clone(),
+        };
+
+        let written =
+            render_export_content(ExportFormat::SqlInserts, &grid, Some(&selection(vec![0])));
+        assert_eq!(written.rows(), 2);
+        assert_eq!(written.refusal(), None);
+
+        // A table whose every column the server computes offers none, which is
+        // a refusal — not a file of nothing reported as two rows.
+        let refused = render_export_content(
+            ExportFormat::SqlInserts,
+            &grid,
+            Some(&selection(Vec::new())),
+        );
+        assert_eq!(refused.rows(), 0);
+        assert!(refused.text().is_empty());
+        assert!(refused.refusal().is_some());
+
+        // A data format writes every row it was given, as it always did.
+        for format in [ExportFormat::Csv, ExportFormat::Json, ExportFormat::Xml] {
+            assert_eq!(render_export_content(format, &grid, None).rows(), 2);
+        }
+    }
+
+    /// A column name that repeats — or that only repeats once XML has
+    /// sanitized it — must still address one column each.
+    #[test]
+    fn emitted_field_names_are_made_unique() {
+        assert_eq!(
+            unique_field_names(vec![
+                "ID".to_string(),
+                "ID".to_string(),
+                "ID".to_string(),
+                "ID_2".to_string(),
+            ]),
+            vec![
+                "ID".to_string(),
+                "ID_2".to_string(),
+                "ID_3".to_string(),
+                "ID_2_2".to_string(),
+            ]
+        );
     }
 
     #[test]

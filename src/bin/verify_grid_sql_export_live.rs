@@ -29,7 +29,7 @@ use space_query::db::{
 };
 use space_query::ui::grid_sql_export::{
     build_sql_inserts, build_sql_updates, build_where_clause, resolve_export_table,
-    GridSqlSelection,
+    GridSqlSelection, SqlWriteDialect,
 };
 use space_query::ui::sql_editor::{QueryProgress, SqlEditorWidget};
 use space_query::ui::ObjectBrowserWidget;
@@ -350,6 +350,17 @@ fn grid_view(events: &[QueryProgress]) -> Option<GridView> {
     Some((columns, kinds, rows))
 }
 
+/// The SQL a builder wrote, or the refusal as this probe's own failure.
+fn written(
+    built: space_query::ui::result_export::ExportContent,
+    label: &str,
+) -> Result<String, String> {
+    built
+        .into_parts()
+        .map(|(sql, _)| sql)
+        .map_err(|reason| format!("{label} was refused: {reason}"))
+}
+
 fn selection(
     db_type: DatabaseType,
     table: &str,
@@ -360,16 +371,20 @@ fn selection(
     selected_rows: Vec<usize>,
 ) -> GridSqlSelection {
     GridSqlSelection {
-        db_type,
+        dialect: SqlWriteDialect::family_default(db_type),
         table: Some(table.to_string()),
         all_columns: columns.to_vec(),
         column_kinds: kinds.to_vec(),
         selected_columns,
         rows: selected_rows
             .into_iter()
-            .filter_map(|index| rows.get(index).cloned())
+            .filter_map(|index| rows.get(index))
+            .map(|row| {
+                row.iter()
+                    .map(|value| (value != "NULL").then(|| value.clone()))
+                    .collect()
+            })
             .collect(),
-        null_text: "NULL".to_string(),
     }
 }
 
@@ -493,7 +508,7 @@ fn verify(target: Target) -> Result<(), String> {
         all_columns.clone(),
         vec![0, 1],
     );
-    let inserts = build_sql_inserts(&insert_selection);
+    let inserts = written(build_sql_inserts(&insert_selection), "SQL Inserts")?;
     println!("--- generated SQL Inserts ---\n{inserts}");
     h.run(&inserts)
         .map_err(|e| format!("generated INSERT statements failed: {e}"))?;
@@ -534,7 +549,7 @@ fn verify(target: Target) -> Result<(), String> {
         vec![name_index],
         vec![0, 1],
     );
-    let updates = build_sql_updates(&update_selection, &keys);
+    let updates = written(build_sql_updates(&update_selection, &keys), "SQL Updates")?;
     println!("--- generated SQL Updates ---\n{updates}");
     h.run(&updates)
         .map_err(|e| format!("generated UPDATE statements failed: {e}"))?;
@@ -565,7 +580,7 @@ fn verify(target: Target) -> Result<(), String> {
         vec![part_index],
         vec![0, 1],
     );
-    let in_clause = build_where_clause(&one_column);
+    let in_clause = written(build_where_clause(&one_column), "one-column Where Clause")?;
     println!("--- generated Where Clause (one column) ---\n{in_clause}");
     let count_events = h
         .run(&format!(
@@ -588,7 +603,7 @@ fn verify(target: Target) -> Result<(), String> {
         vec![part_index, seq_index],
         vec![0],
     );
-    let and_clause = build_where_clause(&key_pair);
+    let and_clause = written(build_where_clause(&key_pair), "key-pair Where Clause")?;
     println!("--- generated Where Clause (key of one row) ---\n{and_clause}");
     let count_events = h
         .run(&format!(
@@ -613,7 +628,7 @@ fn verify(target: Target) -> Result<(), String> {
         vec![name_index],
         vec![0, 1],
     );
-    let null_clause = build_where_clause(&null_column);
+    let null_clause = written(build_where_clause(&null_column), "NULL-column Where Clause")?;
     println!("--- generated Where Clause (column containing NULL) ---\n{null_clause}");
     let count_events = h
         .run(&format!(

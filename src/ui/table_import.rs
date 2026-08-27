@@ -7,11 +7,13 @@
 //! Two decisions shape everything here:
 //!
 //! - **The target column's type decides the literal, never the value's shape.**
-//!   The file carries text; [`crate::db::SqlValueKind`], derived from the
-//!   column's declared type, says whether that text is quoted, converted, or
-//!   emitted bare. It is the same rule `SQL Inserts` export follows, and it is
-//!   what keeps a zero-padded code out of a number and a `VARCHAR2` holding
-//!   `2024-01-01` out of `TO_DATE`.
+//!   The file carries text; [`crate::db::SqlValueKind::for_declared_type`],
+//!   read off the column's declared type in the catalog, says whether that text
+//!   is quoted, converted, or emitted bare. It is the same rule `SQL Inserts`
+//!   export follows — literally the same, because the kind an export reaches
+//!   through the DRIVER and the kind an import reaches through the CATALOG are
+//!   held to writing the same literal — and it is what keeps a zero-padded code
+//!   out of a number and a `VARCHAR2` holding `2024-01-01` out of `TO_DATE`.
 //! - **Rows are batched into few statements.** MySQL takes a multi-row
 //!   `VALUES` list, Oracle takes `INSERT ALL`. A thousand-row file becomes a
 //!   handful of statements instead of a thousand round trips.
@@ -20,16 +22,43 @@
 //! transaction, and the same auto-commit setting as anything typed in the
 //! editor, so an import commits exactly when the user's session says it does.
 
-use crate::db::{DatabaseType, SqlValueKind};
-use crate::ui::grid_sql_export::{quote_column_name, quote_qualified_name, sql_literal_for_value};
+use crate::db::SqlValueKind;
+use crate::ui::grid_sql_export::{
+    quote_column_name, quote_qualified_name, sql_literal_for_value, SqlWriteDialect,
+};
 use crate::ui::result_import::{ImportCell, ImportedTable};
+
+/// Re-exported so the one place that turns a value into Oracle literal text
+/// stays reachable by name from the import side that first needed it.
+pub use crate::ui::grid_sql_export::defuse_substitution;
 
 /// How many rows go into one statement. Large enough that a big file is a few
 /// statements, small enough to stay well inside every backend's limit on
 /// expressions per statement and to keep one failing statement readable.
 pub const DEFAULT_BATCH_ROWS: usize = 100;
 
+/// How much SQL TEXT one statement may carry.
+///
+/// A row count cannot bound this, and the row count is all there used to be:
+/// what a server refuses is a PACKET, and 100 rows of a document column is
+/// twenty megabytes of it. Measured — MariaDB's default `max_allowed_packet`
+/// is 16 MiB and it answered `Packet is larger than max_allowed_packet`, losing
+/// the whole import rather than a row of it.
+///
+/// Four mebibytes: a quarter of that default, an sixteenth of MySQL 8's, and
+/// far above anything an ordinary row reaches, so a normal import still batches
+/// [`DEFAULT_BATCH_ROWS`] rows into one statement exactly as before. It is a
+/// fixed figure rather than one read from the server because nothing else this
+/// writer knows comes from a live session, and a conservative bound is worth
+/// more than a round trip per import.
+pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
 /// A column of the table being loaded.
+///
+/// Only columns a value can actually be written into are ever built into one:
+/// [`crate::ui::object_browser::ObjectBrowserWidget::import_target_columns`]
+/// leaves out the generated and always-identity columns the catalog reports, so
+/// a mapping that the server would reject cannot be expressed here at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetColumn {
     pub name: String,
@@ -41,58 +70,144 @@ pub struct TargetColumn {
 /// column. Indexes point into the target column list.
 pub type ColumnMapping = Vec<Option<usize>>;
 
+/// One column of the table being loaded, writable or not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ImportColumn {
+    name: String,
+    kind: SqlValueKind,
+    nullable: bool,
+    /// Whether a statement may supply a value for it. An Oracle virtual column
+    /// or `GENERATED ALWAYS AS IDENTITY`, or a MySQL-family generated column,
+    /// says no — and the server refuses the whole script for naming one.
+    writable: bool,
+}
+
+/// The table's columns as an import sees them: EVERY column, in the table's own
+/// order, each saying whether a value may be written into it.
+///
+/// One value, rather than a list of writable columns beside a list of the names
+/// left out. A file with a header is mapped by NAME and needs only the first;
+/// a file WITHOUT one is mapped by POSITION, and a position is a place in the
+/// TABLE. Given only the writable list, the dialog answered that question with
+/// it — file column *i* fed the *i*-th WRITABLE column — so a table with a
+/// generated column in the middle shifted every later value one column left.
+/// Silently, and for exactly the file this app's own CSV export writes, which
+/// carries every column the table has.
+///
+/// Built from the catalog in one place so "what may be written into" and "what
+/// position means" cannot drift apart.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportTargets {
+    columns: Vec<ImportColumn>,
+}
+
+impl ImportTargets {
+    /// Read the table's columns as the import builder needs them: the declared
+    /// type resolved to the literal kind it accepts.
+    pub fn from_catalog(
+        db_type: crate::db::DatabaseType,
+        columns: &[crate::db::TableColumnDetail],
+    ) -> Self {
+        Self {
+            columns: columns
+                .iter()
+                .map(|column| ImportColumn {
+                    name: column.name.clone(),
+                    kind: SqlValueKind::for_declared_type(db_type, &column.data_type),
+                    nullable: column.nullable,
+                    writable: !column.is_generated,
+                })
+                .collect(),
+        }
+    }
+
+    /// A table whose every column may be written into.
+    ///
+    /// For callers with no catalog in reach: the capture tour's sample table
+    /// and the unit tests. A real table goes through [`Self::from_catalog`],
+    /// which is the only thing that can know a column is computed — so this
+    /// cannot be used to claim that one is writable when it is not.
+    pub fn all_writable(targets: Vec<TargetColumn>) -> Self {
+        Self {
+            columns: targets
+                .into_iter()
+                .map(|target| ImportColumn {
+                    name: target.name,
+                    kind: target.kind,
+                    nullable: target.nullable,
+                    writable: true,
+                })
+                .collect(),
+        }
+    }
+
+    /// The columns a mapping may point at, in table order.
+    ///
+    /// A column the server computes is left out rather than offered and then
+    /// refused: `default_mapping` matches by name, so it would map itself and
+    /// the server would reject the whole script (Oracle ORA-54013, MySQL 3105).
+    /// The export side of the same rule lives in
+    /// [`crate::ui::grid_sql_export::writable_column_indices`] — what an import
+    /// will not offer is what an export must not name.
+    pub fn writable(&self) -> Vec<TargetColumn> {
+        self.columns
+            .iter()
+            .filter(|column| column.writable)
+            .map(|column| TargetColumn {
+                name: column.name.clone(),
+                kind: column.kind,
+                nullable: column.nullable,
+            })
+            .collect()
+    }
+
+    /// The columns [`Self::writable`] left out, so a dialog can say so instead
+    /// of leaving the user to wonder where a column went.
+    pub fn generated_names(&self) -> Vec<String> {
+        self.columns
+            .iter()
+            .filter(|column| !column.writable)
+            .map(|column| column.name.clone())
+            .collect()
+    }
+
+    /// The mapping a file with no header means: its columns are the TABLE's
+    /// columns, in the table's order.
+    ///
+    /// A file position that lands on a column no value may be written into is
+    /// SKIPPED, not consumed by the next writable one — the file carries a
+    /// value for it (this app's data-format exports write every column), and
+    /// letting it slide over would put it in the wrong column.
+    ///
+    /// Indexes are into [`Self::writable`], which is what a
+    /// [`ColumnMapping`] points at.
+    pub fn positional_mapping(&self, source_count: usize) -> ColumnMapping {
+        let mut writable_index = 0usize;
+        let mut mapping: ColumnMapping = Vec::with_capacity(source_count);
+        for column in self.columns.iter().take(source_count) {
+            if column.writable {
+                mapping.push(Some(writable_index));
+                writable_index += 1;
+            } else {
+                mapping.push(None);
+            }
+        }
+        // A file wider than the table has nothing left to feed.
+        mapping.resize(source_count, None);
+        mapping
+    }
+}
+
 /// Everything the script needs, already resolved.
 pub struct ImportRequest<'a> {
-    pub db_type: DatabaseType,
+    /// How SQL text must be written for the connection this will run on.
+    pub dialect: SqlWriteDialect,
     /// The table to load, qualified but not yet quoted.
     pub table: &'a str,
     pub targets: &'a [TargetColumn],
     pub mapping: &'a ColumnMapping,
     pub data: &'a ImportedTable,
     pub batch_rows: usize,
-}
-
-/// Classify a declared column type into the literal kind it accepts.
-///
-/// The input is what the backend's own catalog reports: Oracle's
-/// `ALL_TAB_COLUMNS.DATA_TYPE` (`VARCHAR2`, `TIMESTAMP(6) WITH TIME ZONE`) or
-/// MySQL's `INFORMATION_SCHEMA.COLUMNS.COLUMN_TYPE` (`varchar(50)`,
-/// `int unsigned`, `enum('a','b')`). Only the leading type word matters.
-pub fn column_kind_for_data_type(db_type: DatabaseType, data_type: &str) -> SqlValueKind {
-    let upper = data_type.trim().to_ascii_uppercase();
-    let head: &str = upper.split(['(', ' ']).next().unwrap_or_default();
-
-    if db_type.is_mysql_or_mariadb() {
-        return match head {
-            "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "DECIMAL"
-            | "DEC" | "NUMERIC" | "FIXED" | "FLOAT" | "DOUBLE" | "REAL" | "BIT" | "YEAR" => {
-                SqlValueKind::Number
-            }
-            "BOOL" | "BOOLEAN" => SqlValueKind::Boolean,
-            "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" => SqlValueKind::Temporal,
-            "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" => {
-                SqlValueKind::Binary
-            }
-            "CHAR" | "VARCHAR" | "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM"
-            | "SET" | "JSON" => SqlValueKind::String,
-            _ => SqlValueKind::Unknown,
-        };
-    }
-
-    match head {
-        "NUMBER" | "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" | "INTEGER" | "INT" | "SMALLINT"
-        | "DECIMAL" | "NUMERIC" | "DEC" | "DOUBLE" | "REAL" => SqlValueKind::Number,
-        "BOOLEAN" => SqlValueKind::Boolean,
-        // `INTERVAL DAY(2) TO SECOND(6)` and the TIMESTAMP family all start
-        // with a word this catches.
-        "DATE" | "TIMESTAMP" | "INTERVAL" => SqlValueKind::Temporal,
-        "RAW" | "BLOB" | "BFILE" => SqlValueKind::Binary,
-        // `LONG` is text, `LONG RAW` is not.
-        "LONG" if upper.starts_with("LONG RAW") => SqlValueKind::Binary,
-        "VARCHAR2" | "NVARCHAR2" | "VARCHAR" | "CHAR" | "NCHAR" | "CLOB" | "NCLOB" | "LONG"
-        | "ROWID" | "UROWID" | "XMLTYPE" | "JSON" => SqlValueKind::String,
-        _ => SqlValueKind::Unknown,
-    }
 }
 
 /// Match every source column to a target column of the same name, ignoring
@@ -119,18 +234,26 @@ pub fn default_mapping(source_columns: &[String], targets: &[TargetColumn]) -> C
 
 /// Everything wrong with a mapping, as a message, or `Ok` with the source
 /// column indexes that will be written, in target order.
-fn resolve_mapping(request: &ImportRequest) -> Result<Vec<(usize, usize)>, String> {
-    if request.data.rows.is_empty() {
+///
+/// The ONE validator. The dialog asks it while it is still open, so a mapping
+/// it refuses can be corrected in place, and [`build_insert_script`] asks it
+/// again before writing anything — neither can accept what the other rejects.
+pub fn check_mapping(
+    targets: &[TargetColumn],
+    mapping: &ColumnMapping,
+    data: &ImportedTable,
+) -> Result<Vec<(usize, usize)>, String> {
+    if data.rows.is_empty() {
         return Err("The file has no rows to import.".to_string());
     }
-    if request.mapping.len() != request.data.columns.len() {
+    if mapping.len() != data.columns.len() {
         return Err("The column mapping does not match the file.".to_string());
     }
 
     let mut pairs: Vec<(usize, usize)> = Vec::new();
-    for (source, target) in request.mapping.iter().enumerate() {
+    for (source, target) in mapping.iter().enumerate() {
         let Some(target) = *target else { continue };
-        if target >= request.targets.len() {
+        if target >= targets.len() {
             return Err(
                 "The column mapping points at a column the table does not have.".to_string(),
             );
@@ -138,7 +261,7 @@ fn resolve_mapping(request: &ImportRequest) -> Result<Vec<(usize, usize)>, Strin
         if pairs.iter().any(|(_, taken)| *taken == target) {
             return Err(format!(
                 "Two file columns are mapped to {}.",
-                request.targets[target].name
+                targets[target].name
             ));
         }
         pairs.push((source, target));
@@ -150,39 +273,46 @@ fn resolve_mapping(request: &ImportRequest) -> Result<Vec<(usize, usize)>, Strin
     Ok(pairs)
 }
 
+fn resolve_mapping(request: &ImportRequest) -> Result<Vec<(usize, usize)>, String> {
+    check_mapping(request.targets, request.mapping, request.data)
+}
+
 /// Build the script that loads `data` into `table`.
 pub fn build_insert_script(request: &ImportRequest) -> Result<String, String> {
     let pairs = resolve_mapping(request)?;
-    let table = quote_qualified_name(request.db_type, request.table);
+    let db_type = request.dialect.db_type();
+    let table = quote_qualified_name(db_type, request.table);
     let column_list = pairs
         .iter()
-        .map(|(_, target)| quote_column_name(request.db_type, &request.targets[*target].name))
+        .map(|(_, target)| quote_column_name(db_type, &request.targets[*target].name))
         .collect::<Vec<_>>()
         .join(", ");
 
     let mut rows: Vec<String> = Vec::with_capacity(request.data.rows.len());
-    for row in &request.data.rows {
+    for (row_index, row) in request.data.rows.iter().enumerate() {
         let values = pairs
             .iter()
             .map(|(source, target)| {
+                let column = &request.targets[*target];
                 cell_literal(
-                    request.db_type,
-                    request.targets[*target].kind,
+                    request.dialect,
+                    &column.name,
+                    row_index + 1,
+                    column.kind,
                     row.get(*source).unwrap_or(&None),
                 )
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()?
             .join(", ");
         rows.push(values);
     }
 
-    let batch = request.batch_rows.max(1);
     let mut script = String::new();
-    for chunk in rows.chunks(batch) {
+    for chunk in batches(&rows, request.batch_rows) {
         if !script.is_empty() {
             script.push('\n');
         }
-        script.push_str(&if request.db_type.is_mysql_or_mariadb() {
+        script.push_str(&if request.dialect.is_mysql_or_mariadb() {
             mysql_batch(&table, &column_list, chunk)
         } else {
             oracle_batch(&table, &column_list, chunk)
@@ -190,6 +320,44 @@ pub fn build_insert_script(request: &ImportRequest) -> Result<String, String> {
         script.push('\n');
     }
     Ok(script)
+}
+
+/// Split `rows` into the groups that each become ONE statement.
+///
+/// Two limits, because a row count alone does not bound what actually gets
+/// sent. `MAX_BATCH_BYTES` is the one that bites on a file of long values:
+/// 100 rows of a 200 KB document column is a twenty-megabyte statement, and
+/// MariaDB refuses it outright — `Packet is larger than max_allowed_packet`,
+/// measured, with the whole import lost rather than a row of it.
+///
+/// A group always holds at least one row. A single row that is larger than the
+/// cap cannot be split any further here — that is one value the server itself
+/// has to accept or refuse, and it says so in its own words.
+///
+/// What is counted is the VALUES text; the statement adds a table name, a
+/// column list and a few characters of punctuation per row on top. That is
+/// kilobytes against a cap of megabytes, which is why the cap is set well below
+/// the smallest limit it has to respect rather than computed exactly.
+fn batches(rows: &[String], max_rows: usize) -> Vec<&[String]> {
+    let max_rows = max_rows.max(1);
+    let mut groups: Vec<&[String]> = Vec::new();
+    let mut start = 0usize;
+    while start < rows.len() {
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < rows.len() && end - start < max_rows {
+            let next = rows[end].len();
+            if end > start && bytes + next > MAX_BATCH_BYTES {
+                break;
+            }
+
+            bytes += next;
+            end += 1;
+        }
+        groups.push(&rows[start..end]);
+        start = end;
+    }
+    groups
 }
 
 /// `INSERT INTO t (a, b) VALUES (…), (…);` — one statement, many rows.
@@ -214,51 +382,29 @@ fn oracle_batch(table: &str, column_list: &str, rows: &[String]) -> String {
     format!("INSERT ALL\n{inserts}\nSELECT * FROM DUAL;")
 }
 
-/// One cell as a SQL literal.
+/// One cell as a SQL literal, or the sentence saying why it cannot be written.
 ///
-/// NULL comes from the file saying so, never from the text looking empty:
-/// [`sql_literal_for_value`] is the entry point that does not second-guess an
-/// empty string.
-fn cell_literal(db_type: DatabaseType, kind: SqlValueKind, cell: &ImportCell) -> String {
+/// NULL comes from the file saying so, never from the text looking empty: the
+/// format already answered that question, and [`sql_literal_for_value`] does not
+/// re-open it. Oracle substitution defusing happens inside that same writer, so
+/// an `&` is as safe here as in a `SQL Inserts` export.
+///
+/// A value too long for any literal is refused HERE, by name, rather than sent:
+/// the server answers `ORA-01704` in the middle of a multi-statement script,
+/// which leaves the earlier batches inserted and the rest not.
+fn cell_literal(
+    dialect: SqlWriteDialect,
+    column: &str,
+    row_number: usize,
+    kind: SqlValueKind,
+    cell: &ImportCell,
+) -> Result<String, String> {
     match cell {
-        None => "NULL".to_string(),
-        Some(value) => defuse_substitution(db_type, &sql_literal_for_value(db_type, kind, value)),
+        None => Ok("NULL".to_string()),
+        Some(value) => sql_literal_for_value(dialect, kind, value).map_err(|refusal| {
+            crate::ui::grid_sql_export::value_too_long_message(column, row_number, refusal)
+        }),
     }
-}
-
-/// Keep an `&` that came out of a file from being read as a substitution
-/// variable.
-///
-/// Oracle's client-side `DEFINE` is on by default and substitutes `&name`
-/// *inside* string literals too, the way SQL*Plus does — so importing a row
-/// holding `AT&T` would stop and ask the user to "Enter value for T". A value
-/// that came from a file is data, never a variable, so every `&` is lifted out
-/// of the literal as `CHR(38)`. The stored text is identical, and the session's
-/// `DEFINE` setting is left exactly as the user set it.
-///
-/// Only a plain string literal is rewritten. A number, a `TO_DATE(…)`, or a
-/// `HEXTORAW(…)` cannot contain an `&`, and MySQL and MariaDB have no
-/// substitution at all.
-pub fn defuse_substitution(db_type: DatabaseType, literal: &str) -> String {
-    if db_type.is_mysql_or_mariadb() || !literal.contains('&') {
-        return literal.to_string();
-    }
-    let Some(inner) = literal
-        .strip_prefix('\'')
-        .and_then(|rest| rest.strip_suffix('\''))
-    else {
-        return literal.to_string();
-    };
-    let mut parts: Vec<String> = Vec::new();
-    for (index, piece) in inner.split('&').enumerate() {
-        if index > 0 {
-            parts.push("CHR(38)".to_string());
-        }
-        if !piece.is_empty() {
-            parts.push(format!("'{piece}'"));
-        }
-    }
-    parts.join("||")
 }
 
 /// A one-line summary of what an import will do, for the dialog and the status
@@ -285,8 +431,29 @@ pub fn describe(request: &ImportRequest) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DatabaseType;
     use crate::ui::result_export::ExportFormat;
     use crate::ui::result_import::{parse, ImportOptions};
+
+    fn writable_column(name: &str, kind: SqlValueKind) -> ImportColumn {
+        ImportColumn {
+            name: name.to_string(),
+            kind,
+            nullable: true,
+            writable: true,
+        }
+    }
+
+    /// A column the server computes: offered to nothing, and counted by
+    /// position all the same.
+    fn computed_column(name: &str) -> ImportColumn {
+        ImportColumn {
+            name: name.to_string(),
+            kind: SqlValueKind::Unknown,
+            nullable: true,
+            writable: false,
+        }
+    }
 
     fn target(name: &str, kind: SqlValueKind) -> TargetColumn {
         TargetColumn {
@@ -323,7 +490,7 @@ mod tests {
         let data = data();
         let mapping = default_mapping(&data.columns, &targets);
         build_insert_script(&ImportRequest {
-            db_type,
+            dialect: SqlWriteDialect::family_default(db_type),
             table: "APP.T",
             targets: &targets,
             mapping: &mapping,
@@ -371,6 +538,42 @@ mod tests {
         assert_eq!(mysql.matches("INSERT INTO").count(), 2);
     }
 
+    /// A batch is bounded by the SIZE of the statement it builds, not only by a
+    /// row count.
+    ///
+    /// A row count cannot see what actually gets sent: 100 rows of a document
+    /// column is a twenty-megabyte statement, and MariaDB answers `Packet is
+    /// larger than max_allowed_packet` (measured) — losing the whole import
+    /// rather than a row of it.
+    #[test]
+    fn a_batch_is_bounded_by_bytes_as_well_as_rows() {
+        let big = "x".repeat(MAX_BATCH_BYTES / 4);
+        let rows: Vec<String> = (0..10).map(|_| big.clone()).collect();
+        let groups = batches(&rows, DEFAULT_BATCH_ROWS);
+        assert_eq!(groups.len(), 3, "10 rows of a quarter of the cap is 4+4+2");
+        for group in &groups {
+            let bytes: usize = group.iter().map(String::len).sum();
+            assert!(bytes <= MAX_BATCH_BYTES, "a group carries {bytes} bytes");
+        }
+        assert_eq!(groups.iter().map(|g| g.len()).sum::<usize>(), rows.len());
+
+        // A row larger than the cap cannot be split further, so it goes alone
+        // rather than being dropped or merged.
+        let huge = vec!["y".repeat(MAX_BATCH_BYTES * 2), "z".to_string()];
+        let groups = batches(&huge, DEFAULT_BATCH_ROWS);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 1);
+
+        // And the row count still applies where it is the smaller limit, which
+        // is every ordinary file.
+        let small: Vec<String> = (0..250).map(|i| i.to_string()).collect();
+        let groups = batches(&small, DEFAULT_BATCH_ROWS);
+        assert_eq!(
+            groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+            vec![100, 100, 50]
+        );
+    }
+
     #[test]
     fn a_batch_size_of_zero_still_produces_valid_statements() {
         assert_eq!(
@@ -396,7 +599,7 @@ mod tests {
         };
         let mapping = default_mapping(&data.columns, &targets);
         let script = build_insert_script(&ImportRequest {
-            db_type: DatabaseType::Oracle,
+            dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
             table: "T",
             targets: &targets,
             mapping: &mapping,
@@ -426,7 +629,7 @@ mod tests {
         };
         let mapping = default_mapping(&data.columns, &targets);
         let script = build_insert_script(&ImportRequest {
-            db_type: DatabaseType::Oracle,
+            dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
             table: "T",
             targets: &targets,
             mapping: &mapping,
@@ -438,6 +641,127 @@ mod tests {
             script.contains("VALUES (00123, '2024-01-01', TO_DATE('2024-01-01','YYYY-MM-DD'))"),
             "{script}"
         );
+    }
+
+    /// A file with no header means the TABLE's columns, in the table's order.
+    ///
+    /// The dialog used to ask this of the writable list alone, so a table with
+    /// a generated column in the middle shifted every later value one column
+    /// left — and every data-format export this app writes carries every
+    /// column, generated ones included, which is exactly such a file.
+    #[test]
+    fn positional_mapping_skips_a_column_no_value_may_be_written_into() {
+        let table = ImportTargets {
+            columns: vec![
+                writable_column("A", SqlValueKind::Number),
+                computed_column("B"),
+                writable_column("C", SqlValueKind::String),
+            ],
+        };
+        assert_eq!(
+            table
+                .writable()
+                .iter()
+                .map(|target| target.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["A".to_string(), "C".to_string()]
+        );
+        assert_eq!(table.generated_names(), vec!["B".to_string()]);
+
+        // Three file columns, one per table column: A feeds A, B is skipped,
+        // and C feeds C — not the writable column that follows B.
+        assert_eq!(
+            table.positional_mapping(3),
+            vec![Some(0), None, Some(1)],
+            "the file's third column must reach the table's third column"
+        );
+
+        // A short file stops where it stops.
+        assert_eq!(table.positional_mapping(2), vec![Some(0), None]);
+        // A file wider than the table has nothing left to feed.
+        assert_eq!(
+            table.positional_mapping(5),
+            vec![Some(0), None, Some(1), None, None]
+        );
+
+        // And a table with nothing computed maps one to one, as it always did.
+        let plain = ImportTargets::all_writable(targets());
+        assert_eq!(plain.positional_mapping(2), vec![Some(0), Some(1)]);
+    }
+
+    /// The whole point of the shift: the values land in the right columns.
+    #[test]
+    fn a_headerless_file_of_every_column_writes_the_right_values() {
+        let table = ImportTargets {
+            columns: vec![
+                writable_column("A", SqlValueKind::Number),
+                computed_column("B"),
+                writable_column("C", SqlValueKind::String),
+            ],
+        };
+        let targets = table.writable();
+        let data = ImportedTable {
+            columns: vec![
+                "COLUMN_1".to_string(),
+                "COLUMN_2".to_string(),
+                "COLUMN_3".to_string(),
+            ],
+            rows: vec![vec![
+                Some("1".to_string()),
+                Some("computed".to_string()),
+                Some("three".to_string()),
+            ]],
+        };
+        let script = build_insert_script(&ImportRequest {
+            dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
+            table: "T",
+            targets: &targets,
+            mapping: &table.positional_mapping(data.columns.len()),
+            data: &data,
+            batch_rows: 10,
+        })
+        .expect("builds");
+        assert!(
+            script.contains("INTO T (A, C) VALUES (1, 'three')"),
+            "the third file column must be C's value: {script}"
+        );
+    }
+
+    /// A value no literal can carry stops the import BEFORE anything runs, and
+    /// says which cell.
+    ///
+    /// The alternative is what used to happen: the script goes out, the server
+    /// answers `ORA-01704` at some statement in the middle, and the batches
+    /// before it are already in.
+    #[test]
+    fn a_value_too_long_for_a_literal_refuses_the_script_and_names_the_cell() {
+        let targets = vec![
+            target("SEQ", SqlValueKind::Number),
+            target("PHOTO", SqlValueKind::Unknown),
+        ];
+        let data = ImportedTable {
+            columns: vec!["SEQ".to_string(), "PHOTO".to_string()],
+            rows: vec![
+                vec![Some("1".to_string()), Some("ab".to_string())],
+                vec![Some("2".to_string()), Some("z".repeat(6000))],
+            ],
+        };
+        let mapping: ColumnMapping = vec![Some(0), Some(1)];
+        let request = |db_type| ImportRequest {
+            dialect: SqlWriteDialect::family_default(db_type),
+            table: "T",
+            targets: &targets,
+            mapping: &mapping,
+            data: &data,
+            batch_rows: 10,
+        };
+        let error = build_insert_script(&request(DatabaseType::Oracle))
+            .expect_err("Oracle cannot carry a 6000-byte literal");
+        assert!(error.contains("Row 2"), "{error}");
+        assert!(error.contains("PHOTO"), "{error}");
+
+        // The MySQL family has no such limit, so the same file imports.
+        assert!(build_insert_script(&request(DatabaseType::MySQL)).is_ok());
     }
 
     #[test]
@@ -470,7 +794,7 @@ mod tests {
         };
         let mapping = default_mapping(&data.columns, &targets);
         let script = build_insert_script(&ImportRequest {
-            db_type: DatabaseType::Oracle,
+            dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
             table: "T",
             targets: &targets,
             mapping: &mapping,
@@ -489,7 +813,7 @@ mod tests {
         let targets = targets();
         let data = data();
         let error = build_insert_script(&ImportRequest {
-            db_type: DatabaseType::Oracle,
+            dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
             table: "T",
             targets: &targets,
             mapping: &vec![None, None, None],
@@ -505,7 +829,7 @@ mod tests {
         let targets = targets();
         let data = data();
         let error = build_insert_script(&ImportRequest {
-            db_type: DatabaseType::Oracle,
+            dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
             table: "T",
             targets: &targets,
             mapping: &vec![Some(0), Some(0), None],
@@ -524,7 +848,7 @@ mod tests {
             rows: Vec::new(),
         };
         assert!(build_insert_script(&ImportRequest {
-            db_type: DatabaseType::Oracle,
+            dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
             table: "T",
             targets: &targets,
             mapping: &vec![Some(0)],
@@ -543,7 +867,7 @@ mod tests {
         };
         let mapping = default_mapping(&data.columns, &targets);
         let script = build_insert_script(&ImportRequest {
-            db_type: DatabaseType::Oracle,
+            dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
             table: "T",
             targets: &targets,
             mapping: &mapping,
@@ -570,7 +894,7 @@ mod tests {
             ),
         ] {
             let script = build_insert_script(&ImportRequest {
-                db_type,
+                dialect: SqlWriteDialect::family_default(db_type),
                 table: if db_type.is_mysql_or_mariadb() {
                     "app.my table"
                 } else {
@@ -607,7 +931,10 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                defuse_substitution(DatabaseType::Oracle, literal),
+                defuse_substitution(
+                    SqlWriteDialect::family_default(DatabaseType::Oracle),
+                    literal
+                ),
                 expected,
                 "{literal}"
             );
@@ -617,7 +944,10 @@ mod tests {
     #[test]
     fn the_mysql_family_has_no_substitution_to_defuse() {
         for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
-            assert_eq!(defuse_substitution(db_type, "'AT&T'"), "'AT&T'");
+            assert_eq!(
+                defuse_substitution(SqlWriteDialect::family_default(db_type), "'AT&T'"),
+                "'AT&T'"
+            );
         }
     }
 
@@ -630,7 +960,7 @@ mod tests {
         };
         let mapping = default_mapping(&data.columns, &targets);
         let oracle = build_insert_script(&ImportRequest {
-            db_type: DatabaseType::Oracle,
+            dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
             table: "T",
             targets: &targets,
             mapping: &mapping,
@@ -640,7 +970,7 @@ mod tests {
         .expect("builds");
         assert!(oracle.contains("VALUES ('R'||CHR(38)||'D')"), "{oracle}");
         let mysql = build_insert_script(&ImportRequest {
-            db_type: DatabaseType::MySQL,
+            dialect: SqlWriteDialect::family_default(DatabaseType::MySQL),
             table: "T",
             targets: &targets,
             mapping: &mapping,
@@ -651,61 +981,59 @@ mod tests {
         assert!(mysql.contains("('R&D')"), "{mysql}");
     }
 
+    /// The import script names the table the catalog named, even when the
+    /// object browser already quoted part of it.
     #[test]
-    fn oracle_types_classify_the_way_the_driver_would() {
-        for (data_type, kind) in [
-            ("VARCHAR2", SqlValueKind::String),
-            ("NVARCHAR2", SqlValueKind::String),
-            ("CHAR", SqlValueKind::String),
-            ("CLOB", SqlValueKind::String),
-            ("LONG", SqlValueKind::String),
-            ("NUMBER", SqlValueKind::Number),
-            ("BINARY_DOUBLE", SqlValueKind::Number),
-            ("DATE", SqlValueKind::Temporal),
-            ("TIMESTAMP(6)", SqlValueKind::Temporal),
-            ("TIMESTAMP(6) WITH TIME ZONE", SqlValueKind::Temporal),
-            ("INTERVAL DAY(2) TO SECOND(6)", SqlValueKind::Temporal),
-            ("RAW", SqlValueKind::Binary),
-            ("LONG RAW", SqlValueKind::Binary),
-            ("BLOB", SqlValueKind::Binary),
-            ("BOOLEAN", SqlValueKind::Boolean),
-            ("SDO_GEOMETRY", SqlValueKind::Unknown),
+    fn an_already_quoted_mysql_table_name_is_not_quoted_twice() {
+        let targets = vec![target("A", SqlValueKind::Number)];
+        let data = ImportedTable {
+            columns: vec!["A".to_string()],
+            rows: vec![vec![Some("1".to_string())]],
+        };
+        let mapping = default_mapping(&data.columns, &targets);
+        for (db_type, table, expected) in [
+            (
+                DatabaseType::MySQL,
+                "app.`zr``tick`",
+                "INSERT INTO `app`.`zr``tick` (`A`)",
+            ),
+            (
+                DatabaseType::MariaDB,
+                "`sales.ops`.`order.items`",
+                "INSERT INTO `sales.ops`.`order.items` (`A`)",
+            ),
+            (
+                DatabaseType::Oracle,
+                "SCOTT.\"my table\"",
+                "INTO SCOTT.\"my table\" (A)",
+            ),
         ] {
-            assert_eq!(
-                column_kind_for_data_type(DatabaseType::Oracle, data_type),
-                kind,
-                "{data_type}"
-            );
+            let script = build_insert_script(&ImportRequest {
+                dialect: SqlWriteDialect::family_default(db_type),
+                table,
+                targets: &targets,
+                mapping: &mapping,
+                data: &data,
+                batch_rows: 100,
+            })
+            .expect("builds");
+            assert!(script.contains(expected), "{db_type}: {script}");
         }
     }
 
+    /// The one validator refuses a mapping the server would, and the DIALOG
+    /// asks it — so this is what the user sees before the modal closes.
     #[test]
-    fn mysql_types_classify_the_way_the_driver_would() {
-        for (data_type, kind) in [
-            ("varchar(50)", SqlValueKind::String),
-            ("longtext", SqlValueKind::String),
-            ("enum('a','b')", SqlValueKind::String),
-            ("json", SqlValueKind::String),
-            ("int unsigned", SqlValueKind::Number),
-            ("decimal(12,2)", SqlValueKind::Number),
-            ("bigint(20)", SqlValueKind::Number),
-            ("bit(1)", SqlValueKind::Number),
-            ("year(4)", SqlValueKind::Number),
-            ("date", SqlValueKind::Temporal),
-            ("datetime(6)", SqlValueKind::Temporal),
-            ("time(3)", SqlValueKind::Temporal),
-            ("varbinary(16)", SqlValueKind::Binary),
-            ("longblob", SqlValueKind::Binary),
-            ("geometry", SqlValueKind::Unknown),
-        ] {
-            for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
-                assert_eq!(
-                    column_kind_for_data_type(db_type, data_type),
-                    kind,
-                    "{data_type}"
-                );
-            }
-        }
+    fn the_shared_validator_refuses_two_file_columns_on_one_target() {
+        let targets = targets();
+        let data = data();
+        let error =
+            check_mapping(&targets, &vec![Some(0), Some(0), None], &data).expect_err("refused");
+        assert!(error.contains("Two file columns"), "{error}");
+        assert!(check_mapping(&targets, &vec![None, None, None], &data)
+            .expect_err("refused")
+            .contains("at least one"),);
+        assert!(check_mapping(&targets, &default_mapping(&data.columns, &targets), &data).is_ok());
     }
 
     #[test]
@@ -724,7 +1052,7 @@ mod tests {
         ];
         let mapping = default_mapping(&data.columns, &targets);
         let request = ImportRequest {
-            db_type: DatabaseType::MySQL,
+            dialect: SqlWriteDialect::family_default(DatabaseType::MySQL),
             table: "app.people",
             targets: &targets,
             mapping: &mapping,
@@ -751,7 +1079,7 @@ mod tests {
         let mapping = default_mapping(&data.columns, &targets);
         assert_eq!(
             describe(&ImportRequest {
-                db_type: DatabaseType::Oracle,
+                dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
                 table: "T",
                 targets: &targets,
                 mapping: &mapping,

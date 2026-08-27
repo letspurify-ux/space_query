@@ -9,12 +9,86 @@
 //! a `VARCHAR2` holding `2024-01-01` from being wrapped in `TO_DATE`, and a
 //! zero-padded code like `00123` from collapsing into a number.
 
-use crate::db::{quote_mysql_identifier, DatabaseType, SqlValueKind};
+use crate::db::{quote_mysql_identifier, ConnectionInfo, DatabaseType, SqlValueKind};
+use crate::ui::result_export::{ExportCell, ExportContent};
 use crate::ui::result_table::ResultTableWidget;
 
 /// The table name used when the base table cannot be resolved from the SQL
 /// (a join, a CTE, a synthetic grid). Same placeholder DataGrip emits.
 const UNKNOWN_TABLE_NAME: &str = "MY_TABLE";
+
+/// How SQL TEXT has to be written for one connection.
+///
+/// The backend family answers most of it: which identifier quotes, which
+/// conversion calls, whether `&` starts a substitution. One thing the family
+/// alone cannot answer is whether a backslash escapes inside a string literal.
+/// MySQL and MariaDB read `\` as an escape *unless* `NO_BACKSLASH_ESCAPES` is
+/// in `sql_mode` — and this app lets every connection choose its own
+/// (`ConnectionAdvancedSettings::mysql_sql_mode`, sent as `SET SESSION
+/// sql_mode` at connect). A writer that assumed the default doubles every
+/// backslash such a session then stores.
+///
+/// Carried as ONE value rather than as a [`DatabaseType`] beside a loose flag,
+/// so "MySQL family, but with Oracle's backslash rule" cannot be assembled by
+/// accident at a call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlWriteDialect {
+    db_type: DatabaseType,
+    /// Whether a `\` inside a string literal escapes the next character.
+    /// Always false outside the MySQL family: Oracle has no such escape.
+    backslash_escapes: bool,
+}
+
+impl SqlWriteDialect {
+    /// The rules the session on `info` actually runs under.
+    ///
+    /// This is the constructor to reach for wherever a connection is in hand;
+    /// it is the only one that can be right about `sql_mode`.
+    pub fn for_connection(info: &ConnectionInfo) -> Self {
+        let db_type = info.db_type;
+        Self {
+            db_type,
+            backslash_escapes: db_type.is_mysql_or_mariadb()
+                && !sql_mode_disables_backslash_escapes(&info.advanced.mysql_sql_mode),
+        }
+    }
+
+    /// The family's own default rules, for a caller with no connection to ask.
+    ///
+    /// Used where the text is not aimed at a specific session (a unit test) or
+    /// where no connection is reachable. It answers `NO_BACKSLASH_ESCAPES` with
+    /// the server default (escapes on), which is what this app's own default
+    /// `sql_mode` (`TRADITIONAL`) leaves in place.
+    pub fn family_default(db_type: DatabaseType) -> Self {
+        Self {
+            db_type,
+            backslash_escapes: db_type.is_mysql_or_mariadb(),
+        }
+    }
+
+    pub fn db_type(self) -> DatabaseType {
+        self.db_type
+    }
+
+    pub fn is_mysql_or_mariadb(self) -> bool {
+        self.db_type.is_mysql_or_mariadb()
+    }
+
+    fn backslash_escapes(self) -> bool {
+        self.backslash_escapes
+    }
+}
+
+/// Whether a `sql_mode` list turns backslash escaping off.
+///
+/// Only the explicit `NO_BACKSLASH_ESCAPES` token does: none of the compound
+/// modes this app offers (`TRADITIONAL`, `ANSI`, `ANSI_QUOTES`, MariaDB's
+/// `ORACLE`) includes it.
+fn sql_mode_disables_backslash_escapes(sql_mode: &str) -> bool {
+    sql_mode
+        .split(',')
+        .any(|mode| mode.trim().eq_ignore_ascii_case("NO_BACKSLASH_ESCAPES"))
+}
 
 /// A snapshot of what the user selected in the grid.
 ///
@@ -23,7 +97,8 @@ const UNKNOWN_TABLE_NAME: &str = "MY_TABLE";
 /// user did not select.
 #[derive(Clone, Debug)]
 pub struct GridSqlSelection {
-    pub db_type: DatabaseType,
+    /// How SQL text must be written for the connection this will run on.
+    pub dialect: SqlWriteDialect,
     /// Resolved base table, already qualified. `None` renders as `MY_TABLE`.
     pub table: Option<String>,
     /// Every non-internal grid column, in grid order.
@@ -33,10 +108,9 @@ pub struct GridSqlSelection {
     pub column_kinds: Vec<SqlValueKind>,
     /// Indexes into `all_columns` covered by the selection rectangle.
     pub selected_columns: Vec<usize>,
-    /// Selected rows, each aligned to `all_columns`.
-    pub rows: Vec<Vec<String>>,
-    /// Display text the grid uses for SQL NULL.
-    pub null_text: String,
+    /// Selected rows, each aligned to `all_columns`. SQL NULL is [`None`], never
+    /// a piece of text that reads like one.
+    pub rows: Vec<Vec<ExportCell>>,
 }
 
 impl GridSqlSelection {
@@ -49,12 +123,12 @@ impl GridSqlSelection {
 
     /// Quote a possibly dot-qualified name for this backend.
     fn quote_identifier(&self, name: &str) -> String {
-        quote_qualified_name(self.db_type, name)
+        quote_qualified_name(self.dialect.db_type(), name)
     }
 
     fn quote_column(&self, index: usize) -> String {
         let name = self.all_columns.get(index).map_or("", String::as_str);
-        quote_column_name(self.db_type, name)
+        quote_column_name(self.dialect.db_type(), name)
     }
 
     fn kind(&self, index: usize) -> SqlValueKind {
@@ -64,21 +138,89 @@ impl GridSqlSelection {
             .unwrap_or(SqlValueKind::Unknown)
     }
 
-    fn cell(&self, row: &[String], index: usize) -> String {
-        row.get(index).cloned().unwrap_or_default()
+    /// A cell of `row`. A column the row does not reach has no value at all,
+    /// which is SQL NULL.
+    fn cell<'a>(&self, row: &'a [ExportCell], index: usize) -> &'a ExportCell {
+        row.get(index).unwrap_or(&None)
     }
 
-    fn is_null(&self, row: &[String], index: usize) -> bool {
-        ResultTableWidget::value_represents_null(&self.cell(row, index), &self.null_text)
+    fn is_null(&self, row: &[ExportCell], index: usize) -> bool {
+        self.cell(row, index).is_none()
     }
 
-    fn literal(&self, row: &[String], index: usize) -> String {
-        sql_literal(
-            self.db_type,
-            self.kind(index),
-            &self.cell(row, index),
-            &self.null_text,
+    /// One cell as a literal, or the sentence saying why it cannot be written.
+    ///
+    /// The row NUMBER travels with the cell because it is half of the only
+    /// thing a refusal can tell the user — which value to look at — and the
+    /// builders are the last place that still knows it.
+    fn literal(
+        &self,
+        row_number: usize,
+        row: &[ExportCell],
+        index: usize,
+    ) -> Result<String, String> {
+        sql_literal_for_cell(self.dialect, self.kind(index), self.cell(row, index)).map_err(
+            |refusal| {
+                value_too_long_message(
+                    self.all_columns.get(index).map_or("?", String::as_str),
+                    row_number,
+                    refusal,
+                )
+            },
         )
+    }
+
+    /// Why SQL cannot be written for this selection, or `None`.
+    ///
+    /// Generated SQL addresses a column by NAME, and a result set does not
+    /// promise that a name belongs to one column: `SELECT a.id, b.id` gives two
+    /// columns both called `ID`, and every driver reports them that way. The
+    /// three shapes then fail three different ways, and two of them fail
+    /// SILENTLY — measured on Oracle 23ai and MySQL 8:
+    ///
+    /// - `INSERT INTO t (ID, ID) VALUES (1, 2)` — the server refuses
+    ///   (ORA-00957, MySQL 1110). Useless, but loud.
+    /// - `UPDATE t SET ID = 2 WHERE ID = 1` — RUNS. One of the two columns
+    ///   became the assignment and the other the key, and nothing says which.
+    /// - `ID = 1 AND ID = 2` — matches nothing, ever.
+    ///
+    /// The writers already learned this on the other side: `unique_field_names`
+    /// makes JSON keys and XML elements unique because a repeated name is one
+    /// name to every reader. SQL cannot take that way out — a renamed column
+    /// names no column — so this refuses instead, and says which name.
+    ///
+    /// `key_columns` is checked too, and against ALL columns rather than the
+    /// selected ones: a key is looked up by name, and picking the first match
+    /// would key the statement on a column the user cannot see it chose.
+    ///
+    /// Case-insensitively, which is not merely the convention the rest of this
+    /// module matches — it is what the emitted SQL means. The MySQL family
+    /// resolves a column name case-insensitively whatever the backticks say,
+    /// and [`quote_column_name`] writes an Oracle name that is a legal bare
+    /// identifier without quotes, so `ID` and `id` both reach the server as
+    /// `ID`. Two columns whose names differ only in case are therefore two
+    /// columns generated SQL cannot address apart either.
+    pub fn ambiguous_column_refusal(&self, key_columns: &[String]) -> Option<String> {
+        let selected = self
+            .selected_columns
+            .iter()
+            .filter_map(|index| self.all_columns.get(*index))
+            .map(String::as_str);
+        if let Some(name) = first_repeated_column_name(selected) {
+            return Some(ambiguous_column_message(&name));
+        }
+        for key in key_columns {
+            let wanted = key.trim();
+            let matches = self
+                .all_columns
+                .iter()
+                .filter(|column| column.trim().eq_ignore_ascii_case(wanted))
+                .count();
+            if matches > 1 {
+                return Some(ambiguous_column_message(wanted));
+            }
+        }
+        None
     }
 
     /// Column index for a name, matched case-insensitively the way SQL resolves
@@ -99,10 +241,10 @@ impl GridSqlSelection {
 /// Quote a possibly dot-qualified object name for `db_type`.
 pub fn quote_qualified_name(db_type: DatabaseType, name: &str) -> String {
     if db_type.is_mysql_or_mariadb() {
-        name.split('.')
-            .map(|segment| quote_mysql_identifier(segment.trim()))
-            .collect::<Vec<_>>()
-            .join(".")
+        // Quote-aware and idempotent: the name reaching here has often been
+        // quoted once already by the object browser, and a naive `split('.')`
+        // would re-quote those segments into a different name.
+        crate::db::quote_mysql_qualified_name(name)
     } else {
         // Oracle: legal unquoted identifiers stay unquoted, so generated SQL
         // reads the way a person would write it.
@@ -125,10 +267,88 @@ pub fn resolve_export_table(descriptor_table: Option<String>, source_sql: &str) 
         .filter(|table| !table.trim().is_empty())
 }
 
+/// The first name in `names` that is not the only one of its name, or `None`.
+///
+/// Compared the way SQL resolves an unquoted identifier, which is how every
+/// other name is paired here.
+pub fn first_repeated_column_name<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for name in names {
+        let name = name.trim();
+        if seen.iter().any(|taken| taken.eq_ignore_ascii_case(name)) {
+            return Some(name.to_string());
+        }
+        seen.push(name);
+    }
+    None
+}
+
+/// What to tell a user whose result offers generated SQL no column to name.
+///
+/// One sentence, because the grid asks it before a snapshot is taken
+/// ([`crate::ui::result_table::ResultTableWidget::sql_export_refusal`]) and the
+/// builders answer it again for a caller with no grid at all — the object
+/// tree's `Export Data...`, which used to write an EMPTY file and report the
+/// table's full row count for it.
+pub fn no_writable_column_message() -> String {
+    "This result has no column that can be written into an INSERT.".to_string()
+}
+
+/// What to tell a user whose result has two columns of one name.
+///
+/// One sentence, because two askers reach it: the export path decides after the
+/// format is chosen, and the grid's `Copy as SQL …` decides on the click.
+pub fn ambiguous_column_message(name: &str) -> String {
+    format!(
+        "More than one column of this result is named {name}. Generated SQL addresses a \
+         column by name, so it cannot tell them apart — give them different aliases in the \
+         query, or select just one of them."
+    )
+}
+
+/// The columns an `INSERT` may name, as indexes into `all_columns`.
+///
+/// A column the server computes cannot be given a value — Oracle answers
+/// `ORA-54013: INSERT operation disallowed on virtual columns`, MySQL and
+/// MariaDB answer error 3105 — so a `SQL Inserts` export that names one writes
+/// a script that cannot run. `SQL Inserts` is the one format whose PURPOSE is
+/// to be re-run, which is why "write what the grid shows" is the wrong rule
+/// for it and right for every other format.
+///
+/// The same rule the import side already applies in
+/// [`crate::ui::object_browser::ObjectBrowserWidget::import_target_columns`],
+/// stated once here so the two ends of the round trip cannot drift: what an
+/// import will not offer as a target is what an export must not name.
+///
+/// Names are matched the way SQL resolves an unquoted identifier, because that
+/// is how the catalog and the result set are paired everywhere else here.
+pub fn writable_column_indices(all_columns: &[String], generated: &[String]) -> Vec<usize> {
+    (0..all_columns.len())
+        .filter(|index| {
+            let name = all_columns[*index].trim();
+            !generated
+                .iter()
+                .any(|skipped| skipped.trim().eq_ignore_ascii_case(name))
+        })
+        .collect()
+}
+
 /// `INSERT INTO <table> (<selected columns>) VALUES (…);` per selected row.
-pub fn build_sql_inserts(selection: &GridSqlSelection) -> String {
-    if selection.selected_columns.is_empty() || selection.rows.is_empty() {
-        return String::new();
+///
+/// Every reason this can write nothing comes back as an
+/// [`ExportContent::Refused`] carrying the sentence to show. It used to be an
+/// empty string, which a caller cannot tell from an empty result — and the
+/// callers then reported the INPUT row count for it, announcing an empty file
+/// as a full export.
+pub fn build_sql_inserts(selection: &GridSqlSelection) -> ExportContent {
+    if let Some(reason) = selection.ambiguous_column_refusal(&[]) {
+        return ExportContent::Refused(reason);
+    }
+    if selection.selected_columns.is_empty() {
+        return ExportContent::Refused(no_writable_column_message());
+    }
+    if selection.rows.is_empty() {
+        return ExportContent::nothing();
     }
     let table = selection.table_name();
     let columns = selection
@@ -139,18 +359,23 @@ pub fn build_sql_inserts(selection: &GridSqlSelection) -> String {
         .join(", ");
 
     let mut out = String::new();
-    for row in &selection.rows {
-        let values = selection
+    let mut written = 0usize;
+    for (row_index, row) in selection.rows.iter().enumerate() {
+        let values = match selection
             .selected_columns
             .iter()
-            .map(|index| selection.literal(row, *index))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .map(|index| selection.literal(row_index + 1, row, *index))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(values) => values.join(", "),
+            Err(reason) => return ExportContent::Refused(reason),
+        };
         out.push_str(&format!(
             "INSERT INTO {table} ({columns}) VALUES ({values});\n"
         ));
+        written += 1;
     }
-    out
+    ExportContent::written(out, written)
 }
 
 /// `UPDATE <table> SET … WHERE <key columns>;` per selected row.
@@ -158,9 +383,18 @@ pub fn build_sql_inserts(selection: &GridSqlSelection) -> String {
 /// `key_columns` are primary-key column names. When none are known the WHERE
 /// clause is omitted, matching DataGrip: it is the caller's job to tell the user
 /// that happened.
-pub fn build_sql_updates(selection: &GridSqlSelection, key_columns: &[String]) -> String {
-    if selection.selected_columns.is_empty() || selection.rows.is_empty() {
-        return String::new();
+pub fn build_sql_updates(selection: &GridSqlSelection, key_columns: &[String]) -> ExportContent {
+    // This is the shape that used to RUN while meaning something nobody asked
+    // for, so the gate is inside the builder now rather than beside it.
+    if let Some(reason) = selection.ambiguous_column_refusal(key_columns) {
+        return ExportContent::Refused(reason);
+    }
+
+    if selection.selected_columns.is_empty() {
+        return ExportContent::Refused(no_writable_column_message());
+    }
+    if selection.rows.is_empty() {
+        return ExportContent::nothing();
     }
     let table = selection.table_name();
 
@@ -184,31 +418,38 @@ pub fn build_sql_updates(selection: &GridSqlSelection, key_columns: &[String]) -
     }
 
     let mut out = String::new();
-    for row in &selection.rows {
-        let assignments = assigned
+    let mut written = 0usize;
+    for (row_index, row) in selection.rows.iter().enumerate() {
+        let row_number = row_index + 1;
+        let assignments = match assigned
             .iter()
             .map(|index| {
-                format!(
-                    "{} = {}",
-                    selection.quote_column(*index),
-                    selection.literal(row, *index)
-                )
+                selection
+                    .literal(row_number, row, *index)
+                    .map(|literal| format!("{} = {literal}", selection.quote_column(*index)))
             })
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(parts) => parts.join(", "),
+            Err(reason) => return ExportContent::Refused(reason),
+        };
         let mut statement = format!("UPDATE {table} SET {assignments}");
         if !keys.is_empty() {
-            let predicates = keys
+            let predicates = match keys
                 .iter()
-                .map(|index| equality_predicate(selection, row, *index))
-                .collect::<Vec<_>>()
-                .join(" AND ");
+                .map(|index| equality_predicate(selection, row_number, row, *index))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(parts) => parts.join(" AND "),
+                Err(reason) => return ExportContent::Refused(reason),
+            };
             statement.push_str(&format!(" WHERE {predicates}"));
         }
         statement.push_str(";\n");
         out.push_str(&statement);
+        written += 1;
     }
-    out
+    ExportContent::written(out, written)
 }
 
 /// A WHERE condition that matches exactly the selected cells.
@@ -218,9 +459,15 @@ pub fn build_sql_updates(selection: &GridSqlSelection, key_columns: &[String]) -
 /// departures, both because the alternative cannot match: a lone value uses `=`
 /// instead of `IN (x)`, and NULLs are lifted out of the `IN` list into
 /// `IS NULL`, since `IN` never matches NULL.
-pub fn build_where_clause(selection: &GridSqlSelection) -> String {
-    if selection.selected_columns.is_empty() || selection.rows.is_empty() {
-        return String::new();
+pub fn build_where_clause(selection: &GridSqlSelection) -> ExportContent {
+    if let Some(reason) = selection.ambiguous_column_refusal(&[]) {
+        return ExportContent::Refused(reason);
+    }
+    if selection.selected_columns.is_empty() {
+        return ExportContent::Refused(no_writable_column_message());
+    }
+    if selection.rows.is_empty() {
+        return ExportContent::nothing();
     }
 
     if let [column] = selection.selected_columns.as_slice() {
@@ -228,40 +475,52 @@ pub fn build_where_clause(selection: &GridSqlSelection) -> String {
     }
 
     let mut groups: Vec<String> = Vec::new();
-    for row in &selection.rows {
-        let group = selection
+    for (row_index, row) in selection.rows.iter().enumerate() {
+        let group = match selection
             .selected_columns
             .iter()
-            .map(|index| equality_predicate(selection, row, *index))
-            .collect::<Vec<_>>()
-            .join(" AND ");
+            .map(|index| equality_predicate(selection, row_index + 1, row, *index))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(parts) => parts.join(" AND "),
+            Err(reason) => return ExportContent::Refused(reason),
+        };
         if !group.is_empty() && !groups.contains(&group) {
             groups.push(group);
         }
     }
 
+    // A clause covers every row it was built from, dedup or not: the count says
+    // what the user asked for, and the text says it as briefly as it can.
+    let rows = selection.rows.len();
     match groups.len() {
-        0 => String::new(),
+        0 => ExportContent::nothing(),
         // One row needs no grouping parentheses.
-        1 => groups.remove(0),
-        _ => groups
-            .into_iter()
-            .map(|group| format!("({group})"))
-            .collect::<Vec<_>>()
-            .join(" OR "),
+        1 => ExportContent::written(groups.remove(0), rows),
+        _ => ExportContent::written(
+            groups
+                .into_iter()
+                .map(|group| format!("({group})"))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+            rows,
+        ),
     }
 }
 
-fn single_column_where(selection: &GridSqlSelection, column: usize) -> String {
+fn single_column_where(selection: &GridSqlSelection, column: usize) -> ExportContent {
     let name = selection.quote_column(column);
     let mut values: Vec<String> = Vec::new();
     let mut has_null = false;
-    for row in &selection.rows {
+    for (row_index, row) in selection.rows.iter().enumerate() {
         if selection.is_null(row, column) {
             has_null = true;
             continue;
         }
-        let literal = selection.literal(row, column);
+        let literal = match selection.literal(row_index + 1, row, column) {
+            Ok(literal) => literal,
+            Err(reason) => return ExportContent::Refused(reason),
+        };
         if !values.contains(&literal) {
             values.push(literal);
         }
@@ -280,64 +539,330 @@ fn single_column_where(selection: &GridSqlSelection, column: usize) -> String {
             clause = format!("{clause} OR {null_test}");
         }
     }
-    clause
+    ExportContent::written(clause, selection.rows.len())
 }
 
-fn equality_predicate(selection: &GridSqlSelection, row: &[String], index: usize) -> String {
+fn equality_predicate(
+    selection: &GridSqlSelection,
+    row_number: usize,
+    row: &[ExportCell],
+    index: usize,
+) -> Result<String, String> {
     let name = selection.quote_column(index);
     if selection.is_null(row, index) {
-        format!("{name} IS NULL")
+        Ok(format!("{name} IS NULL"))
     } else {
-        format!("{name} = {}", selection.literal(row, index))
+        Ok(format!(
+            "{name} = {}",
+            selection.literal(row_number, row, index)?
+        ))
     }
 }
 
-/// Render one displayed cell value as a SQL literal for `db_type`.
-pub fn sql_literal(
-    db_type: DatabaseType,
+/// Render one exported cell as a SQL literal.
+///
+/// SQL NULL is [`None`] and nothing else: by the time a cell reaches here the
+/// question "was this value NULL?" has already been answered once, where the
+/// answer was still knowable, and no text is re-examined for it.
+pub fn sql_literal_for_cell(
+    dialect: SqlWriteDialect,
+    kind: SqlValueKind,
+    cell: &ExportCell,
+) -> Result<String, ValueTooLongForLiteral> {
+    match cell {
+        None => Ok("NULL".to_string()),
+        Some(value) => sql_literal_for_value(dialect, kind, value),
+    }
+}
+
+/// Render `value` as a literal for `kind`.
+///
+/// The one place SQL literal text is written for a value this app did not
+/// author, and therefore the one place the dialect's escaping rules are
+/// applied — including the Oracle substitution defusing, so text that is safe
+/// to STORE is also safe to RUN.
+///
+/// `Err` means no statement can carry this value: see
+/// [`ValueTooLongForLiteral`]. It is a `Result` rather than a lenient `String`
+/// because the alternative is writing SQL that is known to fail, which is the
+/// one thing a writer must not do quietly.
+pub fn sql_literal_for_value(
+    dialect: SqlWriteDialect,
     kind: SqlValueKind,
     value: &str,
-    null_text: &str,
-) -> String {
-    if ResultTableWidget::value_represents_null(value, null_text) {
-        return "NULL".to_string();
-    }
-    sql_literal_for_value(db_type, kind, value)
-}
-
-/// Render `value` as a literal for `kind` with no NULL detection at all.
-///
-/// [`sql_literal`] reads the grid, where an empty cell and the text `NULL` both
-/// mean SQL NULL. A caller that already knows a value is not NULL — a file
-/// import, where the format said so explicitly — needs the empty string to stay
-/// the empty string, and this is that entry point.
-pub fn sql_literal_for_value(db_type: DatabaseType, kind: SqlValueKind, value: &str) -> String {
-    let mysql_family = db_type.is_mysql_or_mariadb();
-    match kind {
+) -> Result<String, ValueTooLongForLiteral> {
+    let mysql_family = dialect.is_mysql_or_mariadb();
+    let literal = match kind {
         SqlValueKind::Number | SqlValueKind::Boolean => {
-            numeric_literal_or_quoted(value, kind, mysql_family)
+            numeric_literal_or_quoted(value, kind, dialect)
         }
         SqlValueKind::Temporal => {
             if mysql_family {
                 // MySQL and MariaDB accept the ISO text the grid already shows.
-                quoted_string(value, mysql_family)
+                quoted_string(value, dialect)
             } else {
-                oracle_temporal_literal(value)
+                oracle_temporal_literal(value, dialect)
             }
         }
         SqlValueKind::Binary => {
             if mysql_family {
                 // The bytes are gone: the grid holds a lossy UTF-8 rendering of
                 // them, so the displayed text is all there is to emit.
-                quoted_string(value, mysql_family)
+                quoted_string(value, dialect)
             } else {
-                // Oracle RAW is displayed as uppercase hex, which HEXTORAW
-                // turns back into the same bytes.
-                format!("HEXTORAW('{}')", value.trim())
+                oracle_binary_literal(value, dialect)
             }
         }
-        SqlValueKind::String | SqlValueKind::Unknown => quoted_string(value, mysql_family),
+        SqlValueKind::String => oracle_text_literal(value, dialect),
+        SqlValueKind::Unknown => quoted_string(value, dialect),
+    }?;
+    Ok(defuse_substitution(dialect, &literal))
+}
+
+/// The literal for a value that is going into MySQL-family text.
+///
+/// The one dialect with no limit on how much a single literal may hold, so this
+/// cannot refuse and does not make its caller pretend otherwise. It picks the
+/// dialect itself rather than taking one, which is what keeps the "cannot fail"
+/// claim true: an Oracle caller cannot reach this at all.
+///
+/// Its caller is the bind prompt, which substitutes a prompted value into the
+/// statement only on MySQL and MariaDB — Oracle BINDS its values, so no literal
+/// is written there.
+pub fn mysql_family_literal(kind: SqlValueKind, value: &str) -> String {
+    let dialect = SqlWriteDialect::family_default(DatabaseType::MySQL);
+    sql_literal_for_value(dialect, kind, value).unwrap_or_else(|_| {
+        debug_assert!(false, "the MySQL family has no per-literal limit");
+        // Unreachable, and if it ever were not, this is what the writer did
+        // before the limit existed: quote it and let the server answer.
+        format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+    })
+}
+
+/// Keep an `&` that came out of the data from being read as a substitution
+/// variable.
+///
+/// Oracle's client-side `DEFINE` is on by default — in this app too
+/// ([`crate::db::SessionState::define_enabled`]) — and substitutes `&name`
+/// *inside* string literals, the way SQL*Plus does. So a row holding `AT&T`
+/// would stop and ask the user to "Enter value for T", whether it arrived from
+/// a file being imported or from a `SQL Inserts` export the user re-runs. A
+/// value is data, never a variable, so every `&` is lifted out of the literal
+/// as `CHR(38)`. The stored text is identical, and the session's `DEFINE`
+/// setting is left exactly as the user set it.
+///
+/// Only a plain string literal is rewritten. A number, a `TO_DATE(…)`, or a
+/// `HEXTORAW(…)` cannot contain an `&`, and MySQL and MariaDB have no
+/// substitution at all. Applying it twice is inert: the first pass leaves no
+/// `&` behind.
+pub fn defuse_substitution(dialect: SqlWriteDialect, literal: &str) -> String {
+    if dialect.is_mysql_or_mariadb() || !literal.contains('&') {
+        return literal.to_string();
     }
+    let Some(inner) = literal
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    else {
+        return literal.to_string();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for (index, piece) in inner.split('&').enumerate() {
+        if index > 0 {
+            parts.push("CHR(38)".to_string());
+        }
+        if !piece.is_empty() {
+            parts.push(format!("'{piece}'"));
+        }
+    }
+    parts.join("||")
+}
+
+/// How many bytes of TEXT one Oracle string literal may hold, quotes excluded.
+///
+/// Oracle's own limit, and it is on the LITERAL rather than on the statement:
+/// a longer one is `ORA-01704: string literal too long` whatever the target
+/// column is, a `CLOB` included. 4000 is what a database with the default
+/// `MAX_STRING_SIZE = STANDARD` accepts — measured on Oracle 23ai, where 4000
+/// went in and 4001 did not, and again through `HEXTORAW('<4000 hex digits>')`,
+/// which is a full `RAW(2000)` and inserts. A database set to `EXTENDED` allows
+/// 32767, but which one a connection is talking to is not something this writer
+/// knows, and the smaller figure is correct on both.
+///
+/// Counted on the literal's CONTENT — the escaped text between the quotes —
+/// because that is what the server counts. Counting the two quotes as well
+/// would refuse a full `RAW(2000)` that the server accepts.
+const ORACLE_MAX_LITERAL_BYTES: usize = 4000;
+
+/// A value that no single SQL literal can carry.
+///
+/// The Oracle-only end of "this app never writes SQL it knows will fail". Text
+/// has a way out — [`oracle_text_literal`] writes it as a `TO_CLOB(…)||…`
+/// chain — and nothing else does: a `BLOB` reaches the grid as hex, and neither
+/// `HEXTORAW` nor any concatenation can build a `RAW` past its own limit. So
+/// the writer says so, by name and before anything runs, instead of handing the
+/// server a statement that answers `ORA-01704` halfway through an import.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValueTooLongForLiteral {
+    /// Bytes the literal's content would need, escaping included.
+    pub literal_bytes: usize,
+}
+
+impl ValueTooLongForLiteral {
+    pub fn limit() -> usize {
+        ORACLE_MAX_LITERAL_BYTES
+    }
+}
+
+/// What to tell a user whose value cannot be written as one SQL literal.
+///
+/// ONE sentence, because three askers reach it: a `SQL Inserts` export, the
+/// grid's `Copy as SQL …`, and a file import — and the row and column are the
+/// only things that tell the user WHICH value to look at. Row numbers are
+/// 1-based and count the rows being written, which is what the user sees.
+///
+/// Deliberately silent about what to do instead: the export path can suggest a
+/// data format and the import path cannot, so the advice belongs to the caller
+/// and the fact belongs here.
+pub fn value_too_long_message(
+    column: &str,
+    row_number: usize,
+    refusal: ValueTooLongForLiteral,
+) -> String {
+    format!(
+        "Row {row_number}, column {column}: this value needs {} bytes as a SQL literal and Oracle \
+         accepts at most {} in one. Only text can be written as a concatenation, and this value \
+         is not text, so no statement can carry it.",
+        refusal.literal_bytes,
+        ValueTooLongForLiteral::limit()
+    )
+}
+
+/// A text value as Oracle SQL, in as many literals as it takes.
+///
+/// One literal while it fits, which is every ordinary value and byte-for-byte
+/// what this wrote before. Past that, `TO_CLOB('…')||TO_CLOB('…')` — Oracle's
+/// own way to build a value longer than a literal can be, and the only way a
+/// file with a long text column can be imported at all: the whole import used
+/// to end at `ORA-01704`, and no batch size could help, because the limit is on
+/// one VALUE.
+///
+/// A `VARCHAR2(n)` target still refuses a value that does not fit it, in its own
+/// words — which is an honest complaint about the DATA rather than about the SQL
+/// this app wrote.
+///
+/// Each piece is defused on its own: [`defuse_substitution`] only rewrites a
+/// plain literal, so an `&` inside a concatenation would otherwise reach the
+/// session's `DEFINE` and stop to ask for a value.
+///
+/// The MySQL family has no per-literal limit — what bites there is the packet,
+/// which [`crate::ui::table_import::MAX_BATCH_BYTES`] bounds — so it keeps the
+/// single literal.
+fn oracle_text_literal(
+    value: &str,
+    dialect: SqlWriteDialect,
+) -> Result<String, ValueTooLongForLiteral> {
+    // Asked of the writer itself rather than measured a second time here: one
+    // rule about what fits in a literal, stated where a literal is written.
+    match quoted_string(value, dialect) {
+        Ok(single) => return Ok(single),
+        Err(_) => debug_assert!(!dialect.is_mysql_or_mariadb()),
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut piece = String::new();
+    let mut piece_bytes = 0usize;
+    for ch in value.chars() {
+        // A quote is DOUBLED on the way into a literal, so the escaped length
+        // is what has to stay under the limit, not the source length.
+        let cost = if ch == '\'' {
+            2 * ch.len_utf8()
+        } else {
+            ch.len_utf8()
+        };
+        if !piece.is_empty() && piece_bytes + cost > ORACLE_MAX_LITERAL_BYTES {
+            parts.push(defuse_substitution(
+                dialect,
+                &quoted_string(&piece, dialect)?,
+            ));
+            piece.clear();
+            piece_bytes = 0;
+        }
+        piece.push(ch);
+        piece_bytes += cost;
+    }
+    if !piece.is_empty() {
+        parts.push(defuse_substitution(
+            dialect,
+            &quoted_string(&piece, dialect)?,
+        ));
+    }
+    Ok(parts
+        .into_iter()
+        .map(|part| format!("TO_CLOB({part})"))
+        .collect::<Vec<_>>()
+        .join("||"))
+}
+
+/// Oracle RAW is displayed as an even run of hex digits, which `HEXTORAW`
+/// turns back into the same bytes — but only text this can PROVE is that shape
+/// may be spliced into the call.
+///
+/// `HEXTORAW('<value>')` used to be built by interpolation, and it was the one
+/// literal here that neither proved its value nor escaped it. That is not a
+/// theoretical hole: this writer is also what an IMPORT uses, so the value is
+/// whatever a file said, and a cell holding
+/// `41')) SELECT * FROM DUAL; DROP TABLE t; --` closed the call, closed the
+/// VALUES list, ended the statement and added one of its own — which the app's
+/// own script splitter then handed to the executor as a separate statement.
+///
+/// Nothing is lost by falling back to a quoted string: Oracle applies the SAME
+/// implicit hex conversion to a string literal assigned to a RAW/BLOB column
+/// (`INSERT INTO t (r) VALUES ('0102FF')` stores the same three bytes as
+/// `HEXTORAW('0102FF')`), and raises the SAME `ORA-01465: invalid hex number`
+/// when the text is not hex. So the fallback keeps the meaning, keeps the
+/// error, and — because it goes through [`quoted_string`] — cannot carry a
+/// quote out of the literal. It is also a plain literal again, so
+/// [`defuse_substitution`] can reach an `&` inside it, which it never could
+/// through `HEXTORAW(…)`.
+fn oracle_binary_literal(
+    value: &str,
+    dialect: SqlWriteDialect,
+) -> Result<String, ValueTooLongForLiteral> {
+    let text = value.trim();
+    if is_plain_hex_literal(text) {
+        // A full `RAW(2000)` is exactly 4000 digits and inserts; a `LONG RAW`
+        // or a `BLOB` read as hex goes further and cannot be written at all.
+        return Ok(format!("HEXTORAW('{}')", spliced_literal_content(text)?));
+    }
+    quoted_string(value, dialect)
+}
+
+/// Text this writer has already proven cannot carry a quote, on its way into a
+/// conversion call.
+///
+/// The limit is the LITERAL's, so it applies here too: `HEXTORAW` and
+/// `TO_TIMESTAMP` wrap a literal, they do not replace one. Stated once so the
+/// two calls that splice proven text cannot come to disagree with
+/// [`quoted_string`], which is where every other literal is measured.
+fn spliced_literal_content(text: &str) -> Result<&str, ValueTooLongForLiteral> {
+    if text.len() > ORACLE_MAX_LITERAL_BYTES {
+        return Err(ValueTooLongForLiteral {
+            literal_bytes: text.len(),
+        });
+    }
+    Ok(text)
+}
+
+/// Whether this text is what `HEXTORAW` accepts: a non-empty, even-length run
+/// of hex digits and nothing else.
+///
+/// The even length is Oracle's own rule — a hex string is a sequence of BYTES,
+/// so an odd digit count is `ORA-01465` too — and requiring it here means the
+/// unquoted form is only ever reached by text the server will also accept.
+pub(crate) fn is_plain_hex_literal(text: &str) -> bool {
+    !text.is_empty()
+        && text.len().is_multiple_of(2)
+        && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// A number is emitted as SQL TEXT, so it has to BE a number.
@@ -357,7 +882,11 @@ pub fn sql_literal_for_value(db_type: DatabaseType, kind: SqlValueKind, value: &
 /// know the value came from a person say so themselves: the bind prompt refuses
 /// the run and names the placeholder rather than quietly comparing against a
 /// string.
-fn numeric_literal_or_quoted(value: &str, kind: SqlValueKind, mysql_family: bool) -> String {
+fn numeric_literal_or_quoted(
+    value: &str,
+    kind: SqlValueKind,
+    dialect: SqlWriteDialect,
+) -> Result<String, ValueTooLongForLiteral> {
     let trimmed = value.trim();
     let provable = is_plain_numeric_literal(trimmed)
         // `TRUE`/`FALSE` are how a boolean is written where one exists, and
@@ -365,9 +894,9 @@ fn numeric_literal_or_quoted(value: &str, kind: SqlValueKind, mysql_family: bool
         || (kind == SqlValueKind::Boolean
             && (trimmed.eq_ignore_ascii_case("TRUE") || trimmed.eq_ignore_ascii_case("FALSE")));
     if provable {
-        trimmed.to_string()
+        Ok(trimmed.to_string())
     } else {
-        quoted_string(value, mysql_family)
+        quoted_string(value, dialect)
     }
 }
 
@@ -416,16 +945,35 @@ pub(crate) fn is_plain_numeric_literal(text: &str) -> bool {
     idx == bytes.len()
 }
 
-fn quoted_string(value: &str, mysql_family: bool) -> String {
-    let escaped = if mysql_family {
-        // MySQL and MariaDB treat `\` as an escape inside string literals unless
-        // NO_BACKSLASH_ESCAPES is set, and this app defaults to
-        // sql_mode=TRADITIONAL, which does not set it.
+/// The ONE place a quoted literal is written — and therefore the one place
+/// Oracle's limit on how much ONE literal may hold is enforced.
+///
+/// The limit used to live in [`oracle_text_literal`], which is reached only by
+/// `SqlValueKind::String`. Every other kind that falls back to a quoted string
+/// — `Unknown` (a `BLOB`, read as hex), an unprovable `Number`, an `INTERVAL`
+/// that no `TO_*` shape matched — walked straight past it, so this app's own
+/// `SQL Inserts` export of a `BLOB` wrote a file that answers `ORA-01704` when
+/// re-imported (measured, thin and OCI alike). A rule that belongs to a value
+/// cannot live in one kind's branch.
+///
+/// The MySQL family has no per-literal limit; what bites there is the packet,
+/// which [`crate::ui::table_import::MAX_BATCH_BYTES`] bounds.
+fn quoted_string(value: &str, dialect: SqlWriteDialect) -> Result<String, ValueTooLongForLiteral> {
+    // A doubled quote is how EVERY dialect here spells one inside a literal.
+    // The backslash is the only disagreement, and the dialect — not the family
+    // — answers it, because a MySQL-family connection running with
+    // `NO_BACKSLASH_ESCAPES` stores a doubled backslash as two characters.
+    let escaped = if dialect.backslash_escapes() {
         value.replace('\\', "\\\\").replace('\'', "''")
     } else {
         value.replace('\'', "''")
     };
-    format!("'{escaped}'")
+    if !dialect.is_mysql_or_mariadb() && escaped.len() > ORACLE_MAX_LITERAL_BYTES {
+        return Err(ValueTooLongForLiteral {
+            literal_bytes: escaped.len(),
+        });
+    }
+    Ok(format!("'{escaped}'"))
 }
 
 /// Wrap an Oracle date/timestamp in the conversion its displayed shape needs.
@@ -433,7 +981,10 @@ fn quoted_string(value: &str, mysql_family: bool) -> String {
 /// The shapes are exhaustive over what the Oracle executors render, so an
 /// unrecognized one means the value is not a plain date — an INTERVAL, say —
 /// and is safest emitted as a string.
-fn oracle_temporal_literal(value: &str) -> String {
+fn oracle_temporal_literal(
+    value: &str,
+    dialect: SqlWriteDialect,
+) -> Result<String, ValueTooLongForLiteral> {
     let text = value.trim();
     let (datetime, zone) = split_timezone_suffix(text);
     let (date_part, time_part) = match datetime.split_once(' ') {
@@ -441,35 +992,46 @@ fn oracle_temporal_literal(value: &str) -> String {
         None => (datetime, None),
     };
     if !is_iso_date(date_part) {
-        return quoted_string(value, false);
+        return quoted_string(value, dialect);
     }
     let Some(time_part) = time_part else {
-        return format!("TO_DATE('{text}','YYYY-MM-DD')");
+        return Ok(format!(
+            "TO_DATE('{}','YYYY-MM-DD')",
+            spliced_literal_content(text)?
+        ));
     };
     let (clock, fraction) = match time_part.split_once('.') {
         Some((clock, fraction)) => (clock, Some(fraction)),
         None => (time_part, None),
     };
     if !is_clock_time(clock) {
-        return quoted_string(value, false);
+        return quoted_string(value, dialect);
     }
-    match (fraction, zone) {
-        (None, None) => format!("TO_DATE('{text}','YYYY-MM-DD HH24:MI:SS')"),
-        (Some(fraction), None) if is_all_digits(fraction) => {
-            format!("TO_TIMESTAMP('{text}','YYYY-MM-DD HH24:MI:SS.FF')")
-        }
+    Ok(match (fraction, zone) {
+        (None, None) => format!(
+            "TO_DATE('{}','YYYY-MM-DD HH24:MI:SS')",
+            spliced_literal_content(text)?
+        ),
+        // A fractional part is digits, and nothing here bounds how many of them
+        // a FILE may carry — the drivers write at most nine.
+        (Some(fraction), None) if is_all_digits(fraction) => format!(
+            "TO_TIMESTAMP('{}','YYYY-MM-DD HH24:MI:SS.FF')",
+            spliced_literal_content(text)?
+        ),
         // The zone is re-joined with an explicit space so the text matches the
         // format model exactly. The drivers render the offset without one, and
         // Oracle then reads `TZH` off a value whose sign is where the space
         // should be — silently turning `-05:30` into `+05:30`.
-        (Some(fraction), Some(zone)) if is_all_digits(fraction) => {
-            format!("TO_TIMESTAMP_TZ('{datetime} {zone}','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')")
-        }
-        (None, Some(zone)) => {
-            format!("TO_TIMESTAMP_TZ('{datetime} {zone}','YYYY-MM-DD HH24:MI:SS TZH:TZM')")
-        }
-        _ => quoted_string(value, false),
-    }
+        (Some(fraction), Some(zone)) if is_all_digits(fraction) => format!(
+            "TO_TIMESTAMP_TZ('{} {zone}','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')",
+            spliced_literal_content(datetime)?
+        ),
+        (None, Some(zone)) => format!(
+            "TO_TIMESTAMP_TZ('{} {zone}','YYYY-MM-DD HH24:MI:SS TZH:TZM')",
+            spliced_literal_content(datetime)?
+        ),
+        _ => return quoted_string(value, dialect),
+    })
 }
 
 /// Split a trailing `+HH:MM` / `-HH:MM` zone offset from a rendered timestamp.
@@ -610,7 +1172,7 @@ mod tests {
                 "12345678901234567890123",
             ] {
                 assert_eq!(
-                    sql_literal_for_value(db_type, SqlValueKind::Number, value),
+                    value_literal(db_type, SqlValueKind::Number, value),
                     value.trim(),
                     "{db_type}: {value} is a number and must be emitted as one"
                 );
@@ -627,7 +1189,7 @@ mod tests {
                 "--1",
                 "1 2",
             ] {
-                let literal = sql_literal_for_value(db_type, SqlValueKind::Number, value);
+                let literal = value_literal(db_type, SqlValueKind::Number, value);
                 assert!(
                     literal.starts_with('\'') && literal.ends_with('\''),
                     "{db_type}: {value:?} is not a number and must be quoted, got {literal}"
@@ -641,7 +1203,7 @@ mod tests {
             // would have the server read `'TRUE'` as 0.
             for value in ["TRUE", "false", "1", "0"] {
                 assert_eq!(
-                    sql_literal_for_value(db_type, SqlValueKind::Boolean, value),
+                    value_literal(db_type, SqlValueKind::Boolean, value),
                     value.trim(),
                     "{db_type}: {value} is a boolean literal"
                 );
@@ -649,13 +1211,19 @@ mod tests {
         }
     }
 
+    /// A selection fixture.
+    ///
+    /// A cell written as the fixture's [`NULL_TEXT`] is SQL NULL — the fixtures
+    /// have always meant it that way, and a grid snapshot now answers that
+    /// question once, where it is knowable, instead of letting every writer
+    /// re-derive it from the text. Everything else is a value.
     fn selection(
         db_type: DatabaseType,
         columns: &[(&str, SqlValueKind)],
         rows: &[&[&str]],
     ) -> GridSqlSelection {
         GridSqlSelection {
-            db_type,
+            dialect: SqlWriteDialect::family_default(db_type),
             table: Some("HR.EMP".to_string()),
             all_columns: columns
                 .iter()
@@ -665,20 +1233,60 @@ mod tests {
             selected_columns: (0..columns.len()).collect(),
             rows: rows
                 .iter()
-                .map(|row| row.iter().map(|value| (*value).to_string()).collect())
+                .map(|row| row.iter().map(|value| cell(value)).collect())
                 .collect(),
-            null_text: NULL_TEXT.to_string(),
+        }
+    }
+
+    /// One fixture cell: SQL NULL, or the text itself.
+    fn cell(value: &str) -> ExportCell {
+        (value != NULL_TEXT).then(|| value.to_string())
+    }
+
+    /// The literal for a fixture cell.
+    ///
+    /// Unwraps on purpose: every fixture here is a value that CAN be written,
+    /// so a refusal is a defect in the writer and a panic naming the cell is
+    /// the most useful thing a test can do with it. The refusal path has tests
+    /// of its own — see `a_value_too_long_for_any_literal_is_refused_by_name`.
+    fn literal_for(db_type: DatabaseType, kind: SqlValueKind, cell: ExportCell) -> String {
+        sql_literal_for_cell(SqlWriteDialect::family_default(db_type), kind, &cell)
+            .unwrap_or_else(|refusal| panic!("{db_type} {kind:?} {cell:?} refused: {refusal:?}"))
+    }
+
+    /// [`sql_literal_for_value`] for a fixture value, with the same rule.
+    fn value_literal(db_type: DatabaseType, kind: SqlValueKind, value: &str) -> String {
+        literal_for(db_type, kind, Some(value.to_string()))
+    }
+
+    /// The text a builder wrote, for a fixture it must not refuse.
+    ///
+    /// A refusal is a defect for these fixtures, and its sentence is the most
+    /// useful thing to fail with. The refusal paths are asserted directly.
+    fn written(built: ExportContent) -> String {
+        match built.into_parts() {
+            Ok((text, _)) => text,
+            Err(reason) => panic!("the builder refused a fixture it should write: {reason}"),
         }
     }
 
     fn oracle_literal(kind: SqlValueKind, value: &str) -> String {
-        sql_literal(DatabaseType::Oracle, kind, value, NULL_TEXT)
+        literal_for(DatabaseType::Oracle, kind, Some(value.to_string()))
     }
 
     fn mysql_literal(kind: SqlValueKind, value: &str) -> String {
-        sql_literal(DatabaseType::MySQL, kind, value, NULL_TEXT)
+        literal_for(DatabaseType::MySQL, kind, Some(value.to_string()))
     }
 
+    /// A NULL cell renders as `NULL` whatever the column's kind — the original
+    /// point of this test.
+    ///
+    /// What changed under it is where the answer comes from: an absent cell,
+    /// decided once by the grid snapshot, instead of a serializer asking
+    /// whether the TEXT reads like a null. That question was generously true
+    /// for an empty box and for every spelling of `null`, and on the MySQL
+    /// family both are real values — so the second half now states the other
+    /// side: text that merely reads like a NULL is not one.
     #[test]
     fn null_wins_over_every_kind() {
         for kind in [
@@ -689,12 +1297,27 @@ mod tests {
             SqlValueKind::Temporal,
             SqlValueKind::Binary,
         ] {
-            assert_eq!(oracle_literal(kind, "NULL"), "NULL");
-            assert_eq!(mysql_literal(kind, "NULL"), "NULL");
-            assert_eq!(
-                sql_literal(DatabaseType::MariaDB, kind, "", NULL_TEXT),
-                "NULL"
-            );
+            for db_type in [
+                DatabaseType::Oracle,
+                DatabaseType::MySQL,
+                DatabaseType::MariaDB,
+            ] {
+                assert_eq!(
+                    literal_for(db_type, kind, None),
+                    "NULL",
+                    "{db_type} {kind:?}"
+                );
+                assert_ne!(
+                    literal_for(db_type, kind, Some(String::new())),
+                    "NULL",
+                    "{db_type} {kind:?}: the empty string is a value"
+                );
+                assert_ne!(
+                    literal_for(db_type, kind, Some("NULL".to_string())),
+                    "NULL",
+                    "{db_type} {kind:?}: the text NULL is a value"
+                );
+            }
         }
     }
 
@@ -726,11 +1349,10 @@ mod tests {
         );
         assert_eq!(mysql_literal(SqlValueKind::String, r"a\b"), r"'a\\b'");
         assert_eq!(
-            sql_literal(
+            literal_for(
                 DatabaseType::MariaDB,
                 SqlValueKind::String,
-                r"a\b",
-                NULL_TEXT
+                Some(r"a\b".to_string())
             ),
             r"'a\\b'"
         );
@@ -828,7 +1450,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            build_sql_inserts(&selection),
+            written(build_sql_inserts(&selection)),
             "INSERT INTO HR.EMP (ID, NAME, HIREDATE) VALUES (7369, 'SMITH', \
              TO_DATE('1980-12-17 00:00:00','YYYY-MM-DD HH24:MI:SS'));\n\
              INSERT INTO HR.EMP (ID, NAME, HIREDATE) VALUES (7499, 'ALLEN', NULL);\n"
@@ -843,7 +1465,7 @@ mod tests {
             &[&["1", "kim"]],
         );
         assert_eq!(
-            build_sql_inserts(&selection),
+            written(build_sql_inserts(&selection)),
             "INSERT INTO `HR`.`EMP` (`id`, `name`) VALUES (1, 'kim');\n"
         );
     }
@@ -857,22 +1479,55 @@ mod tests {
         );
         selection.table = None;
         assert_eq!(
-            build_sql_inserts(&selection),
+            written(build_sql_inserts(&selection)),
             "INSERT INTO MY_TABLE (ID) VALUES (1);\n"
         );
     }
 
+    /// A selection covering no column is refused, and writes nothing.
+    ///
+    /// It used to write nothing and say nothing, which the callers then
+    /// reported as a full export of the input's row count — an empty file
+    /// announced as "N rows". Both halves are pinned: the text is still empty,
+    /// and the refusal now says why.
     #[test]
-    fn inserts_of_an_empty_selection_produce_nothing() {
+    fn a_selection_that_covers_no_column_is_refused_and_writes_nothing() {
         let mut selection = selection(
             DatabaseType::Oracle,
             &[("ID", SqlValueKind::Number)],
             &[&["1"]],
         );
         selection.selected_columns.clear();
-        assert!(build_sql_inserts(&selection).is_empty());
-        assert!(build_sql_updates(&selection, &["ID".to_string()]).is_empty());
-        assert!(build_where_clause(&selection).is_empty());
+        for built in [
+            build_sql_inserts(&selection),
+            build_sql_updates(&selection, &["ID".to_string()]),
+            build_where_clause(&selection),
+        ] {
+            assert_eq!(built.refusal(), Some(no_writable_column_message().as_str()));
+            assert!(built.text().is_empty());
+            assert_eq!(built.rows(), 0);
+        }
+    }
+
+    /// A selection with columns but no ROWS is not a refusal: there is simply
+    /// nothing to write, and the count says so.
+    #[test]
+    fn a_selection_with_no_rows_writes_nothing_and_refuses_nothing() {
+        let mut selection = selection(
+            DatabaseType::Oracle,
+            &[("ID", SqlValueKind::Number)],
+            &[&["1"]],
+        );
+        selection.rows.clear();
+        for built in [
+            build_sql_inserts(&selection),
+            build_sql_updates(&selection, &["ID".to_string()]),
+            build_where_clause(&selection),
+        ] {
+            assert_eq!(built.refusal(), None);
+            assert!(built.text().is_empty());
+            assert_eq!(built.rows(), 0);
+        }
     }
 
     #[test]
@@ -887,7 +1542,7 @@ mod tests {
             &[&["7369", "SMITH", "800"]],
         );
         assert_eq!(
-            build_sql_updates(&selection, &["ID".to_string()]),
+            written(build_sql_updates(&selection, &["ID".to_string()])),
             "UPDATE HR.EMP SET NAME = 'SMITH', SAL = 800 WHERE ID = 7369;\n"
         );
     }
@@ -904,7 +1559,10 @@ mod tests {
             &[&["A-1", "2", "10"]],
         );
         assert_eq!(
-            build_sql_updates(&selection, &["PART".to_string(), "SEQ".to_string()]),
+            written(build_sql_updates(
+                &selection,
+                &["PART".to_string(), "SEQ".to_string()]
+            )),
             "UPDATE HR.EMP SET QTY = 10 WHERE PART = 'A-1' AND SEQ = 2;\n"
         );
     }
@@ -919,7 +1577,7 @@ mod tests {
         // The user selected only NAME; the key value still comes from the row.
         selection.selected_columns = vec![1];
         assert_eq!(
-            build_sql_updates(&selection, &["ID".to_string()]),
+            written(build_sql_updates(&selection, &["ID".to_string()])),
             "UPDATE HR.EMP SET NAME = 'SMITH' WHERE ID = 7369;\n"
         );
     }
@@ -932,7 +1590,7 @@ mod tests {
             &[&["SMITH"]],
         );
         assert_eq!(
-            build_sql_updates(&selection, &[]),
+            written(build_sql_updates(&selection, &[])),
             "UPDATE HR.EMP SET NAME = 'SMITH';\n"
         );
     }
@@ -945,7 +1603,7 @@ mod tests {
             &[&["SMITH"]],
         );
         assert_eq!(
-            build_sql_updates(&selection, &["ID".to_string()]),
+            written(build_sql_updates(&selection, &["ID".to_string()])),
             "UPDATE HR.EMP SET NAME = 'SMITH';\n"
         );
     }
@@ -958,7 +1616,7 @@ mod tests {
             &[&["7369"]],
         );
         assert_eq!(
-            build_sql_updates(&selection, &["ID".to_string()]),
+            written(build_sql_updates(&selection, &["ID".to_string()])),
             "UPDATE HR.EMP SET ID = 7369 WHERE ID = 7369;\n"
         );
     }
@@ -971,7 +1629,7 @@ mod tests {
             &[&["NULL", "SMITH"]],
         );
         assert_eq!(
-            build_sql_updates(&selection, &["ID".to_string()]),
+            written(build_sql_updates(&selection, &["ID".to_string()])),
             "UPDATE HR.EMP SET NAME = 'SMITH' WHERE ID IS NULL;\n"
         );
     }
@@ -983,7 +1641,7 @@ mod tests {
             &[("ID", SqlValueKind::Number)],
             &[&["7369"]],
         );
-        assert_eq!(build_where_clause(&selection), "ID = 7369");
+        assert_eq!(written(build_where_clause(&selection)), "ID = 7369");
     }
 
     #[test]
@@ -993,7 +1651,10 @@ mod tests {
             &[("ID", SqlValueKind::Number)],
             &[&["7369"], &["7499"], &["7521"]],
         );
-        assert_eq!(build_where_clause(&selection), "ID IN (7369, 7499, 7521)");
+        assert_eq!(
+            written(build_where_clause(&selection)),
+            "ID IN (7369, 7499, 7521)"
+        );
     }
 
     #[test]
@@ -1003,7 +1664,10 @@ mod tests {
             &[("ID", SqlValueKind::Number)],
             &[&["7369"], &["7369"], &["7499"]],
         );
-        assert_eq!(build_where_clause(&selection), "ID IN (7369, 7499)");
+        assert_eq!(
+            written(build_where_clause(&selection)),
+            "ID IN (7369, 7499)"
+        );
     }
 
     #[test]
@@ -1014,7 +1678,7 @@ mod tests {
             &[&["7369"], &["NULL"], &["7499"]],
         );
         assert_eq!(
-            build_where_clause(&selection),
+            written(build_where_clause(&selection)),
             "ID IN (7369, 7499) OR ID IS NULL"
         );
     }
@@ -1026,7 +1690,7 @@ mod tests {
             &[("ID", SqlValueKind::Number)],
             &[&["NULL"]],
         );
-        assert_eq!(build_where_clause(&selection), "ID IS NULL");
+        assert_eq!(written(build_where_clause(&selection)), "ID IS NULL");
     }
 
     #[test]
@@ -1037,7 +1701,7 @@ mod tests {
             &[&["7369", "SMITH"]],
         );
         assert_eq!(
-            build_where_clause(&selection),
+            written(build_where_clause(&selection)),
             "ID = 7369 AND NAME = 'SMITH'"
         );
     }
@@ -1050,7 +1714,7 @@ mod tests {
             &[&["7369", "SMITH"], &["7499", "ALLEN"]],
         );
         assert_eq!(
-            build_where_clause(&selection),
+            written(build_where_clause(&selection)),
             "(ID = 7369 AND NAME = 'SMITH') OR (ID = 7499 AND NAME = 'ALLEN')"
         );
     }
@@ -1063,7 +1727,7 @@ mod tests {
             &[&["7369", "SMITH"], &["7369", "SMITH"]],
         );
         assert_eq!(
-            build_where_clause(&selection),
+            written(build_where_clause(&selection)),
             "ID = 7369 AND NAME = 'SMITH'"
         );
     }
@@ -1079,7 +1743,7 @@ mod tests {
         );
         selection.column_kinds.clear();
         assert_eq!(
-            build_sql_inserts(&selection),
+            written(build_sql_inserts(&selection)),
             "INSERT INTO HR.EMP (ID, NAME) VALUES ('7369', 'SMITH');\n"
         );
     }
@@ -1092,7 +1756,7 @@ mod tests {
             &[&["7369", "SMITH"]],
         );
         assert_eq!(
-            build_sql_updates(&selection, &["id".to_string()]),
+            written(build_sql_updates(&selection, &["id".to_string()])),
             "UPDATE HR.EMP SET NAME = 'SMITH' WHERE ID = 7369;\n"
         );
     }
@@ -1105,8 +1769,495 @@ mod tests {
             &[&["x"]],
         );
         assert_eq!(
-            build_sql_inserts(&selection),
+            written(build_sql_inserts(&selection)),
             "INSERT INTO HR.EMP (\"odd name\") VALUES ('x');\n"
         );
+    }
+
+    /// `NO_BACKSLASH_ESCAPES` is a per-CONNECTION setting of this app, so the
+    /// writer has to ask the connection and not the family.
+    ///
+    /// A session running under that mode stores a doubled backslash as two
+    /// characters, so a writer that assumed the server default rewrote the
+    /// data on its way out.
+    #[test]
+    fn a_connection_decides_whether_a_backslash_escapes() {
+        let mut info =
+            ConnectionInfo::new_with_type("m", "u", "p", "h", 3306, "db", DatabaseType::MySQL);
+        info.advanced.mysql_sql_mode = "TRADITIONAL".to_string();
+        assert_eq!(
+            sql_literal_for_value(
+                SqlWriteDialect::for_connection(&info),
+                SqlValueKind::String,
+                r"a\b"
+            )
+            .expect("a short value fits in one literal"),
+            r"'a\\b'",
+            "the default doubles"
+        );
+        info.advanced.mysql_sql_mode = "TRADITIONAL,NO_BACKSLASH_ESCAPES".to_string();
+        assert_eq!(
+            sql_literal_for_value(
+                SqlWriteDialect::for_connection(&info),
+                SqlValueKind::String,
+                r"a\b"
+            )
+            .expect("a short value fits in one literal"),
+            r"'a\b'",
+            "this connection does not"
+        );
+        // Oracle has no such escape whatever the mode says.
+        let oracle =
+            ConnectionInfo::new_with_type("o", "u", "p", "h", 1521, "s", DatabaseType::Oracle);
+        assert!(!SqlWriteDialect::for_connection(&oracle).backslash_escapes());
+    }
+
+    /// Only the explicit token turns it off; none of the compound modes this
+    /// app offers includes it.
+    #[test]
+    fn only_the_named_mode_turns_backslash_escaping_off() {
+        for mode in ["TRADITIONAL", "ANSI", "ANSI_QUOTES", "ORACLE", ""] {
+            assert!(
+                !sql_mode_disables_backslash_escapes(mode),
+                "{mode} does not include NO_BACKSLASH_ESCAPES"
+            );
+        }
+        for mode in [
+            "NO_BACKSLASH_ESCAPES",
+            "traditional, no_backslash_escapes",
+            "ANSI,NO_BACKSLASH_ESCAPES,ONLY_FULL_GROUP_BY",
+        ] {
+            assert!(sql_mode_disables_backslash_escapes(mode), "{mode}");
+        }
+    }
+
+    /// An `&` in the data is data, not a substitution variable.
+    ///
+    /// This app's own `DEFINE` is on by default and substitutes `&name` inside
+    /// string literals the way SQL*Plus does, so a `SQL Inserts` export the
+    /// user re-runs — or an import of a file holding `AT&T` — would stop and
+    /// ask for a value. Lifting it out as `CHR(38)` stores the identical text
+    /// and leaves the session's setting alone.
+    #[test]
+    fn an_ampersand_cannot_become_a_substitution_variable() {
+        assert_eq!(
+            oracle_literal(SqlValueKind::String, "AT&T"),
+            "'AT'||CHR(38)||'T'"
+        );
+        // A value that is nothing but `&` has no literal parts at all.
+        assert_eq!(oracle_literal(SqlValueKind::String, "&"), "CHR(38)");
+        // Applying it twice is inert: the first pass leaves no `&` behind.
+        assert_eq!(
+            defuse_substitution(
+                SqlWriteDialect::family_default(DatabaseType::Oracle),
+                "'AT'||CHR(38)||'T'"
+            ),
+            "'AT'||CHR(38)||'T'"
+        );
+        // The MySQL family has no substitution to defuse.
+        assert_eq!(mysql_literal(SqlValueKind::String, "AT&T"), "'AT&T'");
+    }
+
+    /// A MySQL-family name that another quoter already quoted must not be
+    /// quoted a second time into a DIFFERENT name.
+    #[test]
+    fn a_mysql_qualified_name_is_quoted_once() {
+        assert_eq!(
+            quote_qualified_name(DatabaseType::MySQL, "app.orders"),
+            "`app`.`orders`"
+        );
+        // Idempotent.
+        assert_eq!(
+            quote_qualified_name(DatabaseType::MySQL, "`app`.`orders`"),
+            "`app`.`orders`"
+        );
+        // A dot INSIDE a quoted segment is part of the name, not a separator.
+        assert_eq!(
+            quote_qualified_name(DatabaseType::MariaDB, "`sales.ops`.`order.items`"),
+            "`sales.ops`.`order.items`"
+        );
+        // A doubled backtick is one character of the name.
+        assert_eq!(
+            quote_qualified_name(DatabaseType::MySQL, "app.`zr``tick`"),
+            "`app`.`zr``tick`"
+        );
+    }
+
+    /// Text the app did not author never reaches an unquoted position.
+    ///
+    /// `HEXTORAW` is the only conversion whose argument is not a format model
+    /// the writer chose, so it is the only one a VALUE can reach — and this
+    /// writer serves the IMPORT path, where the value is whatever a file said.
+    /// Only text that is provably hex may be spliced in; everything else is a
+    /// quoted string, which Oracle reads with the same implicit hex conversion
+    /// and rejects with the same ORA-01465.
+    #[test]
+    fn a_binary_value_that_is_not_provably_hex_is_quoted() {
+        assert_eq!(
+            oracle_literal(SqlValueKind::Binary, "DEADBEEF"),
+            "HEXTORAW('DEADBEEF')"
+        );
+        assert_eq!(
+            oracle_literal(SqlValueKind::Binary, "  00ff  "),
+            "HEXTORAW('00ff')"
+        );
+        for value in [
+            "hello",     // not hex at all
+            "ABC",       // odd digit count: ORA-01465
+            "",          // nothing to convert
+            "[LOB]",     // a placeholder, not bytes
+            "DEAD BEEF", // a space is not a hex digit
+            "0x41",      // an `x` is not a hex digit
+        ] {
+            let literal = oracle_literal(SqlValueKind::Binary, value);
+            assert!(
+                literal.starts_with('\'') && literal.ends_with('\''),
+                "{value:?} produced {literal}"
+            );
+        }
+        // A quote in the value can no longer leave the literal...
+        assert_eq!(oracle_literal(SqlValueKind::Binary, "a'b"), "'a''b'");
+        // ...and an `&` is defused now that the fallback is a plain literal,
+        // which it never was inside `HEXTORAW(…)`.
+        assert_eq!(
+            oracle_literal(SqlValueKind::Binary, "A&B"),
+            "'A'||CHR(38)||'B'"
+        );
+        assert_eq!(mysql_literal(SqlValueKind::Binary, "abc"), "'abc'");
+        assert_eq!(mysql_literal(SqlValueKind::Binary, "a'b"), "'a''b'");
+    }
+
+    /// No kind, and no value, may add a statement to the script it lands in.
+    ///
+    /// The property the `HEXTORAW` hole broke, stated for every kind at once so
+    /// a kind added later is covered by the same rule: put the literal in the
+    /// statement it is written for, split it with the app's OWN script
+    /// splitter — the one an import script actually goes through — and require
+    /// exactly one statement back. A value that closes its own call and starts
+    /// a statement of its own is what this catches: it used to yield three.
+    #[test]
+    fn no_value_can_add_a_statement_to_the_script_it_lands_in() {
+        use crate::db::query::QueryExecutor;
+
+        let hostile = [
+            "41')) SELECT * FROM DUAL; DROP TABLE victim; --",
+            "x'); DROP TABLE victim; --",
+            "1); DROP TABLE victim; INSERT INTO t (a) VALUES (2",
+            "a'b",
+            "'; DELETE FROM t; --",
+            "a\\'; DELETE FROM t; --",
+            "AT&T",
+            "line1\nline2\n/\nDROP TABLE victim;",
+            "]]>--",
+            "0102FF",
+            "DEADBEEF",
+        ];
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+        ] {
+            let dialect = SqlWriteDialect::family_default(db_type);
+            for kind in [
+                SqlValueKind::Unknown,
+                SqlValueKind::String,
+                SqlValueKind::Number,
+                SqlValueKind::Boolean,
+                SqlValueKind::Temporal,
+                SqlValueKind::Binary,
+            ] {
+                for value in hostile {
+                    let literal = sql_literal_for_value(dialect, kind, value)
+                        .expect("every hostile value here is short enough for one literal");
+                    let script = format!("INSERT INTO t (c) VALUES ({literal});\n");
+                    let items = QueryExecutor::split_script_items(&script);
+                    assert_eq!(
+                        items.len(),
+                        1,
+                        "{db_type} {kind:?} {value:?} produced {} statements: {script}",
+                        items.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A value longer than one Oracle literal is written in as many as it takes.
+    ///
+    /// `ORA-01704: string literal too long` is what a single literal past 4000
+    /// bytes gets — measured on Oracle 23ai, where 4000 went in and 4001 did
+    /// not — whatever the target column is, a `CLOB` included. No batch size
+    /// helps, because the limit is on one VALUE.
+    #[test]
+    fn a_long_oracle_text_value_is_written_in_several_literals() {
+        // Everything that fits is one literal, byte for byte what it always was.
+        assert_eq!(oracle_literal(SqlValueKind::String, "short"), "'short'");
+        // The limit is on the literal's CONTENT — measured on Oracle 23ai,
+        // where 4000 characters went in and 4001 did not — so 4000 is still one
+        // literal and one more character is not.
+        let at_limit = "x".repeat(ORACLE_MAX_LITERAL_BYTES);
+        assert_eq!(
+            oracle_literal(SqlValueKind::String, &at_limit),
+            format!("'{at_limit}'")
+        );
+        assert!(
+            oracle_literal(SqlValueKind::String, &format!("{at_limit}x")).starts_with("TO_CLOB('")
+        );
+
+        let long = "y".repeat(10_000);
+        let literal = oracle_literal(SqlValueKind::String, &long);
+        assert!(literal.starts_with("TO_CLOB('"), "{}", &literal[..40]);
+        assert_eq!(
+            literal.matches("TO_CLOB(").count(),
+            3,
+            "10000 / 4000 rounds to 3"
+        );
+        for piece in literal.split("||") {
+            assert!(
+                piece.len() <= "TO_CLOB('')".len() + super::ORACLE_MAX_LITERAL_BYTES,
+                "a piece is longer than one literal may be: {}",
+                piece.len()
+            );
+        }
+        // And it still says the same thing.
+        assert_eq!(
+            literal
+                .split("||")
+                .map(|piece| piece
+                    .trim_start_matches("TO_CLOB('")
+                    .trim_end_matches("')")
+                    .to_string())
+                .collect::<String>(),
+            long
+        );
+
+        // A quote is DOUBLED on the way in, so the ESCAPED length is what the
+        // limit applies to — a value of nothing but quotes must still fit.
+        let quotes = "'".repeat(4000);
+        for piece in oracle_literal(SqlValueKind::String, &quotes).split("||") {
+            assert!(
+                piece.len() <= "TO_CLOB('')".len() + super::ORACLE_MAX_LITERAL_BYTES,
+                "an escaped piece overflowed: {}",
+                piece.len()
+            );
+        }
+
+        // An `&` inside a piece is defused per piece: the whole expression is
+        // not a plain literal, so the outer defuser cannot reach into it.
+        let ampersand = format!("{}&T", "z".repeat(5000));
+        let literal = oracle_literal(SqlValueKind::String, &ampersand);
+        assert!(
+            literal.contains("CHR(38)"),
+            "{}",
+            &literal[literal.len() - 60..]
+        );
+        assert!(!literal.contains('&'), "an ampersand survived the defusing");
+
+        // The MySQL family has no per-literal limit; what bites there is the
+        // packet, which the batch size bounds.
+        assert_eq!(
+            mysql_literal(SqlValueKind::String, &long),
+            format!("'{long}'")
+        );
+    }
+
+    /// A value no single literal can carry is refused BY NAME, not sent.
+    ///
+    /// Text has a way out and everything else does not: a `BLOB` reaches the
+    /// grid as hex, and `HEXTORAW` is a call around a literal rather than a way
+    /// past one. Measured on Oracle 23ai through both drivers — a 3000-byte
+    /// `BLOB` is 6000 hex characters, and the `INSERT` this used to write
+    /// answered `ORA-01704: string literal too long` after the export had
+    /// already claimed to be a file.
+    #[test]
+    fn a_value_too_long_for_any_literal_is_refused_by_name() {
+        let oracle = SqlWriteDialect::family_default(DatabaseType::Oracle);
+        let mysql = SqlWriteDialect::family_default(DatabaseType::MySQL);
+
+        // A full RAW(2000) is exactly 4000 hex digits and the server takes it,
+        // so the writer must too — the limit is on the literal's CONTENT.
+        let at_limit = "AB".repeat(ORACLE_MAX_LITERAL_BYTES / 2);
+        assert_eq!(at_limit.len(), ORACLE_MAX_LITERAL_BYTES);
+        assert_eq!(
+            sql_literal_for_value(oracle, SqlValueKind::Binary, &at_limit),
+            Ok(format!("HEXTORAW('{at_limit}')"))
+        );
+
+        // One hex pair further is a value no statement can carry.
+        let too_long = format!("{at_limit}CD");
+        assert_eq!(
+            sql_literal_for_value(oracle, SqlValueKind::Binary, &too_long),
+            Err(ValueTooLongForLiteral {
+                literal_bytes: too_long.len()
+            })
+        );
+        // Which is what a BLOB looks like: not hex-shaped, still too long.
+        let blob_text = "z".repeat(6000);
+        for kind in [
+            SqlValueKind::Unknown,
+            SqlValueKind::Binary,
+            SqlValueKind::Number,
+            SqlValueKind::Boolean,
+            SqlValueKind::Temporal,
+        ] {
+            assert!(
+                sql_literal_for_value(oracle, kind, &blob_text).is_err(),
+                "{kind:?} wrote a literal the server cannot take"
+            );
+            // The MySQL family has no per-literal limit at all.
+            assert!(
+                sql_literal_for_value(mysql, kind, &blob_text).is_ok(),
+                "{kind:?} was refused on a family that has no such limit"
+            );
+        }
+        // Text is the one kind with a way out, and keeps it.
+        assert!(sql_literal_for_value(oracle, SqlValueKind::String, &blob_text).is_ok());
+
+        // A conversion call wraps a literal rather than replacing one, so the
+        // limit reaches inside it. Nothing bounds how many digits of fractional
+        // second a FILE carries; the drivers write at most nine.
+        let long_fraction = format!("2024-01-01 00:00:00.{}", "1".repeat(5000));
+        assert!(sql_literal_for_value(oracle, SqlValueKind::Temporal, &long_fraction).is_err());
+        assert_eq!(
+            sql_literal_for_value(oracle, SqlValueKind::Temporal, "2024-01-01 00:00:00.123456"),
+            Ok("TO_TIMESTAMP('2024-01-01 00:00:00.123456','YYYY-MM-DD HH24:MI:SS.FF')".to_string())
+        );
+
+        // The sentence names the row and the column, which is the only thing
+        // that tells the user which value to look at.
+        let message = value_too_long_message(
+            "PHOTO",
+            7,
+            ValueTooLongForLiteral {
+                literal_bytes: 6000,
+            },
+        );
+        assert!(message.contains("Row 7"), "{message}");
+        assert!(message.contains("PHOTO"), "{message}");
+        assert!(message.contains("6000"), "{message}");
+        assert!(message.contains("4000"), "{message}");
+    }
+
+    /// And a builder handed one refuses the WHOLE build, naming the cell.
+    #[test]
+    fn a_builder_refuses_a_whole_build_for_one_value_it_cannot_write() {
+        let mut selection = selection(
+            DatabaseType::Oracle,
+            &[
+                ("ID", SqlValueKind::Number),
+                ("PHOTO", SqlValueKind::Unknown),
+            ],
+            &[&["1", "short"], &["2", "short"]],
+        );
+        selection.rows[1][1] = Some("z".repeat(6000));
+
+        for built in [
+            build_sql_inserts(&selection),
+            build_sql_updates(&selection, &["ID".to_string()]),
+            build_where_clause(&selection),
+        ] {
+            let reason = built.refusal().expect("the second row cannot be written");
+            assert!(reason.contains("Row 2"), "{reason}");
+            assert!(reason.contains("PHOTO"), "{reason}");
+            // Nothing partial reaches a file or the clipboard.
+            assert!(built.text().is_empty(), "a refused build still wrote text");
+        }
+
+        // The same selection on the MySQL family writes every row: what bites
+        // there is the packet, which the import batch size bounds.
+        let mut mysql = selection.clone();
+        mysql.dialect = SqlWriteDialect::family_default(DatabaseType::MySQL);
+        assert_eq!(build_sql_inserts(&mysql).rows(), 2);
+    }
+
+    /// A name that belongs to two columns cannot be written as SQL at all.
+    ///
+    /// `SELECT a.id, b.id` is an ordinary query and every driver reports both
+    /// columns as `ID`. Written out, one of the three shapes is refused by the
+    /// server and the other two RUN while meaning something nobody asked for —
+    /// measured on Oracle 23ai and MySQL 8:
+    /// `UPDATE t SET ID = 2 WHERE ID = 1` reported one row updated, and
+    /// `WHERE ID = 1 AND ID = 2` matched none.
+    #[test]
+    fn a_name_that_belongs_to_two_columns_is_refused() {
+        let ambiguous = selection(
+            DatabaseType::Oracle,
+            &[("ID", SqlValueKind::Number), ("ID", SqlValueKind::Number)],
+            &[&["1", "2"]],
+        );
+        let reason = ambiguous
+            .ambiguous_column_refusal(&[])
+            .expect("two selected columns named ID");
+        assert!(
+            reason.contains("ID"),
+            "the sentence names the column: {reason}"
+        );
+
+        // And nothing is written, so a caller that forgot to ask gets nothing
+        // rather than SQL that is refused — or worse, SQL that runs. The gate
+        // is inside the builders now, so what comes back is the same sentence
+        // rather than an empty string the caller cannot read.
+        for built in [
+            build_sql_inserts(&ambiguous),
+            build_where_clause(&ambiguous),
+            build_sql_updates(&ambiguous, &["ID".to_string()]),
+        ] {
+            assert_eq!(built.refusal(), Some(reason.as_str()));
+            assert!(built.text().is_empty());
+        }
+
+        // Selecting only ONE of the two is not ambiguous, and still works.
+        let mut one = ambiguous.clone();
+        one.selected_columns = vec![0];
+        assert_eq!(one.ambiguous_column_refusal(&[]), None);
+        assert_eq!(
+            written(build_sql_inserts(&one)),
+            "INSERT INTO HR.EMP (ID) VALUES (1);\n"
+        );
+
+        // But a KEY looked up by that name still is: the lookup takes the first
+        // match, and the two columns do not have to hold the same value.
+        assert!(one.ambiguous_column_refusal(&["id".to_string()]).is_some());
+        let keyed = build_sql_updates(&one, &["id".to_string()]);
+        assert!(keyed.refusal().is_some());
+        assert!(keyed.text().is_empty());
+        // A key that names one column is fine.
+        let plain = selection(
+            DatabaseType::MySQL,
+            &[("ID", SqlValueKind::Number), ("NAME", SqlValueKind::String)],
+            &[&["1", "x"]],
+        );
+        assert_eq!(plain.ambiguous_column_refusal(&["ID".to_string()]), None);
+        assert!(!written(build_sql_updates(&plain, &["ID".to_string()])).is_empty());
+    }
+
+    #[test]
+    fn a_repeated_name_is_found_the_way_sql_resolves_one() {
+        assert_eq!(
+            first_repeated_column_name(["A", "b", " a "]),
+            Some("a".to_string()),
+            "unquoted identifiers are matched case-insensitively, and trimmed"
+        );
+        assert_eq!(first_repeated_column_name(["A", "B", "C"]), None);
+        assert_eq!(first_repeated_column_name([]), None);
+    }
+
+    /// A column the server computes is never named by `SQL Inserts`.
+    #[test]
+    fn generated_columns_are_not_writable_targets() {
+        let columns = vec![
+            "A".to_string(),
+            "TOTAL".to_string(),
+            "ID".to_string(),
+            "VIRT".to_string(),
+        ];
+        assert_eq!(
+            writable_column_indices(&columns, &["total".to_string(), " VIRT ".to_string()]),
+            vec![0, 2],
+            "matched the way SQL resolves an unquoted name"
+        );
+        // Nothing generated — every format but `SQL Inserts` — keeps every
+        // column.
+        assert_eq!(writable_column_indices(&columns, &[]), vec![0, 1, 2, 3]);
     }
 }

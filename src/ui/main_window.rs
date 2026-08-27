@@ -42,7 +42,8 @@ use crate::ui::grid_sort::NullOrdering;
 use crate::ui::result_export::{ExportDestination, ExportFormat};
 use crate::ui::result_export_dialog::ExportChoice;
 use crate::ui::result_table::{
-    ResultGridEditExecuteCallback, ResultGridSqlExecuteCallback, ResultTableContextAction,
+    ExportAbandonReason, ResultGridEditExecuteCallback, ResultGridSqlExecuteCallback,
+    ResultTableContextAction,
 };
 use crate::ui::theme;
 use crate::ui::{
@@ -6819,6 +6820,14 @@ enum FileActionResult {
     CopyToClipboard {
         result: Result<(String, String), String>,
     },
+    /// Something the user asked for did not happen, said once this channel is
+    /// drained.
+    ///
+    /// Sending is what makes it safe: the one producer — a deferred export the
+    /// lazy fetch it was queued behind abandoned — runs deep inside the cancel
+    /// path, with the app-state mutex held. An alert from there would run a
+    /// nested FLTK event loop under that lock.
+    Notice { message: String },
 }
 
 enum SaveTabOutcome {
@@ -7781,9 +7790,9 @@ impl MainWindow {
     fn prepare_result_export(
         state: &Arc<Mutex<AppState>>,
         choice: ExportChoice,
-        db_type: Option<DatabaseType>,
-        callback: Box<dyn FnMut(String, usize)>,
-    ) -> Result<Option<(String, usize)>, String> {
+        dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
+        callback: crate::ui::result_table::ExportReadyCallback,
+    ) -> Result<Option<crate::ui::result_export::ExportContent>, String> {
         let result_tabs = {
             let guard = state
                 .lock()
@@ -7798,7 +7807,7 @@ impl MainWindow {
             choice.format,
             choice.scope,
             choice.destination,
-            db_type,
+            dialect,
             callback,
         ))
     }
@@ -7986,16 +7995,22 @@ impl MainWindow {
         // The refusal is decided under the guard and SAID after it: an alert
         // runs a nested FLTK event loop, and callbacks firing inside it must
         // never find the app state mutex still held.
-        let Some((db_type, has_selection)) = ({
+        let Some((dialect, has_selection, sql_export_possible, export_refusal)) = ({
             let guard = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.result_tabs.has_data().then(|| {
                 (
-                    guard
-                        .active_connection_runtime()
-                        .map(|runtime| runtime.sanitized_info().db_type),
+                    guard.active_connection_runtime().map(
+                        |runtime| -> crate::ui::grid_sql_export::SqlWriteDialect {
+                            crate::ui::grid_sql_export::SqlWriteDialect::for_connection(
+                                &runtime.sanitized_info(),
+                            )
+                        },
+                    ),
                     guard.result_tabs.has_grid_selection(),
+                    guard.result_tabs.has_sql_exportable_columns(),
+                    guard.result_tabs.export_refusal(),
                 )
             })
         }) else {
@@ -8003,15 +8018,46 @@ impl MainWindow {
             return;
         };
 
-        // `SQL Inserts` writes dialect-specific literals, so it is only on offer
-        // while a connection can say which dialect that is.
+        // Decided under the guard above and SAID here, for the same reason the
+        // refusal above is.
+        if let Some(reason) = export_refusal {
+            crate::ui::alert_on_main(&reason);
+            return;
+        }
+
+        // `SQL Inserts` writes dialect-specific literals, so it needs a
+        // connection to say which dialect — and it needs at least one column it
+        // may name in an INSERT, which a result of nothing but internal columns
+        // (`SET HEADING OFF` blanks every name) does not have. Offering it there
+        // produced an empty file and a "0 rows" report; an entry that cannot
+        // work does not belong in the list.
         let formats: Vec<ExportFormat> = ExportFormat::ALL
             .into_iter()
-            .filter(|format| db_type.is_some() || *format != ExportFormat::SqlInserts)
+            .filter(|format| {
+                *format != ExportFormat::SqlInserts || (dialect.is_some() && sql_export_possible)
+            })
             .collect();
         let Some(choice) = crate::ui::result_export_dialog::show(&formats, has_selection) else {
             return;
         };
+
+        // The format list answered for the whole result and only about having a
+        // nameable column at all. A SELECTION can still cover none of them, and
+        // either scope can hold TWO columns of one name — both only knowable
+        // once the scope is chosen, and both asked of one reader so the sentence
+        // the user reads is the same one `Copy as SQL …` gives.
+        if choice.format == ExportFormat::SqlInserts {
+            let refusal = {
+                let guard = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.result_tabs.sql_export_refusal(choice.scope)
+            };
+            if let Some(reason) = refusal {
+                crate::ui::alert_on_main(&reason);
+                return;
+            }
+        }
 
         let destination = match choice.destination {
             ExportDestination::Clipboard => None,
@@ -8030,15 +8076,52 @@ impl MainWindow {
         let export = match MainWindow::prepare_result_export(
             state,
             choice,
-            db_type,
-            Box::new(move |content, row_count| {
-                Self::deliver_export(
-                    &deferred_sender,
-                    deferred_destination.clone(),
-                    format,
-                    content,
-                    row_count,
-                );
+            dialect,
+            Box::new(move |ready| match ready {
+                Ok(built) => match built.into_parts() {
+                    Ok((content, row_count)) => Self::deliver_export(
+                        &deferred_sender,
+                        deferred_destination.clone(),
+                        format,
+                        content,
+                        row_count,
+                    ),
+                    // A refusal reaches the user the same way an abandonment
+                    // does, and for the same reason: this runs with the
+                    // app-state mutex held, where an alert would open a nested
+                    // FLTK loop under it.
+                    Err(reason) => {
+                        let _ = deferred_sender.send(FileActionResult::Notice { message: reason });
+                        app::awake();
+                    }
+                },
+                // The user has already chosen a format and a file name by now,
+                // so an export that says nothing would look like it had quietly
+                // succeeded. The reason comes with the abandonment because the
+                // two are different things to someone about to go looking for
+                // the file.
+                //
+                // SENT, not alerted: this runs from inside the lazy-fetch cancel
+                // path and from the arrival of a new result, both of which hold
+                // the app-state mutex, and an alert there would run a nested
+                // FLTK event loop under it.
+                Err(reason) => {
+                    let message = match reason {
+                        ExportAbandonReason::FetchStopped => {
+                            "The export was not written: the result stopped loading before every \
+                             row arrived. Run the query again and export once it has finished."
+                        }
+                        ExportAbandonReason::ResultReplaced => {
+                            "The export was not written: a new result took the grid it covered \
+                             before every row had arrived. Run that query again and export once \
+                             it has finished."
+                        }
+                    };
+                    let _ = deferred_sender.send(FileActionResult::Notice {
+                        message: message.to_string(),
+                    });
+                    app::awake();
+                }
             }),
         ) {
             Ok(export) => export,
@@ -8047,10 +8130,18 @@ impl MainWindow {
                 return;
             }
         };
-        let Some((content, row_count)) = export else {
+        let Some(built) = export else {
             return;
         };
-        Self::deliver_export(&sender, destination, format, content, row_count);
+        match built.into_parts() {
+            Ok((content, row_count)) => {
+                Self::deliver_export(&sender, destination, format, content, row_count);
+            }
+            // Nothing was written, so nothing is delivered — and the file the
+            // user just named is left alone rather than truncated to an empty
+            // one that looks like a finished export.
+            Err(reason) => crate::ui::alert_on_main(&reason),
+        }
     }
 
     /// Where the exported text should go. `None` means the user cancelled the
@@ -8074,13 +8165,14 @@ impl MainWindow {
                 Some(path)
             }
         };
-        Self::deliver_export(
-            sender,
-            destination,
-            delivery.format,
-            delivery.text,
-            delivery.row_count,
-        );
+        match delivery.content.into_parts() {
+            Ok((text, row_count)) => {
+                Self::deliver_export(sender, destination, delivery.format, text, row_count);
+            }
+            // Reached only if a refusal slipped past the object browser's own
+            // report; the file the user just named stays untouched either way.
+            Err(reason) => crate::ui::alert_on_main(&reason),
+        }
     }
 
     fn ask_export_file_path(format: ExportFormat) -> Option<PathBuf> {
@@ -8192,29 +8284,56 @@ impl MainWindow {
         let Some(runtime) = s.active_connection_runtime() else {
             return;
         };
-        let db_type = runtime.sanitized_info().db_type;
-        let Some(selection) = s.result_tabs.sql_export_context(db_type) else {
+        let dialect =
+            crate::ui::grid_sql_export::SqlWriteDialect::for_connection(&runtime.sanitized_info());
+        let Some(selection) = s.result_tabs.sql_export_context(dialect) else {
             return;
         };
-        let row_count = selection.rows.len();
+        // A name is how generated SQL addresses a column, and a result does not
+        // promise a name belongs to one. The builders ask this too — the gate
+        // lives inside them now — but asking here as well is what keeps the
+        // `SQL Updates` road from spending a catalog round trip on a selection
+        // that cannot be written either way. The guard is dropped first:
+        // reporting runs a nested event loop.
+        if let Some(reason) = selection.ambiguous_column_refusal(&[]) {
+            drop(s);
+            crate::ui::alert_on_main(&reason);
+            return;
+        }
 
-        let (sql, message) = match action {
+        // Every builder reports what it WROTE, refusal included, so a copy that
+        // produced nothing can no longer be announced as "Copied N statements".
+        // The message is chosen with the builder rather than after it, because
+        // a clause is one thing however many rows it covers.
+        type Announce = fn(usize) -> String;
+        let statements: Announce =
+            |written| format!("Copied {written} INSERT statements to clipboard");
+        let clause: Announce = |_| "Copied WHERE clause to clipboard".to_string();
+        let built: (crate::ui::result_export::ExportContent, Announce) = match action {
             ResultTableContextAction::CopySqlInserts => (
                 crate::ui::grid_sql_export::build_sql_inserts(&selection),
-                format!("Copied {row_count} INSERT statements to clipboard"),
+                statements,
             ),
             ResultTableContextAction::CopyWhereClause => (
                 crate::ui::grid_sql_export::build_where_clause(&selection),
-                "Copied WHERE clause to clipboard".to_string(),
+                clause,
             ),
             ResultTableContextAction::CopySqlUpdates => {
                 let Some(table) = selection.table.clone() else {
                     // No base table means no primary key to look up either.
-                    let sql = crate::ui::grid_sql_export::build_sql_updates(&selection, &[]);
-                    let message = format!(
-                        "Copied {row_count} UPDATE statements (table unknown — WHERE omitted)"
-                    );
-                    Self::finish_clipboard_copy(&mut s, &sql, &message);
+                    let built = crate::ui::grid_sql_export::build_sql_updates(&selection, &[]);
+                    match built.into_parts() {
+                        Ok((sql, written)) => {
+                            let message = format!(
+                                "Copied {written} UPDATE statements (table unknown — WHERE omitted)"
+                            );
+                            Self::finish_clipboard_copy(&mut s, &sql, &message);
+                        }
+                        Err(reason) => {
+                            drop(s);
+                            crate::ui::alert_on_main(&reason);
+                        }
+                    }
                     return;
                 };
                 let connection = runtime.connection();
@@ -8230,20 +8349,31 @@ impl MainWindow {
                         &table,
                     );
                     let result = match keys {
+                        // The KEY is resolved by name too, and only here — the
+                        // catalog answer is what says whether that name belongs
+                        // to one column of this result. Picking the first match
+                        // would key every statement on a column the user cannot
+                        // see it chose.
                         Ok(keys) => {
-                            let sql =
-                                crate::ui::grid_sql_export::build_sql_updates(&selection, &keys);
-                            let message = if keys.is_empty() {
-                                format!(
-                                    "Copied {row_count} UPDATE statements \
+                            crate::ui::grid_sql_export::build_sql_updates(&selection, &keys)
+                                .into_parts()
+                                .map(|(sql, written)| {
+                                    let message = if keys.is_empty() {
+                                        format!(
+                                            "Copied {written} UPDATE statements \
                                      (no primary key — WHERE omitted)"
-                                )
-                            } else {
-                                format!("Copied {row_count} UPDATE statements to clipboard")
-                            };
-                            Ok((sql, message))
+                                        )
+                                    } else {
+                                        format!("Copied {written} UPDATE statements to clipboard")
+                                    };
+                                    (sql, message)
+                                })
                         }
-                        Err(err) => Err(err),
+                        // The producer names what failed; the channel is
+                        // shared with every other clipboard delivery.
+                        Err(err) => Err(format!(
+                            "Failed to read the primary key for SQL Updates: {err}"
+                        )),
                     };
                     let _ = sender.send(FileActionResult::CopyToClipboard { result });
                     app::awake();
@@ -8253,7 +8383,17 @@ impl MainWindow {
             _ => return,
         };
 
-        Self::finish_clipboard_copy(&mut s, &sql, &message);
+        let (built, announce) = built;
+        match built.into_parts() {
+            Ok((sql, written)) => {
+                let message = announce(written);
+                Self::finish_clipboard_copy(&mut s, &sql, &message);
+            }
+            Err(reason) => {
+                drop(s);
+                crate::ui::alert_on_main(&reason);
+            }
+        }
     }
 
     /// Put generated SQL on the clipboard and report it in the status bar.
@@ -17594,16 +17734,18 @@ impl MainWindow {
                                             Some(format!("Failed to export results: {}", err));
                                     }
                                 },
+                                FileActionResult::Notice { message } => {
+                                    deferred_alert = Some(message);
+                                }
                                 FileActionResult::CopyToClipboard { result } => match result {
                                     Ok((sql, message)) => {
                                         MainWindow::finish_clipboard_copy(&mut s, &sql, &message);
                                     }
-                                    Err(err) => {
-                                        deferred_alert = Some(format!(
-                                            "Failed to read the primary key for SQL Updates: {}",
-                                            err
-                                        ));
-                                    }
+                                    // The message comes from whoever failed:
+                                    // this channel carries every clipboard
+                                    // delivery, and naming one of them here
+                                    // made the report lie about the others.
+                                    Err(err) => deferred_alert = Some(err),
                                 },
                             }
 
@@ -18830,7 +18972,7 @@ impl MainWindow {
             "employees.csv",
             text,
             "HR.EMP",
-            &targets,
+            &crate::ui::table_import::ImportTargets::all_writable(targets),
             ExportFormat::Csv,
         );
     }
@@ -18853,12 +18995,23 @@ impl MainWindow {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let selection = state
             .result_tabs
-            .sql_export_context(db_type)
+            .sql_export_context(crate::ui::grid_sql_export::SqlWriteDialect::family_default(
+                db_type,
+            ))
             .ok_or_else(|| "the result grid has no exportable selection".to_string())?;
+        // A refusal is an error to a caller that asked for three scripts: the
+        // builders return one only when they wrote one, and an empty string is
+        // not a script.
         Ok((
-            crate::ui::grid_sql_export::build_sql_inserts(&selection),
-            crate::ui::grid_sql_export::build_sql_updates(&selection, primary_key),
-            crate::ui::grid_sql_export::build_where_clause(&selection),
+            crate::ui::grid_sql_export::build_sql_inserts(&selection)
+                .into_parts()?
+                .0,
+            crate::ui::grid_sql_export::build_sql_updates(&selection, primary_key)
+                .into_parts()?
+                .0,
+            crate::ui::grid_sql_export::build_where_clause(&selection)
+                .into_parts()?
+                .0,
         ))
     }
 
@@ -22472,7 +22625,7 @@ mod tests {
             scope: crate::ui::result_export::ExportScope::All,
             destination: ExportDestination::File,
         };
-        let export = MainWindow::prepare_result_export(&state, choice, None, Box::new(|_, _| {}))
+        let export = MainWindow::prepare_result_export(&state, choice, None, Box::new(|_| {}))
             .expect("prepare export should succeed");
 
         assert!(export.is_none());

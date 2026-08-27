@@ -100,16 +100,30 @@ fn grid() -> ExportGrid {
             .map(|(name, _)| (*name).to_string())
             .collect(),
         column_kinds: columns.iter().map(|(_, kind)| *kind).collect(),
-        rows: rows(),
+        // The grid's own snapshot turns a cell whose text IS the NULL display
+        // text into an absent cell; this fixture states the same thing.
+        rows: rows()
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| (value != NULL_TEXT).then_some(value))
+                    .collect()
+            })
+            .collect(),
         null_text: NULL_TEXT.to_string(),
     }
 }
 
-/// Whether a cell reads as SQL NULL to the grid, which is what the structured
-/// formats render as "no value".
+/// Whether a cell is SQL NULL, which is what the structured formats render as
+/// "no value".
+///
+/// Exactly the grid's NULL display text and nothing else. It used to say an
+/// empty cell was NULL too, matching the writers, and that is the behaviour that
+/// turned every MySQL-family empty string into SQL NULL on the way out; the
+/// writers now carry NULL as an absent cell and this fixture states the same
+/// rule the grid's own export snapshot applies.
 fn is_null_cell(row: usize, col: usize) -> bool {
-    let value = &rows()[row][col];
-    value.is_empty() || value == NULL_TEXT
+    rows()[row][col] == NULL_TEXT
 }
 
 /// What a value looks like after the markup formats replace the characters XML
@@ -350,9 +364,16 @@ fn check_markdown(text: &str) -> Result<(), String> {
                 })
                 .collect()
         };
+        // `\<` is the third escape the writer emits: only a BARE `<br>` is the
+        // line break it inserted, which is what keeps a `<br>` that was in the
+        // data from turning into one.
         let recovered: Vec<String> = cells
             .iter()
-            .map(|cell| cell.replace("\\|", "|").replace("\\\\", "\\"))
+            .map(|cell| {
+                cell.replace("\\|", "|")
+                    .replace("\\<", "<")
+                    .replace("\\\\", "\\")
+            })
             .collect();
         if recovered != expected {
             return Err(format!(
@@ -365,6 +386,9 @@ fn check_markdown(text: &str) -> Result<(), String> {
 }
 
 /// A Markdown cell cannot hold a line break, so both kinds fold into `<br>`.
+///
+/// Nothing else is folded: the reader below gives back every escaped character,
+/// `\<` included, so what is compared is the value the grid held.
 fn markdown_expected(value: &str) -> String {
     value.replace("\r\n", "<br>").replace(['\n', '\r'], "<br>")
 }

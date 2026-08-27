@@ -34,7 +34,7 @@ use space_query::db::{
 };
 use space_query::ui::column_layout::{self, ColumnLayoutPlan, ColumnLayoutRow, HiddenColumns};
 use space_query::ui::grid_sort::{compare_cell_values, NullOrdering, SortColumn};
-use space_query::ui::grid_sql_export::{self, GridSqlSelection};
+use space_query::ui::grid_sql_export::{self, GridSqlSelection, SqlWriteDialect};
 use space_query::ui::grid_value_filter;
 use space_query::ui::result_export::{ExportFormat, ExportGrid};
 use space_query::ui::result_import;
@@ -286,14 +286,25 @@ fn selection(
     selected_columns: Vec<usize>,
 ) -> GridSqlSelection {
     GridSqlSelection {
-        db_type,
+        dialect: SqlWriteDialect::family_default(db_type),
         table: Some(TABLE.to_string()),
         all_columns: columns.to_vec(),
         column_kinds: kinds.to_vec(),
         selected_columns,
-        rows: rows.to_vec(),
-        null_text: NULL_TEXT.to_string(),
+        rows: export_cells(rows),
     }
+}
+
+/// Grid rows as export cells: a cell whose text IS the grid's NULL display text
+/// is the absence of a value, which is what the grid's own export snapshot does.
+fn export_cells(rows: &[Vec<String>]) -> Vec<Vec<space_query::ui::result_export::ExportCell>> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| (value != NULL_TEXT).then(|| value.clone()))
+                .collect()
+        })
+        .collect()
 }
 
 /// The ID column of each row, which is what the comparisons below use as the
@@ -358,7 +369,10 @@ fn check_value_filter(
             kinds,
             &one_row,
             selected_columns.clone(),
-        ));
+        ))
+        .into_parts()
+        .map_err(|reason| format!("{label}: the WHERE clause was refused: {reason}"))?
+        .0;
         let sql = format!("SELECT ID FROM {TABLE} WHERE {where_clause} ORDER BY ID");
         // Oracle's editable-grid path injects a ROWID column ahead of the
         // select list, so the ID column is found by name rather than position.
@@ -532,7 +546,7 @@ fn check_export_round_trip(target: Target, view: &GridView) -> Result<(), String
     let grid = ExportGrid {
         columns: columns.clone(),
         column_kinds: kinds.clone(),
-        rows: rows.clone(),
+        rows: export_cells(rows),
         null_text: NULL_TEXT.to_string(),
     };
     let sql_selection = selection(db_type, columns, kinds, rows, (0..columns.len()).collect());
@@ -549,7 +563,9 @@ fn check_export_round_trip(target: Target, view: &GridView) -> Result<(), String
             format,
             &grid,
             Some(&sql_selection),
-        );
+        )
+        .into_parts()
+        .map_err(|reason| format!("{format:?} was refused: {reason}"))?;
         if row_count != rows.len() {
             return Err(format!(
                 "{format:?} reported {row_count} rows, the grid has {}",

@@ -360,6 +360,10 @@ fn main() {
         format!("moved: {moved:?}, expected only {sibling_tab}"),
     );
 
+    println!("  --- a name is one tree node, and one menu entry ---");
+    verify_an_object_name_is_one_tree_node(&mut report);
+    verify_a_name_survives_a_menu_round_trip(&mut report);
+
     println!();
     if report.failures.is_empty() {
         println!("ALL PER-TAB OBJECT BROWSER CHECKS PASSED");
@@ -370,4 +374,80 @@ fn main() {
         }
         std::process::exit(1);
     }
+}
+
+/// An object's name is ONE node, whatever is in it.
+///
+/// The escape is measured against the widget rather than against a string: an
+/// FLTK tree path is split on `/`, so a table named `A/B` used to become a
+/// folder `A` holding a leaf `B` — and, next to a table really called `A`, the
+/// two MERGED and the real `A/B` could not be selected, expanded, exported or
+/// imported into. `space_query::ui::widget_label::tree_path_segment` is what
+/// the browser builds every path segment with.
+fn verify_an_object_name_is_one_tree_node(report: &mut Report) {
+    use fltk::prelude::{GroupExt, WidgetBase};
+    use fltk::tree::Tree;
+    use space_query::ui::widget_label::tree_path_segment;
+
+    let window = fltk::window::Window::new(0, 0, 300, 200, None);
+    let mut tree = Tree::new(0, 0, 200, 180, None);
+    for name in ["A/B", "A", "PLAIN"] {
+        tree.add(&format!("Tables/{}", tree_path_segment(name)));
+    }
+    window.end();
+
+    let labels: Vec<String> = tree
+        .get_items()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| item.parent().and_then(|parent| parent.label()).as_deref() == Some("Tables"))
+        .filter_map(|item| item.label())
+        .collect();
+    report.check(
+        "an object name is one tree node under its category",
+        labels == vec!["A/B".to_string(), "A".to_string(), "PLAIN".to_string()],
+        format!("the tree holds {labels:?}"),
+    );
+    // And nothing became a folder: the awkward name has no children.
+    let nested: Vec<String> = tree
+        .get_items()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| {
+            item.parent().and_then(|parent| parent.label()).as_deref() == Some("Tables")
+                && item.has_children()
+        })
+        .filter_map(|item| item.label())
+        .collect();
+    report.check(
+        "no object name opened a folder of its own",
+        nested.is_empty(),
+        format!("{nested:?} became a folder — the name was split into a path"),
+    );
+}
+
+/// Escaping a name for a menu is transparent to IDENTITY.
+///
+/// The scope picker resolves its selection by reading an entry's text back and
+/// matching it to a schema name, so the whole design rests on the widget
+/// storing the name and not the escape. Measured against the widget: FLTK's
+/// menu parser consumes the `\\`, and `Choice::text` gives the name back.
+fn verify_a_name_survives_a_menu_round_trip(report: &mut Report) {
+    use fltk::menu::Choice;
+    use fltk::prelude::{MenuExt, WidgetBase};
+    use space_query::ui::widget_label::add_menu_item;
+
+    let hostile = ["A|B", "C/D", "E&F", "G_H", r"I\J", "PLAIN"];
+    let mut choice = Choice::new(0, 0, 10, 10, None);
+    for name in hostile {
+        add_menu_item(&mut choice, name);
+    }
+    let stored: Vec<String> = (0..choice.size().saturating_sub(1))
+        .map(|index| choice.text(index).unwrap_or_default())
+        .collect();
+    report.check(
+        "a name reaches a menu as ONE entry holding that name",
+        stored == hostile.iter().map(|n| (*n).to_string()).collect::<Vec<_>>(),
+        format!("the menu holds {stored:?}, wanted {hostile:?}"),
+    );
 }

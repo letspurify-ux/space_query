@@ -274,6 +274,101 @@ pub(crate) fn oracle_thin_value_kind(column_type: &OracleThinColumnType) -> SqlV
     }
 }
 
+/// One Oracle thin value as the text a RESULT cell carries, or [`None`] for
+/// SQL NULL.
+///
+/// The ONE converter for thin result DATA, shared by the statement pipeline
+/// that fills the grid and by [`ObjectBrowser::execute_thin_query`], which is
+/// what `Export Data...` reads a table with. They used to be two: the export
+/// went through the CATALOG reader
+/// ([`ObjectBrowser::thin_catalog_value_to_text`]), and so it spelled a NULL as
+/// the empty string (the grid and OCI both use
+/// [`QueryCell::null_result_text`]), dropped a TIMESTAMP's fractional seconds,
+/// and rendered a RAW as `[222, 173, 190, 239]` — Rust's debug of a byte
+/// vector — where every other road shows `DEADBEEF`. An exported Oracle table
+/// therefore depended on which driver fetched it.
+///
+/// NULL is returned as [`None`] rather than as any particular text, because
+/// the two callers spell it differently on purpose: the grid writes the
+/// session's display text, and a result being exported carries the driver's own
+/// marker so the export can tell a NULL from the four letters `NULL`.
+pub(crate) fn oracle_thin_result_cell(value: &OracleThinValue) -> Option<String> {
+    match value {
+        OracleThinValue::Text(text) | OracleThinValue::Number(text) => Some(text.clone()),
+        OracleThinValue::Boolean(value) => Some(if *value { "TRUE" } else { "FALSE" }.to_string()),
+        OracleThinValue::Null => None,
+        OracleThinValue::DateTime(value) => Some(format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            value.year, value.month, value.day, value.hour, value.minute, value.second
+        )),
+        OracleThinValue::Timestamp(value) => {
+            let mut text = format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+                value.year,
+                value.month,
+                value.day,
+                value.hour,
+                value.minute,
+                value.second,
+                value.nanosecond / 1_000
+            );
+            if let Some(suffix) = value.timezone_suffix() {
+                text.push_str(&suffix);
+            }
+            Some(text)
+        }
+        OracleThinValue::Bytes(bytes) => Some(
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>(),
+        ),
+        OracleThinValue::JsonId(bytes) => Some(
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>(),
+        ),
+        OracleThinValue::Lob(_) => Some("[LOB]".to_string()),
+        OracleThinValue::Cursor(_) => Some("[CURSOR]".to_string()),
+        OracleThinValue::Object(_)
+        | OracleThinValue::Array(_)
+        | OracleThinValue::IndexedArray(_) => {
+            serde_json::to_string(&oracle_thin_value_json(value)).ok()
+        }
+    }
+}
+
+pub(crate) fn oracle_thin_value_json(value: &OracleThinValue) -> serde_json::Value {
+    match value {
+        OracleThinValue::Null => serde_json::Value::Null,
+        OracleThinValue::Number(value) => value
+            .parse::<serde_json::Number>()
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|_| serde_json::Value::String(value.clone())),
+        OracleThinValue::Boolean(value) => serde_json::Value::Bool(*value),
+        OracleThinValue::Text(value) => serde_json::Value::String(value.clone()),
+        OracleThinValue::Object(attributes) => {
+            let mut object = serde_json::Map::new();
+            for (name, value) in attributes {
+                object.insert(name.clone(), oracle_thin_value_json(value));
+            }
+            serde_json::Value::Object(object)
+        }
+        OracleThinValue::Array(values) => {
+            serde_json::Value::Array(values.iter().map(oracle_thin_value_json).collect())
+        }
+        OracleThinValue::IndexedArray(values) => {
+            let mut object = serde_json::Map::new();
+            for (index, value) in values {
+                object.insert(index.to_string(), oracle_thin_value_json(value));
+            }
+            serde_json::Value::Object(object)
+        }
+        _ => serde_json::Value::String(oracle_thin_result_cell(value).unwrap_or_default()),
+    }
+}
+
 pub(crate) fn oracle_thin_column_info(
     columns: &[OracleThinColumnMetadata],
     normalize_internal_rowid_alias: bool,
@@ -4190,14 +4285,16 @@ impl QueryExecutor {
                    AND cc.owner = c.owner
                    AND cc.table_name = c.table_name
                    AND cc.column_name = c.column_name
-                   AND ROWNUM = 1) as is_pk
+                   AND ROWNUM = 1) as is_pk,
+                {generated} as is_generated
             FROM all_tab_columns c
             WHERE c.owner = :1
               AND c.table_name = :2
             ORDER BY c.column_id
         "#;
+        let sql = sql.replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR);
 
-        let mut stmt = match conn.statement(sql).build() {
+        let mut stmt = match conn.statement(&sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -4278,6 +4375,13 @@ impl QueryExecutor {
                     return Err(err);
                 }
             };
+            let is_generated = match row.get::<_, Option<String>>(8) {
+                Ok(value) => value.as_deref().map(str::trim) == Some("Y"),
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
             columns.push(TableColumnDetail {
                 name,
                 data_type,
@@ -4287,6 +4391,7 @@ impl QueryExecutor {
                 nullable,
                 default_value,
                 is_primary_key,
+                is_generated,
             });
         }
 
@@ -9186,20 +9291,35 @@ impl ObjectBrowser {
             .query_described_fetch_all_request(&request)
             .map_err(|err| err.to_string())?;
         let columns = oracle_thin_column_info(&described.columns, false);
+        // The RESULT converter, not the catalog one: this is a table's DATA,
+        // and it has to reach the exporter spelled exactly as OCI spells it —
+        // SQL NULL as the driver's own marker, a RAW as hex, a TIMESTAMP with
+        // its fractional seconds. `QueryCell::null_result_text` is what
+        // `row_value_to_text` writes on the OCI side, so the two drivers hand
+        // `render_table_export` the same rows.
         let rows: Vec<Vec<String>> = described
             .result
             .rows
             .into_iter()
             .map(|row| {
-                row.into_iter()
-                    .map(Self::thin_metadata_value_to_text)
+                row.iter()
+                    .map(|value| {
+                        oracle_thin_result_cell(value).unwrap_or_else(QueryCell::null_result_text)
+                    })
                     .collect()
             })
             .collect();
         Ok(QueryResult::new_select(sql, columns, rows, start.elapsed()))
     }
 
-    fn thin_metadata_value_to_text(value: OracleThinValue) -> String {
+    /// One Oracle thin value as CATALOG text.
+    ///
+    /// Deliberately not [`oracle_thin_result_cell`]: every caller reads fixed
+    /// positions out of a metadata row and wants a missing value to be the
+    /// empty string, not a marker it would then have to strip. Reading a
+    /// table's DATA with this is what made an exported table depend on the
+    /// driver, so the name says which of the two questions it answers.
+    fn thin_catalog_value_to_text(value: OracleThinValue) -> String {
         match value {
             OracleThinValue::Null => String::new(),
             OracleThinValue::Number(value) | OracleThinValue::Text(value) => value,
@@ -9264,7 +9384,7 @@ impl ObjectBrowser {
                     .map(|row| {
                         let mut row: Vec<String> = row
                             .into_iter()
-                            .map(Self::thin_metadata_value_to_text)
+                            .map(Self::thin_catalog_value_to_text)
                             .collect();
                         if row.len() < column_count {
                             row.resize(column_count, String::new());
@@ -9314,7 +9434,7 @@ impl ObjectBrowser {
             .into_iter()
             .next()
             .and_then(|row| row.into_iter().next())
-            .map(Self::thin_metadata_value_to_text)
+            .map(Self::thin_catalog_value_to_text)
             .ok_or_else(|| "Oracle Thin metadata query returned no rows".to_string())
     }
 
@@ -11597,14 +11717,16 @@ impl ObjectBrowser {
                    AND con.constraint_type = 'P'
                    AND cc.table_name = c.table_name
                    AND cc.column_name = c.column_name
-                   AND ROWNUM = 1) as is_pk
+                   AND ROWNUM = 1) as is_pk,
+                {generated} as is_generated
             FROM all_tab_columns c
             WHERE c.owner = :1
               AND c.table_name = :2
             ORDER BY c.column_id
         "#;
+        let sql = sql.replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR);
 
-        let mut stmt = match conn.statement(sql).build() {
+        let mut stmt = match conn.statement(&sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -11685,6 +11807,13 @@ impl ObjectBrowser {
                     return Err(err);
                 }
             };
+            let is_generated = match row.get::<_, Option<String>>(8) {
+                Ok(value) => value.as_deref().map(str::trim) == Some("Y"),
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
             columns.push(TableColumnDetail {
                 name,
                 data_type,
@@ -11694,6 +11823,7 @@ impl ObjectBrowser {
                 nullable,
                 default_value,
                 is_primary_key,
+                is_generated,
             });
         }
 
@@ -11723,17 +11853,19 @@ impl ObjectBrowser {
                    AND con.constraint_type = 'P'
                    AND cc.table_name = c.table_name
                    AND cc.column_name = c.column_name
-                   AND ROWNUM = 1) as is_pk
+                   AND ROWNUM = 1) as is_pk,
+                {generated} as is_generated
             FROM all_tab_columns c
             WHERE c.owner = :1
               AND c.table_name = :2
             ORDER BY c.column_id
         "#;
+        let sql = sql.replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR);
 
         let rows = Self::thin_query_text_rows(
             conn,
-            sql,
-            8,
+            &sql,
+            9,
             vec![
                 OracleThinBindValue::Text(owner),
                 OracleThinBindValue::Text(table_name),
@@ -11753,6 +11885,7 @@ impl ObjectBrowser {
                 nullable: row.get(5).map(|value| value == "Y").unwrap_or(false),
                 default_value: row.get(6).and_then(|value| Self::thin_optional_text(value)),
                 is_primary_key: row.get(7).map(|value| !value.is_empty()).unwrap_or(false),
+                is_generated: row.get(8).map(|value| value.trim() == "Y").unwrap_or(false),
             });
         }
 
@@ -12473,6 +12606,34 @@ pub struct CompilationError {
     pub attribute: String,
 }
 
+/// The catalog expression that answers "can a value be written into this
+/// column?" for Oracle, as `'Y'`/`'N'`.
+///
+/// ONE const because three statements ask it — OCI's table structure, the thin
+/// driver's, and `DESCRIBE` — and because the two drivers must never be able to
+/// give the object browser a different answer about the same table. It is a pair
+/// of scalar subqueries rather than joins on purpose: `ALL_TAB_COLUMNS.
+/// DATA_DEFAULT` is a `LONG`, and a `LONG` in the select list of a joined query
+/// is not something to rely on.
+///
+/// `VIRTUAL_COLUMN` (11g and later) covers generated columns; `GENERATION_TYPE`
+/// from `ALL_TAB_IDENTITY_COLS` (12.1 and later, which is also the oldest server
+/// this app's own thin driver negotiates a protocol with) covers
+/// `GENERATED ALWAYS AS IDENTITY` — and only ALWAYS, because a `BY DEFAULT`
+/// identity accepts an explicit value and must stay importable.
+pub(crate) const ORACLE_GENERATED_COLUMN_EXPR: &str = r#"
+                CASE WHEN (SELECT tc.virtual_column
+                             FROM all_tab_cols tc
+                            WHERE tc.owner = c.owner
+                              AND tc.table_name = c.table_name
+                              AND tc.column_name = c.column_name) = 'YES'
+                       OR (SELECT ic.generation_type
+                             FROM all_tab_identity_cols ic
+                            WHERE ic.owner = c.owner
+                              AND ic.table_name = c.table_name
+                              AND ic.column_name = c.column_name) = 'ALWAYS'
+                     THEN 'Y' ELSE 'N' END"#;
+
 /// Detailed column information for table structure
 #[derive(Debug, Clone)]
 pub struct TableColumnDetail {
@@ -12485,6 +12646,15 @@ pub struct TableColumnDetail {
     #[allow(dead_code)]
     pub default_value: Option<String>,
     pub is_primary_key: bool,
+    /// Whether the server computes this column's value, so no statement may
+    /// supply one: an Oracle virtual column or `GENERATED ALWAYS AS IDENTITY`,
+    /// a MySQL-family `VIRTUAL`/`STORED GENERATED` column.
+    ///
+    /// Read here rather than inferred later because only the catalog knows, and
+    /// because every consumer that writes a statement — the import mapping above
+    /// all — has to be able to leave such a column out instead of watching the
+    /// server reject the whole script.
+    pub is_generated: bool,
 }
 
 impl TableColumnDetail {

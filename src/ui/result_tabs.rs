@@ -3059,15 +3059,15 @@ impl ResultTabsWidget {
         format: ExportFormat,
         scope: ExportScope,
         destination: ExportDestination,
-        db_type: Option<crate::db::DatabaseType>,
-        callback: Box<dyn FnMut(String, usize)>,
-    ) -> Option<(String, usize)> {
+        dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
+        callback: crate::ui::result_table::ExportReadyCallback,
+    ) -> Option<crate::ui::result_export::ExportContent> {
         let table = self.current_table()?;
         let request = ExportRequest {
             format,
             scope,
             destination,
-            db_type,
+            dialect,
             table: Self::resolve_grid_export_table(&table),
         };
         table.export_after_fetch_all(request, callback)
@@ -3100,6 +3100,25 @@ impl ResultTabsWidget {
     pub(crate) fn has_grid_selection(&self) -> bool {
         self.current_table()
             .is_some_and(|table| table.has_selection())
+    }
+
+    /// Why the visible result cannot be exported yet, or `None`.
+    pub(crate) fn export_refusal(&self) -> Option<String> {
+        self.current_table()
+            .and_then(|table| table.export_refusal())
+    }
+
+    /// Why generated SQL cannot be written for the visible result at `scope`,
+    /// or `None`.
+    pub(crate) fn sql_export_refusal(&self, scope: ExportScope) -> Option<String> {
+        self.current_table()
+            .and_then(|table| table.sql_export_refusal(scope))
+    }
+
+    /// Whether a `SQL Inserts` export of the whole result could name a column.
+    pub(crate) fn has_sql_exportable_columns(&self) -> bool {
+        self.current_table()
+            .is_some_and(|table| table.sql_export_covers_a_column(ExportScope::All))
     }
 
     pub fn row_count(&self) -> usize {
@@ -3424,10 +3443,10 @@ impl ResultTabsWidget {
     /// cancelled lazy fetch left populated — still names its real table.
     pub(crate) fn sql_export_context(
         &self,
-        db_type: crate::db::DatabaseType,
+        dialect: crate::ui::grid_sql_export::SqlWriteDialect,
     ) -> Option<GridSqlSelection> {
         let table = self.current_table()?;
-        let mut selection = table.sql_export_selection(db_type, None)?;
+        let mut selection = table.sql_export_selection(dialect, None)?;
         selection.table = Self::resolve_grid_export_table(&table);
         Some(selection)
     }

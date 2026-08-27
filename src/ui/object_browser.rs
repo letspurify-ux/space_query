@@ -103,10 +103,15 @@ pub enum SqlAction {
 /// A finished tree export, ready to be written or copied.
 #[derive(Clone, Debug)]
 pub struct ObjectExportDelivery {
-    pub text: String,
+    /// What was rendered and how many rows it covers, or why nothing was.
+    ///
+    /// One value rather than a `text` beside a `row_count`, because the two are
+    /// one fact: `SQL Inserts` of a table whose every column the server
+    /// computes writes nothing, and the count taken from the input announced
+    /// that empty file as a full export.
+    pub content: crate::ui::result_export::ExportContent,
     pub format: crate::ui::result_export::ExportFormat,
     pub destination: crate::ui::result_export::ExportDestination,
-    pub row_count: usize,
     /// Base name to offer in the save panel, without an extension.
     pub suggested_name: String,
 }
@@ -1132,11 +1137,19 @@ enum ObjectActionResult {
     ImportTarget {
         qualified_name: String,
         file_label: String,
-        db_type: crate::db::DatabaseType,
         format: crate::ui::result_export::ExportFormat,
-        /// The file's text and the table's columns, loaded together so one
-        /// failure reports one message.
-        result: Result<(String, Vec<TableColumnDetail>), String>,
+        /// The file's text, the table's columns, and the SQL-writing rules of
+        /// the connection they were read on, loaded together so one failure
+        /// reports one message and so the script cannot be written for a
+        /// different connection than the one it was prepared against.
+        result: Result<
+            (
+                String,
+                Vec<TableColumnDetail>,
+                crate::ui::grid_sql_export::SqlWriteDialect,
+            ),
+            String,
+        >,
     },
     TableIndexes {
         table_name: String,
@@ -1189,9 +1202,21 @@ enum ObjectActionResult {
     },
     ExportedTable {
         qualified_name: String,
-        db_type: crate::db::DatabaseType,
         choice: crate::ui::result_export_dialog::ExportChoice,
-        result: Result<crate::db::QueryResult, String>,
+        /// The rows, the columns no statement may write into, and the
+        /// SQL-writing rules of the connection they came from.
+        ///
+        /// The middle one is read only for `SQL Inserts` — the one format that
+        /// is meant to be RUN — and is empty for every other, which costs a
+        /// plain CSV export nothing.
+        result: Result<
+            (
+                crate::db::QueryResult,
+                Vec<String>,
+                crate::ui::grid_sql_export::SqlWriteDialect,
+            ),
+            String,
+        >,
     },
 }
 
@@ -1474,6 +1499,7 @@ impl ObjectBrowserWidget {
             nullable,
             default_value: None,
             is_primary_key,
+            is_generated: false,
         }
     }
 
@@ -3370,22 +3396,33 @@ impl ObjectBrowserWidget {
                         },
                         ObjectActionResult::ExportedTable {
                             qualified_name,
-                            db_type,
                             choice,
                             result,
                         } => match result {
-                            Ok(query_result) => {
+                            Ok((query_result, generated, dialect)) => {
                                 let delivery = ObjectBrowserWidget::render_table_export(
                                     &qualified_name,
-                                    db_type,
+                                    dialect,
                                     choice,
                                     &query_result,
+                                    &generated,
                                 );
+                                // Said only for an export that HAS rows: a
+                                // refusal is the user's answer, and announcing
+                                // a row count beside it would contradict it.
+                                if let Some(reason) = delivery.content.refusal() {
+                                    crate::ui::alert_on_main(reason);
+                                    ObjectBrowserWidget::emit_status_callback(
+                                        &status_callback,
+                                        &format!("{qualified_name} was not exported"),
+                                    );
+                                    continue;
+                                }
                                 ObjectBrowserWidget::emit_status_callback(
                                     &status_callback,
                                     &format!(
                                         "Exporting {qualified_name}: {} rows as {}",
-                                        delivery.row_count,
+                                        delivery.content.rows(),
                                         choice.format.label()
                                     ),
                                 );
@@ -3403,17 +3440,16 @@ impl ObjectBrowserWidget {
                         ObjectActionResult::ImportTarget {
                             qualified_name,
                             file_label,
-                            db_type,
                             format,
                             result,
                         } => match result {
-                            Ok((text, columns)) => {
+                            Ok((text, columns, dialect)) => {
                                 if let Some((sql, summary)) =
                                     ObjectBrowserWidget::build_import_script_from_dialog(
                                         &file_label,
                                         &text,
                                         &qualified_name,
-                                        db_type,
+                                        dialect,
                                         &columns,
                                         format,
                                     )
@@ -3591,9 +3627,13 @@ impl ObjectBrowserWidget {
                                     );
                                     // The node the user pressed Right on is the
                                     // one that should now be open.
-                                    if let Some(mut item) =
-                                        tree.find_item(&format!("Tables/{}", table_name))
-                                    {
+                                    // The same escape the path was BUILT with,
+                                    // or a name holding a `/` looks up a node
+                                    // that does not exist.
+                                    if let Some(mut item) = tree.find_item(&format!(
+                                        "Tables/{}",
+                                        crate::ui::widget_label::tree_path_segment(&table_name)
+                                    )) {
                                         item.open();
                                     }
                                     tree.redraw();
@@ -3636,9 +3676,12 @@ impl ObjectBrowserWidget {
                                         &package_open_paths,
                                     );
                                     if select_first_child_after_load {
-                                        if let Some(item) =
-                                            tree.find_item(&format!("Packages/{}", package_name))
-                                        {
+                                        if let Some(item) = tree.find_item(&format!(
+                                            "Packages/{}",
+                                            crate::ui::widget_label::tree_path_segment(
+                                                &package_name
+                                            )
+                                        )) {
                                             ObjectBrowserWidget::select_first_child_item(
                                                 &mut tree, &item,
                                             );
@@ -4738,50 +4781,13 @@ impl ObjectBrowserWidget {
         }
     }
 
+    /// Fully quote a MySQL-family name that may already be partly quoted.
+    ///
+    /// Delegates to [`crate::db::quote_mysql_qualified_name`] so the tree, the
+    /// generated-SQL writer and the import script builder cannot disagree about
+    /// what `app.`zr``tick`` names.
     fn quote_mysql_identifier_path(identifier: &str) -> String {
-        let mut segments = Vec::new();
-        let mut start = 0usize;
-        let mut active_quote = false;
-        let trimmed = identifier.trim();
-        let mut chars = trimmed.char_indices().peekable();
-
-        while let Some((idx, ch)) = chars.next() {
-            if ch == '`' {
-                if active_quote {
-                    if chars.peek().is_some_and(|(_, next)| *next == '`') {
-                        chars.next();
-                    } else {
-                        active_quote = false;
-                    }
-                } else {
-                    active_quote = true;
-                }
-                continue;
-            }
-            if ch == '.' && !active_quote {
-                if let Some(segment) = trimmed.get(start..idx) {
-                    segments.push(segment);
-                }
-                start = idx + ch.len_utf8();
-            }
-        }
-
-        if let Some(segment) = trimmed.get(start..) {
-            segments.push(segment);
-        }
-
-        segments
-            .into_iter()
-            .filter_map(|segment| {
-                let trimmed = segment.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                let unquoted = crate::sql_text::strip_identifier_quotes(trimmed);
-                Some(format!("`{}`", unquoted.replace('`', "``")))
-            })
-            .collect::<Vec<_>>()
-            .join(".")
+        crate::db::quote_mysql_qualified_name(identifier)
     }
 
     fn scope_label_text(_db_type: crate::db::DatabaseType) -> &'static str {
@@ -4868,8 +4874,12 @@ impl ObjectBrowserWidget {
 
         if needs_rebuild {
             scope_choice.clear();
-            if !available_scopes.is_empty() {
-                scope_choice.add_choice(&available_scopes.join("|"));
+            // ONE entry per scope, whatever a schema is called. Joining on `|`
+            // made a name holding one into two entries, and the picker resolves
+            // its selection by index and by matching the entry's text to a
+            // scope name — so both roads pointed at the wrong schema.
+            for scope in available_scopes {
+                crate::ui::widget_label::add_menu_item(scope_choice, scope);
             }
         }
 
@@ -5412,6 +5422,21 @@ impl ObjectBrowserWidget {
         object_name: &str,
     ) -> String {
         object_browser_behavior_for(db_type).qualify_object_name(selected_scope, object_name)
+    }
+
+    /// The qualified name `Import Data...` and `Export Data...` hand to the
+    /// builders for an object.
+    ///
+    /// Public only so `verify_import_live` can name a table exactly the way the
+    /// tree does — a name the browser already quoted is the input the script
+    /// builders have to get right. Not part of the supported surface.
+    #[doc(hidden)]
+    pub fn qualified_object_name(
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+        object_name: &str,
+    ) -> String {
+        Self::qualify_object_name_for_scope(db_type, selected_scope, object_name)
     }
 
     fn mysql_scope_for_context<'a>(
@@ -7928,17 +7953,28 @@ impl ObjectBrowserWidget {
     ///
     /// Goes through the same `render_export_content` the result grid uses, so a
     /// table exported from the tree is byte-identical to the same table
-    /// exported from a `Select Data` grid. The one thing that has to be
-    /// translated is NULL: a driver reports it as a sentinel, and the
-    /// serializers expect the grid's NULL display text.
-    fn render_table_export(
+    /// exported from a `Select Data` grid.
+    ///
+    /// NULL is carried straight through: the driver's own marker is still on
+    /// every cell here, so this path answers "was it NULL?" from the fact
+    /// rather than from the text, and a `VARCHAR` holding the four letters
+    /// `NULL` or an empty string survives the export intact — which a grid
+    /// export, whose rows are already display text, cannot promise.
+    ///
+    /// Public only so `verify_import_live` can render a tree export exactly the
+    /// way the object browser does, with the same choice the modal returns.
+    /// Not part of the supported surface.
+    #[doc(hidden)]
+    pub fn render_table_export(
         qualified_name: &str,
-        db_type: crate::db::DatabaseType,
+        dialect: crate::ui::grid_sql_export::SqlWriteDialect,
         choice: crate::ui::result_export_dialog::ExportChoice,
         result: &crate::db::QueryResult,
+        generated_columns: &[String],
     ) -> ObjectExportDelivery {
-        // No grid here to ask for its NULL text, so use the one a grid
-        // starts with; a session `SET NULL` cannot reach this path.
+        // Only CSV and TSV read this: they dump what a grid would SHOW, and no
+        // grid here means the text a grid starts with. A session `SET NULL`
+        // cannot reach this path.
         let null_text = crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT.to_string();
         let columns: Vec<String> = result
             .columns
@@ -7947,12 +7983,14 @@ impl ObjectBrowserWidget {
             .collect();
         let column_kinds: Vec<crate::db::SqlValueKind> =
             result.columns.iter().map(|column| column.kind).collect();
-        let rows: Vec<Vec<String>> = result
+        let rows: Vec<Vec<crate::ui::result_export::ExportCell>> = result
             .rows
             .iter()
             .map(|row| {
                 row.iter()
-                    .map(|value| crate::db::QueryCell::display_result_text(value, &null_text))
+                    .map(|value| {
+                        (!crate::db::QueryCell::is_null_result_text(value)).then(|| value.clone())
+                    })
                     .collect()
             })
             .collect();
@@ -7960,31 +7998,40 @@ impl ObjectBrowserWidget {
             columns: columns.clone(),
             column_kinds: column_kinds.clone(),
             rows: rows.clone(),
-            null_text: null_text.clone(),
+            null_text,
         };
         let sql_selection = crate::ui::grid_sql_export::GridSqlSelection {
-            db_type,
+            dialect,
             table: Some(qualified_name.to_string()),
-            selected_columns: (0..columns.len()).collect(),
+            // Every data format writes every column, because that is what the
+            // table HAS. `SQL Inserts` alone writes a script that will be RUN,
+            // so it names only the columns a statement may write into —
+            // `generated_columns` is empty for every other format, which makes
+            // this the same list.
+            selected_columns: crate::ui::grid_sql_export::writable_column_indices(
+                &columns,
+                generated_columns,
+            ),
             all_columns: columns,
             column_kinds,
             rows,
-            null_text,
         };
-        let (text, row_count) = crate::ui::result_export::render_export_content(
+        let content = crate::ui::result_export::render_export_content(
             choice.format,
             &grid,
             Some(&sql_selection),
-        );
-        ObjectExportDelivery {
-            text: crate::ui::result_export::with_destination_prelude(
+        )
+        .map_text(|text| {
+            crate::ui::result_export::with_destination_prelude(
                 choice.format,
                 choice.destination,
                 text,
-            ),
+            )
+        });
+        ObjectExportDelivery {
+            content,
             format: choice.format,
             destination: choice.destination,
-            row_count,
             suggested_name: Self::export_file_stem(qualified_name),
         }
     }
@@ -8015,20 +8062,21 @@ impl ObjectBrowserWidget {
         file_label: &str,
         text: &str,
         qualified_name: &str,
-        db_type: crate::db::DatabaseType,
+        dialect: crate::ui::grid_sql_export::SqlWriteDialect,
         columns: &[TableColumnDetail],
         format: crate::ui::result_export::ExportFormat,
     ) -> Option<(String, String)> {
-        let targets = Self::import_target_columns(db_type, columns);
+        let table_columns = Self::import_targets(dialect.db_type(), columns);
+        let targets = table_columns.writable();
         let outcome = crate::ui::table_import_dialog::show(
             file_label,
             text,
             qualified_name,
-            &targets,
+            &table_columns,
             format,
         )?;
         let request = crate::ui::table_import::ImportRequest {
-            db_type,
+            dialect,
             table: qualified_name,
             targets: &targets,
             mapping: &outcome.mapping,
@@ -8048,24 +8096,29 @@ impl ObjectBrowserWidget {
         }
     }
 
-    /// The table's columns as the import builder needs them: the declared type
-    /// resolved to the literal kind it accepts.
+    /// The table's columns as an import sees them.
+    ///
+    /// A thin delegate to [`crate::ui::table_import::ImportTargets`], which owns
+    /// the rule: a column the server computes is left out of the targets rather
+    /// than offered and then refused. The DATA formats of `Export Data...`
+    /// write every column of a table, generated ones included, so the file the
+    /// user is most likely to import is the one whose header names them — and
+    /// `default_mapping` matches by name, so they would map themselves and the
+    /// server would reject the whole script (Oracle ORA-54013, MySQL 3105). Not
+    /// offering the target is the same rule the context menu already follows for
+    /// actions the connection would refuse: an entry that is guaranteed to fail
+    /// does not belong in the list.
+    ///
+    /// The export side of the same rule lives in
+    /// [`crate::ui::grid_sql_export::writable_column_indices`], which is what
+    /// `SQL Inserts` — the one format meant to be RUN — names its columns
+    /// through. What an import will not offer is what an export must not name.
     #[doc(hidden)]
-    pub fn import_target_columns(
+    pub fn import_targets(
         db_type: crate::db::DatabaseType,
         columns: &[TableColumnDetail],
-    ) -> Vec<crate::ui::table_import::TargetColumn> {
-        columns
-            .iter()
-            .map(|column| crate::ui::table_import::TargetColumn {
-                name: column.name.clone(),
-                kind: crate::ui::table_import::column_kind_for_data_type(
-                    db_type,
-                    &column.data_type,
-                ),
-                nullable: column.nullable,
-            })
-            .collect()
+    ) -> crate::ui::table_import::ImportTargets {
+        crate::ui::table_import::ImportTargets::from_catalog(db_type, columns)
     }
 
     /// Which file to import. `None` means the user cancelled the chooser.
@@ -8399,6 +8452,14 @@ impl ObjectBrowserWidget {
                                         selected_scope.as_deref(),
                                         activity,
                                         |context, session| {
+                                            // Asked of the SESSION the columns
+                                            // were read on, so the literals the
+                                            // script writes match the sql_mode
+                                            // it will run under.
+                                            let dialect =
+                                                crate::ui::grid_sql_export::SqlWriteDialect::for_connection(
+                                                    &context.connection_info,
+                                                );
                                             object_browser_behavior_for(
                                                 context.connection_info.db_type,
                                             )
@@ -8408,15 +8469,15 @@ impl ObjectBrowserWidget {
                                                 selected_scope.as_deref(),
                                                 &table_name,
                                             )
+                                            .map(|columns| (columns, dialect))
                                         },
                                     )
-                                    .map(|columns| (text, columns))
+                                    .map(|(columns, dialect)| (text, columns, dialect))
                                 })
                             });
                             let _ = sender.send(ObjectActionResult::ImportTarget {
                                 qualified_name: qualified_for_thread,
                                 file_label: file_label_for_thread,
-                                db_type,
                                 format,
                                 result,
                             });
@@ -8455,19 +8516,48 @@ impl ObjectBrowserWidget {
                                     selected_scope.as_deref(),
                                     activity,
                                     |context, session| {
-                                        object_browser_behavior_for(context.connection_info.db_type)
+                                        let dialect =
+                                            crate::ui::grid_sql_export::SqlWriteDialect::for_connection(
+                                                &context.connection_info,
+                                            );
+                                        let behavior = object_browser_behavior_for(
+                                            context.connection_info.db_type,
+                                        );
+                                        // Only `SQL Inserts` is a script the
+                                        // user will RUN, and only it therefore
+                                        // has to know which columns the server
+                                        // computes. Asked on the SAME session
+                                        // the rows come from, so the two cannot
+                                        // describe different tables.
+                                        let generated = if choice.format
+                                            == crate::ui::result_export::ExportFormat::SqlInserts
+                                        {
+                                            ObjectBrowserWidget::import_targets(
+                                                context.connection_info.db_type,
+                                                &behavior.load_table_structure(
+                                                    context,
+                                                    session,
+                                                    selected_scope.as_deref(),
+                                                    &table_name,
+                                                )?,
+                                            )
+                                            .generated_names()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        behavior
                                             .load_table_rows(
                                                 context,
                                                 session,
                                                 selected_scope.as_deref(),
                                                 &table_name,
                                             )
+                                            .map(|rows| (rows, generated, dialect))
                                     },
                                 )
                             });
                             let _ = sender.send(ObjectActionResult::ExportedTable {
                                 qualified_name: qualified_for_thread,
-                                db_type,
                                 choice,
                                 result,
                             });
@@ -9451,56 +9541,85 @@ impl ObjectBrowserWidget {
             .map(|column| column.name.clone())
     }
 
+    /// The segments an FLTK tree would split `path` into.
+    ///
+    /// The reader side of [`crate::ui::widget_label::tree_path_segment`], so a
+    /// test can assert what the WIDGET will see rather than what the writer
+    /// happened to spell.
+    #[cfg(test)]
+    fn unescaped_tree_segments(path: &str) -> Vec<String> {
+        let mut segments = vec![String::new()];
+        let mut chars = path.chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        segments.last_mut().expect("one segment").push(next);
+                    }
+                }
+                '/' => segments.push(String::new()),
+                _ => segments.last_mut().expect("one segment").push(ch),
+            }
+        }
+        segments
+    }
+
     fn collect_tree_paths(cache: &ObjectCache, filter_text: &str) -> Vec<String> {
+        // An object's name is ONE node of the tree, whatever is in it. FLTK
+        // splits a path on `/`, so a table named `A/B` used to become a folder
+        // `A` holding a leaf `B` — and, when a table really called `A` existed,
+        // the two MERGED and the actual table could not be reached, expanded or
+        // exported at all.
+        let node = crate::ui::widget_label::tree_path_segment;
         let mut paths: Vec<String> = Vec::new();
         for table in &cache.tables {
             if filter_text.is_empty() || table.to_lowercase().contains(filter_text) {
-                paths.push(format!("Tables/{}", table));
+                paths.push(format!("Tables/{}", node(table)));
                 // Columns only exist here once the table has been expanded
                 // once. Emitting them from the cache is what keeps them alive
                 // across the rebuild that every filter keystroke triggers.
                 for column in cache.table_columns.get(table).into_iter().flatten() {
                     paths.push(format!(
                         "Tables/{}/{}",
-                        table,
-                        Self::column_node_label(column)
+                        node(table),
+                        node(&Self::column_node_label(column))
                     ));
                 }
             }
         }
         for view in &cache.views {
             if filter_text.is_empty() || view.to_lowercase().contains(filter_text) {
-                paths.push(format!("Views/{}", view));
+                paths.push(format!("Views/{}", node(view)));
             }
         }
         for procedure in &cache.procedures {
             if filter_text.is_empty() || procedure.to_lowercase().contains(filter_text) {
-                paths.push(format!("Procedures/{}", procedure));
+                paths.push(format!("Procedures/{}", node(procedure)));
             }
         }
         for func in &cache.functions {
             if filter_text.is_empty() || func.to_lowercase().contains(filter_text) {
-                paths.push(format!("Functions/{}", func));
+                paths.push(format!("Functions/{}", node(func)));
             }
         }
         for seq in &cache.sequences {
             if filter_text.is_empty() || seq.to_lowercase().contains(filter_text) {
-                paths.push(format!("Sequences/{}", seq));
+                paths.push(format!("Sequences/{}", node(seq)));
             }
         }
         for trig in &cache.triggers {
             if filter_text.is_empty() || trig.to_lowercase().contains(filter_text) {
-                paths.push(format!("Triggers/{}", trig));
+                paths.push(format!("Triggers/{}", node(trig)));
             }
         }
         for event in &cache.events {
             if filter_text.is_empty() || event.to_lowercase().contains(filter_text) {
-                paths.push(format!("Events/{}", event));
+                paths.push(format!("Events/{}", node(event)));
             }
         }
         for syn in &cache.synonyms {
             if filter_text.is_empty() || syn.to_lowercase().contains(filter_text) {
-                paths.push(format!("Synonyms/{}", syn));
+                paths.push(format!("Synonyms/{}", node(syn)));
             }
         }
 
@@ -9522,12 +9641,20 @@ impl ObjectBrowserWidget {
                 .collect();
 
             if package_matches || !matching_routines.is_empty() {
-                paths.push(format!("Packages/{}", package));
+                paths.push(format!("Packages/{}", node(package)));
                 for routine in matching_routines {
                     if routine.routine_type == "FUNCTION" {
-                        paths.push(format!("Packages/{}/Functions/{}", package, routine.name));
+                        paths.push(format!(
+                            "Packages/{}/Functions/{}",
+                            node(package),
+                            node(&routine.name)
+                        ));
                     } else {
-                        paths.push(format!("Packages/{}/Procedures/{}", package, routine.name));
+                        paths.push(format!(
+                            "Packages/{}/Procedures/{}",
+                            node(package),
+                            node(&routine.name)
+                        ));
                     }
                 }
             }
@@ -12308,7 +12435,12 @@ impl MultiObjectBrowserWidget {
         Self::disambiguate_choice_labels(&mut labels);
         self.connection_choice.clear();
         for label in &labels {
-            self.connection_choice.add_choice(label);
+            // A connection name is typed by the user, so `|` and `/` are one
+            // keystroke away. The callback below resolves the pick by INDEX
+            // against `dropdown_connections`, which a name that became two
+            // entries shifted — the user picked one connection and the card
+            // showed another.
+            crate::ui::widget_label::add_menu_item(&mut self.connection_choice, label);
         }
         if labels.is_empty() {
             self.connection_choice.deactivate();
@@ -13721,6 +13853,7 @@ mod tests {
             nullable: true,
             default_value: None,
             is_primary_key: false,
+            is_generated: false,
         }
     }
 
@@ -13878,38 +14011,168 @@ mod tests {
         for format in ExportFormat::ALL {
             let delivery = ObjectBrowserWidget::render_table_export(
                 "HR.EMP",
-                DatabaseType::Oracle,
+                crate::ui::grid_sql_export::SqlWriteDialect::family_default(DatabaseType::Oracle),
                 ExportChoice {
                     format,
                     scope: ExportScope::All,
                     destination: ExportDestination::Clipboard,
                 },
                 &result,
+                &[],
             );
             let grid = ExportGrid {
                 columns: vec!["EMPNO".to_string(), "ENAME".to_string()],
                 column_kinds: vec![SqlValueKind::Number, SqlValueKind::String],
+                // The driver reported the second name as NULL, which the tree
+                // export carries as the absence of a value rather than as the
+                // NULL display text.
                 rows: vec![
-                    vec!["7369".to_string(), "SMITH".to_string()],
-                    vec!["7499".to_string(), null_text.clone()],
+                    vec![Some("7369".to_string()), Some("SMITH".to_string())],
+                    vec![Some("7499".to_string()), None],
                 ],
                 null_text: null_text.clone(),
             };
             let selection = crate::ui::grid_sql_export::GridSqlSelection {
-                db_type: DatabaseType::Oracle,
+                dialect: crate::ui::grid_sql_export::SqlWriteDialect::family_default(
+                    DatabaseType::Oracle,
+                ),
                 table: Some("HR.EMP".to_string()),
                 all_columns: grid.columns.clone(),
                 column_kinds: grid.column_kinds.clone(),
                 selected_columns: vec![0, 1],
                 rows: grid.rows.clone(),
-                null_text: null_text.clone(),
             };
-            let (expected, expected_rows) =
+            let expected =
                 crate::ui::result_export::render_export_content(format, &grid, Some(&selection));
-            assert_eq!(delivery.text, expected, "{format:?} bytes differ");
             assert_eq!(
-                delivery.row_count, expected_rows,
+                delivery.content.text(),
+                expected.text(),
+                "{format:?} bytes differ"
+            );
+            assert_eq!(
+                delivery.content.rows(),
+                expected.rows(),
                 "{format:?} row count differs"
+            );
+            assert_eq!(
+                delivery.content.refusal(),
+                expected.refusal(),
+                "{format:?} refusal differs"
+            );
+        }
+    }
+
+    /// A tree export answers "was this NULL?" from the driver's own marker, so
+    /// a `VARCHAR` really holding the four letters `NULL` — or an empty string —
+    /// reaches the file as the value it is.
+    ///
+    /// The rows still carried the driver's NULL marker at this point and it was
+    /// thrown away one line before it was needed: every cell was flattened to
+    /// display text, and every serializer then re-derived NULL-ness from that
+    /// text, folding both of these into SQL NULL.
+    #[test]
+    fn a_tree_export_tells_a_real_null_from_text_that_reads_like_one() {
+        use crate::db::{ColumnInfo, DatabaseType, QueryCell, QueryResult, SqlValueKind};
+        use crate::ui::result_export::{ExportDestination, ExportFormat, ExportScope};
+        use crate::ui::result_export_dialog::ExportChoice;
+
+        let result = QueryResult::new_select(
+            "SELECT * FROM APP.T",
+            vec![ColumnInfo {
+                name: "V".to_string(),
+                data_type: "VARCHAR".to_string(),
+                kind: SqlValueKind::String,
+            }],
+            vec![
+                vec![QueryCell::null_result_text()],
+                vec!["NULL".to_string()],
+                vec![String::new()],
+            ],
+            std::time::Duration::from_millis(1),
+        );
+        let render = |format| {
+            ObjectBrowserWidget::render_table_export(
+                "APP.T",
+                crate::ui::grid_sql_export::SqlWriteDialect::family_default(DatabaseType::MySQL),
+                ExportChoice {
+                    format,
+                    scope: ExportScope::All,
+                    destination: ExportDestination::Clipboard,
+                },
+                &result,
+                &[],
+            )
+            .content
+            .into_parts()
+            .expect("this fixture is exportable in every format")
+            .0
+        };
+
+        let sql = render(ExportFormat::SqlInserts);
+        assert!(sql.contains("VALUES (NULL);"), "{sql}");
+        assert!(sql.contains("VALUES ('NULL');"), "{sql}");
+        assert!(sql.contains("VALUES ('');"), "{sql}");
+
+        let json = render(ExportFormat::Json);
+        assert!(json.contains("\"V\": null"), "{json}");
+        assert!(json.contains("\"V\": \"NULL\""), "{json}");
+        assert!(json.contains("\"V\": \"\""), "{json}");
+
+        // XML spells the two apart too: `<V/>` is NULL, `<V></V>` is empty.
+        let xml = render(ExportFormat::Xml);
+        assert!(xml.contains("<V/>"), "{xml}");
+        assert!(xml.contains("<V>NULL</V>"), "{xml}");
+        assert!(xml.contains("<V></V>"), "{xml}");
+    }
+
+    /// A column the server computes is not offered as an import target, and the
+    /// dialog is told which ones those were.
+    ///
+    /// `Export Data...` writes every column of a table, so the file a user is
+    /// most likely to import names the generated ones — and `default_mapping`
+    /// matches by name, so they mapped themselves and the whole script was
+    /// rejected: every backend here refuses an explicit value for a column it
+    /// computes itself.
+    #[test]
+    fn a_generated_column_is_not_an_import_target() {
+        use crate::db::DatabaseType;
+
+        let mut plain = super::TableColumnDetail {
+            name: "ID".to_string(),
+            data_type: "NUMBER".to_string(),
+            data_length: 0,
+            data_precision: None,
+            data_scale: None,
+            nullable: false,
+            default_value: None,
+            is_primary_key: true,
+            is_generated: false,
+        };
+        let mut computed = plain.clone();
+        computed.name = "TOTAL".to_string();
+        computed.is_generated = true;
+        plain.name = "ID".to_string();
+        let columns = vec![plain, computed];
+
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+        ] {
+            let targets = ObjectBrowserWidget::import_targets(db_type, &columns);
+            assert_eq!(
+                targets
+                    .writable()
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .collect::<Vec<_>>(),
+                vec!["ID".to_string()],
+                "{db_type}"
+            );
+            assert_eq!(
+                targets.generated_names(),
+                vec!["TOTAL".to_string()],
+                "{db_type}"
             );
         }
     }
@@ -13937,18 +14200,149 @@ mod tests {
         };
         let to_file = ObjectBrowserWidget::render_table_export(
             "HR.EMP",
-            DatabaseType::Oracle,
+            crate::ui::grid_sql_export::SqlWriteDialect::family_default(DatabaseType::Oracle),
             choice(ExportDestination::File),
             &result,
+            &[],
         );
         let to_clipboard = ObjectBrowserWidget::render_table_export(
             "HR.EMP",
-            DatabaseType::Oracle,
+            crate::ui::grid_sql_export::SqlWriteDialect::family_default(DatabaseType::Oracle),
             choice(ExportDestination::Clipboard),
             &result,
+            &[],
         );
-        assert_eq!(&to_file.text.as_bytes()[..3], &[0xEF, 0xBB, 0xBF]);
-        assert!(!to_clipboard.text.starts_with('\u{feff}'));
+        assert_eq!(&to_file.content.text().as_bytes()[..3], &[0xEF, 0xBB, 0xBF]);
+        assert!(!to_clipboard.content.text().starts_with('\u{feff}'));
+    }
+
+    /// An object's name is ONE node of the tree, whatever is in it.
+    ///
+    /// FLTK splits a tree path on `/`, so `Tables/A/B` is a folder `A` holding
+    /// a leaf `B`. For a table actually named `A/B` that meant the table was
+    /// not in the tree at all — and when a table called `A` also existed, the
+    /// two MERGED into one node, so the real `A/B` could not be selected,
+    /// expanded, exported or imported into.
+    #[test]
+    fn an_object_name_is_one_tree_node_whatever_is_in_it() {
+        use std::collections::HashMap;
+
+        let cache = ObjectCache {
+            tables: vec!["A/B".to_string(), "A".to_string(), "PLAIN".to_string()],
+            views: vec![r"V\W".to_string()],
+            procedures: Vec::new(),
+            functions: Vec::new(),
+            sequences: Vec::new(),
+            triggers: Vec::new(),
+            events: Vec::new(),
+            synonyms: Vec::new(),
+            packages: Vec::new(),
+            package_routines: HashMap::new(),
+            table_columns: HashMap::new(),
+        };
+        let paths = ObjectBrowserWidget::collect_tree_paths(&cache, "");
+
+        assert!(
+            paths.contains(&r"Tables/A\/B".to_string()),
+            "the separator inside a name is escaped: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"Tables/A".to_string()),
+            "and a table really called A keeps its own node: {paths:?}"
+        );
+        assert!(
+            paths.contains(&r"Views/V\\W".to_string()),
+            "a backslash in a name is escaped too, or it would escape what follows: {paths:?}"
+        );
+        // Every path names exactly one object under exactly one category.
+        for path in &paths {
+            let segments = ObjectBrowserWidget::unescaped_tree_segments(path);
+            assert_eq!(
+                segments.len(),
+                2,
+                "{path:?} is not one object under one category: {segments:?}"
+            );
+        }
+    }
+
+    /// A column the server computes is left out of `SQL Inserts` — and ONLY of
+    /// `SQL Inserts`.
+    ///
+    /// The data formats write what the table HAS, so a CSV of a table with a
+    /// virtual column still carries that column. `SQL Inserts` is the one
+    /// format whose purpose is to be RUN, and naming a computed column there
+    /// makes a script the server refuses (Oracle ORA-54013, MySQL 3105).
+    #[test]
+    fn only_the_sql_inserts_export_drops_a_computed_column() {
+        use crate::db::{ColumnInfo, DatabaseType, QueryResult, SqlValueKind};
+        use crate::ui::result_export::{ExportDestination, ExportFormat, ExportScope};
+        use crate::ui::result_export_dialog::ExportChoice;
+
+        let result = QueryResult::new_select(
+            "SELECT * FROM APP.T",
+            vec![
+                ColumnInfo {
+                    name: "A".to_string(),
+                    data_type: "NUMBER".to_string(),
+                    kind: SqlValueKind::Number,
+                },
+                ColumnInfo {
+                    name: "TOTAL".to_string(),
+                    data_type: "NUMBER".to_string(),
+                    kind: SqlValueKind::Number,
+                },
+            ],
+            vec![vec!["5".to_string(), "10".to_string()]],
+            std::time::Duration::from_millis(1),
+        );
+        let render = |format, generated: &[String]| {
+            ObjectBrowserWidget::render_table_export(
+                "APP.T",
+                crate::ui::grid_sql_export::SqlWriteDialect::family_default(DatabaseType::Oracle),
+                ExportChoice {
+                    format,
+                    scope: ExportScope::All,
+                    destination: ExportDestination::Clipboard,
+                },
+                &result,
+                generated,
+            )
+            .content
+            .into_parts()
+            .expect("this fixture is exportable")
+            .0
+        };
+
+        let generated = vec!["TOTAL".to_string()];
+        let inserts = render(ExportFormat::SqlInserts, &generated);
+        assert_eq!(
+            inserts, "INSERT INTO APP.T (A) VALUES (5);\n",
+            "SQL Inserts must not name a computed column"
+        );
+
+        // Every other format is a picture of the table, computed columns
+        // included — the generated list must not reach them.
+        for format in [
+            ExportFormat::Csv,
+            ExportFormat::Tsv,
+            ExportFormat::Json,
+            ExportFormat::Xml,
+            ExportFormat::Html,
+            ExportFormat::Markdown,
+        ] {
+            let text = render(format, &generated);
+            assert!(
+                text.contains("TOTAL") && text.contains("10"),
+                "{} dropped the computed column: {text}",
+                format.label()
+            );
+            assert_eq!(
+                text,
+                render(format, &[]),
+                "{} must not read the generated list at all",
+                format.label()
+            );
+        }
     }
 
     #[test]

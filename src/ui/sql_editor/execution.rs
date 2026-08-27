@@ -1,3 +1,4 @@
+use crate::db::query::oracle_thin_result_cell;
 use fltk::{
     app,
     button::Button,
@@ -3967,8 +3968,12 @@ impl SqlEditorWidget {
         items.len() == 1
             && matches!(
                 &items[0],
+                // The ONE reader of that mark. Asking `contains` here was a
+                // second opinion about it, and the one that a value could
+                // satisfy: a SELECT of the marker as a string turned lazy fetch
+                // off for the user's own query.
                 ScriptItem::Statement(sql)
-                    if !sql.contains(crate::ui::table_browse::TABLE_BROWSE_MATERIALIZE_MARKER)
+                    if !crate::ui::table_browse::is_materialized_grid_statement(sql)
             )
     }
 
@@ -4049,20 +4054,28 @@ impl SqlEditorWidget {
         )
     }
 
+    /// The request id of a statement THIS app wrote to carry a grid save, or
+    /// `None` for anything else.
+    ///
+    /// The exact inverse of [`Self::internal_result_edit_marker`], and it has to
+    /// be. It used to search the whole statement text — `contains`, then `find`
+    /// — which is a question a VALUE can answer: a query selecting those two
+    /// strings, or an import whose file held them in a cell, was taken for a
+    /// grid save. Its bind placeholders went unasked, it was refused outright
+    /// while a lazy fetch was open, and its result was delivered to the edit
+    /// session rather than to the grid.
+    ///
+    /// The marker is a COMMENT at the head of a statement of a fixed shape, and
+    /// a value can be neither.
     fn internal_result_edit_request_id(sql: &str) -> Option<u64> {
-        if !sql.contains("SQ_INTERNAL_RESULT_EDIT") {
+        const HEAD: &str = "UPDATE /* SQ_SAVE_REQUEST:";
+        const TAIL: &str = " SQ_INTERNAL_RESULT_EDIT */";
+        let rest = sql.trim_start().strip_prefix(HEAD)?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() || !rest[digits.len()..].starts_with(TAIL) {
             return None;
         }
-        let marker = "SQ_SAVE_REQUEST:";
-        let start = sql.find(marker)?.saturating_add(marker.len());
-        let digits = sql
-            .get(start..)?
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect::<String>();
-        (!digits.is_empty())
-            .then(|| digits.parse::<u64>().ok())
-            .flatten()
+        digits.parse::<u64>().ok()
     }
 
     pub fn focus(&mut self) {
@@ -18610,7 +18623,7 @@ impl SqlEditorWidget {
                     ));
                 }
                 (_, value) => {
-                    let text = Self::oracle_thin_string_cell(&value);
+                    let text = oracle_thin_result_cell(&value);
                     let display = text.clone().unwrap_or_else(|| null_text.clone());
                     messages.push(format!(":{} = {}", bind.name, display));
                     updates.push((bind.name.clone(), BindValue::Scalar(text)));
@@ -19541,83 +19554,6 @@ impl SqlEditorWidget {
         )
     }
 
-    fn oracle_thin_string_cell(value: &OracleValue) -> Option<String> {
-        match value {
-            OracleValue::Text(text) | OracleValue::Number(text) => Some(text.clone()),
-            OracleValue::Boolean(value) => Some(if *value { "TRUE" } else { "FALSE" }.to_string()),
-            OracleValue::Null => None,
-            OracleValue::DateTime(value) => Some(format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                value.year, value.month, value.day, value.hour, value.minute, value.second
-            )),
-            OracleValue::Timestamp(value) => {
-                let mut text = format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
-                    value.year,
-                    value.month,
-                    value.day,
-                    value.hour,
-                    value.minute,
-                    value.second,
-                    value.nanosecond / 1_000
-                );
-                if let Some(suffix) = value.timezone_suffix() {
-                    text.push_str(&suffix);
-                }
-                Some(text)
-            }
-            OracleValue::Bytes(bytes) => Some(
-                bytes
-                    .iter()
-                    .map(|byte| format!("{byte:02X}"))
-                    .collect::<String>(),
-            ),
-            OracleValue::JsonId(bytes) => Some(
-                bytes
-                    .iter()
-                    .map(|byte| format!("{byte:02X}"))
-                    .collect::<String>(),
-            ),
-            OracleValue::Lob(_) => Some("[LOB]".to_string()),
-            OracleValue::Cursor(_) => Some("[CURSOR]".to_string()),
-            OracleValue::Object(_) | OracleValue::Array(_) | OracleValue::IndexedArray(_) => {
-                serde_json::to_string(&Self::oracle_thin_value_json(value)).ok()
-            }
-        }
-    }
-
-    fn oracle_thin_value_json(value: &OracleValue) -> serde_json::Value {
-        match value {
-            OracleValue::Null => serde_json::Value::Null,
-            OracleValue::Number(value) => value
-                .parse::<serde_json::Number>()
-                .map(serde_json::Value::Number)
-                .unwrap_or_else(|_| serde_json::Value::String(value.clone())),
-            OracleValue::Boolean(value) => serde_json::Value::Bool(*value),
-            OracleValue::Text(value) => serde_json::Value::String(value.clone()),
-            OracleValue::Object(attributes) => {
-                let mut object = serde_json::Map::new();
-                for (name, value) in attributes {
-                    object.insert(name.clone(), Self::oracle_thin_value_json(value));
-                }
-                serde_json::Value::Object(object)
-            }
-            OracleValue::Array(values) => {
-                serde_json::Value::Array(values.iter().map(Self::oracle_thin_value_json).collect())
-            }
-            OracleValue::IndexedArray(values) => {
-                let mut object = serde_json::Map::new();
-                for (index, value) in values {
-                    object.insert(index.to_string(), Self::oracle_thin_value_json(value));
-                }
-                serde_json::Value::Object(object)
-            }
-            _ => {
-                serde_json::Value::String(Self::oracle_thin_string_cell(value).unwrap_or_default())
-            }
-        }
-    }
-
     fn oracle_thin_display_cell(
         conn: &mut OracleThinSession,
         value: OracleValue,
@@ -19631,8 +19567,7 @@ impl SqlEditorWidget {
                     .map_err(|err| format!("Failed to serialize nested cursor result: {err}"))
             }
             value => {
-                let text =
-                    Self::oracle_thin_string_cell(&value).unwrap_or_else(|| null_text.to_string());
+                let text = oracle_thin_result_cell(&value).unwrap_or_else(|| null_text.to_string());
                 Self::oracle_thin_close_owned_cursor_value(conn, value);
                 Ok(text)
             }
@@ -19673,8 +19608,8 @@ impl SqlEditorWidget {
             }
             OracleValue::Null => Ok(QueryCell::null_result_text()),
             value => {
-                let text = Self::oracle_thin_string_cell(&value)
-                    .unwrap_or_else(QueryCell::null_result_text);
+                let text =
+                    oracle_thin_result_cell(&value).unwrap_or_else(QueryCell::null_result_text);
                 Self::oracle_thin_close_owned_cursor_value(conn, value);
                 Ok(text)
             }
@@ -19760,8 +19695,7 @@ impl SqlEditorWidget {
                 Self::oracle_thin_cursor_display_json(conn, cursor, null_text, depth)
             }
             value => {
-                let text =
-                    Self::oracle_thin_string_cell(&value).unwrap_or_else(|| null_text.to_string());
+                let text = oracle_thin_result_cell(&value).unwrap_or_else(|| null_text.to_string());
                 Self::oracle_thin_close_owned_cursor_value(conn, value);
                 Ok(serde_json::Value::String(text))
             }
@@ -19904,7 +19838,7 @@ impl SqlEditorWidget {
             let values = execution.values;
             let status = values
                 .get(1)
-                .and_then(Self::oracle_thin_string_cell)
+                .and_then(oracle_thin_result_cell)
                 .unwrap_or_else(|| "1".to_string());
             if status.trim() != "0" {
                 break;
@@ -19912,7 +19846,7 @@ impl SqlEditorWidget {
             lines.push(
                 values
                     .first()
-                    .and_then(Self::oracle_thin_string_cell)
+                    .and_then(oracle_thin_result_cell)
                     .unwrap_or_default(),
             );
         }
@@ -31025,7 +30959,7 @@ mod sqlplus_substitution_tests {
 
 #[cfg(test)]
 mod oracle_thin_value_render_tests {
-    use super::{OracleValue, SqlEditorWidget};
+    use super::{oracle_thin_result_cell, OracleValue};
 
     #[test]
     fn decoded_oracle_collections_render_their_elements() {
@@ -31040,8 +30974,28 @@ mod oracle_thin_value_render_tests {
         ]);
 
         assert_eq!(
-            SqlEditorWidget::oracle_thin_string_cell(&value).as_deref(),
+            oracle_thin_result_cell(&value).as_deref(),
             Some(r#"[10,null,"thirty",{"NESTED":[true]}]"#)
+        );
+    }
+
+    /// The rules a RESULT cell follows, on the one converter that now serves
+    /// both the grid and `Export Data...`.
+    ///
+    /// Each line is a way the export used to differ from OCI, because it went
+    /// through the catalog reader instead: a NULL was the empty string, a RAW
+    /// was Rust's debug of a byte vector, and a TIMESTAMP lost its fractional
+    /// seconds.
+    #[test]
+    fn a_result_cell_says_null_by_absence_and_renders_bytes_as_hex() {
+        assert_eq!(oracle_thin_result_cell(&OracleValue::Null), None);
+        assert_eq!(
+            oracle_thin_result_cell(&OracleValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])).as_deref(),
+            Some("DEADBEEF")
+        );
+        assert_eq!(
+            oracle_thin_result_cell(&OracleValue::Text("x".to_string())).as_deref(),
+            Some("x")
         );
     }
 
@@ -31053,7 +31007,7 @@ mod oracle_thin_value_render_tests {
         ]);
 
         assert_eq!(
-            SqlEditorWidget::oracle_thin_string_cell(&value).as_deref(),
+            oracle_thin_result_cell(&value).as_deref(),
             Some(r#"{"5":"x","9":42}"#)
         );
     }
@@ -41851,6 +41805,39 @@ mod mysql_batch_execution_regression_tests {
             ),
             None
         );
+
+        // A VALUE cannot forge it. This used to search the whole statement
+        // text, so a query that merely SELECTED the two markers — or an import
+        // whose file held them in a cell — was taken for a grid save: its
+        // placeholders went unasked, it was refused while a lazy fetch was open,
+        // and its result was delivered to the edit session.
+        for forged in [
+            "SELECT 'SQ_SAVE_REQUEST:42 SQ_INTERNAL_RESULT_EDIT' FROM DUAL",
+            "INSERT INTO NOTES (BODY) VALUES              ('UPDATE /* SQ_SAVE_REQUEST:42 SQ_INTERNAL_RESULT_EDIT */ x')",
+            "-- UPDATE /* SQ_SAVE_REQUEST:42 SQ_INTERNAL_RESULT_EDIT */\nSELECT 1 FROM DUAL",
+        ] {
+            assert_eq!(
+                SqlEditorWidget::internal_result_edit_request_id(forged),
+                None,
+                "a value forged the mark: {forged}"
+            );
+        }
+        // Leading whitespace is not a forgery; the executor trims statements.
+        assert_eq!(
+            SqlEditorWidget::internal_result_edit_request_id(&format!("  \n{marker}")),
+            Some(42)
+        );
+        // A tag that is not a number, or the wrong comment, is not the marker.
+        for near_miss in [
+            "UPDATE /* SQ_SAVE_REQUEST:x SQ_INTERNAL_RESULT_EDIT */ t SET a = a",
+            "UPDATE /* SQ_SAVE_REQUEST:42 */ t SET a = a",
+        ] {
+            assert_eq!(
+                SqlEditorWidget::internal_result_edit_request_id(near_miss),
+                None,
+                "{near_miss}"
+            );
+        }
     }
 
     fn mysql_test_env(name: &str) -> Option<String> {

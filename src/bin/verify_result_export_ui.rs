@@ -36,12 +36,15 @@ use fltk::{
     window::Window,
 };
 use space_query::db::{ColumnInfo, QueryResult, SqlValueKind};
-use space_query::ui::result_export::{render, ExportFormat, ExportGrid, ExportScope};
-use space_query::ui::MainWindow;
+use space_query::ui::result_export::{
+    render, ExportContent, ExportFormat, ExportGrid, ExportScope,
+};
+use space_query::ui::result_table::{ExportAbandonReason, LazyFetchCallback};
+use space_query::ui::{MainWindow, ResultTableWidget};
 use space_query::utils::{arithmetic::safe_div, AppConfig};
 use std::io::Write;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const NULL_TEXT: &str = "NULL";
 const MENU_PATH: &str = "&Tools/&Export Results";
@@ -155,7 +158,17 @@ fn expected_grid(scope: ExportScope) -> ExportGrid {
             .iter()
             .map(|column| column.kind)
             .collect(),
-        rows,
+        // The grid's own export snapshot reads a cell whose text IS the NULL
+        // display text as the absence of a value; the expectation states the
+        // same thing.
+        rows: rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| (value != NULL_TEXT).then_some(value))
+                    .collect()
+            })
+            .collect(),
         null_text: NULL_TEXT.to_string(),
     }
 }
@@ -255,6 +268,9 @@ fn main() {
         Err(err) => failures.push(format!("cancel: {err}")),
     }
 
+    verify_a_repeated_column_name_is_refused(&mut failures);
+    verify_a_new_result_does_not_inherit_a_queued_export(&mut failures);
+
     if failures.is_empty() {
         say("\nResult export verified end to end through the running application.");
     } else {
@@ -265,6 +281,128 @@ fn main() {
         std::process::exit(1);
     }
     app::quit();
+}
+
+/// A result whose columns repeat a name cannot be written as SQL.
+///
+/// `SELECT a.id, b.id` is an ordinary query and every driver reports both
+/// columns as `ID`. The grid's own reader has to say so BEFORE a snapshot is
+/// taken, because two of the three shapes used to run: measured on Oracle 23ai,
+/// `UPDATE t SET ID = 2 WHERE ID = 1` reported one row updated and
+/// `WHERE ID = 1 AND ID = 2` matched none.
+///
+/// Driven on a real widget rather than in a unit test because the widget is
+/// what turns a scope into the list of columns a statement would name, and that
+/// is the step the refusal has to agree with.
+fn verify_a_repeated_column_name_is_refused(failures: &mut Vec<String>) {
+    let mut grid = ResultTableWidget::new();
+    grid.start_streaming(&["ID".to_string(), "ID".to_string()]);
+    grid.append_rows(vec![vec!["1".to_string(), "2".to_string()]]);
+    grid.finish_streaming();
+
+    match grid.sql_export_refusal(ExportScope::All) {
+        Some(reason) if reason.contains("ID") => {
+            say(&format!(
+                "PASS: a repeated column name is refused — {reason}"
+            ));
+        }
+        Some(reason) => failures.push(format!("the refusal does not name the column: {reason}")),
+        None => failures
+            .push("a result with two columns named ID was not refused for SQL export".to_string()),
+    }
+
+    // The same grid with distinct names is not refused, so the rule is about
+    // the repetition and not about the grid.
+    let mut plain = ResultTableWidget::new();
+    plain.start_streaming(&["ID".to_string(), "NAME".to_string()]);
+    plain.append_rows(vec![vec!["1".to_string(), "x".to_string()]]);
+    plain.finish_streaming();
+    if let Some(reason) = plain.sql_export_refusal(ExportScope::All) {
+        failures.push(format!(
+            "a result with distinct names was refused: {reason}"
+        ));
+    } else {
+        say("PASS: a result whose column names are distinct is not refused");
+    }
+}
+
+/// A queued export belongs to the result it was queued against.
+///
+/// An "All rows" export of a grid with an open lazy fetch queues itself behind
+/// a full fetch. `start_streaming` — a NEW result landing in the same grid —
+/// used to clear the lazy session and leave that queue alone, while
+/// `clear_lazy_fetch_session` runs pending actions by session id without asking
+/// whether the session is still the grid's. The export would then have rendered
+/// the NEW result into the file the user named for the old one.
+fn verify_a_new_result_does_not_inherit_a_queued_export(failures: &mut Vec<String>) {
+    let mut grid = ResultTableWidget::new();
+    grid.start_streaming(&["A".to_string()]);
+    grid.append_rows(vec![vec!["old".to_string()]]);
+
+    let fetch_all_asked = Arc::new(Mutex::new(false));
+    let asked = fetch_all_asked.clone();
+    // The production type's own shape: a lazy-fetch callback lives on the UI
+    // thread and is never sent anywhere.
+    #[allow(clippy::arc_with_non_send_sync)]
+    let callback: LazyFetchCallback =
+        Arc::new(Mutex::new(Some(Box::new(move |_session_id, _request| {
+            *asked.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            true
+        }))));
+    grid.set_lazy_fetch_callback(callback);
+    grid.set_lazy_fetch_session(4242);
+
+    type Outcome = Result<ExportContent, ExportAbandonReason>;
+    let outcome: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
+    let outcome_for_callback = outcome.clone();
+    let queued = grid.capture_tour_export_after_fetch_all(Box::new(move |ready| {
+        *outcome_for_callback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(ready);
+    }));
+    if queued.is_some() {
+        failures.push("the export did not queue behind the full fetch".to_string());
+        return;
+    }
+    if !*fetch_all_asked.lock().unwrap_or_else(|p| p.into_inner()) {
+        failures.push("queueing did not ask for the rest of the rows".to_string());
+        return;
+    }
+
+    // A NEW result lands in the same grid.
+    grid.start_streaming(&["B".to_string()]);
+    grid.append_rows(vec![vec!["new".to_string()]]);
+    grid.finish_streaming();
+
+    match outcome.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+        // And it is abandoned for the RIGHT reason: the notice the user reads
+        // says a new result took the grid, not that the rows stopped arriving.
+        Some(Err(ExportAbandonReason::ResultReplaced)) => {
+            say("PASS: a queued export is abandoned when a new result replaces its own")
+        }
+        Some(Err(other)) => failures.push(format!(
+            "the queued export was abandoned, but reported {other:?} rather than a replacement"
+        )),
+        Some(Ok(built)) => failures.push(format!(
+            "the queued export rendered the NEW result: {} rows, {:?}",
+            built.rows(),
+            built.text()
+        )),
+        None => failures.push(
+            "the queued export was neither run nor abandoned — the caller waits forever"
+                .to_string(),
+        ),
+    }
+
+    // And the completion of the old session must not resurrect it.
+    grid.clear_lazy_fetch_session(4242, true);
+    let after_close = outcome.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    if let Some(Ok(built)) = after_close {
+        failures.push(format!(
+            "closing the old session ran the abandoned export after all: {:?}",
+            built.text()
+        ));
+    }
 }
 
 /// Start an export from the application's own menu, drive the modal it opens,

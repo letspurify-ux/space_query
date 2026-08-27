@@ -20,8 +20,12 @@ use crate::ui::constants::*;
 use crate::ui::result_export::{ExportDestination, ExportFormat, ExportScope};
 use crate::ui::{center_on_main, theme};
 
+/// What the export modal settled on.
+///
+/// Public with the module: the live harnesses render a tree export through the
+/// production path and have to hand it the same value the modal returns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ExportChoice {
+pub struct ExportChoice {
     pub format: ExportFormat,
     pub scope: ExportScope,
     pub destination: ExportDestination,

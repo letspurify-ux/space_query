@@ -34,6 +34,8 @@ pub mod main_window;
 pub mod menu;
 pub mod object_browser;
 pub(crate) mod object_drag_payload;
+#[doc(hidden)]
+pub mod widget_label;
 // Public only so the verification binaries can drive the same ranking and the
 // same modal the app uses; not part of the supported surface.
 pub mod object_search;
@@ -44,7 +46,9 @@ pub mod query_tabs;
 // to real JSON/XML/HTML/CSV parsers; not part of the supported surface.
 #[doc(hidden)]
 pub mod result_export;
-pub(crate) mod result_export_dialog;
+/// Public for the live harnesses, which drive the real export path and must
+/// hand it the same [`result_export_dialog::ExportChoice`] the modal returns.
+pub mod result_export_dialog;
 pub(crate) mod result_filter;
 // Public only so `verify_import_live` can drive the same parsers the dialog
 // uses; not part of the supported surface.

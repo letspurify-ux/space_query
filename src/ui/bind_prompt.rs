@@ -32,7 +32,7 @@ use crate::db::{
 };
 use crate::sql_parser_engine::{lexical_spans, LexicalKind};
 use crate::sql_text::{is_identifier_char, is_identifier_start_byte};
-use crate::ui::grid_sql_export::sql_literal_for_value;
+use crate::ui::grid_sql_export::mysql_family_literal;
 
 /// Prefix for the bind names generated for Oracle `?` placeholders.
 const POSITIONAL_BIND_PREFIX: &str = "SQ_P";
@@ -413,11 +413,15 @@ fn literal_for(param: &BindParam) -> String {
         return "NULL".to_string();
     };
     // The MySQL family is the only caller, and both members quote the same way.
-    sql_literal_for_value(
-        DatabaseType::MySQL,
-        param.param_type.sql_value_kind(),
-        &value,
-    )
+    // The family default is used rather than the connection's own dialect
+    // because no connection is reachable here; a session running with
+    // `NO_BACKSLASH_ESCAPES` therefore still sees a doubled backslash in a
+    // prompted value, which is the one thing this entry point cannot know.
+    //
+    // `mysql_family_literal` rather than the general writer because that one
+    // can refuse — an Oracle value too long for any literal — and this path
+    // cannot be handed such a value: it writes MySQL-family text only.
+    mysql_family_literal(param.param_type.sql_value_kind(), &value)
 }
 
 /// Bind names that must not be prompted for: declared by `VARIABLE` in this

@@ -29,7 +29,9 @@ use crate::ui::grid_search::{grid_matches, GridSearchHighlight};
 use crate::ui::grid_sort::{compare_cell_values, NullOrdering, SortColumn};
 use crate::ui::grid_sql_export::GridSqlSelection;
 use crate::ui::grid_value_filter::GridValueFilter;
-use crate::ui::result_export::{ExportDestination, ExportFormat, ExportGrid, ExportScope};
+use crate::ui::result_export::{
+    ExportContent, ExportDestination, ExportFormat, ExportGrid, ExportScope,
+};
 use crate::ui::selection_summary::{summarize_selection, SelectionSummary};
 use crate::ui::sql_editor::LazyFetchRequest;
 use crate::ui::theme;
@@ -148,7 +150,29 @@ enum LazyFetchPendingAction {
         edge: ResultTableEdge,
         selection: Option<(i32, i32, i32, i32)>,
     },
-    Export(ExportRequest, Box<dyn FnMut(String, usize)>),
+    /// `None` tells the caller the export will NOT happen — the fetch it was
+    /// waiting for stopped before every row arrived. Silence was not an option
+    /// here: by this point the user has chosen a format and a file name.
+    Export(ExportRequest, ExportReadyCallback),
+}
+
+/// What a deferred export reports back: the rendered bytes and their row count,
+/// or why it will not happen.
+pub(crate) type ExportReadyCallback = Box<dyn FnMut(Result<ExportContent, ExportAbandonReason>)>;
+
+/// Why a queued export will not happen.
+///
+/// Carried rather than folded into one `None`, because the two are different
+/// things to a user who has already chosen a format and a file name and is
+/// about to go looking for the file: one says the rows stopped arriving, the
+/// other says the result those rows belonged to is not on screen any more. A
+/// single sentence would have to be wrong about one of them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportAbandonReason {
+    /// The fetch it was queued behind ended before every row arrived.
+    FetchStopped,
+    /// A new result took the grid it covered.
+    ResultReplaced,
 }
 
 /// What applying a value filter produced, for the strip that reports it.
@@ -158,6 +182,47 @@ pub struct ValueFilterOutcome {
     pub description: String,
     pub kept_rows: usize,
     pub total_rows: usize,
+}
+
+/// How an export snapshot decides a cell is SQL NULL.
+///
+/// The ONE reader of that question on the grid side. It holds the two facts the
+/// grid actually has — the text a driver NULL was written with, and the cells a
+/// pending edit has explicitly marked NULL — so the serializers downstream never
+/// re-derive NULL-ness from text. Re-deriving it is what folded the MySQL-family
+/// empty string, and any value spelled `NULL`, into SQL NULL on the way out.
+struct ExportNullRule {
+    /// The text this grid draws for a NULL. A driver NULL is stored as exactly
+    /// this, always: it is applied when the rows arrive and set on the widget in
+    /// the same breath ([`ResultTabsWidget::start_streaming`]).
+    null_text: String,
+    /// `row -> columns` a pending edit has marked NULL. A user who clears a cell
+    /// means NULL and the grid records it here; the cell itself still shows what
+    /// they typed, so the text alone cannot answer.
+    explicit: HashMap<usize, HashSet<usize>>,
+}
+
+impl ExportNullRule {
+    /// One grid cell as an exported cell.
+    ///
+    /// A column the row does not reach has no value at all, which is SQL NULL
+    /// rather than the empty string.
+    fn cell(
+        &self,
+        row_index: usize,
+        row: &[String],
+        column: usize,
+    ) -> crate::ui::result_export::ExportCell {
+        if self
+            .explicit
+            .get(&row_index)
+            .is_some_and(|columns| columns.contains(&column))
+        {
+            return None;
+        }
+        let value = row.get(column)?;
+        (!ResultTableWidget::displayed_value_is_null(value, &self.null_text)).then(|| value.clone())
+    }
 }
 
 /// What an export should produce, carried across a deferred full fetch so the
@@ -170,7 +235,7 @@ pub(crate) struct ExportRequest {
     /// does.
     pub destination: ExportDestination,
     /// Only `SqlInserts` reads these; every other format is dialect-agnostic.
-    pub db_type: Option<crate::db::DatabaseType>,
+    pub dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
     pub table: Option<String>,
 }
 
@@ -180,7 +245,7 @@ impl ExportRequest {
             format: ExportFormat::Csv,
             scope: ExportScope::All,
             destination: ExportDestination::File,
-            db_type: None,
+            dialect: None,
             table: None,
         }
     }
@@ -744,6 +809,61 @@ impl ResultTableWidget {
         value.is_empty()
             || trimmed.eq_ignore_ascii_case("NULL")
             || Self::input_matches_null_text(trimmed, null_text)
+    }
+
+    /// The rule an export snapshot answers "is this cell SQL NULL?" with.
+    ///
+    /// Built once per snapshot from the two facts the grid actually holds — the
+    /// text a driver NULL was written with, and the cells a pending edit has
+    /// marked NULL — so no serializer has to guess from the text afterwards.
+    fn export_null_rule(&self) -> ExportNullRule {
+        ExportNullRule {
+            null_text: self.current_null_text(),
+            explicit: self.explicit_null_cells(),
+        }
+    }
+
+    /// Whether a cell the grid is SHOWING stands for SQL NULL.
+    ///
+    /// A different question from [`Self::value_represents_null`], which answers
+    /// the cell EDITOR's — "did the user type something that means NULL?" — and
+    /// is deliberately generous: it accepts an empty box and every spelling of
+    /// `null`. An export must not be generous. On the MySQL family `''` is a
+    /// value and so is the text `NULL`, and folding either into SQL NULL
+    /// rewrites the data on its way out of the app.
+    ///
+    /// The grid stores exactly what it draws and draws a NULL as exactly the
+    /// session's NULL text, so equality is both the strictest test available
+    /// here and the most this side can know. A value whose text IS the NULL text
+    /// is still indistinguishable from NULL in a grid export; the export path
+    /// that still holds the driver's own NULL marker — the object tree's — asks
+    /// that instead and is exact.
+    pub(crate) fn displayed_value_is_null(value: &str, null_text: &str) -> bool {
+        value == null_text
+    }
+
+    /// Cells a pending grid edit has marked as SQL NULL, as `row -> columns`.
+    ///
+    /// Only rows that have one are listed. Taken and released BEFORE `full_data`
+    /// by every caller: the edit path locks `full_data` first and `edit_session`
+    /// second, so anything needing both has to ask in that order too.
+    fn explicit_null_cells(&self) -> HashMap<usize, HashSet<usize>> {
+        let guard = self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(session) = guard.as_ref() else {
+            return HashMap::new();
+        };
+        session
+            .row_states
+            .iter()
+            .enumerate()
+            .filter_map(|(row_index, row_state)| {
+                let columns = Self::row_state_explicit_null_cols(row_state);
+                (!columns.is_empty()).then(|| (row_index, columns.clone()))
+            })
+            .collect()
     }
 
     fn cell_edit_state(
@@ -8923,6 +9043,15 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        // A queued action belongs to the result it was queued against, and this
+        // grid is about to show a different one. The session field was already
+        // cleared here; the QUEUE was not, and `clear_lazy_fetch_session` runs
+        // pending actions by session id without asking whether that session is
+        // still the grid's — so an export waiting behind a full fetch would have
+        // rendered THIS result into the file named for the last one. It is told
+        // it will not happen, which is the same sentence a cancelled fetch gives
+        // it.
+        self.abandon_every_pending_lazy_action(ExportAbandonReason::ResultReplaced);
         self.clear_pending_page_navigation();
 
         let save_pending = *self
@@ -9558,11 +9687,25 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        self.pending_lazy_actions
+        self.abandon_every_pending_lazy_action(ExportAbandonReason::FetchStopped);
+        self.clear_pending_page_navigation();
+    }
+
+    /// Drop every queued action, whatever session it was queued for, and tell
+    /// whoever is waiting on one that it will not happen.
+    ///
+    /// The ONE way a queued action leaves without running, so the two events
+    /// that end a result — an abort, and a NEW result replacing it — cannot
+    /// disagree about whether the user hears about it.
+    fn abandon_every_pending_lazy_action(&self, reason: ExportAbandonReason) {
+        let dropped: Vec<LazyFetchPendingAction> = self
+            .pending_lazy_actions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        self.clear_pending_page_navigation();
+            .drain(..)
+            .map(|(_, action)| action)
+            .collect();
+        Self::abandon_lazy_actions(dropped, reason);
     }
 
     pub fn active_lazy_fetch_session(&self) -> Option<u64> {
@@ -9613,11 +9756,40 @@ impl ResultTableWidget {
     }
 
     fn clear_pending_lazy_actions_for_session(&self, session_id: u64) {
-        let mut guard = self
-            .pending_lazy_actions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.retain(|(queued_session_id, _)| *queued_session_id != session_id);
+        self.drop_pending_lazy_actions_for_session(session_id, ExportAbandonReason::FetchStopped)
+    }
+
+    fn drop_pending_lazy_actions_for_session(&self, session_id: u64, reason: ExportAbandonReason) {
+        let dropped = {
+            let mut guard = self
+                .pending_lazy_actions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut dropped = Vec::new();
+            let mut kept = VecDeque::new();
+            while let Some((queued_session_id, action)) = guard.pop_front() {
+                if queued_session_id == session_id {
+                    dropped.push(action);
+                } else {
+                    kept.push_back((queued_session_id, action));
+                }
+            }
+            *guard = kept;
+            dropped
+        };
+        Self::abandon_lazy_actions(dropped, reason);
+    }
+
+    /// Tell whoever is waiting on a dropped action that it will not happen.
+    ///
+    /// The lock is released first on purpose: a callback reports to the user,
+    /// which runs a nested event loop.
+    fn abandon_lazy_actions(actions: Vec<LazyFetchPendingAction>, reason: ExportAbandonReason) {
+        for action in actions {
+            if let LazyFetchPendingAction::Export(_, mut callback) = action {
+                callback(Err(reason));
+            }
+        }
     }
 
     fn run_pending_lazy_actions(&mut self, session_id: u64) {
@@ -9678,8 +9850,7 @@ impl ResultTableWidget {
                     }
                 }
                 LazyFetchPendingAction::Export(request, mut callback) => {
-                    let (content, row_count) = self.current_export_snapshot(&request);
-                    callback(content, row_count);
+                    callback(Ok(self.current_export_snapshot(&request)));
                 }
             }
         }
@@ -9961,8 +10132,9 @@ impl ResultTableWidget {
         // fall back to "unknown" rather than pair a type with the wrong value.
         let kinds_aligned = kinds.len() == headers.len();
         // Read before the row lock: the sort path holds these two in the other
-        // order, and nothing here needs them held together.
-        let null_text = self.current_null_text();
+        // order, and the edit path locks `full_data` before `edit_session`.
+        let null_rule = self.export_null_rule();
+        let null_text = null_rule.null_text.clone();
         let full_data = self
             .full_data
             .lock()
@@ -10008,11 +10180,11 @@ impl ResultTableWidget {
                 })
                 .collect(),
             rows: row_range
-                .filter_map(|row| full_data.get(row))
-                .map(|row| {
+                .filter_map(|row_index| Some((row_index, full_data.get(row_index)?)))
+                .map(|(row_index, row)| {
                     source_indices
                         .iter()
-                        .map(|index| row.get(*index).cloned().unwrap_or_default())
+                        .map(|index| null_rule.cell(row_index, row, *index))
                         .collect()
                 })
                 .collect(),
@@ -10039,8 +10211,8 @@ impl ResultTableWidget {
 
     pub fn export_to_csv_after_fetch_all(
         &self,
-        callback: Box<dyn FnMut(String, usize)>,
-    ) -> Option<(String, usize)> {
+        callback: ExportReadyCallback,
+    ) -> Option<ExportContent> {
         self.export_after_fetch_all(ExportRequest::csv_file(), callback)
     }
 
@@ -10516,8 +10688,8 @@ impl ResultTableWidget {
     pub(crate) fn export_after_fetch_all(
         &self,
         request: ExportRequest,
-        callback: Box<dyn FnMut(String, usize)>,
-    ) -> Option<(String, usize)> {
+        callback: ExportReadyCallback,
+    ) -> Option<ExportContent> {
         match request.scope {
             ExportScope::Selection => Some(self.current_export_snapshot(&request)),
             ExportScope::All => {
@@ -10533,26 +10705,47 @@ impl ResultTableWidget {
         }
     }
 
-    fn current_export_snapshot(&self, request: &ExportRequest) -> (String, usize) {
-        let (text, row_count) = self.render_export(request);
-        (
+    /// Queue an "All rows" export behind a full fetch, as the export path does.
+    ///
+    /// Public only so `verify_result_export_ui` can drive the real queue on the
+    /// process main thread — the widget tests that could do it in-process are
+    /// `#[ignore]`d because FLTK refuses to build widgets off it. Not part of
+    /// the supported surface.
+    #[doc(hidden)]
+    pub fn capture_tour_export_after_fetch_all(
+        &self,
+        callback: ExportReadyCallback,
+    ) -> Option<ExportContent> {
+        self.export_after_fetch_all(
+            ExportRequest {
+                format: ExportFormat::Csv,
+                scope: ExportScope::All,
+                destination: ExportDestination::File,
+                dialect: None,
+                table: None,
+            },
+            callback,
+        )
+    }
+
+    fn current_export_snapshot(&self, request: &ExportRequest) -> ExportContent {
+        self.render_export(request).map_text(|text| {
             crate::ui::result_export::with_destination_prelude(
                 request.format,
                 request.destination,
                 text,
-            ),
-            row_count,
-        )
+            )
+        })
     }
 
-    fn render_export(&self, request: &ExportRequest) -> (String, usize) {
+    fn render_export(&self, request: &ExportRequest) -> ExportContent {
         // The two snapshots are built separately and only one is ever taken:
         // both copy every exported row, and a large `SQL Inserts` export should
         // not also materialize a grid snapshot it will not read.
         if matches!(request.format, ExportFormat::SqlInserts) {
-            let sql_selection = request.db_type.and_then(|db_type| match request.scope {
-                ExportScope::All => self.sql_export_all_rows(db_type, request.table.clone()),
-                ExportScope::Selection => self.sql_export_selection(db_type, request.table.clone()),
+            let sql_selection = request.dialect.and_then(|dialect| match request.scope {
+                ExportScope::All => self.sql_export_all_rows(dialect, request.table.clone()),
+                ExportScope::Selection => self.sql_export_selection(dialect, request.table.clone()),
             });
             return crate::ui::result_export::render_export_content(
                 request.format,
@@ -10678,9 +10871,140 @@ impl ResultTableWidget {
     /// The grid does not know which connection produced it, so the caller
     /// supplies `db_type` and the resolved base table.
     #[doc(hidden)]
+    /// Grid column indexes generated SQL may name, in grid order.
+    ///
+    /// The ONE statement of that rule: the snapshot builder and the question
+    /// "is a `SQL Inserts` export possible at all?" have to agree, or the export
+    /// dialog offers a format that then writes an empty file.
+    fn sql_exportable_source_indices(
+        headers: &[String],
+        hidden_col: &HiddenColumns,
+        rowid_col: Option<usize>,
+    ) -> Vec<usize> {
+        (0..headers.len())
+            .filter(|index| {
+                !Self::is_internal_export_column(headers, *index, hidden_col, rowid_col)
+            })
+            .collect()
+    }
+
+    /// Why this result cannot be exported yet, or `None`.
+    ///
+    /// An export covers the whole result, so it has to wait for the whole
+    /// result — the same rule its two siblings already state
+    /// ([`Self::column_layout_refusal`], [`Self::value_filter_refusal`]).
+    /// Without it, an "All rows" export taken while rows were still arriving
+    /// wrote a file that stopped wherever the stream had got to and said
+    /// nothing about it.
+    ///
+    /// A LAZY fetch is not this case: those rows are all on the server and the
+    /// export queues itself behind a full fetch
+    /// ([`Self::export_after_fetch_all`]), which is a wait, not a truncation.
+    pub(crate) fn export_refusal(&self) -> Option<String> {
+        Self::export_refusal_for(
+            self.is_streaming_in_progress(),
+            self.active_lazy_fetch_session().is_some(),
+        )
+    }
+
+    /// The rule itself, from the two facts that decide it.
+    ///
+    /// Split out from the widget so it can be stated once and tested without
+    /// one: both facts are booleans, and the pairing of them is the whole
+    /// answer.
+    fn export_refusal_for(streaming: bool, lazy_fetch_open: bool) -> Option<String> {
+        (streaming && !lazy_fetch_open)
+            .then(|| "Wait for the result to finish loading before exporting it.".to_string())
+    }
+
+    /// Why generated SQL cannot be written for `scope`, or `None`.
+    ///
+    /// The fourth of the refusal family ([`Self::export_refusal`],
+    /// [`Self::column_layout_refusal`], `value_filter_refusal`), and asked the
+    /// same way: columns only, no rows, so it costs nothing to ask before a
+    /// snapshot is taken.
+    ///
+    /// It answers the two ways this result can defeat a name. Having no column
+    /// generated SQL may name is one; the other is having TWO of one name,
+    /// which no gate used to ask at all — see
+    /// [`crate::ui::grid_sql_export::GridSqlSelection::ambiguous_column_refusal`]
+    /// for what that used to produce.
+    pub fn sql_export_refusal(&self, scope: ExportScope) -> Option<String> {
+        if !self.sql_export_covers_a_column(scope) {
+            return Some(match scope {
+                // The whole-result sentence is the builders' own, so a caller
+                // with no scope to speak of — the object tree's export — reads
+                // the same words from `build_sql_inserts`.
+                ExportScope::All => crate::ui::grid_sql_export::no_writable_column_message(),
+                ExportScope::Selection => {
+                    "The selected cells cover no column that can be written into an INSERT."
+                        .to_string()
+                }
+            });
+        }
+        let headers = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let names: Vec<&str> = self
+            .sql_export_source_indices(&headers, scope)?
+            .into_iter()
+            .filter_map(|index| headers.get(index).map(String::as_str))
+            .collect();
+        crate::ui::grid_sql_export::first_repeated_column_name(names)
+            .map(|name| crate::ui::grid_sql_export::ambiguous_column_message(&name))
+    }
+
+    /// The columns generated SQL would name for `scope`, or `None` when the
+    /// scope covers nothing at all.
+    ///
+    /// The ONE place the two scopes are turned into a column list for SQL, so
+    /// the refusal above and the selection builders below cannot disagree about
+    /// which columns a statement would name.
+    fn sql_export_source_indices(
+        &self,
+        headers: &[String],
+        scope: ExportScope,
+    ) -> Option<Vec<usize>> {
+        let hidden_col = self.hidden_columns();
+        let rowid_col = Self::find_rowid_column_index(headers);
+        let exportable = Self::sql_exportable_source_indices(headers, &hidden_col, rowid_col);
+        match scope {
+            ExportScope::All => Some(exportable),
+            ExportScope::Selection => {
+                let (_, col_left, _, col_right) = Self::normalized_selection_bounds_with_limits(
+                    self.table.get_selection(),
+                    self.table.rows().max(0) as usize,
+                    self.table.cols().max(0) as usize,
+                )?;
+                Some(
+                    exportable
+                        .into_iter()
+                        .filter(|index| (col_left..=col_right).contains(index))
+                        .collect(),
+                )
+            }
+        }
+    }
+
+    /// Whether generated SQL could name at least one column of `scope`.
+    ///
+    /// Columns only — no rows are read — because this is asked before the
+    /// export dialog opens, to decide whether `SQL Inserts` is offered at all.
+    pub(crate) fn sql_export_covers_a_column(&self, scope: ExportScope) -> bool {
+        let headers = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.sql_export_source_indices(&headers, scope)
+            .is_some_and(|indices| !indices.is_empty())
+    }
+
     pub fn sql_export_selection(
         &self,
-        db_type: crate::db::DatabaseType,
+        dialect: crate::ui::grid_sql_export::SqlWriteDialect,
         table: Option<String>,
     ) -> Option<GridSqlSelection> {
         let bounds = Self::normalized_selection_bounds_with_limits(
@@ -10688,14 +11012,14 @@ impl ResultTableWidget {
             self.table.rows().max(0) as usize,
             self.table.cols().max(0) as usize,
         )?;
-        self.sql_export_snapshot(db_type, table, bounds)
+        self.sql_export_snapshot(dialect, table, bounds)
     }
 
     /// The same snapshot over every fetched row and every exportable column,
     /// for an export whose scope is the whole result rather than a selection.
     fn sql_export_all_rows(
         &self,
-        db_type: crate::db::DatabaseType,
+        dialect: crate::ui::grid_sql_export::SqlWriteDialect,
         table: Option<String>,
     ) -> Option<GridSqlSelection> {
         let row_bot = self
@@ -10710,15 +11034,16 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
             .checked_sub(1)?;
-        self.sql_export_snapshot(db_type, table, (0, 0, row_bot, col_right))
+        self.sql_export_snapshot(dialect, table, (0, 0, row_bot, col_right))
     }
 
     fn sql_export_snapshot(
         &self,
-        db_type: crate::db::DatabaseType,
+        dialect: crate::ui::grid_sql_export::SqlWriteDialect,
         table: Option<String>,
         (row_top, col_left, row_bot, col_right): (usize, usize, usize, usize),
     ) -> Option<GridSqlSelection> {
+        let null_rule = self.export_null_rule();
         let headers = self
             .headers
             .lock()
@@ -10743,21 +11068,21 @@ impl ResultTableWidget {
 
         // `all_columns` keeps every exportable column so key columns outside the
         // selection still have values; `selected_columns` indexes into it.
-        let mut all_columns: Vec<String> = Vec::with_capacity(headers.len());
-        let mut column_kinds: Vec<SqlValueKind> = Vec::with_capacity(headers.len());
-        let mut source_indices: Vec<usize> = Vec::with_capacity(headers.len());
-        for index in 0..headers.len() {
-            if Self::is_internal_export_column(&headers, index, &hidden_col, rowid_col) {
-                continue;
-            }
-            all_columns.push(headers[index].clone());
-            column_kinds.push(if kinds_aligned {
-                kinds[index]
-            } else {
-                SqlValueKind::Unknown
-            });
-            source_indices.push(index);
-        }
+        let source_indices = Self::sql_exportable_source_indices(&headers, &hidden_col, rowid_col);
+        let all_columns: Vec<String> = source_indices
+            .iter()
+            .map(|index| headers[*index].clone())
+            .collect();
+        let column_kinds: Vec<SqlValueKind> = source_indices
+            .iter()
+            .map(|index| {
+                if kinds_aligned {
+                    kinds[*index]
+                } else {
+                    SqlValueKind::Unknown
+                }
+            })
+            .collect();
 
         let selected_columns: Vec<usize> = source_indices
             .iter()
@@ -10769,12 +11094,12 @@ impl ResultTableWidget {
             return None;
         }
 
-        let rows: Vec<Vec<String>> = (row_top..=row_bot)
-            .filter_map(|row| full_data.get(row))
-            .map(|row| {
+        let rows: Vec<Vec<crate::ui::result_export::ExportCell>> = (row_top..=row_bot)
+            .filter_map(|row_index| Some((row_index, full_data.get(row_index)?)))
+            .map(|(row_index, row)| {
                 source_indices
                     .iter()
-                    .map(|source| row.get(*source).cloned().unwrap_or_default())
+                    .map(|source| null_rule.cell(row_index, row, *source))
                     .collect()
             })
             .collect();
@@ -10783,13 +11108,12 @@ impl ResultTableWidget {
         }
 
         Some(GridSqlSelection {
-            db_type,
+            dialect,
             table,
             all_columns,
             column_kinds,
             selected_columns,
             rows,
-            null_text: self.current_null_text(),
         })
     }
 
@@ -11485,6 +11809,119 @@ mod row_edit_sql_tests {
             })
             .collect();
         assert_eq!(internal, vec![true, false, true, true, true]);
+    }
+
+    /// A cell a pending edit marked NULL exports as NULL, whatever text the
+    /// user left in it.
+    ///
+    /// Clearing a cell is how a user says NULL in the grid, and the cell then
+    /// shows an empty box while the session records the fact. The export used to
+    /// read that box as NULL by accident — its predicate called any empty or
+    /// `null`-shaped text a NULL, which is also what folded real empty strings
+    /// and real `NULL` values into SQL NULL. Now the fact is asked directly, and
+    /// only the fact.
+    #[test]
+    fn an_edited_cell_marked_null_exports_as_null_whatever_it_shows() {
+        let rule = ExportNullRule {
+            null_text: "NULL".to_string(),
+            explicit: HashMap::from([(1, HashSet::from([0]))]),
+        };
+        let driver_null = vec!["NULL".to_string(), "keep".to_string()];
+        let edited = vec![String::new(), String::new()];
+
+        // Row 0: the text a driver NULL is written with is NULL; the rest is not.
+        assert_eq!(rule.cell(0, &driver_null, 0), None);
+        assert_eq!(rule.cell(0, &driver_null, 1), Some("keep".to_string()));
+        // Row 1 column 0 was cleared by the user and means NULL…
+        assert_eq!(rule.cell(1, &edited, 0), None);
+        // …while column 1 is an empty box the edit did NOT mark, so it is the
+        // empty string — a different value from NULL everywhere but Oracle.
+        assert_eq!(rule.cell(1, &edited, 1), Some(String::new()));
+        // A column the row does not reach has no value at all.
+        assert_eq!(rule.cell(1, &edited, 9), None);
+        // With no edit session at all, only the NULL text is NULL.
+        let plain = ExportNullRule {
+            null_text: "(null)".to_string(),
+            explicit: HashMap::new(),
+        };
+        assert_eq!(
+            plain.cell(0, &driver_null, 0),
+            Some("NULL".to_string()),
+            "with another NULL text, the four letters NULL are a value"
+        );
+        assert_eq!(
+            plain.cell(0, &["(null)".to_string()], 0),
+            None,
+            "the session's own NULL text is the one that counts"
+        );
+        assert_eq!(plain.cell(0, &[String::new()], 0), Some(String::new()));
+
+        // The residual this side cannot close: while the NULL text IS `NULL`, a
+        // value spelled `NULL` is drawn exactly like one and the grid keeps only
+        // what it draws. The export path that still holds the driver's own
+        // marker — the object tree's — answers from that instead and is exact.
+        assert_eq!(rule.cell(0, &["NULL".to_string()], 0), None);
+    }
+
+    /// An export covers the whole result, so it waits for the whole result —
+    /// and says so when it cannot.
+    ///
+    /// Rows still arriving from the executor used to be exported as they stood:
+    /// an "All rows" file that stopped wherever the stream had got to, reported
+    /// as a successful export of that many rows. The two sibling whole-result
+    /// operations on the same grid — rearranging its columns and filtering it —
+    /// already refuse in the same words.
+    ///
+    /// A LAZY fetch is the one case that is NOT a truncation: those rows are all
+    /// on the server, and the export queues itself behind a full fetch instead.
+    #[test]
+    fn an_export_waits_for_a_result_that_is_still_arriving() {
+        assert!(ResultTableWidget::export_refusal_for(false, false).is_none());
+        assert!(
+            ResultTableWidget::export_refusal_for(true, true).is_none(),
+            "a lazy fetch is waited for, not refused"
+        );
+        assert!(
+            ResultTableWidget::export_refusal_for(false, true).is_none(),
+            "a lazy session with nothing in flight is still exportable"
+        );
+        let refusal = ResultTableWidget::export_refusal_for(true, false)
+            .expect("a streaming result cannot be exported whole");
+        assert!(refusal.contains("finish loading"), "{refusal}");
+    }
+
+    /// The exportable-column rule the snapshot builder uses is the same one the
+    /// export dialog asks before offering `SQL Inserts`.
+    ///
+    /// They used to be separate: a result of nothing but internal columns
+    /// (`SET HEADING OFF` blanks every name) still offered the format, the
+    /// snapshot then came back empty, and the user got a 0-byte file reported
+    /// as "0 rows" with no reason given.
+    #[test]
+    fn the_exportable_columns_are_the_ones_generated_sql_may_name() {
+        let headers = vec![
+            String::new(),
+            "EMPNO".to_string(),
+            "ROWID".to_string(),
+            "ENAME".to_string(),
+        ];
+        let rowid_col = ResultTableWidget::find_rowid_column_index(&headers);
+        assert_eq!(
+            ResultTableWidget::sql_exportable_source_indices(
+                &headers,
+                &HiddenColumns::default(),
+                rowid_col
+            ),
+            vec![1, 3]
+        );
+        // A result whose every column is internal can produce no INSERT at all.
+        let all_internal = vec![String::new(), "  ".to_string()];
+        assert!(ResultTableWidget::sql_exportable_source_indices(
+            &all_internal,
+            &HiddenColumns::default(),
+            None
+        )
+        .is_empty());
     }
 
     #[test]
@@ -17262,12 +17699,24 @@ mod tests {
         widget.set_lazy_fetch_session(77);
 
         let exported = Arc::new(Mutex::new(None));
+        let abandoned = Arc::new(Mutex::new(false));
         let exported_for_callback = exported.clone();
+        let abandoned_for_callback = abandoned.clone();
         assert!(widget
-            .export_to_csv_after_fetch_all(Box::new(move |csv, row_count| {
-                *exported_for_callback
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((csv, row_count));
+            .export_to_csv_after_fetch_all(Box::new(move |ready| match ready {
+                Ok(built) => {
+                    let (csv, row_count) = built
+                        .into_parts()
+                        .expect("a CSV export of a plain grid is never refused");
+                    *exported_for_callback
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((csv, row_count));
+                }
+                Err(_) => {
+                    *abandoned_for_callback
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                }
             }))
             .is_none());
 
@@ -17293,6 +17742,12 @@ mod tests {
                 .as_ref()
                 .map(|(_, row_count)| *row_count),
             Some(1)
+        );
+        assert!(
+            !*abandoned
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            "an export that ran must not also be reported as abandoned"
         );
     }
 
@@ -17361,6 +17816,14 @@ mod tests {
         any(target_os = "macos", target_os = "linux"),
         ignore = "FLTK widget tests require a native UI test environment"
     )]
+    /// An abort must not leave a queued export in the queue — and must not
+    /// leave the caller waiting for it either.
+    ///
+    /// This used to assert only that no export ran. That was true and also how
+    /// the defect looked from the outside: the action was discarded in silence,
+    /// while the user had already chosen a format and a file name for it. The
+    /// callback is now told `None`, which is what lets the caller say so, and
+    /// the assertion states both halves.
     fn lazy_fetch_abort_drops_pending_export_action() {
         let mut widget = ResultTableWidget::new();
 
@@ -17378,12 +17841,17 @@ mod tests {
         widget.set_lazy_fetch_session(88);
 
         let exported = Arc::new(Mutex::new(false));
+        let abandoned = Arc::new(Mutex::new(false));
         let exported_for_callback = exported.clone();
+        let abandoned_for_callback = abandoned.clone();
         assert!(widget
-            .export_to_csv_after_fetch_all(Box::new(move |_, _| {
-                *exported_for_callback
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            .export_to_csv_after_fetch_all(Box::new(move |ready| {
+                let slot = if ready.is_ok() {
+                    &exported_for_callback
+                } else {
+                    &abandoned_for_callback
+                };
+                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
             }))
             .is_none());
 
@@ -17397,9 +17865,18 @@ mod tests {
                 .as_slice(),
             &[(88, LazyFetchRequest::All)]
         );
-        assert!(!*exported
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(
+            !*exported
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            "an aborted fetch must not produce export bytes"
+        );
+        assert!(
+            *abandoned
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            "an aborted fetch must TELL the caller its export will not happen"
+        );
         assert!(widget
             .pending_lazy_actions
             .lock()

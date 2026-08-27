@@ -19,8 +19,9 @@
 use fltk::{app, prelude::*, window::Window};
 use space_query::db::{ColumnInfo, DatabaseType, QueryResult, SqlValueKind};
 use space_query::ui::grid_sql_export::{
-    build_sql_inserts, build_sql_updates, build_where_clause, resolve_export_table,
+    build_sql_inserts, build_sql_updates, build_where_clause, resolve_export_table, SqlWriteDialect,
 };
+use space_query::ui::result_export::ExportContent;
 use space_query::ui::ResultTableWidget;
 use std::process::Command;
 use std::time::Duration;
@@ -81,8 +82,20 @@ fn read_clipboard() -> Result<String, String> {
 
 /// Copy `sql` the way `MainWindow::finish_clipboard_copy` does, read it back
 /// off the OS clipboard, and compare against `expected`.
-fn check_clipboard(label: &str, sql: &str, expected: &str, failures: &mut Vec<String>) {
-    app::copy(sql);
+/// Copy what a builder wrote and compare the clipboard with `expected`.
+///
+/// Takes the builder's whole answer rather than a string: a refusal is a
+/// failure of the check, and reporting it by name beats comparing an empty
+/// clipboard with the expected SQL.
+fn check_clipboard(label: &str, built: ExportContent, expected: &str, failures: &mut Vec<String>) {
+    let sql = match built.into_parts() {
+        Ok((sql, _)) => sql,
+        Err(reason) => {
+            failures.push(format!("{label} was refused: {reason}"));
+            return;
+        }
+    };
+    app::copy(&sql);
     app::wait_for(0.2).ok();
     match read_clipboard() {
         Ok(clip) => {
@@ -116,15 +129,17 @@ fn main() {
     // (1) Oracle, whole grid selected: every kind in one statement per row.
     grid.select_all();
     app::wait_for(0.1).ok();
-    let Some(oracle) = grid.sql_export_selection(DatabaseType::Oracle, Some("HR.EMP".into()))
-    else {
+    let Some(oracle) = grid.sql_export_selection(
+        SqlWriteDialect::family_default(DatabaseType::Oracle),
+        Some("HR.EMP".into()),
+    ) else {
         eprintln!("FAILURES:\n  - selection snapshot was empty after select_all");
         std::process::exit(1);
     };
 
     check_clipboard(
         "Oracle SQL Inserts",
-        &build_sql_inserts(&oracle),
+        build_sql_inserts(&oracle),
         concat!(
             "INSERT INTO HR.EMP (ID, NAME, HIREDATE, RAW_COL, FLAG, NOTE) VALUES ",
             "(7369, 'it''s SMITH', TO_DATE('1980-12-17 00:00:00','YYYY-MM-DD HH24:MI:SS'), ",
@@ -137,7 +152,7 @@ fn main() {
 
     check_clipboard(
         "Oracle SQL Updates (PK = ID)",
-        &build_sql_updates(&oracle, &["ID".to_string()]),
+        build_sql_updates(&oracle, &["ID".to_string()]),
         concat!(
             "UPDATE HR.EMP SET NAME = 'it''s SMITH', ",
             "HIREDATE = TO_DATE('1980-12-17 00:00:00','YYYY-MM-DD HH24:MI:SS'), ",
@@ -150,7 +165,7 @@ fn main() {
 
     check_clipboard(
         "Oracle SQL Updates (no PK)",
-        &build_sql_updates(&oracle, &[]),
+        build_sql_updates(&oracle, &[]),
         concat!(
             "UPDATE HR.EMP SET ID = 7369, NAME = 'it''s SMITH', ",
             "HIREDATE = TO_DATE('1980-12-17 00:00:00','YYYY-MM-DD HH24:MI:SS'), ",
@@ -162,14 +177,17 @@ fn main() {
     );
 
     // (2) MySQL: backticked identifiers, quoted ISO datetimes, lossy binary.
-    let Some(mysql) = grid.sql_export_selection(DatabaseType::MySQL, Some("hr.emp".into())) else {
+    let Some(mysql) = grid.sql_export_selection(
+        SqlWriteDialect::family_default(DatabaseType::MySQL),
+        Some("hr.emp".into()),
+    ) else {
         failures.push("MySQL selection snapshot was empty".into());
         finish(&failures, win, app);
         return;
     };
     check_clipboard(
         "MySQL SQL Inserts",
-        &build_sql_inserts(&mysql),
+        build_sql_inserts(&mysql),
         concat!(
             "INSERT INTO `hr`.`emp` (`ID`, `NAME`, `HIREDATE`, `RAW_COL`, `FLAG`, `NOTE`) VALUES ",
             "(7369, 'it''s SMITH', '1980-12-17 00:00:00', 'DEADBEEF', '00123', '[LOB]');\n",
@@ -182,10 +200,13 @@ fn main() {
     // (3) Where Clause over a single column: collapses into IN.
     grid.get_widget().set_selection(0, 0, 1, 0);
     app::wait_for(0.1).ok();
-    match grid.sql_export_selection(DatabaseType::Oracle, Some("HR.EMP".into())) {
+    match grid.sql_export_selection(
+        SqlWriteDialect::family_default(DatabaseType::Oracle),
+        Some("HR.EMP".into()),
+    ) {
         Some(one_column) => check_clipboard(
             "Oracle Where Clause (one column)",
-            &build_where_clause(&one_column),
+            build_where_clause(&one_column),
             "ID IN (7369, 7499)",
             &mut failures,
         ),
@@ -196,10 +217,13 @@ fn main() {
     //     and a NULL compared with IS NULL.
     grid.get_widget().set_selection(0, 0, 1, 2);
     app::wait_for(0.1).ok();
-    match grid.sql_export_selection(DatabaseType::Oracle, Some("HR.EMP".into())) {
+    match grid.sql_export_selection(
+        SqlWriteDialect::family_default(DatabaseType::Oracle),
+        Some("HR.EMP".into()),
+    ) {
         Some(three_columns) => check_clipboard(
             "Oracle Where Clause (three columns, two rows)",
-            &build_where_clause(&three_columns),
+            build_where_clause(&three_columns),
             concat!(
                 "(ID = 7369 AND NAME = 'it''s SMITH' AND ",
                 "HIREDATE = TO_DATE('1980-12-17 00:00:00','YYYY-MM-DD HH24:MI:SS')) OR ",
@@ -250,10 +274,10 @@ fn check_streaming_grid(grid: &mut ResultTableWidget, failures: &mut Vec<String>
 
     grid.select_all();
     app::wait_for(0.1).ok();
-    match grid.sql_export_selection(DatabaseType::Oracle, table) {
+    match grid.sql_export_selection(SqlWriteDialect::family_default(DatabaseType::Oracle), table) {
         Some(streaming) => check_clipboard(
             "Oracle SQL Inserts (statement not finished)",
-            &build_sql_inserts(&streaming),
+            build_sql_inserts(&streaming),
             concat!(
                 "INSERT INTO HR.EMP (ID, NAME) VALUES (7369, 'SMITH');\n",
                 "INSERT INTO HR.EMP (ID, NAME) VALUES (7499, 'ALLEN');\n",

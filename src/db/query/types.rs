@@ -22,6 +22,103 @@ pub enum SqlValueKind {
     Binary,
 }
 
+impl SqlValueKind {
+    /// The kind a column of `data_type` accepts, read from the CATALOG's own
+    /// spelling of the declared type: Oracle's `ALL_TAB_COLUMNS.DATA_TYPE`
+    /// (`VARCHAR2`, `TIMESTAMP(6) WITH TIME ZONE`) or MySQL's
+    /// `INFORMATION_SCHEMA.COLUMNS.COLUMN_TYPE` (`varchar(50)`, `int unsigned`,
+    /// `enum('a','b')`). Only the leading type word matters.
+    ///
+    /// The twin of the per-driver classifiers — [`QueryExecutor::oracle_value_kind`],
+    /// [`crate::db::query::executor::oracle_thin_value_kind`] and
+    /// [`MysqlExecutor::mysql_value_kind`] —
+    /// which answer the same question from the type a DRIVER reports for a
+    /// fetched column. Two roads exist because only one of them is reachable at
+    /// each end: an import holds the catalog and no result, a grid holds a
+    /// result and no catalog.
+    ///
+    /// **They must never write a different literal for the same text.** That is
+    /// the invariant, and `catalog_and_driver_kinds_write_the_same_literal`
+    /// below is what holds it: it walks every declared type beside the driver
+    /// type a column of that type arrives as, and compares the SQL
+    /// [`crate::ui::grid_sql_export::sql_literal_for_value`] writes for each.
+    ///
+    /// Equality of the kinds themselves would be too strong: the MySQL protocol
+    /// cannot separate `VARCHAR` from `VARBINARY`, or `TEXT` from `BLOB` — they
+    /// share a type code and differ only by charset — and `String` and `Binary`
+    /// write the same quoted literal on that family, so that pair is free to
+    /// differ. `Number` and `Unknown` are not: one writes `1` and the other
+    /// `'1'`, and MySQL reads a string into a `BIT` column as its BYTES, so the
+    /// two mean 1 and 49.
+    pub fn for_declared_type(db_type: crate::db::DatabaseType, data_type: &str) -> Self {
+        let upper = data_type.trim().to_ascii_uppercase();
+        let head: &str = upper.split(['(', ' ']).next().unwrap_or_default();
+        if db_type.is_mysql_or_mariadb() {
+            Self::for_mysql_declared_type(head)
+        } else {
+            Self::for_oracle_declared_type(head, &upper)
+        }
+    }
+
+    fn for_mysql_declared_type(head: &str) -> Self {
+        match head {
+            // `BOOL` and `BOOLEAN` are in this list, not in a `Boolean` one:
+            // on this family they are spellings of `TINYINT(1)`, the protocol
+            // hands the column over as `MYSQL_TYPE_TINY`, and the driver
+            // renders its value as `1`/`0` — never as `TRUE`. A `Boolean` kind
+            // would emit a bare `TRUE` where the driver road emits `'TRUE'`,
+            // which is the one thing the two roads may never do. (In practice
+            // `COLUMN_TYPE`, which is what this reads, always says
+            // `tinyint(1)`.)
+            "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "DECIMAL"
+            | "DEC" | "NUMERIC" | "FIXED" | "FLOAT" | "DOUBLE" | "REAL" | "YEAR" | "BOOL"
+            | "BOOLEAN" => SqlValueKind::Number,
+            "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" => SqlValueKind::Temporal,
+            "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" => {
+                SqlValueKind::Binary
+            }
+            "CHAR" | "VARCHAR" | "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM"
+            | "SET" | "JSON" => SqlValueKind::String,
+            // `BIT` is deliberately not a number. The driver hands a `BIT`
+            // column over as its raw bytes, which reach the grid through
+            // `String::from_utf8_lossy` — so `BIT(8)` holding 49 is DISPLAYED
+            // as `1`, and writing that back unquoted would store 1. Quoted, it
+            // stores 49 again, because that is how MySQL reads a string into a
+            // `BIT`. Neither spelling is a faithful rendering, which is exactly
+            // what `Unknown` means, and it is what both drivers already say.
+            _ => SqlValueKind::Unknown,
+        }
+    }
+
+    fn for_oracle_declared_type(head: &str, upper: &str) -> Self {
+        match head {
+            "NUMBER" | "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" | "INTEGER" | "INT"
+            | "SMALLINT" | "DECIMAL" | "NUMERIC" | "DEC" | "DOUBLE" | "REAL" => {
+                SqlValueKind::Number
+            }
+            "BOOLEAN" => SqlValueKind::Boolean,
+            // `INTERVAL DAY(2) TO SECOND(6)` and the TIMESTAMP family all start
+            // with a word this catches.
+            "DATE" | "TIMESTAMP" | "INTERVAL" => SqlValueKind::Temporal,
+            "RAW" => SqlValueKind::Binary,
+            // `LONG` is text, `LONG RAW` is not.
+            "LONG" if upper.starts_with("LONG RAW") => SqlValueKind::Binary,
+            "VARCHAR2" | "NVARCHAR2" | "VARCHAR" | "CHAR" | "NCHAR" | "CLOB" | "NCLOB" | "LONG"
+            | "ROWID" | "UROWID" | "XMLTYPE" | "JSON" => SqlValueKind::String,
+            // `BLOB` and `BFILE` are NOT `Binary`. `Binary` means "the text is
+            // the value's bytes in hex, and `HEXTORAW` turns it back", which is
+            // true of `RAW` and of nothing else here: a large `BLOB` reaches
+            // the grid as `[LOB]` and a `BFILE` as a locator, neither of which
+            // any literal reconstructs. Both drivers already answer `Unknown`
+            // for them, and quoting the displayed text is the honest reply —
+            // Oracle applies the same implicit hex conversion to a quoted
+            // string as `HEXTORAW` does, and raises the same ORA-01465 when the
+            // text is not hex.
+            _ => SqlValueKind::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ColumnInfo {
     pub name: String,
@@ -1144,5 +1241,280 @@ mod routine_definition_tests {
             RoutineOverload::invocation_of(&[], None),
             RoutineInvocation::Ordinary
         );
+    }
+}
+
+/// The invariant that binds the two roads a column's literal kind is reached by.
+#[cfg(test)]
+mod sql_value_kind_tests {
+    use super::SqlValueKind;
+    use crate::db::query::mysql_executor::MysqlExecutor;
+    use crate::db::query::{oracle_thin_value_kind, QueryExecutor};
+    use crate::db::DatabaseType;
+    use mysql::consts::ColumnType as MysqlColumnType;
+    use oracle::sql_type::OracleType;
+    use tns_thin::exec::OracleColumnType as OracleThinColumnType;
+
+    /// Every declared type, beside the driver type a column of that type
+    /// arrives as.
+    ///
+    /// This table is the whole point: it is what pairs the two roads a kind can
+    /// be reached by, so a change to either one is compared against the other
+    /// instead of drifting quietly. A driver type with no declared-type
+    /// counterpart (`RefCursor`, `Vector`, `Object`) is deliberately absent —
+    /// no catalog column is declared as one.
+    const ORACLE_TYPE_PAIRS: &[(&str, OracleType, OracleThinColumnType)] = &[
+        (
+            "VARCHAR2(200)",
+            OracleType::Varchar2(200),
+            OracleThinColumnType::Varchar,
+        ),
+        (
+            "NVARCHAR2(200)",
+            OracleType::NVarchar2(200),
+            OracleThinColumnType::Varchar,
+        ),
+        (
+            "CHAR(2)",
+            OracleType::Char(2),
+            OracleThinColumnType::Varchar,
+        ),
+        (
+            "NCHAR(2)",
+            OracleType::NChar(2),
+            OracleThinColumnType::Varchar,
+        ),
+        ("CLOB", OracleType::CLOB, OracleThinColumnType::Clob),
+        ("NCLOB", OracleType::NCLOB, OracleThinColumnType::Nclob),
+        ("LONG", OracleType::Long, OracleThinColumnType::Long),
+        ("ROWID", OracleType::Rowid, OracleThinColumnType::Rowid),
+        ("UROWID", OracleType::Rowid, OracleThinColumnType::Urowid),
+        ("XMLTYPE", OracleType::Xml, OracleThinColumnType::Xml),
+        ("JSON", OracleType::Json, OracleThinColumnType::Json),
+        (
+            "NUMBER(12,2)",
+            OracleType::Number(12, 2),
+            OracleThinColumnType::Number,
+        ),
+        (
+            "FLOAT(126)",
+            OracleType::Float(126),
+            OracleThinColumnType::Number,
+        ),
+        (
+            "BINARY_FLOAT",
+            OracleType::BinaryFloat,
+            OracleThinColumnType::BinaryFloat,
+        ),
+        (
+            "BINARY_DOUBLE",
+            OracleType::BinaryDouble,
+            OracleThinColumnType::BinaryDouble,
+        ),
+        (
+            "BOOLEAN",
+            OracleType::Boolean,
+            OracleThinColumnType::Boolean,
+        ),
+        ("DATE", OracleType::Date, OracleThinColumnType::Date),
+        (
+            "TIMESTAMP(6)",
+            OracleType::Timestamp(6),
+            OracleThinColumnType::Timestamp,
+        ),
+        (
+            "TIMESTAMP(6) WITH TIME ZONE",
+            OracleType::TimestampTZ(6),
+            OracleThinColumnType::Timestamp,
+        ),
+        (
+            "TIMESTAMP(6) WITH LOCAL TIME ZONE",
+            OracleType::TimestampLTZ(6),
+            OracleThinColumnType::Timestamp,
+        ),
+        (
+            "INTERVAL DAY(2) TO SECOND(6)",
+            OracleType::IntervalDS(2, 6),
+            OracleThinColumnType::IntervalDaySecond,
+        ),
+        (
+            "INTERVAL YEAR(2) TO MONTH",
+            OracleType::IntervalYM(2),
+            OracleThinColumnType::IntervalYearMonth,
+        ),
+        ("RAW(8)", OracleType::Raw(8), OracleThinColumnType::Raw),
+        ("LONG RAW", OracleType::LongRaw, OracleThinColumnType::Raw),
+        ("BLOB", OracleType::BLOB, OracleThinColumnType::Blob),
+        ("BFILE", OracleType::BFILE, OracleThinColumnType::Bfile),
+    ];
+
+    /// The MySQL-family twin. Several declared types share one protocol code —
+    /// the protocol cannot separate `VARCHAR` from `VARBINARY`, or `TEXT` from
+    /// `BLOB` — which is why the invariant is about the LITERAL and not about
+    /// the kind.
+    const MYSQL_TYPE_PAIRS: &[(&str, MysqlColumnType)] = &[
+        ("varchar(50)", MysqlColumnType::MYSQL_TYPE_VAR_STRING),
+        ("char(2)", MysqlColumnType::MYSQL_TYPE_STRING),
+        ("longtext", MysqlColumnType::MYSQL_TYPE_BLOB),
+        ("text", MysqlColumnType::MYSQL_TYPE_BLOB),
+        ("enum('a','b')", MysqlColumnType::MYSQL_TYPE_STRING),
+        ("set('a','b')", MysqlColumnType::MYSQL_TYPE_STRING),
+        ("json", MysqlColumnType::MYSQL_TYPE_JSON),
+        ("tinyint(1)", MysqlColumnType::MYSQL_TYPE_TINY),
+        ("int unsigned", MysqlColumnType::MYSQL_TYPE_LONG),
+        ("bigint(20)", MysqlColumnType::MYSQL_TYPE_LONGLONG),
+        ("decimal(12,2)", MysqlColumnType::MYSQL_TYPE_NEWDECIMAL),
+        ("double", MysqlColumnType::MYSQL_TYPE_DOUBLE),
+        ("year(4)", MysqlColumnType::MYSQL_TYPE_YEAR),
+        ("date", MysqlColumnType::MYSQL_TYPE_DATE),
+        ("datetime(6)", MysqlColumnType::MYSQL_TYPE_DATETIME),
+        ("timestamp", MysqlColumnType::MYSQL_TYPE_TIMESTAMP),
+        ("time(3)", MysqlColumnType::MYSQL_TYPE_TIME),
+        ("binary(16)", MysqlColumnType::MYSQL_TYPE_STRING),
+        ("varbinary(16)", MysqlColumnType::MYSQL_TYPE_VAR_STRING),
+        ("longblob", MysqlColumnType::MYSQL_TYPE_BLOB),
+        ("bit(8)", MysqlColumnType::MYSQL_TYPE_BIT),
+        ("geometry", MysqlColumnType::MYSQL_TYPE_GEOMETRY),
+        ("mediumint", MysqlColumnType::MYSQL_TYPE_INT24),
+        ("float", MysqlColumnType::MYSQL_TYPE_FLOAT),
+        ("numeric(8,2)", MysqlColumnType::MYSQL_TYPE_NEWDECIMAL),
+        ("tinyblob", MysqlColumnType::MYSQL_TYPE_BLOB),
+        ("mediumtext", MysqlColumnType::MYSQL_TYPE_BLOB),
+        // A spelling of `TINYINT(1)`, which is why it must classify as one.
+        ("bool", MysqlColumnType::MYSQL_TYPE_TINY),
+        ("boolean", MysqlColumnType::MYSQL_TYPE_TINY),
+    ];
+
+    /// Text shapes that tell the kinds apart. A value that is not a plain
+    /// number, not `TRUE`/`FALSE`, and not an ISO date reaches the same quoted
+    /// literal from every kind, so only these shapes can expose a disagreement.
+    const KIND_PROBE_VALUES: &[&str] = &[
+        "1",
+        "0",
+        "00123",
+        "-1.5",
+        "1e5",
+        "TRUE",
+        "FALSE",
+        "DEADBEEF",
+        "abc",
+        "2024-03-04",
+        "2024-03-04 10:11:12",
+        "a'b",
+        "",
+    ];
+
+    /// The catalog road and the driver road must write the same SQL.
+    ///
+    /// Not "must be the same kind": the MySQL protocol merges `VARCHAR` with
+    /// `VARBINARY` and `TEXT` with `BLOB`, and `String` and `Binary` write the
+    /// same quoted literal there, so those pairs are free to differ. What is
+    /// never free to differ is the text that reaches the server — and that is
+    /// what this compares, for both write dialects, over the shapes that can
+    /// tell the kinds apart.
+    #[test]
+    fn catalog_and_driver_kinds_write_the_same_literal() {
+        use crate::ui::grid_sql_export::{sql_literal_for_value, SqlWriteDialect};
+
+        let oracle = SqlWriteDialect::family_default(DatabaseType::Oracle);
+        for (declared, oci, thin) in ORACLE_TYPE_PAIRS {
+            let catalog = SqlValueKind::for_declared_type(DatabaseType::Oracle, declared);
+            let oci_kind = QueryExecutor::oracle_value_kind(oci);
+            let thin_kind = oracle_thin_value_kind(thin);
+            for value in KIND_PROBE_VALUES {
+                let from_catalog = sql_literal_for_value(oracle, catalog, value);
+                assert_eq!(
+                    from_catalog,
+                    sql_literal_for_value(oracle, oci_kind, value),
+                    "{declared} ({value:?}): catalog says {catalog:?}, OCI says {oci_kind:?}"
+                );
+                assert_eq!(
+                    from_catalog,
+                    sql_literal_for_value(oracle, thin_kind, value),
+                    "{declared} ({value:?}): catalog says {catalog:?}, thin says {thin_kind:?}"
+                );
+            }
+        }
+
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let dialect = SqlWriteDialect::family_default(db_type);
+            for (declared, driver) in MYSQL_TYPE_PAIRS {
+                let catalog = SqlValueKind::for_declared_type(db_type, declared);
+                let driver_kind = MysqlExecutor::mysql_value_kind(*driver);
+                for value in KIND_PROBE_VALUES {
+                    assert_eq!(
+                        sql_literal_for_value(dialect, catalog, value),
+                        sql_literal_for_value(dialect, driver_kind, value),
+                        "{db_type} {declared} ({value:?}): catalog says {catalog:?}, \
+                         driver says {driver_kind:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The declared-type reader itself, kind by kind.
+    ///
+    /// Moved here with the function it describes. Two entries changed when it
+    /// moved, and both changed to what the test's own name always asked for —
+    /// the answer the driver gives: `BLOB`/`BFILE` are `Unknown`, not `Binary`
+    /// (only `RAW` is hex the app can turn back into bytes), and `bit` is
+    /// `Unknown`, not `Number` (its displayed text is raw bytes).
+    #[test]
+    fn oracle_types_classify_the_way_the_driver_would() {
+        for (data_type, kind) in [
+            ("VARCHAR2", SqlValueKind::String),
+            ("NVARCHAR2", SqlValueKind::String),
+            ("CHAR", SqlValueKind::String),
+            ("CLOB", SqlValueKind::String),
+            ("LONG", SqlValueKind::String),
+            ("NUMBER", SqlValueKind::Number),
+            ("BINARY_DOUBLE", SqlValueKind::Number),
+            ("DATE", SqlValueKind::Temporal),
+            ("TIMESTAMP(6)", SqlValueKind::Temporal),
+            ("TIMESTAMP(6) WITH TIME ZONE", SqlValueKind::Temporal),
+            ("INTERVAL DAY(2) TO SECOND(6)", SqlValueKind::Temporal),
+            ("RAW", SqlValueKind::Binary),
+            ("LONG RAW", SqlValueKind::Binary),
+            ("BLOB", SqlValueKind::Unknown),
+            ("BFILE", SqlValueKind::Unknown),
+            ("BOOLEAN", SqlValueKind::Boolean),
+            ("SDO_GEOMETRY", SqlValueKind::Unknown),
+        ] {
+            assert_eq!(
+                SqlValueKind::for_declared_type(DatabaseType::Oracle, data_type),
+                kind,
+                "{data_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_types_classify_the_way_the_driver_would() {
+        for (data_type, kind) in [
+            ("varchar(50)", SqlValueKind::String),
+            ("longtext", SqlValueKind::String),
+            ("enum('a','b')", SqlValueKind::String),
+            ("json", SqlValueKind::String),
+            ("int unsigned", SqlValueKind::Number),
+            ("decimal(12,2)", SqlValueKind::Number),
+            ("bigint(20)", SqlValueKind::Number),
+            ("bit(1)", SqlValueKind::Unknown),
+            ("year(4)", SqlValueKind::Number),
+            ("date", SqlValueKind::Temporal),
+            ("datetime(6)", SqlValueKind::Temporal),
+            ("time(3)", SqlValueKind::Temporal),
+            ("varbinary(16)", SqlValueKind::Binary),
+            ("longblob", SqlValueKind::Binary),
+            ("geometry", SqlValueKind::Unknown),
+        ] {
+            for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+                assert_eq!(
+                    SqlValueKind::for_declared_type(db_type, data_type),
+                    kind,
+                    "{data_type}"
+                );
+            }
+        }
     }
 }

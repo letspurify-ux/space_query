@@ -28,7 +28,10 @@ use crate::ui::result_export::ExportFormat;
 use crate::ui::result_import::{
     header_choice_applies, null_text_choice_applies, parse, ImportOptions, ImportedTable,
 };
-use crate::ui::table_import::{default_mapping, ColumnMapping, TargetColumn};
+use crate::ui::table_import::{
+    check_mapping, default_mapping, ColumnMapping, ImportTargets, TargetColumn,
+};
+use crate::ui::widget_label::add_menu_item;
 use crate::ui::{center_on_main, theme};
 
 /// Height of one source-column row inside the mapping area — the same height
@@ -48,7 +51,18 @@ pub(crate) struct ImportOutcome {
 /// Everything the callbacks share.
 struct DialogState {
     text: String,
+    /// Every column of the table, writable or not, in the table's own order.
+    ///
+    /// Held whole rather than pre-filtered because a headerless file is mapped
+    /// by POSITION, and a position means a place in the TABLE — see
+    /// [`ImportTargets::positional_mapping`].
+    table_columns: ImportTargets,
+    /// The subset a mapping points at, in table order. Derived once so the
+    /// mapping indexes and the dropdown items cannot come from two readings.
     targets: Vec<TargetColumn>,
+    /// Columns the table has that no value may be written into, so the summary
+    /// can name them. They are deliberately absent from `targets`.
+    generated_columns: Vec<String>,
     formats: Vec<ExportFormat>,
     /// The width a mapping row gets. Taken from the dialog's own size rather
     /// than from the Scroll, whose Flex-assigned width is not final until the
@@ -58,6 +72,16 @@ struct DialogState {
     parsed: Mutex<Result<ImportedTable, String>>,
     /// One Choice per file column: 0 is "skip", n+1 is target column n.
     mapping_choices: Mutex<Vec<Choice>>,
+    /// What the mapping area on screen was built for: the file's columns, or the
+    /// parse error it is showing instead.
+    ///
+    /// Rebuilding that area is what discards the user's picks, so it happens
+    /// only when this changes. It used to happen on every reload, and a reload
+    /// runs on every keystroke in the NULL text — which does not change the
+    /// file's columns at all, so a hand-made mapping was thrown away by typing.
+    /// The error is part of the key because the area SHOWS it: two different
+    /// errors are two different things to draw.
+    mapped_columns: Mutex<Option<Result<Vec<String>, String>>>,
 }
 
 impl DialogState {
@@ -95,11 +119,18 @@ pub(crate) fn show(
     file_label: &str,
     text: &str,
     table_label: &str,
-    targets: &[TargetColumn],
+    table_columns: &ImportTargets,
     initial_format: ExportFormat,
 ) -> Option<ImportOutcome> {
+    let targets = table_columns.writable();
+    let generated_columns = table_columns.generated_names();
     if targets.is_empty() {
-        crate::ui::alert_on_main("The table has no columns to import into.");
+        crate::ui::alert_on_main(if generated_columns.is_empty() {
+            "The table has no columns to import into."
+        } else {
+            "Every column of this table is computed by the server, so there is \
+             nothing an import could write."
+        });
         return None;
     }
 
@@ -225,11 +256,14 @@ pub(crate) fn show(
 
     let state = Arc::new(DialogState {
         text: text.to_string(),
-        targets: targets.to_vec(),
+        table_columns: table_columns.clone(),
+        targets,
+        generated_columns,
         formats,
         row_width: width - DIALOG_MARGIN * 2 - DIALOG_SPACING * 2 - app::scrollbar_size(),
         parsed: Mutex::new(Err(String::new())),
         mapping_choices: Mutex::new(Vec::new()),
+        mapped_columns: Mutex::new(None),
     });
 
     let reload = {
@@ -253,7 +287,27 @@ pub(crate) fn show(
 
             let options = state.options(format, header_check.is_set(), null_input.value());
             let parsed = parse(&state.text, &options);
-            rebuild_mapping_rows(&state, &mut scroll, &parsed, options.has_header);
+            // The mapping rows describe the FILE's columns. When those are the
+            // same as the ones on screen, the rows already on screen describe
+            // them — including any target the user picked by hand.
+            let columns = parsed
+                .as_ref()
+                .map(|data| data.columns.clone())
+                .map_err(String::clone);
+            let rebuild = {
+                let mut built_for = state
+                    .mapped_columns
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let changed = built_for.as_ref() != Some(&columns);
+                if changed {
+                    *built_for = Some(columns);
+                }
+                changed
+            };
+            if rebuild {
+                rebuild_mapping_rows(&state, &mut scroll, &parsed, options.has_header);
+            }
             *state
                 .parsed
                 .lock()
@@ -311,8 +365,12 @@ pub(crate) fn show(
                 }
             };
             let mapping = state.mapping();
-            if mapping.iter().all(Option::is_none) {
-                crate::ui::alert_on_main("Map at least one file column to a table column.");
+            // The SAME validator the script builder runs, asked while the
+            // dialog is still open: a mapping it refuses can be corrected here
+            // instead of costing the user the file chooser and every choice
+            // they made in this dialog.
+            if let Err(error) = check_mapping(&state.targets, &mapping, &data) {
+                crate::ui::alert_on_main(&error);
                 return;
             }
             *outcome
@@ -393,7 +451,7 @@ fn rebuild_mapping_rows(
             let mapping = if has_header {
                 default_mapping(&data.columns, &state.targets)
             } else {
-                positional_mapping(data.columns.len(), state.targets.len())
+                state.table_columns.positional_mapping(data.columns.len())
             };
             for (index, column) in data.columns.iter().enumerate() {
                 let mut name = Frame::new(x, y, MAPPING_NAME_WIDTH, MAPPING_ROW_HEIGHT, None);
@@ -405,17 +463,25 @@ fn rebuild_mapping_rows(
                 let choice_x = x + MAPPING_NAME_WIDTH + DIALOG_SPACING;
                 let choice_w = (usable - MAPPING_NAME_WIDTH - DIALOG_SPACING).max(120);
                 let mut choice = Choice::new(choice_x, y, choice_w, MAPPING_ROW_HEIGHT, None);
-                choice.add_choice(&escape_menu_label("(skip)"));
+                // ONE item per target, whatever a column is called: the
+                // mapping this dialog returns is the item INDEX, so a name that
+                // became two entries mapped every later column onto its
+                // neighbour — the user picked NAME and the import wrote into
+                // the next one.
+                add_menu_item(&mut choice, "(skip)");
                 for target in &state.targets {
-                    choice.add_choice(&escape_menu_label(&format!(
-                        "{}  ·  {}",
-                        target.name,
-                        if target.nullable {
-                            "null ok"
-                        } else {
-                            "required"
-                        }
-                    )));
+                    add_menu_item(
+                        &mut choice,
+                        &format!(
+                            "{}  ·  {}",
+                            target.name,
+                            if target.nullable {
+                                "null ok"
+                            } else {
+                                "required"
+                            }
+                        ),
+                    );
                 }
                 choice.set_value(
                     mapping
@@ -447,13 +513,6 @@ fn rebuild_mapping_rows(
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = choices;
     scroll.scroll_to(0, 0);
     scroll.redraw();
-}
-
-/// Match file columns to table columns by position, for a file with no header.
-fn positional_mapping(source_count: usize, target_count: usize) -> ColumnMapping {
-    (0..source_count)
-        .map(|index| (index < target_count).then_some(index))
-        .collect()
 }
 
 fn update_summary(state: &DialogState, summary: &mut Frame) {
@@ -488,25 +547,17 @@ fn update_summary(state: &DialogState, summary: &mut Frame) {
                     elide(&unmapped.join(", "), 80)
                 ));
             }
+            if !state.generated_columns.is_empty() {
+                text.push_str(&format!(
+                    "\nComputed by the server, so not listed: {}",
+                    elide(&state.generated_columns.join(", "), 80)
+                ));
+            }
             text
         }
     };
     summary.set_label(&text);
     summary.redraw();
-}
-
-/// FLTK parses a menu label: `|` splits items, `/` opens a submenu, `&` marks
-/// an accelerator, and `_` draws a divider. A column name gets to keep all of
-/// them.
-fn escape_menu_label(label: &str) -> String {
-    let mut escaped = String::with_capacity(label.len());
-    for ch in label.chars() {
-        if matches!(ch, '&' | '/' | '\\' | '_' | '|') {
-            escaped.push('\\');
-        }
-        escaped.push(ch);
-    }
-    escaped
 }
 
 fn elide(text: &str, limit: usize) -> String {
