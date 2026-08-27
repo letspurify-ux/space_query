@@ -85,7 +85,23 @@ error. One keystroke, three different wrong answers.
 reader, and it is FAIL-OPEN by design: only what the app can PROVE has no plan
 is named, so DDL as a class is deliberately absent — Oracle plans a
 `CREATE TABLE … AS SELECT` and a `CREATE INDEX`, which share a `SqlKind` with
-`CREATE PROCEDURE`. It is asked in the body of
+`CREATE PROCEDURE`. The reader consults the GRAMMAR before the kind, because
+`SqlKind` is the session-safety taxonomy and answers the plan question only by
+coincidence: a `SHOW` really returns rows, so it classifies `SelectLike` — the
+one kind the gate trusted as certainly plannable — and every `SHOW` walked
+through and was wrapped and SENT (measured: `ERROR 1064` on MySQL 8.0.46 and
+MariaDB 12.2.2 for `EXPLAIN SHOW INDEX FROM t` and every other `SHOW`;
+`ORA-00905` for `EXPLAIN PLAN … FOR SHOW PARAMETER …`, where `SHOW` is
+SQL*Plus's word and begins no server statement at all). The grammar readers
+(`statement_is_table_maintenance`, `statement_is_client_report_or_lock`) also
+name the rest of the maintenance family (`CHECK`/`CHECKSUM`/`OPTIMIZE`/`REPAIR
+… TABLE`, all measured `ERROR 1064` when wrapped, all previously leaking
+through the kind match as fail-open `Ddl`), `HELP` (both MySQL products read
+`EXPLAIN HELP 'x'` as a DESCRIBE of a table named `HELP` — the `ANALYZE TABLE`
+shape again), and Oracle's `LOCK TABLE` (DML to the classifier, so fail-open;
+`ORA-00905` measured). The MySQL family's `LOCK`/`UNLOCK` need no new name:
+its classifier reads them as session control and the kind match already
+refuses those. It is asked in the body of
 `ExplainPlanBackend::refusal_before_sending`, the only default method that trait
 has, so no backend can answer it differently or skip it; each backend still
 answers its own half (`refusal_from_what_this_explain_does`). And it is asked of
@@ -112,9 +128,59 @@ prompt every other execution entry point uses, where they change what is sent
 substitutes them into the text, while Oracle's `EXPLAIN PLAN` only parses the
 statement it explains and needs none).
 
+MariaDB's `SET STATEMENT <assignments> FOR <statement>` wrapper is one more
+spelling only that product has, and the explain goes INSIDE it: `EXPLAIN SET
+STATEMENT … FOR SELECT …` — what wrapping the whole wrapper produced — is
+`ERROR 1064` (measured, 12.2.2), while `SET STATEMENT … FOR EXPLAIN SELECT …`
+answers with a real plan. The classification side always unwrapped the wrapper
+(`SqlStatementAnalysis::new_for_db_type`), so the builder and the
+executing-explain reader reading only the leading `SET` was one text with two
+readings; `mariadb_set_statement_wrapper(db_type, sql)` now hands the builder
+BOTH halves from one parse, the builder rebuilds `SET STATEMENT <assignments>
+FOR EXPLAIN <inner>` (the assignments are KEPT — they can change the very plan
+being asked about), an inner that is already an explain passes the whole
+wrapper through, and `mysql_explain_executed_statement` sees through the
+wrapper so a wrapped `ANALYZE <write>` is refused exactly as the bare spelling
+is — and so the implicit-commit and uncommitted-work tables judge what
+actually runs. MySQL never takes this road: the wrapper reader takes the
+`db_type`, and there the words are a syntax error the gate judges as the `SET`
+they lead with.
+
+Every one of those decisions reads ONE prepared view of the text —
+`sql_classification::statement_reader_view`, the same preparation the
+classifier has always used: leading comments stripped and, on the MySQL
+family, executable comments (`/*! … */`, `/*M! … */`) EXPANDED, because those
+servers execute their content. Parsed raw instead, `/*! ANALYZE */` was a
+comment to the readers and an ANALYZE to the server — measured: MySQL 8.0.46
+ran `EXPLAIN /*! ANALYZE */ SELECT SLEEP(2)` for the full two seconds, MariaDB
+12.2.2 ran `/*! ANALYZE */ UPDATE …` and wrote — so
+`EXPLAIN /*! ANALYZE */ UPDATE …` walked through the write gate that exists to
+refuse an executing explain of a write (on MySQL ≥ 8.3 the iterator executor
+runs the UPDATE). The pass-through wire still carries the user's raw bytes;
+only the DECISIONS read the expanded view, and Oracle's view expands nothing
+because its servers give those comments no meaning.
+
+MariaDB's `SHOW EXPLAIN FOR <id>` / `SHOW ANALYZE FOR <id>` — its own explains
+of a RUNNING statement — pass through as the user's explain (measured: real
+plan rows, `ERROR 1094 Unknown thread id` for a bad id), where MySQL keeps the
+SHOW refusal because there the spelling is `EXPLAIN FOR CONNECTION <id>`
+(1064 for the SHOW forms, measured). One reader
+(`mariadb_show_spelled_explain`) answers both the refusal gate and the
+builder, so the one cannot refuse what the other passes through.
+
 Both roads are driven against a real server by
 `verify_explain_plan_live`, whose two statements read different tables so the
 plan itself says which one was explained.
+
+Everything F6 shows — the plan tab, the note, a refusal, a failure — is
+delivered by the WORKER, on the operation's own progress channel, BEFORE
+`OperationFinished` (`deliver_explain_plan_outcome`): the same contract every
+other result keeps. It used to ride a second channel to a UI-side poll that
+re-sent it under the operation's token a beat AFTER the worker had finished the
+operation — so the moment anything newer owned the tab (F6 auto-repeat, F6 then
+`Ctrl+Enter` inside the poll's 50 ms window) the delivery filter dropped a plan
+that had really come back, in silence. The `UiActionResult` now carries only
+the status-bar line, so the late road is unwritable.
 
 The status line and the Messages pane say what the result said: a plan with no
 steps reports `No plan output.` rather than claiming it loaded, and a cancelled

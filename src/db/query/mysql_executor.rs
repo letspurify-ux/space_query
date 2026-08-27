@@ -1279,16 +1279,45 @@ impl MysqlExecutor {
     /// [`MysqlExplainStatement::app_chosen_target`].
     pub fn explain_plan_statement(db_type: DatabaseType, sql: &str) -> MysqlExplainStatement {
         let normalized = QueryExecutor::normalize_sql_for_execute(sql);
-        let passes_through = match QueryExecutor::leading_keyword(&normalized).as_deref() {
-            Some("EXPLAIN") | Some("DESCRIBE") | Some("DESC") => true,
-            Some("ANALYZE") => crate::db::sql_classification::mysql_explain_executed_statement(
-                db_type,
-                &normalized,
-            )
-            .is_some(),
-            _ => false,
-        };
-        if passes_through {
+        // MariaDB's `SET STATEMENT <assignments> FOR <statement>` wrapper: the
+        // explain goes INSIDE it, because that is the only place the server
+        // accepts one. Wrapping the whole wrapper — `EXPLAIN SET STATEMENT …
+        // FOR SELECT …` — is ERROR 1064 (measured on 12.2.2), while
+        // `SET STATEMENT … FOR EXPLAIN SELECT …` answers with a real plan; and
+        // rebuilding rather than stripping is the truthful choice, because the
+        // assignments can change the very plan being asked about
+        // (`optimizer_switch`, join buffers). The wrapper reader takes the
+        // `db_type`, so MySQL — where these words are a syntax error — never
+        // takes this road and its text is wrapped whole for the gate to judge.
+        // Both halves come from the reader's ONE parse of the ONE prepared
+        // view the classifier reads (`statement_reader_view`), so the rebuilt
+        // wire carries that view's bytes — the same reading the server makes
+        // of the user's text, executable comments expanded and all.
+        //
+        // An inner statement that is ALREADY an explain passes the whole
+        // wrapper through unchanged, exactly as a bare explain always has.
+        // An inner with no assignments to carry is not the wrapper the server
+        // accepts, so it falls through and is judged as the plain text it is.
+        if let Some(wrapper) =
+            crate::db::sql_classification::mariadb_set_statement_wrapper(db_type, &normalized)
+        {
+            if Self::statement_is_already_an_explain(db_type, &wrapper.inner) {
+                return MysqlExplainStatement {
+                    sql: normalized,
+                    app_chosen_target: None,
+                };
+            }
+            if !wrapper.assignments.is_empty() {
+                return MysqlExplainStatement {
+                    sql: format!(
+                        "SET STATEMENT {} FOR EXPLAIN {}",
+                        wrapper.assignments, wrapper.inner
+                    ),
+                    app_chosen_target: Some(wrapper.inner),
+                };
+            }
+        }
+        if Self::statement_is_already_an_explain(db_type, &normalized) {
             return MysqlExplainStatement {
                 sql: normalized,
                 app_chosen_target: None,
@@ -1297,6 +1326,40 @@ impl MysqlExecutor {
         MysqlExplainStatement {
             sql: format!("EXPLAIN {}", normalized),
             app_chosen_target: Some(normalized),
+        }
+    }
+
+    /// Whether the user already wrote this text as an explain of their own —
+    /// the one decision behind every pass-through above, stated once so the
+    /// bare road and the `SET STATEMENT` road cannot come to disagree about
+    /// what counts as one.
+    ///
+    /// The decision reads the same prepared view the classifier and the write
+    /// gate read (`statement_reader_view`): executable comments are what the
+    /// server executes, so `/*! ANALYZE */ SELECT …` on MariaDB IS that
+    /// product's executing explain and must pass through as one — parsed raw,
+    /// the leading word was `SELECT`, the text was wrapped, and the wrap
+    /// handed the server `EXPLAIN ANALYZE …` the app never judged.
+    ///
+    /// `EXPLAIN`/`DESCRIBE`/`DESC` by their leading word; `ANALYZE` only when
+    /// the reader that knows both products' spellings says it really is the
+    /// executing explain (`ANALYZE TABLE …` is maintenance, not an explain);
+    /// `SHOW` only for MariaDB's `SHOW EXPLAIN FOR` / `SHOW ANALYZE FOR` —
+    /// that product's own explain of a RUNNING statement, whose output is a
+    /// real plan (measured), and which the refusal gate excepts through the
+    /// same one reader (`mariadb_show_spelled_explain`).
+    fn statement_is_already_an_explain(db_type: DatabaseType, sql: &str) -> bool {
+        let view = crate::db::sql_classification::statement_reader_view(db_type, sql);
+        match QueryExecutor::leading_keyword(view.as_ref()).as_deref() {
+            Some("EXPLAIN") | Some("DESCRIBE") | Some("DESC") => true,
+            Some("ANALYZE") => {
+                crate::db::sql_classification::mysql_explain_executed_statement(db_type, sql)
+                    .is_some()
+            }
+            Some("SHOW") => {
+                crate::db::sql_classification::mariadb_show_spelled_explain(db_type, sql)
+            }
+            _ => false,
         }
     }
 
@@ -3519,6 +3582,109 @@ mod tests {
                 "EXPLAIN ANALYZE LOCAL TABLE t",
                 "{db_type}"
             );
+        }
+    }
+
+    /// MariaDB's `SET STATEMENT … FOR <statement>` wrapper: the explain goes
+    /// INSIDE it, because that is the only place the server accepts one.
+    ///
+    /// MEASURED on 12.2.2: `EXPLAIN SET STATEMENT … FOR SELECT …` — what
+    /// wrapping the whole wrapper produced — is ERROR 1064, while
+    /// `SET STATEMENT … FOR EXPLAIN SELECT …` answers with a real plan. The
+    /// assignments are KEPT rather than stripped, because they can change the
+    /// very plan being asked about (`optimizer_switch`, join buffers).
+    #[test]
+    fn mariadb_explain_of_a_set_statement_wrapper_puts_the_explain_inside() {
+        let stmt = MysqlExecutor::explain_plan_statement(
+            DatabaseType::MariaDB,
+            "SET STATEMENT max_statement_time=10 FOR SELECT * FROM t;",
+        );
+        assert_eq!(
+            stmt.sql(),
+            "SET STATEMENT max_statement_time=10 FOR EXPLAIN SELECT * FROM t"
+        );
+        assert_eq!(stmt.app_chosen_target(), Some("SELECT * FROM t"));
+
+        // One already carrying its explain — plan-only or executing — passes
+        // through whole, exactly as a bare explain always has.
+        for sql in [
+            "SET STATEMENT max_statement_time=10 FOR EXPLAIN SELECT 1",
+            "SET STATEMENT max_statement_time=10 FOR ANALYZE SELECT 1",
+        ] {
+            let stmt = MysqlExecutor::explain_plan_statement(DatabaseType::MariaDB, sql);
+            assert_eq!(stmt.sql(), sql);
+            assert_eq!(stmt.app_chosen_target(), None, "{sql}");
+        }
+
+        // A plan-less inner statement is still the APP's choice, so the gate
+        // that asks "has this a plan at all?" is asked about IT — maintenance
+        // inside the wrapper is refused as maintenance, not sent.
+        let stmt = MysqlExecutor::explain_plan_statement(
+            DatabaseType::MariaDB,
+            "SET STATEMENT x=1 FOR ANALYZE TABLE t",
+        );
+        assert_eq!(stmt.app_chosen_target(), Some("ANALYZE TABLE t"));
+
+        // MySQL has no such wrapper: the words are a syntax error there, and
+        // the text is wrapped whole for the plan gate to judge as the `SET`
+        // it leads with.
+        let stmt = MysqlExecutor::explain_plan_statement(
+            DatabaseType::MySQL,
+            "SET STATEMENT max_statement_time=10 FOR SELECT 1",
+        );
+        assert_eq!(
+            stmt.sql(),
+            "EXPLAIN SET STATEMENT max_statement_time=10 FOR SELECT 1"
+        );
+    }
+
+    /// The builder decides from the same prepared view the server effectively
+    /// reads — executable comments expanded (`statement_reader_view`) — while
+    /// the PASS-THROUGH wire keeps the user's raw bytes.
+    #[test]
+    fn the_explain_builder_reads_executable_comments_like_the_server() {
+        // MariaDB executes `/*! … */` content (measured: `/*! ANALYZE */
+        // UPDATE …` really wrote), so its bare executing explain hidden in one
+        // IS that explain and passes through as the user's own.
+        let stmt = MysqlExecutor::explain_plan_statement(
+            DatabaseType::MariaDB,
+            "/*! ANALYZE */ SELECT * FROM t",
+        );
+        assert_eq!(stmt.sql(), "/*! ANALYZE */ SELECT * FROM t");
+        assert_eq!(stmt.app_chosen_target(), None);
+        // On MySQL the bare word is not that product's spelling, so the text
+        // is wrapped whole — and the wire the server reads as
+        // `EXPLAIN ANALYZE …` is exactly what the write gate judges.
+        let stmt = MysqlExecutor::explain_plan_statement(
+            DatabaseType::MySQL,
+            "/*! ANALYZE */ SELECT * FROM t",
+        );
+        assert_eq!(stmt.sql(), "EXPLAIN /*! ANALYZE */ SELECT * FROM t");
+        // A wrapper only visible through an executable comment is one wrapper
+        // to every asker — rebuilt with the explain inside, like the plain
+        // spelling. The rebuilt wire carries the prepared view's bytes: that
+        // is the reading the server makes of the user's text.
+        let stmt = MysqlExecutor::explain_plan_statement(
+            DatabaseType::MariaDB,
+            "SET /*!STATEMENT*/ x=1 FOR SELECT 1",
+        );
+        assert_eq!(stmt.sql(), "SET STATEMENT x=1 FOR EXPLAIN SELECT 1");
+        assert_eq!(stmt.app_chosen_target(), Some("SELECT 1"));
+    }
+
+    /// MariaDB's `SHOW EXPLAIN FOR <id>` / `SHOW ANALYZE FOR <id>` pass
+    /// through as the user's own explain — their output IS a plan (measured) —
+    /// while on MySQL the words begin no statement (ERROR 1064 measured) and
+    /// are wrapped whole for the gate to refuse as the SHOW they look like.
+    #[test]
+    fn a_show_spelled_explain_is_the_users_own_explain_on_mariadb() {
+        for sql in ["SHOW EXPLAIN FOR 5", "SHOW ANALYZE FORMAT=JSON FOR 5"] {
+            let stmt = MysqlExecutor::explain_plan_statement(DatabaseType::MariaDB, sql);
+            assert_eq!(stmt.sql(), sql);
+            assert_eq!(stmt.app_chosen_target(), None, "{sql}");
+
+            let stmt = MysqlExecutor::explain_plan_statement(DatabaseType::MySQL, sql);
+            assert_eq!(stmt.app_chosen_target(), Some(sql), "{sql}");
         }
     }
 

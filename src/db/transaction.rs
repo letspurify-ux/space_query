@@ -4698,10 +4698,10 @@ fn mysql_statement_may_leave_uncommitted_work_for_analysis(
 ) -> bool {
     match crate::db::sql_classification::mysql_fully_executed_explain_target(db_type, sql) {
         Some(executed) => {
-            let executed_analysis = SqlStatementAnalysis::new_for_db_type(db_type, executed);
+            let executed_analysis = SqlStatementAnalysis::new_for_db_type(db_type, &executed);
             mysql_statement_may_leave_uncommitted_work_for_statement(
                 db_type,
-                executed,
+                &executed,
                 &executed_analysis,
             )
         }

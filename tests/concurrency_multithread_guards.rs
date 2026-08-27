@@ -8286,6 +8286,18 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
         pre_prompt_gate < prompt,
         "the backend's refusal must be asked before the prompt, not after it: {explain}"
     );
+    // Everything F6 shows travels through ONE delivery, from the WORKER, on
+    // the operation's own progress channel: `deliver_explain_plan_outcome`.
+    // It used to travel on the UI-action channel to a 50 ms poll that re-sent
+    // it under the operation's token AFTER the worker had finished the
+    // operation — so the moment anything newer owned the tab (F6 auto-repeat,
+    // F6 then Ctrl+Enter inside the poll window) the delivery filter dropped
+    // a plan that had really come back, in silence: no tab, no message, no
+    // error.
+    let deliver = editor
+        .find("fn deliver_explain_plan_outcome(")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("F6's one delivery function should exist");
     // The note that says what a plan cannot see must be sent BEFORE the plan.
     // An Info message selects the Messages pane when the operation has no
     // result tab of its own to keep the view on, and F6 has none until the plan
@@ -8293,19 +8305,15 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
     // had just asked for. The plan tab selects the Data Grid unconditionally,
     // which is what makes the earlier send the deterministic order rather than
     // a race.
-    let handler = editor
-        .find("fn setup_ui_action_handler(")
-        .map(|at| slice_to_end_of_fn(&editor, at))
-        .expect("the editor's UI action handler should exist");
-    let note_send = handler
-        .find("explain_plan_session_note()")
+    let note_send = deliver
+        .find("session_note")
         .expect("a plan must say what it cannot see");
-    let plan_send = handler
+    let plan_send = deliver
         .find("QueryProgress::ExplainPlanOutput")
         .expect("a plan must reach the Data Grid");
     assert!(
         note_send < plan_send,
-        "the note must be sent before the plan, or it takes the pane the plan opens: {handler}"
+        "the note must be sent before the plan, or it takes the pane the plan opens: {deliver}"
     );
     // ... and beside an ERROR it goes only with a FAILURE. The note opens
     // "This plan was built on the connection's own DB session", a fact about a
@@ -8313,27 +8321,61 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
     // sentence is simply untrue, and beside a cancel a line about invisible
     // temporary tables reads as a reason the user's plan was stopped.
     assert!(
-        handler.contains("matches!(err, ExplainPlanError::Failed(_)) && !cancelled"),
-        "the note must go only with a failure the tab's own session could explain: {handler}"
+        deliver.contains("matches!(err, ExplainPlanError::Failed(_)) && !cancelled"),
+        "the note must go only with a failure the tab's own session could explain: {deliver}"
     );
     // And a refusal is not a failure: the pane must not announce one. Both
     // used to be a bare `String`, so every refusal was prefixed and read
     // `Explain plan failed: Explain plan was not run: …` — the app reporting a
     // failure of its own rule.
     assert!(
-        handler.contains("ExplainPlanError::Refused(refusal) => (false, refusal.clone())")
-            || handler.contains("ExplainPlanError::Refused(refusal) => {"),
-        "a refusal must reach the pane as its own sentence: {handler}"
+        deliver.contains("ExplainPlanError::Refused(refusal) => (false, refusal.clone())")
+            || deliver.contains("ExplainPlanError::Refused(refusal) => {"),
+        "a refusal must reach the pane as its own sentence: {deliver}"
     );
-    let failure_prefix = handler
+    let failure_prefix = deliver
         .find("format!(\"Explain plan failed: {evidence}\")")
         .expect("a failure must say what it is evidence of");
-    let refusal_arm = handler
+    let refusal_arm = deliver
         .find("ExplainPlanError::Refused(")
         .expect("a refusal must have its own arm");
     assert!(
         refusal_arm < failure_prefix,
-        "the refusal is answered before the failure prefix is ever reached: {handler}"
+        "the refusal is answered before the failure prefix is ever reached: {deliver}"
+    );
+    // The delivery happens BEFORE the operation is finished — on BOTH exits
+    // that announce an operation: the worker and the spawn-failure road. The
+    // delivery filter measures the payload's token against what the tab is
+    // doing NOW, so a payload sent after `OperationFinished` (worse: after the
+    // tab is published idle) is one a fast next action makes disappear. The
+    // count pins both roads; the position pins the order on the first, which
+    // is textually the worker's.
+    assert_eq!(
+        explain.matches("deliver_explain_plan_outcome(").count(),
+        2,
+        "both of F6's operation-announcing exits must deliver through the one function: {explain}"
+    );
+    let worker_delivery = explain
+        .find("deliver_explain_plan_outcome(")
+        .expect("the worker must deliver the payload itself");
+    let operation_finished = explain
+        .find("QueryProgress::OperationFinished")
+        .expect("the worker must finish its operation");
+    assert!(
+        worker_delivery < operation_finished,
+        "the payload must be delivered before the operation is finished, or a fast next action \
+         drops a plan that really came back: {explain}"
+    );
+    // ... and the UI-side poll can no longer deliver it: the UiActionResult
+    // carries only the status line. A poll that re-sent the payload under the
+    // operation's token was the defect.
+    let handler = editor
+        .find("fn setup_ui_action_handler(")
+        .map(|at| slice_to_end_of_fn(&editor, at))
+        .expect("the editor's UI action handler should exist");
+    assert!(
+        !handler.contains("QueryProgress::ExplainPlanOutput"),
+        "the poll must not re-send the plan a beat after the operation finished: {handler}"
     );
     // Every call the app makes on the connection's own Oracle session runs
     // under the tab's query timeout, on BOTH drivers. Thin had none at all —

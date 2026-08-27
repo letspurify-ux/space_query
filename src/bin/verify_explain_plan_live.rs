@@ -802,8 +802,37 @@ fn verify_a_statement_with_no_plan_is_answered_not_sent(
             format!("ANALYZE TABLE {PARENT_TABLE} COMPUTE STATISTICS"),
             "a table maintenance statement",
         ));
+        // MEASURED (Oracle 23.26): ORA-00905 to both wrapped forms. `SHOW` is
+        // SQL*Plus's word and begins no server statement; `LOCK TABLE` is DML
+        // to the classifier — fail-open — so only the grammar read refuses it.
+        // The refusal is also what keeps the probe from really locking the
+        // table: nothing is sent.
+        cases.push((
+            "SHOW PARAMETER open_cursors".to_string(),
+            "a SHOW statement",
+        ));
+        cases.push((
+            format!("LOCK TABLE {PARENT_TABLE} IN EXCLUSIVE MODE"),
+            "a lock statement",
+        ));
     } else {
         cases.push((format!("CALL {PROC_NAME}(1)"), "a routine call"));
+        // MEASURED (MySQL 8.0.46, MariaDB 12.2.2): ERROR 1064 to every
+        // wrapped `SHOW` — a `SHOW` classifies `SelectLike` (rows really come
+        // back), the one kind the gate used to trust as certainly plannable,
+        // so it was wrapped and SENT. `SHOW INDEX FROM t` and not one of the
+        // spellings the splitter reads as a tool command, so this really
+        // reaches the backend gate.
+        cases.push((
+            format!("SHOW INDEX FROM {PARENT_TABLE}"),
+            "a SHOW statement",
+        ));
+        // MEASURED: `EXPLAIN CHECK TABLE t` is ERROR 1064 on both products;
+        // the statement leaked through the kind match as fail-open DDL.
+        cases.push((
+            format!("CHECK TABLE {PARENT_TABLE}"),
+            "a table maintenance statement",
+        ));
     }
 
     for (sql, subject) in cases {
@@ -1109,6 +1138,215 @@ fn verify_mariadb_explains_its_own_analyze_spelling(h: &mut Harness) -> Result<(
     }
 }
 
+/// F6 on a statement written inside MariaDB's `SET STATEMENT … FOR` wrapper.
+///
+/// Only this server settles the premise: `EXPLAIN SET STATEMENT … FOR SELECT …`
+/// — what wrapping the whole wrapper produced — is ERROR 1064, while
+/// `SET STATEMENT … FOR EXPLAIN SELECT …` answers with a real plan. So the one
+/// product with a statement-scoped way to bound an explain could not explain
+/// anything written with it, and MySQL — which rejects the wrapper outright —
+/// answered the same keystroke differently again.
+fn verify_mariadb_explains_inside_its_set_statement_wrapper(h: &mut Harness) -> Result<(), String> {
+    // A plain statement inside the wrapper: the app rebuilds it with the
+    // explain INSIDE, and the server answers with the inner statement's plan.
+    let wrapped = format!("SET STATEMENT max_statement_time=10 FOR SELECT * FROM {PARENT_TABLE}");
+    let plan = h
+        .explain(&wrapped)
+        .map_err(|e| format!("explain of a SET STATEMENT wrapper: {e}"))?;
+    if plan.rows.is_empty() {
+        return Err("a SET STATEMENT wrapper produced no plan".to_string());
+    }
+    if !plan
+        .columns
+        .iter()
+        .any(|column| column.name.eq_ignore_ascii_case("id"))
+    {
+        return Err(format!(
+            "a SET STATEMENT wrapper's plan is missing the server's own columns: {:?}",
+            plan.columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>()
+        ));
+    }
+    println!("  OK  a statement inside `SET STATEMENT … FOR` explains (the explain goes inside)");
+
+    // One that already carries its own executing explain passes through whole
+    // — `EXPLAIN ANALYZE` is the spelling this server rejects, so a rewrap in
+    // either direction would be a syntax error.
+    let executing =
+        format!("SET STATEMENT max_statement_time=10 FOR ANALYZE SELECT * FROM {PARENT_TABLE}");
+    let measured = h
+        .explain(&executing)
+        .map_err(|e| format!("a wrapped executing explain of a read: {e}"))?;
+    if measured.rows.is_empty() {
+        return Err("a wrapped `ANALYZE <select>` produced no plan".to_string());
+    }
+    println!("  OK  a wrapped `ANALYZE <select>` reaches the server as written");
+
+    // ... and a wrapped executing explain of a WRITE is refused before it is
+    // sent, exactly as the bare spelling is: the wrapper scopes variables, it
+    // does not change what the statement RUNS.
+    let would_write = format!(
+        "SET STATEMENT max_statement_time=10 FOR ANALYZE INSERT INTO {PARENT_TABLE} VALUES (4344, 'WRAPPED')"
+    );
+    match h.explain(&would_write) {
+        Ok(_) => Err(format!(
+            "`{would_write}` was sent: it runs the statement it explains, on a session no tab owns"
+        )),
+        Err(message) if message.contains("ANALYZE executes the statement it explains") => {
+            println!("  OK  a wrapped `ANALYZE <write>` is refused before it is sent");
+            Ok(())
+        }
+        Err(message) => Err(format!(
+            "`{would_write}` was refused, but not as a statement that would run: {message}"
+        )),
+    }
+}
+
+/// The gate reads executable comments the way the server executes them.
+///
+/// Only a server settles the premise, and both were measured: MySQL 8.0.46
+/// ran `EXPLAIN /*! ANALYZE */ SELECT SLEEP(2)` for the full two seconds —
+/// the comment IS the ANALYZE — and MySQL ≥ 8.3's iterator executor runs DML
+/// under `EXPLAIN ANALYZE`, so a gate that parsed the raw bytes (where
+/// `/*! … */` is a comment) let `EXPLAIN /*! ANALYZE */ UPDATE …` reach the
+/// connection's own session. MariaDB rejects that spelling (1064) but
+/// executes `/*! ANALYZE */ <statement>` — measured: an UPDATE written that
+/// way really wrote.
+fn verify_the_gate_reads_executable_comments_like_the_server(
+    h: &mut Harness,
+    target: Target,
+) -> Result<(), String> {
+    // An executing explain of a WRITE hidden in an executable comment is
+    // refused before it is sent.
+    let would_write = format!("EXPLAIN /*! ANALYZE */ UPDATE {PARENT_TABLE} SET DNAME = DNAME");
+    match h.explain(&would_write) {
+        Ok(_) => {
+            return Err(format!(
+                "`{would_write}` was sent: the server reads it as EXPLAIN ANALYZE UPDATE"
+            ))
+        }
+        Err(message) if message.contains("executes the statement it explains") => {
+            println!("  OK  a comment-hidden executing explain of a write is refused");
+        }
+        Err(message) => {
+            return Err(format!(
+                "`{would_write}` was refused, but not as a statement that would run: {message}"
+            ))
+        }
+    }
+    // ... and one of a READ reaches the server as the user's own explain, in
+    // the spelling THIS product executes.
+    let read = match target {
+        Target::MySql => format!("EXPLAIN /*! ANALYZE */ SELECT * FROM {PARENT_TABLE}"),
+        _ => format!("/*! ANALYZE */ SELECT * FROM {PARENT_TABLE}"),
+    };
+    let plan = h
+        .explain(&read)
+        .map_err(|e| format!("a comment-hidden executing explain of a read: {e}"))?;
+    if plan.rows.is_empty() {
+        return Err("a comment-hidden executing explain of a read produced no plan".to_string());
+    }
+    println!("  OK  a comment-hidden executing explain of a read answers with the server's plan");
+    Ok(())
+}
+
+/// `SHOW EXPLAIN FOR <id>` / `SHOW ANALYZE FOR <id>`: MariaDB's own explains
+/// of a RUNNING statement, refused on the product that does not have them.
+///
+/// Only a server settles both halves: MariaDB 12.2.2 answers real plan rows
+/// for a running statement's id and ERROR 1094 `Unknown thread id` for a bad
+/// one — while MySQL 8.0.46 answers ERROR 1064, because there the same intent
+/// is spelled `EXPLAIN FOR CONNECTION <id>` (which passes through on its
+/// leading word). The app used to refuse the SHOW spellings everywhere as
+/// "a SHOW statement" — a sentence that is literally false for a statement
+/// whose whole output IS an execution plan.
+fn verify_show_spelled_explain_per_product(h: &mut Harness, target: Target) -> Result<(), String> {
+    if target == Target::MySql {
+        match h.explain("SHOW EXPLAIN FOR 1") {
+            Ok(_) => return Err("MySQL sent `SHOW EXPLAIN FOR 1`".to_string()),
+            Err(message) if message.contains("There is no execution plan for a SHOW statement") => {
+                println!("  OK  MySQL keeps the SHOW refusal (its spelling is FOR CONNECTION)");
+                return Ok(());
+            }
+            Err(message) => {
+                return Err(format!(
+                    "MySQL refused `SHOW EXPLAIN FOR 1`, but not as a SHOW statement: {message}"
+                ))
+            }
+        }
+    }
+
+    use mysql::prelude::Queryable;
+    // A raw side connection running a long statement, so the id names work
+    // that is really in flight when F6's statement executes.
+    let opts = mysql::OptsBuilder::new()
+        .ip_or_hostname(Some("127.0.0.1"))
+        .tcp_port(3306)
+        .user(Some("root"))
+        .pass(Some("password"))
+        .db_name(Some("query_tool_test"));
+    let mut sleeper = mysql::Conn::new(opts).map_err(|e| format!("side connection: {e}"))?;
+    let sleeper_id = sleeper.connection_id();
+    let sleeper_thread = std::thread::spawn(move || {
+        // Ended by the KILL QUERY below; the bound is only a backstop.
+        let _ = sleeper.query_drop("SELECT SLEEP(60)");
+    });
+    // Give the sleeper time to be ON the server before asking about it.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let outcome = (|| -> Result<(), String> {
+        let plan = h
+            .explain(&format!("SHOW EXPLAIN FOR {sleeper_id}"))
+            .map_err(|e| format!("SHOW EXPLAIN FOR a running statement: {e}"))?;
+        if plan.rows.is_empty() {
+            return Err("SHOW EXPLAIN FOR answered no rows for a running statement".to_string());
+        }
+        if !plan
+            .columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case("id"))
+        {
+            return Err(format!(
+                "SHOW EXPLAIN FOR is missing the server's own plan columns: {:?}",
+                plan.columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>()
+            ));
+        }
+        println!("  OK  `SHOW EXPLAIN FOR <running id>` answers with the running plan");
+
+        // A bad id must come back as the SERVER's failure — proof the
+        // statement was SENT rather than refused by the app.
+        match h.explain("SHOW EXPLAIN FOR 999999") {
+            Ok(_) => Err("`SHOW EXPLAIN FOR 999999` answered a plan".to_string()),
+            Err(message) if message.contains("Unknown thread id") => {
+                println!("  OK  a bad id fails with the server's own sentence (it was sent)");
+                Ok(())
+            }
+            Err(message) => Err(format!(
+                "`SHOW EXPLAIN FOR 999999` failed, but not with the server's answer: {message}"
+            )),
+        }
+    })();
+
+    // End the sleeper whatever the outcome, so the run leaves no session
+    // holding a 60-second call.
+    let kill_opts = mysql::OptsBuilder::new()
+        .ip_or_hostname(Some("127.0.0.1"))
+        .tcp_port(3306)
+        .user(Some("root"))
+        .pass(Some("password"))
+        .db_name(Some("query_tool_test"));
+    if let Ok(mut killer) = mysql::Conn::new(kill_opts) {
+        let _ = killer.query_drop(format!("KILL QUERY {sleeper_id}"));
+    }
+    let _ = sleeper_thread.join();
+    outcome
+}
+
 /// A plan the SERVER draws is readable in the grid, on both products.
 ///
 /// Only a server settles the premise: these formats answer with ONE column
@@ -1408,6 +1646,13 @@ fn verify(target: Target) -> Result<(), String> {
     // ---- each family's own explain spelling reaches the server ------------
     if target == Target::MariaDb {
         verify_mariadb_explains_its_own_analyze_spelling(&mut h)?;
+        verify_mariadb_explains_inside_its_set_statement_wrapper(&mut h)?;
+    }
+
+    // ---- the gate reads the text the way the server does ------------------
+    if !target.is_oracle() {
+        verify_the_gate_reads_executable_comments_like_the_server(&mut h, target)?;
+        verify_show_spelled_explain_per_product(&mut h, target)?;
     }
 
     // ---- ... and a plan the server draws itself stays readable ------------

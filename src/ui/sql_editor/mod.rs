@@ -2502,9 +2502,19 @@ pub(crate) enum QuickDescribeData {
 
 #[derive(Clone)]
 enum UiActionResult {
+    /// F6 finished, and this is only its STATUS-BAR line. The payload — the
+    /// plan tab, the "what this plan cannot see" note, a refusal, a failure —
+    /// travelled on the operation's own progress channel, from the worker,
+    /// BEFORE `OperationFinished` (`deliver_explain_plan_outcome`). It used to
+    /// travel here instead, delivered by a UI-side poll a beat later and
+    /// re-sent under the operation's token — and by then the operation was
+    /// finished, so the moment anything newer owned the tab the filter
+    /// dropped a plan that had really come back, in silence. Carrying only
+    /// the status makes that road unwritable: there is no payload here to
+    /// re-send late.
     ExplainPlan {
         token: QueryOperationToken,
-        result: Result<ExplainPlanData, ExplainPlanError>,
+        status: String,
     },
     QuickDescribe {
         object_name: String,
@@ -2683,6 +2693,23 @@ impl ExplainStatement {
 /// `Explain plan failed: Explain plan was not run: …` — the app announcing a
 /// failure of its own rule. Nothing could tell the two apart, because nothing
 /// carried the difference.
+/// What F6's guarded worker body produced — deliberately NOT a
+/// [`UiActionResult`], so its payload can only leave the worker through
+/// [`SqlEditorWidget::deliver_explain_plan_outcome`], on the operation's own
+/// progress channel, before the operation is finished. When the payload could
+/// ride the UI-action channel, a UI-side poll re-sent it under the operation's
+/// token a beat AFTER the worker had finished the operation — and the delivery
+/// filter dropped a plan that had really come back whenever anything newer
+/// owned the tab.
+enum ExplainWorkerOutcome {
+    /// The connection lock was already held; nothing was sent and nothing came
+    /// back. The tab is told "busy", exactly as before the worker started.
+    Busy,
+    /// The explain ran — or was refused, or failed on the way — and this is
+    /// everything there is to show for it.
+    Done(Result<ExplainPlanData, ExplainPlanError>),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum ExplainPlanError {
     /// The app decided not to send the statement. The sentence stands alone.
@@ -7645,113 +7672,20 @@ impl SqlEditorWidget {
                             _ => true,
                         };
                         match action {
-                            UiActionResult::ExplainPlan { token, result } => match result {
-                                Ok(plan) => {
-                                    let plan_result =
-                                        SqlEditorWidget::build_explain_plan_result(&plan);
-                                    // The result's own sentence, so a plan that
-                                    // came back with no steps does not report
-                                    // itself as one that loaded.
-                                    let status = plan_result.message.clone();
-                                    // A plan that is about a session other than
-                                    // this tab's says so — beside the plan
-                                    // rather than instead of it, because the
-                                    // plan is still the answer to most of the
-                                    // question.
-                                    //
-                                    // BEFORE the plan, and that ordering is the
-                                    // whole of it: an Info message selects the
-                                    // Messages pane when the operation has no
-                                    // result tab of its own to keep the view on
-                                    // (`should_select_support_result_pane`), and
-                                    // F6 has none until the line below opens it.
-                                    // Sent after, the note took the user off the
-                                    // plan they had just asked for. The plan tab
-                                    // selects the Data Grid unconditionally, so
-                                    // sending it first ends on the plan whatever
-                                    // the pane rule decides.
-                                    if let Some(note) = widget.explain_plan_session_note() {
-                                        let _ = widget.progress_sender.for_operation(token).send(
-                                            QueryProgress::Message {
-                                                kind: ResultMessageKind::Info,
-                                                lines: vec![note],
-                                            },
-                                        );
-                                    }
-                                    let _ = widget.progress_sender.for_operation(token).send(
-                                        QueryProgress::ExplainPlanOutput {
-                                            result: plan_result,
-                                        },
-                                    );
-                                    if widget.operation_token_is_current_or_completed(token) {
-                                        widget.emit_status(&status);
-                                    }
+                            UiActionResult::ExplainPlan { token, status } => {
+                                // Only the status line arrives here. The
+                                // payload was delivered by the WORKER, on the
+                                // operation's own progress channel, before the
+                                // operation finished
+                                // (`deliver_explain_plan_outcome`) — the same
+                                // contract every other result in the app
+                                // keeps. Emitting the status is still gated on
+                                // the token, because the status bar belongs to
+                                // whatever the tab is doing NOW.
+                                if widget.operation_token_is_current_or_completed(token) {
+                                    widget.emit_status(&status);
                                 }
-                                Err(err) => {
-                                    // A cancel is not a failure, and it is the
-                                    // app's own word on every backend: without
-                                    // this the user who pressed Cancel read
-                                    // `ORA-01013` on Oracle and `Query
-                                    // execution was interrupted` on the MySQL
-                                    // family, from a pane labelled Errors.
-                                    //
-                                    // Asked of a FAILURE only. A refusal is a
-                                    // decision this app made and never reached
-                                    // a server to be cancelled, and its
-                                    // sentence stands alone — prefixing it
-                                    // announced "Explain plan failed: Explain
-                                    // plan was not run: …", the app reporting
-                                    // a failure of its own rule.
-                                    let (cancelled, message) = match &err {
-                                        ExplainPlanError::Refused(refusal) => {
-                                            (false, refusal.clone())
-                                        }
-                                        ExplainPlanError::Failed(evidence) => {
-                                            if crate::db::session_policy::message_indicates_query_cancel(evidence) {
-                                                (
-                                                    true,
-                                                    crate::db::query::result_messages::EXPLAIN_PLAN_CANCELLED
-                                                        .to_string(),
-                                                )
-                                            } else {
-                                                (false, format!("Explain plan failed: {evidence}"))
-                                            }
-                                        }
-                                    };
-                                    // A failure the tab's own session explains —
-                                    // an object that only IT has — is the case
-                                    // the note exists for, so it goes with the
-                                    // error rather than into a pane the user is
-                                    // not looking at.
-                                    //
-                                    // A FAILURE only, and that is the whole of
-                                    // the condition. The note opens "This plan
-                                    // was built on the connection's own DB
-                                    // session", which is a fact about a plan
-                                    // that was attempted: beside a REFUSAL
-                                    // nothing was built and the sentence is
-                                    // simply untrue, and beside a CANCEL
-                                    // nothing about what the tab's session
-                                    // holds explains a plan the user stopped —
-                                    // a line about invisible temporary tables
-                                    // there reads as a reason it was stopped.
-                                    let explains_a_failure =
-                                        matches!(err, ExplainPlanError::Failed(_)) && !cancelled;
-                                    let mut lines = vec![message.clone()];
-                                    if explains_a_failure {
-                                        lines.extend(widget.explain_plan_session_note());
-                                    }
-                                    let _ = widget.progress_sender.for_operation(token).send(
-                                        QueryProgress::Message {
-                                            kind: ResultMessageKind::Error,
-                                            lines,
-                                        },
-                                    );
-                                    if widget.operation_token_is_current_or_completed(token) {
-                                        widget.emit_status(&message);
-                                    }
-                                }
-                            },
+                            }
                             UiActionResult::QuickDescribe {
                                 object_name,
                                 result,
@@ -8247,6 +8181,13 @@ impl SqlEditorWidget {
         // A snapshot is enough: this tab is already marked query-running, and
         // the toolbar refuses a mode change while it is.
         let tab_transaction_mode_override = self.tab_transaction_mode_override_value();
+        // What the tab's own session holds that the plan cannot see, read on
+        // the UI thread now and DELIVERED by the worker beside the plan
+        // (`deliver_explain_plan_outcome`). A snapshot is enough here too:
+        // the tab is query-running for the whole explain, so nothing can add
+        // residue to its session in between — and the note's subject is the
+        // session state at explain time in any case.
+        let explain_session_note = self.explain_plan_session_note();
         let sender = self.ui_action_sender.clone();
         let progress_sender =
             Self::operation_progress_sender(self.progress_sender.clone(), operation_token);
@@ -8266,6 +8207,7 @@ impl SqlEditorWidget {
 
         let spawn_error_sender = sender.clone();
         let spawn_error_progress_sender = progress_sender.clone();
+        let spawn_error_session_note = explain_session_note.clone();
         let spawn_error_query_running = query_running.clone();
         let spawn_error_cancel_flag = cancel_flag.clone();
         let spawn_error_current_query_connection = current_query_connection.clone();
@@ -8291,16 +8233,12 @@ impl SqlEditorWidget {
                         &connection,
                         &operation_activity,
                     ) else {
-                        return UiActionResult::QueryAlreadyRunning;
+                        return ExplainWorkerOutcome::Busy;
                     };
                     if conn_guard.connection_generation() != operation_token.connection_generation {
-                        return UiActionResult::ExplainPlan {
-                            token: operation_token,
-                            result: Err(ExplainPlanError::Failed(
-                                "Connection changed before explain plan execution started"
-                                    .to_string(),
-                            )),
-                        };
+                        return ExplainWorkerOutcome::Done(Err(ExplainPlanError::Failed(
+                            "Connection changed before explain plan execution started".to_string(),
+                        )));
                     }
 
                     // The statement was prepared for the backend this tab was
@@ -8309,13 +8247,9 @@ impl SqlEditorWidget {
                     // its own shape, so saying it costs one comparison and
                     // turns a wrong-backend send into a message.
                     if conn_guard.db_type() != explain_db_type {
-                        return UiActionResult::ExplainPlan {
-                            token: operation_token,
-                            result: Err(ExplainPlanError::Failed(
-                                "Connection changed before explain plan execution started"
-                                    .to_string(),
-                            )),
-                        };
+                        return ExplainWorkerOutcome::Done(Err(ExplainPlanError::Failed(
+                            "Connection changed before explain plan execution started".to_string(),
+                        )));
                     }
 
                     // Every reason this statement must not be sent, asked in one
@@ -8371,10 +8305,7 @@ impl SqlEditorWidget {
                             })
                         })
                     {
-                        return UiActionResult::ExplainPlan {
-                            token: operation_token,
-                            result: Err(ExplainPlanError::Refused(message)),
-                        };
+                        return ExplainWorkerOutcome::Done(Err(ExplainPlanError::Refused(message)));
                     }
 
                     let result = SqlEditorWidget::get_explain_plan_for_locked_connection(
@@ -8390,15 +8321,49 @@ impl SqlEditorWidget {
                         ),
                         &cancel_flag,
                     );
-                    UiActionResult::ExplainPlan {
-                        token: operation_token,
-                        // Everything from here down is EVIDENCE of something
-                        // that went wrong reaching the plan — a driver error, a
-                        // cancel, a timeout — never a rule this app applied.
-                        // Every refusal has already returned above.
-                        result: result.map_err(ExplainPlanError::Failed),
-                    }
+                    // Everything from here down is EVIDENCE of something that
+                    // went wrong reaching the plan — a driver error, a cancel,
+                    // a timeout — never a rule this app applied. Every refusal
+                    // has already returned above.
+                    ExplainWorkerOutcome::Done(result.map_err(ExplainPlanError::Failed))
                 }));
+
+                let outcome = match action_result {
+                    Ok(outcome) => outcome,
+                    Err(payload) => {
+                        let panic_msg = SqlEditorWidget::panic_payload_to_string(payload.as_ref());
+                        crate::utils::logging::log_error(
+                            "sql_editor::explain",
+                            &format!("sql_editor::explain thread panicked: {panic_msg}"),
+                        );
+                        ExplainWorkerOutcome::Done(Err(ExplainPlanError::Failed(format!(
+                            "Internal error: {panic_msg}"
+                        ))))
+                    }
+                };
+                // Delivered FIRST — before the operation snapshot is cleared,
+                // before `OperationFinished`, before the tab is published idle
+                // — because the delivery filter measures the payload's token
+                // against what the tab is doing NOW. Sent after any of those,
+                // a plan that had really come back was dropped in silence the
+                // moment anything newer owned the tab (F6 auto-repeat, F6 then
+                // Ctrl+Enter). This is the contract every other result already
+                // keeps: the worker sends its results while its operation is
+                // still the current one.
+                let ui_result = match outcome {
+                    ExplainWorkerOutcome::Busy => UiActionResult::QueryAlreadyRunning,
+                    ExplainWorkerOutcome::Done(result) => {
+                        let status = SqlEditorWidget::deliver_explain_plan_outcome(
+                            &progress_sender,
+                            &result,
+                            explain_session_note.as_deref(),
+                        );
+                        UiActionResult::ExplainPlan {
+                            token: operation_token,
+                            status,
+                        }
+                    }
+                };
 
                 SqlEditorWidget::set_current_query_cancel_handle(
                     &current_query_cancel_handle,
@@ -8438,29 +8403,22 @@ impl SqlEditorWidget {
                 if cleanup_owns_operation {
                     SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
                 }
-
-                let ui_result = match action_result {
-                    Ok(result) => result,
-                    Err(payload) => {
-                        let panic_msg = SqlEditorWidget::panic_payload_to_string(payload.as_ref());
-                        crate::utils::logging::log_error(
-                            "sql_editor::explain",
-                            &format!("sql_editor::explain thread panicked: {panic_msg}"),
-                        );
-                        UiActionResult::ExplainPlan {
-                            token: operation_token,
-                            result: Err(ExplainPlanError::Failed(format!(
-                                "Internal error: {panic_msg}"
-                            ))),
-                        }
-                    }
-                };
                 let _ = sender.send(ui_result);
                 app::awake();
             });
         if let Err(err) = spawn_result {
             let message = format!("Failed to start explain plan thread: {err}");
             crate::utils::logging::log_error("sql_editor::explain", &message);
+            // The same delivery-before-teardown order the worker keeps: the
+            // failure reaches the pane through the operation's own progress
+            // channel while the operation is still the current one.
+            let failure: Result<ExplainPlanData, ExplainPlanError> =
+                Err(ExplainPlanError::Failed(message));
+            let status = SqlEditorWidget::deliver_explain_plan_outcome(
+                &spawn_error_progress_sender,
+                &failure,
+                spawn_error_session_note.as_deref(),
+            );
             SqlEditorWidget::set_current_query_cancel_handle(
                 &spawn_error_current_query_cancel_handle,
                 None,
@@ -8501,7 +8459,7 @@ impl SqlEditorWidget {
             }
             let _ = spawn_error_sender.send(UiActionResult::ExplainPlan {
                 token: operation_token,
-                result: Err(ExplainPlanError::Failed(message)),
+                status,
             });
             app::awake();
             if app::is_ui_thread() {
@@ -8532,6 +8490,112 @@ impl SqlEditorWidget {
             cancel_slots,
             cancel_flag,
         )
+    }
+
+    /// Deliver everything F6 has to show — the plan tab, the "what this plan
+    /// cannot see" note, a refusal, a failure — on the operation's OWN
+    /// progress channel, and hand back the one status-bar sentence.
+    ///
+    /// Called by the WORKER, before `OperationFinished`, which is the whole
+    /// point: this payload used to ride a second channel to a UI-side poll
+    /// that re-sent it under the operation's token a beat later — after the
+    /// worker had already finished the operation — so the moment anything
+    /// newer owned the tab (F6 auto-repeat, F6 then Ctrl+Enter inside the
+    /// poll's 50 ms window), the delivery filter dropped a plan that had
+    /// really come back: no tab, no message, no error. Every other result in
+    /// the app is sent from its worker while its operation is current;
+    /// this puts F6 on the same contract.
+    ///
+    /// `session_note` is what the TAB's own session holds that the plan cannot
+    /// see (`explain_plan_session_note`), read on the UI thread before the
+    /// worker was spawned. Reading it early is not a staleness trade: the tab
+    /// is query-running for the whole explain, so nothing can add residue to
+    /// its session in between — and the note's subject is the session state
+    /// AT explain time in any case.
+    fn deliver_explain_plan_outcome(
+        progress_sender: &QueryProgressSender,
+        result: &Result<ExplainPlanData, ExplainPlanError>,
+        session_note: Option<&str>,
+    ) -> String {
+        match result {
+            Ok(plan) => {
+                let plan_result = SqlEditorWidget::build_explain_plan_result(plan);
+                // The result's own sentence, so a plan that came back with no
+                // steps does not report itself as one that loaded.
+                let status = plan_result.message.clone();
+                // A plan that is about a session other than this tab's says so
+                // — beside the plan rather than instead of it, because the
+                // plan is still the answer to most of the question.
+                //
+                // BEFORE the plan, and that ordering is the whole of it: an
+                // Info message selects the Messages pane when the operation
+                // has no result tab of its own to keep the view on
+                // (`should_select_support_result_pane`), and F6 has none until
+                // the send below opens it. Sent after, the note took the user
+                // off the plan they had just asked for. The plan tab selects
+                // the Data Grid unconditionally, so sending it first ends on
+                // the plan whatever the pane rule decides.
+                if let Some(note) = session_note {
+                    let _ = progress_sender.send(QueryProgress::Message {
+                        kind: ResultMessageKind::Info,
+                        lines: vec![note.to_string()],
+                    });
+                }
+                let _ = progress_sender.send(QueryProgress::ExplainPlanOutput {
+                    result: plan_result,
+                });
+                status
+            }
+            Err(err) => {
+                // A cancel is not a failure, and it is the app's own word on
+                // every backend: without this the user who pressed Cancel read
+                // `ORA-01013` on Oracle and `Query execution was interrupted`
+                // on the MySQL family, from a pane labelled Errors.
+                //
+                // Asked of a FAILURE only. A refusal is a decision this app
+                // made and never reached a server to be cancelled, and its
+                // sentence stands alone — prefixing it announced "Explain plan
+                // failed: Explain plan was not run: …", the app reporting a
+                // failure of its own rule.
+                let (cancelled, message) = match err {
+                    ExplainPlanError::Refused(refusal) => (false, refusal.clone()),
+                    ExplainPlanError::Failed(evidence) => {
+                        if crate::db::session_policy::message_indicates_query_cancel(evidence) {
+                            (
+                                true,
+                                crate::db::query::result_messages::EXPLAIN_PLAN_CANCELLED
+                                    .to_string(),
+                            )
+                        } else {
+                            (false, format!("Explain plan failed: {evidence}"))
+                        }
+                    }
+                };
+                // A failure the tab's own session explains — an object that
+                // only IT has — is the case the note exists for, so it goes
+                // with the error rather than into a pane the user is not
+                // looking at.
+                //
+                // A FAILURE only, and that is the whole of the condition. The
+                // note opens "This plan was built on the connection's own DB
+                // session", which is a fact about a plan that was attempted:
+                // beside a REFUSAL nothing was built and the sentence is
+                // simply untrue, and beside a CANCEL nothing about what the
+                // tab's session holds explains a plan the user stopped — a
+                // line about invisible temporary tables there reads as a
+                // reason it was stopped.
+                let explains_a_failure = matches!(err, ExplainPlanError::Failed(_)) && !cancelled;
+                let mut lines = vec![message.clone()];
+                if explains_a_failure {
+                    lines.extend(session_note.map(str::to_string));
+                }
+                let _ = progress_sender.send(QueryProgress::Message {
+                    kind: ResultMessageKind::Error,
+                    lines,
+                });
+                message
+            }
+        }
     }
 
     /// Turn a plan into the grid the Explain Plan tab shows.
@@ -13387,6 +13451,13 @@ mod explain_plan_tests {
                 ("CALL p(1)", "a routine call"),
                 ("COMMIT", "a transaction control statement"),
                 ("ANALYZE TABLE t", "a table maintenance statement"),
+                // MEASURED refused everywhere: ERROR 1064 on both MySQL
+                // products, ORA-00905 on Oracle, where `SHOW` is SQL*Plus's
+                // word and begins no server statement at all. It classifies
+                // `SelectLike` — rows really come back — which is the one
+                // kind the gate used to trust as certainly plannable, so it
+                // was wrapped and SENT.
+                ("SHOW INDEX FROM t", "a SHOW statement"),
             ] {
                 let statement = backend.statement(db_type, sql);
                 assert_eq!(
@@ -13398,6 +13469,59 @@ mod explain_plan_tests {
                     statement.sql()
                 );
             }
+        }
+
+        // The halves each family alone has. `HELP` and the rest of the
+        // maintenance family are MySQL-family words (on Oracle they begin no
+        // statement, and text the app cannot read stays fail-open); Oracle's
+        // `LOCK TABLE` is DML to the classifier, so only the grammar read
+        // refuses it there, while this family's locks are already refused as
+        // session control. MariaDB's `SET STATEMENT` wrapper is seen THROUGH:
+        // the gate judges the inner statement the app chose to explain.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let backend = super::explain_plan_backend_for(db_type);
+            for (sql, subject) in [
+                ("HELP 'SELECT'", "a HELP statement"),
+                ("CHECK TABLE t", "a table maintenance statement"),
+                ("OPTIMIZE TABLE t", "a table maintenance statement"),
+            ] {
+                let statement = backend.statement(db_type, sql);
+                assert_eq!(
+                    backend.refusal_before_sending(db_type, &statement),
+                    Some(crate::db::query::result_messages::no_execution_plan_for(
+                        subject
+                    )),
+                    "{db_type}: `{sql}`"
+                );
+            }
+        }
+        {
+            let oracle = super::explain_plan_backend_for(DatabaseType::Oracle);
+            let statement =
+                oracle.statement(DatabaseType::Oracle, "LOCK TABLE t IN EXCLUSIVE MODE");
+            assert_eq!(
+                oracle.refusal_before_sending(DatabaseType::Oracle, &statement),
+                Some(crate::db::query::result_messages::no_execution_plan_for(
+                    "a lock statement"
+                ))
+            );
+        }
+        {
+            let mariadb = super::explain_plan_backend_for(DatabaseType::MariaDB);
+            let statement = mariadb.statement(
+                DatabaseType::MariaDB,
+                "SET STATEMENT max_statement_time=1 FOR COMMIT",
+            );
+            assert_eq!(
+                statement.statement_the_app_chose_to_explain(),
+                Some("COMMIT")
+            );
+            assert_eq!(
+                mariadb.refusal_before_sending(DatabaseType::MariaDB, &statement),
+                Some(crate::db::query::result_messages::no_execution_plan_for(
+                    "a transaction control statement"
+                ))
+            );
         }
 
         // ... and an explain the USER typed is still passed straight to the
@@ -13453,6 +13577,82 @@ mod explain_plan_tests {
                     "{db_type}: `{sql}` was refused a plan it may well have"
                 );
             }
+        }
+    }
+
+    /// The backend's gate reads the text the way the SERVER reads it:
+    /// executable comments are executed by the MySQL family (measured on
+    /// both — MySQL 8.0.46 ran `EXPLAIN /*! ANALYZE */ SELECT SLEEP(2)` for
+    /// the full two seconds, MariaDB 12.2.2 ran `/*! ANALYZE */ UPDATE …` and
+    /// wrote), so an executing explain hidden in one is judged for what the
+    /// server will make of it, never for the comment it wears.
+    #[test]
+    fn the_backend_gate_reads_executable_comments_like_the_server() {
+        use crate::db::DatabaseType;
+        // The write hole: `EXPLAIN /*! ANALYZE */ UPDATE …` is
+        // `EXPLAIN ANALYZE UPDATE …` to the server (MySQL ≥ 8.3 runs the
+        // UPDATE on the connection's own session), and it used to be "not an
+        // executing explain" to a gate that parsed the raw bytes.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let backend = super::explain_plan_backend_for(db_type);
+            let statement = backend.statement(db_type, "EXPLAIN /*! ANALYZE */ UPDATE t SET c = 1");
+            let refusal = backend
+                .refusal_before_sending(db_type, &statement)
+                .expect("an executing explain of a write must be refused");
+            assert!(
+                refusal.contains("executes the statement it explains"),
+                "{db_type}: {refusal}"
+            );
+        }
+        // MariaDB's bare spelling hidden the same way passes through as the
+        // user's own executing explain when it runs a READ, and is refused
+        // when what it runs is a write.
+        let mariadb = super::explain_plan_backend_for(DatabaseType::MariaDB);
+        let statement = mariadb.statement(DatabaseType::MariaDB, "/*! ANALYZE */ SELECT 1");
+        assert_eq!(statement.statement_the_app_chose_to_explain(), None);
+        assert_eq!(
+            mariadb.refusal_before_sending(DatabaseType::MariaDB, &statement),
+            None
+        );
+        let statement =
+            mariadb.statement(DatabaseType::MariaDB, "/*! ANALYZE */ UPDATE t SET c = 1");
+        assert!(mariadb
+            .refusal_before_sending(DatabaseType::MariaDB, &statement)
+            .is_some());
+    }
+
+    /// MariaDB's `SHOW EXPLAIN FOR <id>` / `SHOW ANALYZE FOR <id>` are that
+    /// product's own explains of a RUNNING statement (measured: real plan
+    /// rows on 12.2.2, ERROR 1094 for a bad id), so F6 passes them through —
+    /// while on MySQL, where the spelling is ERROR 1064, the SHOW refusal
+    /// stands and the same intent is written `EXPLAIN FOR CONNECTION <id>`,
+    /// which has always passed through on its leading word.
+    #[test]
+    fn a_show_spelled_explain_passes_through_on_the_product_that_has_it() {
+        use crate::db::DatabaseType;
+        for sql in ["SHOW EXPLAIN FOR 5", "SHOW ANALYZE FOR 5"] {
+            let mariadb = super::explain_plan_backend_for(DatabaseType::MariaDB);
+            let statement = mariadb.statement(DatabaseType::MariaDB, sql);
+            assert_eq!(
+                statement.statement_the_app_chose_to_explain(),
+                None,
+                "{sql}"
+            );
+            assert_eq!(
+                mariadb.refusal_before_sending(DatabaseType::MariaDB, &statement),
+                None,
+                "{sql}"
+            );
+
+            let mysql = super::explain_plan_backend_for(DatabaseType::MySQL);
+            let statement = mysql.statement(DatabaseType::MySQL, sql);
+            assert_eq!(
+                mysql.refusal_before_sending(DatabaseType::MySQL, &statement),
+                Some(crate::db::query::result_messages::no_execution_plan_for(
+                    "a SHOW statement"
+                )),
+                "{sql}"
+            );
         }
     }
 
