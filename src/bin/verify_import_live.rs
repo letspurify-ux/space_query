@@ -49,7 +49,7 @@ use space_query::ui::grid_sql_export::{
 };
 use space_query::ui::object_browser::ObjectBrowserWidget;
 use space_query::ui::result_export::{
-    render, ExportDestination, ExportFormat, ExportGrid, ExportScope,
+    render, ExportCell, ExportDestination, ExportFormat, ExportGrid, ExportScope,
 };
 use space_query::ui::result_export_dialog::ExportChoice;
 use space_query::ui::result_import::ImportedTable;
@@ -927,6 +927,149 @@ fn verify(target: Target) -> Result<(), String> {
 
     println!("\n----- round 9: a column `SELECT *` leaves out -----");
     verify_invisible_columns(target, &mut h)?;
+
+    println!("\n----- round 10: a column name the server reported -----");
+    verify_reported_column_names(target, &mut h)?;
+    Ok(())
+}
+
+/// A table whose column names only a QUOTED identifier can name again.
+const REPORTED_NAME_TABLE: &str = "OQT_IMPORT_NAMES";
+
+/// A column name comes from the CATALOG, so it has to be written back the way
+/// the server spells it.
+///
+/// Oracle folds a bare identifier to upper case, so a column declared `"id"` is
+/// named by `"id"` and by nothing else, and a reserved word (`"COMMENT"`) is a
+/// syntax error unquoted. The quoter this app used for a generated column name
+/// was the one that suits a name PARSED out of the user's SQL — where folding is
+/// right — so every statement it wrote for such a table answered `ORA-00904`:
+/// the import script would not run at all, and neither would the `SQL Inserts`
+/// export. The MySQL family always backticks, so it was unaffected, which is
+/// exactly the kind of backend split this checks is gone.
+///
+/// Both ends, on a real server: the import script RUNS and its values land in
+/// the columns they were mapped to, and the `SQL Inserts` export of those rows
+/// RUNS too.
+fn verify_reported_column_names(target: Target, h: &mut Harness) -> Result<(), String> {
+    let _ = h.run(&target.drop_sql(REPORTED_NAME_TABLE));
+    // Three names a bare identifier cannot name again on Oracle: lower case,
+    // mixed case, and a reserved word. On the MySQL family they are ordinary
+    // names that the backtick quoter has always handled — the same file has to
+    // import on all four.
+    let create = if target.is_oracle() {
+        format!(
+            "CREATE TABLE {REPORTED_NAME_TABLE}              (\"id\" NUMBER, \"Mixed\" NUMBER, \"COMMENT\" VARCHAR2(20))"
+        )
+    } else {
+        format!(
+            "CREATE TABLE {REPORTED_NAME_TABLE}              (`id` INT, `Mixed` INT, `comment` VARCHAR(20))"
+        )
+    };
+    h.run(&create)
+        .map_err(|e| format!("create a table with quoted column names: {e}"))?;
+    let _ = h.run("COMMIT");
+
+    let columns = read_table_structure(target, REPORTED_NAME_TABLE)?;
+    let db_type = target.connection_info().db_type;
+    let table_columns = ObjectBrowserWidget::import_targets(db_type, &columns);
+    let targets = table_columns.writable();
+    let names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
+    println!("  catalog reports {names:?}");
+    if names.len() != 3 {
+        let _ = h.run(&target.drop_sql(REPORTED_NAME_TABLE));
+        return Err(format!("expected three target columns, got {names:?}"));
+    }
+
+    // (1) The import script names them the way the server spells them.
+    let data = ImportedTable {
+        columns: names.clone(),
+        rows: vec![vec![
+            Some("1".to_string()),
+            Some("2".to_string()),
+            Some("three".to_string()),
+        ]],
+        file_named_the_columns: true,
+    };
+    let mapping = default_mapping(&data.columns, &targets);
+    if mapping.iter().any(Option::is_none) {
+        let _ = h.run(&target.drop_sql(REPORTED_NAME_TABLE));
+        return Err(format!("a file naming {names:?} mapped to {mapping:?}"));
+    }
+    let script = build_insert_script(&ImportRequest {
+        dialect: SqlWriteDialect::for_connection(&target.connection_info()),
+        table: REPORTED_NAME_TABLE,
+        targets: &targets,
+        mapping: &mapping,
+        data: &data,
+        batch_rows: BATCH_ROWS,
+    })
+    .map_err(|e| format!("build the import script: {e}"))?;
+    println!("  import script: {}", script.trim());
+    let imported = h.run_script(&script).map(|_| ()).map_err(|e| e.to_string());
+    let _ = h.run("COMMIT");
+    if let Err(err) = imported {
+        let _ = h.run(&target.drop_sql(REPORTED_NAME_TABLE));
+        return Err(format!(
+            "the import named a column the server could not resolve: {err}"
+        ));
+    }
+
+    // (2) And every value landed in the column it was mapped to.
+    let read_back = read_table_rows(target, &format!("SELECT * FROM {REPORTED_NAME_TABLE}"))?;
+    let landed: Vec<String> = read_back
+        .rows
+        .first()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|cell| cell.trim().to_string())
+        .collect();
+    println!("  stored {landed:?}");
+    if landed != ["1", "2", "three"] {
+        let _ = h.run(&target.drop_sql(REPORTED_NAME_TABLE));
+        return Err(format!(
+            "the values landed as {landed:?}, expected [\"1\", \"2\", \"three\"]"
+        ));
+    }
+
+    // (3) The `SQL Inserts` export of those rows runs too — the same quoter,
+    //     the other end.
+    let delivery = ObjectBrowserWidget::render_table_export(
+        REPORTED_NAME_TABLE,
+        SqlWriteDialect::for_connection(&target.connection_info()),
+        ExportChoice {
+            format: ExportFormat::SqlInserts,
+            scope: ExportScope::All,
+            destination: ExportDestination::Clipboard,
+        },
+        &read_back,
+        &[],
+    );
+    let exported = delivery
+        .content
+        .into_parts()
+        .map_err(|reason| format!("the SQL Inserts export was refused: {reason}"))?
+        .0;
+    println!("  SQL Inserts export: {}", exported.trim());
+    let export_ran = h
+        .run_script(&exported)
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    let _ = h.run("COMMIT");
+    let events = h.run(&format!("SELECT COUNT(*) AS N FROM {REPORTED_NAME_TABLE}"))?;
+    let count = single_count(&events);
+    let _ = h.run(&target.drop_sql(REPORTED_NAME_TABLE));
+    let _ = h.run("COMMIT");
+    export_ran.map_err(|err| format!("the exported SQL Inserts script did not run: {err}"))?;
+    if count.as_deref() != Some("2") {
+        return Err(format!(
+            "after re-running the export the table holds {count:?} rows, expected 2"
+        ));
+    }
+    println!(
+        "PASS: a column name the server reported is written back so the server names it again"
+    );
     Ok(())
 }
 
@@ -1000,6 +1143,7 @@ fn verify_invisible_columns(target: Target, h: &mut Harness) -> Result<(), Strin
     let data = ImportedTable {
         columns: vec!["COLUMN_1".to_string(), "COLUMN_2".to_string()],
         rows: vec![vec![Some("100".to_string()), Some("300".to_string())]],
+        file_named_the_columns: false,
     };
     let mapping = table_columns.positional_mapping(data.columns.len());
     let script = build_insert_script(&ImportRequest {
@@ -1366,6 +1510,7 @@ fn verify_a_value_no_literal_can_hold(target: Target, h: &mut Harness) -> Result
     let data = ImportedTable {
         columns: vec!["B".to_string()],
         rows: vec![vec![Some(blob_text)]],
+        file_named_the_columns: true,
     };
     let mapping = default_mapping(&data.columns, &targets);
     match build_insert_script(&ImportRequest {
@@ -1591,6 +1736,7 @@ fn verify_generated_columns(target: Target, h: &mut Harness) -> Result<(), Strin
             .iter()
             .map(|_| Some("7".to_string()))
             .collect::<Vec<ImportCell>>()],
+        file_named_the_columns: true,
     };
     let mapping = default_mapping(&data.columns, &targets);
     let script = build_insert_script(&ImportRequest {
@@ -1636,6 +1782,7 @@ fn verify_generated_columns(target: Target, h: &mut Harness) -> Result<(), Strin
         rows: vec![(1..=columns.len())
             .map(|n| Some((n * 100).to_string()))
             .collect::<Vec<ImportCell>>()],
+        file_named_the_columns: false,
     };
     let script = build_insert_script(&ImportRequest {
         dialect: SqlWriteDialect::for_connection(&target.connection_info()),
@@ -1675,20 +1822,22 @@ fn verify_generated_columns(target: Target, h: &mut Harness) -> Result<(), Strin
     // `render_table_export` does and runs what it wrote.
     let generated_names = table_columns.generated_names();
     let all_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-    let inserts = build_sql_inserts(&GridSqlSelection {
+    let mut selection = GridSqlSelection {
         dialect: SqlWriteDialect::for_connection(&target.connection_info()),
         table: Some(GENERATED_TABLE.to_string()),
         column_kinds: all_columns.iter().map(|_| SqlValueKind::Number).collect(),
-        selected_columns: space_query::ui::grid_sql_export::writable_column_indices(
-            &all_columns,
-            &generated_names,
-        ),
+        selected_columns: (0..all_columns.len()).collect(),
         rows: vec![all_columns.iter().map(|_| Some("9".to_string())).collect()],
         all_columns,
-    })
-    .into_parts()
-    .map_err(|reason| format!("the SQL Inserts export was refused: {reason}"))?
-    .0;
+    };
+    // Through the production method, not a copy of the rule: every road that
+    // writes a re-runnable statement narrows its columns here, so a harness that
+    // mirrored it could pass while the roads drifted.
+    selection.restrict_to_writable_columns(&generated_names);
+    let inserts = build_sql_inserts(&selection)
+        .into_parts()
+        .map_err(|reason| format!("the SQL Inserts export was refused: {reason}"))?
+        .0;
     println!(
         "  SQL Inserts export of a table with computed columns:\n    {}",
         inserts.trim()
@@ -1802,6 +1951,7 @@ fn verify_a_production_sized_batch(target: Target, h: &mut Harness) -> Result<()
                 ]
             })
             .collect(),
+        file_named_the_columns: true,
     };
     let mapping = default_mapping(&data.columns, &targets);
     let script = build_insert_script(&ImportRequest {
@@ -1935,6 +2085,7 @@ fn verify_a_file_cell_cannot_inject_a_statement(
     let data = ImportedTable {
         columns: vec!["SEQ".to_string(), "B".to_string()],
         rows: vec![vec![Some("1".to_string()), Some(payload.clone())]],
+        file_named_the_columns: true,
     };
     let mapping = default_mapping(&data.columns, &targets);
     let script = build_insert_script(&ImportRequest {
@@ -2268,6 +2419,7 @@ fn verify_awkward_table_name(target: Target, h: &mut Harness) -> Result<(), Stri
     let data = ImportedTable {
         columns: vec!["A".to_string()],
         rows: vec![vec![Some("1".to_string())]],
+        file_named_the_columns: true,
     };
     let mapping = default_mapping(&data.columns, &targets);
     let script = build_insert_script(&ImportRequest {
@@ -2338,6 +2490,7 @@ fn verify_batched_script_reimport(target: Target, h: &mut Harness) -> Result<(),
         rows: (1..=rows)
             .map(|index| vec![Some(index.to_string()), Some(format!("row {index}"))])
             .collect(),
+        file_named_the_columns: true,
     };
     let mapping = default_mapping(&data.columns, &targets);
     // BATCH_ROWS is 2, so five rows are three statements and every one of them
@@ -2437,6 +2590,7 @@ fn verify_no_backslash_escapes(target: Target, h: &mut Harness) -> Result<(), St
         let data = ImportedTable {
             columns: vec!["SEQ".to_string(), "V".to_string()],
             rows: vec![vec![Some(seq.to_string()), Some("a\\b".to_string())]],
+            file_named_the_columns: true,
         };
         let mapping = default_mapping(&data.columns, &targets);
         build_insert_script(&ImportRequest {
@@ -2492,6 +2646,50 @@ fn verify_no_backslash_escapes(target: Target, h: &mut Harness) -> Result<(), St
         ));
     }
     println!("PASS: NO_BACKSLASH_ESCAPES is honoured (default doubled it, the connection did not)");
+
+    // And the `SQL Inserts` FILE such a connection writes reads back as the
+    // values it was given. The escaping rule is the one thing a file's bytes
+    // cannot answer — `'a\b'` is three characters under this mode and two under
+    // the default — so the file declares it and the reader reads the
+    // declaration. Without that, this app could not import a file it had just
+    // exported: `a\b` came back as `a` + U+0008.
+    let nbe_dialect = SqlWriteDialect::for_connection(&info);
+    let values = ["a\\b", "a\\", "a\\nb", "C:\\path\\to"];
+    let rows: Vec<Vec<ExportCell>> = values
+        .iter()
+        .map(|value| vec![Some((*value).to_string())])
+        .collect();
+    let sql_file = build_sql_inserts(&GridSqlSelection {
+        dialect: nbe_dialect,
+        table: Some(table.clone()),
+        all_columns: vec!["V".to_string()],
+        column_kinds: vec![SqlValueKind::String],
+        selected_columns: vec![0],
+        rows: rows.clone(),
+    })
+    .into_parts()
+    .map_err(|reason| format!("the SQL Inserts export was refused: {reason}"))?
+    .0;
+    println!(
+        "  SQL Inserts written under NO_BACKSLASH_ESCAPES:\n{}",
+        sql_file.trim()
+    );
+    let back = parse(
+        &sql_file,
+        &ImportOptions {
+            format: ExportFormat::SqlInserts,
+            has_header: true,
+            null_text: NULL_TEXT.to_string(),
+        },
+    )
+    .map_err(|error| format!("this app could not read back its own export: {error}"))?;
+    if back.rows != rows {
+        return Err(format!(
+            "the export read back as {:?}, expected {:?}",
+            back.rows, rows
+        ));
+    }
+    println!("PASS: a SQL Inserts file written under NO_BACKSLASH_ESCAPES reads back exactly");
     Ok(())
 }
 

@@ -160,8 +160,8 @@ impl ImportTargets {
     /// refused: `default_mapping` matches by name, so it would map itself and
     /// the server would reject the whole script (Oracle ORA-54013, MySQL 3105).
     /// The export side of the same rule lives in
-    /// [`crate::ui::grid_sql_export::writable_column_indices`] — what an import
-    /// will not offer is what an export must not name.
+    /// [`crate::ui::grid_sql_export::GridSqlSelection::restrict_to_writable_columns`]
+    /// — what an import will not offer is what an export must not name.
     pub fn writable(&self) -> Vec<TargetColumn> {
         self.columns
             .iter()
@@ -523,6 +523,7 @@ mod tests {
                 ],
                 vec![Some("2".to_string()), None, Some(String::new())],
             ],
+            file_named_the_columns: true,
         }
     }
 
@@ -637,6 +638,7 @@ mod tests {
         let data = ImportedTable {
             columns: vec!["NAME".to_string()],
             rows: vec![vec![Some("NULL".to_string())]],
+            file_named_the_columns: true,
         };
         let mapping = default_mapping(&data.columns, &targets);
         let script = build_insert_script(&ImportRequest {
@@ -667,6 +669,7 @@ mod tests {
                 Some("2024-01-01".to_string()),
                 Some("2024-01-01".to_string()),
             ]],
+            file_named_the_columns: true,
         };
         let mapping = default_mapping(&data.columns, &targets);
         let script = build_insert_script(&ImportRequest {
@@ -817,6 +820,7 @@ mod tests {
                 Some("computed".to_string()),
                 Some("three".to_string()),
             ]],
+            file_named_the_columns: false,
         };
         let script = build_insert_script(&ImportRequest {
             dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
@@ -851,6 +855,7 @@ mod tests {
                 vec![Some("1".to_string()), Some("ab".to_string())],
                 vec![Some("2".to_string()), Some("z".repeat(6000))],
             ],
+            file_named_the_columns: true,
         };
         let mapping: ColumnMapping = vec![Some(0), Some(1)];
         let request = |db_type| ImportRequest {
@@ -897,6 +902,7 @@ mod tests {
         let data = ImportedTable {
             columns: vec!["CODE".to_string(), "ID".to_string()],
             rows: vec![vec![Some("x".to_string()), Some("1".to_string())]],
+            file_named_the_columns: true,
         };
         let mapping = default_mapping(&data.columns, &targets);
         let script = build_insert_script(&ImportRequest {
@@ -952,6 +958,7 @@ mod tests {
         let data = ImportedTable {
             columns: vec!["ID".to_string()],
             rows: Vec::new(),
+            file_named_the_columns: true,
         };
         assert!(build_insert_script(&ImportRequest {
             dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
@@ -970,6 +977,7 @@ mod tests {
         let data = ImportedTable {
             columns: vec!["ID".to_string(), "NAME".to_string(), "CODE".to_string()],
             rows: vec![vec![Some("1".to_string())]],
+            file_named_the_columns: true,
         };
         let mapping = default_mapping(&data.columns, &targets);
         let script = build_insert_script(&ImportRequest {
@@ -990,6 +998,7 @@ mod tests {
         let data = ImportedTable {
             columns: vec!["MY COL".to_string()],
             rows: vec![vec![Some("1".to_string())]],
+            file_named_the_columns: true,
         };
         let mapping = default_mapping(&data.columns, &targets);
         for (db_type, expected) in [
@@ -1063,6 +1072,7 @@ mod tests {
         let data = ImportedTable {
             columns: vec!["NAME".to_string()],
             rows: vec![vec![Some("R&D".to_string())]],
+            file_named_the_columns: true,
         };
         let mapping = default_mapping(&data.columns, &targets);
         let oracle = build_insert_script(&ImportRequest {
@@ -1095,6 +1105,7 @@ mod tests {
         let data = ImportedTable {
             columns: vec!["A".to_string()],
             rows: vec![vec![Some("1".to_string())]],
+            file_named_the_columns: true,
         };
         let mapping = default_mapping(&data.columns, &targets);
         for (db_type, table, expected) in [
@@ -1181,6 +1192,7 @@ mod tests {
         let data = ImportedTable {
             columns: vec!["ID".to_string(), "UNRELATED".to_string()],
             rows: vec![vec![Some("1".to_string()), Some("x".to_string())]],
+            file_named_the_columns: true,
         };
         let mapping = default_mapping(&data.columns, &targets);
         assert_eq!(

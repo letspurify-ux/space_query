@@ -35,6 +35,66 @@ pub type ImportCell = Option<String>;
 pub struct ImportedTable {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<ImportCell>>,
+    /// Whether `columns` are names the FILE gave, or placeholders this reader
+    /// invented for a file that named nothing (`COLUMN_1`, `COLUMN_2`, …).
+    ///
+    /// It decides what a column MEANS to whoever loads the file: a named column
+    /// is matched to a table column by NAME, a placeholder only by POSITION.
+    /// The parse is the one thing that can answer it — the "first row is a
+    /// header" checkbox cannot, because it is only one of the three inputs. An
+    /// HTML table with `<th>` cells names its columns whatever the checkbox
+    /// says, and JSON, XML, Markdown and a file of `INSERT`s always do while the
+    /// checkbox does not even apply to them ([`header_choice_applies`]) — yet it
+    /// keeps whatever value it was last left with.
+    ///
+    /// So the answer travels with the columns. The import dialog used to derive
+    /// it a second time from the checkbox and silently mapped named columns by
+    /// position, writing every value into the wrong column whenever the file's
+    /// order was not the table's.
+    pub file_named_the_columns: bool,
+}
+
+impl ImportedTable {
+    /// A file whose column NAMES are inside the data: JSON keys, XML element
+    /// names, a Markdown header row, an `INSERT`'s column list.
+    fn of_named_columns(columns: Vec<String>, rows: Vec<Vec<ImportCell>>) -> Self {
+        Self {
+            columns,
+            rows,
+            file_named_the_columns: true,
+        }
+    }
+
+    /// A file of flat records whose FIRST one may or may not name the columns.
+    ///
+    /// The one place that turns that answer into columns, so the answer and the
+    /// columns are produced together and cannot be re-derived apart.
+    fn of_records(
+        first: Vec<ImportCell>,
+        rest: impl Iterator<Item = Vec<ImportCell>>,
+        first_record_names_the_columns: bool,
+    ) -> Self {
+        let (columns, leading_row) = if first_record_names_the_columns {
+            (
+                first.into_iter().map(Option::unwrap_or_default).collect(),
+                None,
+            )
+        } else {
+            (
+                (1..=first.len())
+                    .map(|index| format!("COLUMN_{index}"))
+                    .collect(),
+                Some(first),
+            )
+        };
+        let mut rows: Vec<Vec<ImportCell>> = leading_row.into_iter().collect();
+        rows.extend(rest);
+        Self {
+            columns,
+            rows,
+            file_named_the_columns: first_record_names_the_columns,
+        }
+    }
 }
 
 /// How to read the file. Only the fields the chosen format actually uses are
@@ -134,24 +194,6 @@ fn validate(mut table: ImportedTable) -> Result<ImportedTable, String> {
         row.resize(width, None);
     }
     Ok(table)
-}
-
-fn header_or_generated(
-    first: Vec<ImportCell>,
-    has_header: bool,
-) -> (Vec<String>, Option<Vec<ImportCell>>) {
-    if has_header {
-        let columns = first
-            .into_iter()
-            .map(|cell| cell.unwrap_or_default())
-            .collect();
-        (columns, None)
-    } else {
-        let columns = (1..=first.len())
-            .map(|index| format!("COLUMN_{index}"))
-            .collect();
-        (columns, Some(first))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,10 +358,11 @@ fn parse_separated(
     } else {
         to_cells(first)
     };
-    let (columns, leading_row) = header_or_generated(first_cells, options.has_header);
-    let mut rows: Vec<Vec<ImportCell>> = leading_row.into_iter().collect();
-    rows.extend(records.map(to_cells));
-    Ok(ImportedTable { columns, rows })
+    Ok(ImportedTable::of_records(
+        first_cells,
+        records.map(to_cells),
+        options.has_header,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +403,7 @@ fn parse_json(text: &str) -> Result<ImportedTable, String> {
                 .collect()
         })
         .collect();
-    Ok(ImportedTable { columns, rows })
+    Ok(ImportedTable::of_named_columns(columns, rows))
 }
 
 /// One JSON object with its keys still in document order and its values still
@@ -848,7 +891,7 @@ fn parse_xml(text: &str) -> Result<ImportedTable, String> {
                 .collect()
         })
         .collect();
-    Ok(ImportedTable { columns, rows })
+    Ok(ImportedTable::of_named_columns(columns, rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -873,13 +916,7 @@ fn parse_html(text: &str, has_header: bool) -> Result<ImportedTable, String> {
     let Some(first) = rows.next() else {
         return Err("The HTML table has no rows.".to_string());
     };
-    let (columns, leading_row) = header_or_generated(first, header_first);
-    let mut data: Vec<Vec<ImportCell>> = leading_row.into_iter().collect();
-    data.extend(rows);
-    Ok(ImportedTable {
-        columns,
-        rows: data,
-    })
+    Ok(ImportedTable::of_records(first, rows, header_first))
 }
 
 fn find_html_table<'a>(nodes: impl Iterator<Item = &'a MarkupNode>) -> Option<&'a MarkupNode> {
@@ -1019,7 +1056,7 @@ fn parse_markdown(text: &str) -> Result<ImportedTable, String> {
         }
         rows.push(split_markdown_row(line));
     }
-    Ok(ImportedTable { columns, rows })
+    Ok(ImportedTable::of_named_columns(columns, rows))
 }
 
 /// The `| --- | --- |` line that separates a Markdown header from its body.
@@ -1164,24 +1201,43 @@ fn parse_sql_inserts(text: &str) -> Result<ImportedTable, String> {
     if columns.is_empty() {
         return Err("The file has no INSERT statement with a column list.".to_string());
     }
-    Ok(ImportedTable { columns, rows })
+    Ok(ImportedTable::of_named_columns(columns, rows))
 }
 
 /// Which escape rules a file's string literals follow.
 ///
-/// The two dialects disagree about ONE thing, and it is the thing that decides
-/// where a literal ENDS: MySQL and MariaDB read `\` as an escape, Oracle reads
-/// it as an ordinary character. `'C:\path\'` is therefore a complete Oracle
-/// literal and an unterminated MySQL one.
+/// The dialects disagree about ONE thing, and it is the thing that decides
+/// where a literal ENDS: a `\` may escape the next character or may be an
+/// ordinary one. `'C:\path\'` is a complete literal under the second rule and
+/// an unterminated one under the first.
+///
+/// THREE states, not two, because the writer has three: Oracle, the MySQL
+/// family as it usually runs, and the MySQL family under `NO_BACKSLASH_ESCAPES`
+/// — which this app lets any connection choose
+/// ([`crate::ui::grid_sql_export::SqlWriteDialect`]) and which writes literals
+/// Oracle's rule reads correctly and the MySQL default's rule does not. While
+/// this held two, a backtick in the file meant "escapes on", so this app could
+/// not read back a file it had written itself: `a\b` came back as `a` + U+0008,
+/// and a value ending in a backslash swallowed every statement after it.
+///
+/// The family still comes from the file's own quoting; the escape rule comes
+/// from what the file SAYS, because nothing else in it can answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SqlFileDialect {
     Oracle,
-    MysqlFamily,
+    MysqlFamily { backslash_escapes: bool },
 }
 
 impl SqlFileDialect {
     fn backslash_escapes(self) -> bool {
-        matches!(self, SqlFileDialect::MysqlFamily)
+        matches!(self, SqlFileDialect::MysqlFamily { backslash_escapes } if backslash_escapes)
+    }
+
+    /// Whether Oracle's own literal shapes — `TO_CLOB(…)||CHR(38)||…` — may
+    /// appear in this file. The MySQL family has no substitution to defuse and
+    /// spells concatenation another way.
+    fn is_oracle(self) -> bool {
+        matches!(self, SqlFileDialect::Oracle)
     }
 }
 
@@ -1194,13 +1250,23 @@ impl SqlFileDialect {
 /// holding `'C:\path\'` then lost every statement after it, and one holding
 /// `'a\''b'` decoded to `a\`. One file has one writer, so one answer.
 ///
-/// The signal is a backtick-quoted identifier: only the MySQL family writes one,
-/// and this app's `SQL Inserts` export always writes one for that family. The
-/// pre-pass scans with Oracle's rule because that rule ends BOTH dialects'
-/// literals correctly for the forms this app writes — its MySQL literals double
-/// every backslash and spell a quote `''`, so an odd run of backslashes can
-/// never precede a closing quote.
+/// The signal for the FAMILY is a backtick-quoted identifier: only the MySQL
+/// family writes one, and this app's `SQL Inserts` export always writes one for
+/// that family. The pre-pass scans with Oracle's rule because that rule ends
+/// EVERY dialect's literals correctly for the forms this app writes — a
+/// backslash-escaping MySQL session doubles every backslash and spells a quote
+/// `''`, so an odd run of backslashes can never precede a closing quote, and a
+/// `NO_BACKSLASH_ESCAPES` session follows Oracle's rule exactly.
+///
+/// The signal for the ESCAPE RULE is the file's own declaration, read by
+/// [`crate::ui::grid_sql_export::sql_file_declares_no_backslash_escapes`] — the
+/// exact inverse of the writer that puts it there. Nothing else in a file can
+/// answer it: the same bytes mean two things, so this is read rather than
+/// guessed. A file that says nothing keeps the family default, which is what
+/// every other tool's dump (mysqldump above all) is written with.
 fn detect_sql_file_dialect(text: &str) -> SqlFileDialect {
+    let backslash_escapes =
+        !crate::ui::grid_sql_export::sql_file_declares_no_backslash_escapes(text);
     let mut index = 0usize;
     while index < text.len() {
         let rest = &text[index..];
@@ -1214,7 +1280,7 @@ fn detect_sql_file_dialect(text: &str) -> SqlFileDialect {
                 index = quoted_identifier_end(text, index, '"');
                 continue;
             }
-            '`' => return SqlFileDialect::MysqlFamily,
+            '`' => return SqlFileDialect::MysqlFamily { backslash_escapes },
             '-' if rest.starts_with("--") => {
                 index = rest.find('\n').map_or(text.len(), |at| index + at + 1);
                 continue;
@@ -1812,7 +1878,7 @@ fn sql_value_text(value: &str, dialect: SqlFileDialect) -> Result<ImportCell, St
 /// defuse, so the writer never emits this shape for it, and `||` means something
 /// else there.
 fn concatenated_literal_text(value: &str, dialect: SqlFileDialect) -> Option<String> {
-    if dialect != SqlFileDialect::Oracle {
+    if !dialect.is_oracle() {
         return None;
     }
     // No minimum part count: a value that is nothing but `&` is written as the
@@ -2061,6 +2127,7 @@ mod tests {
                 ],
                 vec![Some("2".to_string()), Some("한글".to_string()), None],
             ],
+            file_named_the_columns: true,
         }
     }
 
@@ -3001,6 +3068,195 @@ mod tests {
 
     /// The script this app writes for an import reads back as the rows it was
     /// built from — at any batch size, on every dialect.
+    /// What a parse SAYS about its columns is what it DID.
+    ///
+    /// This is the fact an import maps by: a column the FILE named is matched
+    /// to a table column by NAME, one this reader invented only by POSITION.
+    /// Three inputs decide it — the format, the "first row is a header"
+    /// checkbox, and (for HTML) whether the first row was written with `<th>`
+    /// — so the checkbox alone cannot answer it, and the import dialog used to
+    /// try: it mapped named columns positionally, writing every value into the
+    /// wrong column as soon as the file's order was not the table's.
+    #[test]
+    fn a_parse_says_whether_the_file_named_its_columns() {
+        let generated = |count: usize| {
+            (1..=count)
+                .map(|index| format!("COLUMN_{index}"))
+                .collect::<Vec<_>>()
+        };
+
+        // CSV and TSV: the checkbox really is the answer, and the columns it
+        // produces match what it says.
+        for format in [ExportFormat::Csv, ExportFormat::Tsv] {
+            let text = render(format, &hostile_grid());
+            for has_header in [true, false] {
+                let parsed = parse(
+                    &text,
+                    &ImportOptions {
+                        format,
+                        has_header,
+                        null_text: NULL_TEXT.to_string(),
+                    },
+                )
+                .expect("parses");
+                assert_eq!(parsed.file_named_the_columns, has_header, "{format:?}");
+                if has_header {
+                    assert_eq!(parsed.columns, vec!["ID", "NAME", "CODE"]);
+                } else {
+                    assert_eq!(parsed.columns, generated(3));
+                }
+            }
+        }
+
+        // HTML: a `<th>` row names the columns whatever the checkbox says.
+        // Reading the checkbox instead would have mapped these BY POSITION.
+        let html = render(ExportFormat::Html, &hostile_grid());
+        for has_header in [true, false] {
+            let parsed = parse(
+                &html,
+                &ImportOptions {
+                    format: ExportFormat::Html,
+                    has_header,
+                    null_text: NULL_TEXT.to_string(),
+                },
+            )
+            .expect("parses");
+            assert!(
+                parsed.file_named_the_columns,
+                "a <th> row names the columns with has_header={has_header}"
+            );
+            assert_eq!(parsed.columns, vec!["ID", "NAME", "CODE"]);
+        }
+        // Without `<th>` the checkbox decides, as it does for CSV.
+        let td_only = "<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>";
+        for has_header in [true, false] {
+            let parsed = parse(
+                td_only,
+                &ImportOptions {
+                    format: ExportFormat::Html,
+                    has_header,
+                    null_text: NULL_TEXT.to_string(),
+                },
+            )
+            .expect("parses");
+            assert_eq!(parsed.file_named_the_columns, has_header);
+        }
+
+        // The formats that carry their names inside the data always name them,
+        // and the checkbox does not even apply to them — but it keeps whatever
+        // value it was last left with, which is how a stale `false` reached
+        // them.
+        for format in [
+            ExportFormat::Json,
+            ExportFormat::Xml,
+            ExportFormat::Markdown,
+        ] {
+            assert!(!header_choice_applies(format), "{format:?}");
+            let text = render(format, &hostile_grid());
+            for has_header in [true, false] {
+                let parsed = parse(
+                    &text,
+                    &ImportOptions {
+                        format,
+                        has_header,
+                        null_text: NULL_TEXT.to_string(),
+                    },
+                )
+                .expect("parses");
+                assert!(
+                    parsed.file_named_the_columns,
+                    "{format:?} names its own columns with has_header={has_header}"
+                );
+                assert_eq!(parsed.columns, vec!["ID", "NAME", "CODE"], "{format:?}");
+            }
+        }
+
+        // And so does a file of INSERT statements.
+        assert!(!header_choice_applies(ExportFormat::SqlInserts));
+        for has_header in [true, false] {
+            let parsed = parse(
+                "INSERT INTO T (ID, NAME) VALUES (1, 'a');\n",
+                &ImportOptions {
+                    format: ExportFormat::SqlInserts,
+                    has_header,
+                    null_text: NULL_TEXT.to_string(),
+                },
+            )
+            .expect("parses");
+            assert!(parsed.file_named_the_columns);
+            assert_eq!(parsed.columns, vec!["ID", "NAME"]);
+        }
+    }
+
+    /// Every `SQL Inserts` file this app can write reads back as the values it
+    /// was given — under EVERY escaping rule a connection may run with.
+    ///
+    /// The escape rule is the one fact about such a file that its bytes cannot
+    /// answer: `'a\\b'` is `a`+`\\`+`b` under `NO_BACKSLASH_ESCAPES` and
+    /// `a`+U+0008 under the MySQL default. The reader used to decide it from the
+    /// backticks alone, so a file written by a `NO_BACKSLASH_ESCAPES` connection
+    /// came back with its backslashes eaten, and one holding a value that ENDS
+    /// in a backslash lost every statement after it — measured, on this app's
+    /// own export.
+    ///
+    /// The property, not a spelling: build with a dialect, read with nothing but
+    /// the file, get the values back.
+    #[test]
+    fn a_sql_inserts_file_reads_back_under_every_escaping_rule() {
+        use crate::db::{ConnectionInfo, DatabaseType};
+        use crate::ui::grid_sql_export::{build_sql_inserts, GridSqlSelection, SqlWriteDialect};
+
+        let dialect_for = |db_type, sql_mode: &str| {
+            let mut info = ConnectionInfo::new_with_type("c", "u", "p", "h", 3306, "db", db_type);
+            info.advanced.mysql_sql_mode = sql_mode.to_string();
+            SqlWriteDialect::for_connection(&info)
+        };
+        let values = [
+            r"a\b", // an escape sequence to one rule, three characters to the other
+            r"a\",  // ends in a backslash: closes the literal, or does not
+            r"a\\b",
+            r"C:\path\to\file",
+            r"a\nb", // spells `\n`, which one rule turns into a newline
+            r"a\Zb",
+            r"a\%b",
+            "line\nbreak", // a real newline
+            "it's",
+            "AT&T",
+            "plain",
+        ];
+        let rows: Vec<Vec<crate::ui::result_export::ExportCell>> = values
+            .iter()
+            .map(|value| vec![Some((*value).to_string())])
+            .collect();
+
+        for dialect in [
+            SqlWriteDialect::family_default(DatabaseType::Oracle),
+            dialect_for(DatabaseType::MySQL, "TRADITIONAL"),
+            dialect_for(DatabaseType::MySQL, "TRADITIONAL,NO_BACKSLASH_ESCAPES"),
+            dialect_for(DatabaseType::MariaDB, "TRADITIONAL"),
+            dialect_for(DatabaseType::MariaDB, "TRADITIONAL,NO_BACKSLASH_ESCAPES"),
+        ] {
+            let selection = GridSqlSelection {
+                dialect,
+                table: Some("APP.T".to_string()),
+                all_columns: vec!["V".to_string()],
+                column_kinds: vec![SqlValueKind::String],
+                selected_columns: vec![0],
+                rows: rows.clone(),
+            };
+            let file = build_sql_inserts(&selection)
+                .into_parts()
+                .unwrap_or_else(|reason| panic!("{dialect:?} refused a writable fixture: {reason}"))
+                .0;
+            let back = parse(&file, &options(ExportFormat::SqlInserts))
+                .unwrap_or_else(|error| panic!("{dialect:?} wrote a file it cannot read: {error}"));
+            assert_eq!(
+                back.rows, rows,
+                "{dialect:?} did not read back what it wrote:\n{file}"
+            );
+        }
+    }
+
     #[test]
     fn the_import_script_this_app_writes_reads_back_whole() {
         use crate::db::DatabaseType;
@@ -3026,6 +3282,7 @@ mod tests {
             rows: (1..=5)
                 .map(|index| vec![Some(index.to_string()), Some(format!("row {index}"))])
                 .collect(),
+            file_named_the_columns: true,
         };
         let mapping = default_mapping(&data.columns, &targets);
         for db_type in [

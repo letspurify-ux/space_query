@@ -264,7 +264,7 @@ fn check_streaming_grid(grid: &mut ResultTableWidget, failures: &mut Vec<String>
         failures.push("a streaming grid reported no source SQL".into());
         return;
     }
-    let table = resolve_export_table(None, &source_sql);
+    let table = resolve_export_table(DatabaseType::Oracle, None, &source_sql);
     if table.as_deref() != Some("HR.EMP") {
         failures.push(format!(
             "streaming grid resolved the table as {table:?}, expected Some(\"HR.EMP\")"

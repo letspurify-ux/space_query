@@ -100,6 +100,19 @@ pub enum SqlAction {
     ExportData(ObjectExportDelivery),
 }
 
+/// What the catalog says about one table that generated SQL has to respect.
+///
+/// Both facts come from ONE structure read: see
+/// [`ObjectBrowserWidget::load_generated_sql_table_facts`].
+#[derive(Clone, Debug, Default)]
+pub struct GeneratedSqlTableFacts {
+    /// The primary-key columns, which are what a generated `UPDATE` keys on.
+    pub key_columns: Vec<String>,
+    /// The columns the server computes, which no `INSERT` or `UPDATE` may give
+    /// a value to.
+    pub generated_columns: Vec<String>,
+}
+
 /// A finished tree export, ready to be written or copied.
 #[derive(Clone, Debug)]
 pub struct ObjectExportDelivery {
@@ -4224,20 +4237,34 @@ impl ObjectBrowserWidget {
         });
     }
 
-    /// Primary-key column names of `table_name`, in key order.
+    /// What the catalog says about a table that generated SQL has to respect.
     ///
-    /// Blocking: callers run it on a worker thread. Used by the result grid's
-    /// "SQL Updates" export to build the WHERE clause. Goes through the same
-    /// per-DB behavior the object browser uses for table structure, so Oracle
-    /// (OCI and thin), MySQL, and MariaDB all resolve the real key.
+    /// Blocking: callers run it on a worker thread. Goes through the same per-DB
+    /// behavior the object browser uses for table structure, so Oracle (OCI and
+    /// thin), MySQL and MariaDB all answer from their own catalog.
+    ///
+    /// ONE read, because the two questions a generated statement asks — which
+    /// columns identify a row, and which columns a value may be written into —
+    /// come off the same row of the same catalog. Asking them apart is how the
+    /// two ends of the second one came to disagree: the object tree's
+    /// `Export Data...` left computed columns out and the result grid's
+    /// `SQL Inserts` named them, so the same table exported two scripts, one of
+    /// which the server refuses.
+    ///
+    /// The names come back exactly as the catalog spells them, because that is
+    /// what [`crate::ui::grid_sql_export::quote_column_name`] has to write back.
+    ///
+    /// A qualified name carries its own schema, which the per-DB loaders take as
+    /// the scope rather than as part of the table name.
+    ///
+    /// `pub` for the live harnesses, which read the same facts the production
+    /// roads do. Not part of the supported surface.
     #[doc(hidden)]
-    pub fn load_primary_key_columns(
+    pub fn load_generated_sql_table_facts(
         connection: &SharedConnection,
         selected_scope: Option<&str>,
         table_name: &str,
-    ) -> Result<Vec<String>, String> {
-        // A qualified name carries its own schema, which the per-DB loaders take
-        // as the scope rather than as part of the table name.
+    ) -> Result<GeneratedSqlTableFacts, String> {
         let (scope, table_name) = match table_name.trim().rsplit_once('.') {
             Some((schema, table)) if !schema.trim().is_empty() && !table.trim().is_empty() => {
                 (Some(schema.trim().to_string()), table.trim().to_string())
@@ -4247,22 +4274,34 @@ impl ObjectBrowserWidget {
                 table_name.trim().to_string(),
             ),
         };
-        let activity = format!("Reading primary key of {}", table_name);
-        let columns =
-            Self::with_pooled_object_session(
-                connection,
-                scope.as_deref(),
-                activity,
-                |context, session| {
-                    object_browser_behavior_for(context.connection_info.db_type)
-                        .load_table_structure(context, session, scope.as_deref(), &table_name)
-                },
-            )?;
-        Ok(columns
-            .into_iter()
-            .filter(|column| column.is_primary_key)
-            .map(|column| column.name)
-            .collect())
+        let activity = format!("Reading the structure of {}", table_name);
+        // The db_type comes back with the columns because the literal kinds
+        // depend on it, and only the session's own context can say which
+        // backend answered.
+        let (db_type, columns) = Self::with_pooled_object_session(
+            connection,
+            scope.as_deref(),
+            activity,
+            |context, session| {
+                let db_type = context.connection_info.db_type;
+                object_browser_behavior_for(db_type)
+                    .load_table_structure(context, session, scope.as_deref(), &table_name)
+                    .map(|columns| (db_type, columns))
+            },
+        )?;
+        Ok(GeneratedSqlTableFacts {
+            key_columns: columns
+                .iter()
+                .filter(|column| column.is_primary_key)
+                .map(|column| column.name.clone())
+                .collect(),
+            // Asked of `ImportTargets`, which is where "may a value be written
+            // into this column" is decided for the whole app. Reading
+            // `is_generated` again here would be a second reader of the fact the
+            // import side already owns, and the two roads have to give the same
+            // answer about the same table — which is the entire point of this.
+            generated_columns: Self::import_targets(db_type, &columns).generated_names(),
+        })
     }
 
     fn browse_target_for_object(
@@ -8001,22 +8040,21 @@ impl ObjectBrowserWidget {
             rows: rows.clone(),
             null_text,
         };
-        let sql_selection = crate::ui::grid_sql_export::GridSqlSelection {
+        let mut sql_selection = crate::ui::grid_sql_export::GridSqlSelection {
             dialect,
             table: Some(qualified_name.to_string()),
-            // Every data format writes every column, because that is what the
-            // table HAS. `SQL Inserts` alone writes a script that will be RUN,
-            // so it names only the columns a statement may write into —
-            // `generated_columns` is empty for every other format, which makes
-            // this the same list.
-            selected_columns: crate::ui::grid_sql_export::writable_column_indices(
-                &columns,
-                generated_columns,
-            ),
+            selected_columns: (0..columns.len()).collect(),
             all_columns: columns,
             column_kinds,
             rows,
         };
+        // Every data format writes every column, because that is what the table
+        // HAS. `SQL Inserts` alone writes a script that will be RUN, so it names
+        // only the columns a statement may write into — the caller passes an
+        // empty `generated_columns` for every other format, which narrows
+        // nothing. Applied through the same method the result grid's roads use,
+        // so the two ends of this rule cannot drift apart again.
+        sql_selection.restrict_to_writable_columns(generated_columns);
         let content = crate::ui::result_export::render_export_content(
             choice.format,
             &grid,
@@ -8111,9 +8149,10 @@ impl ObjectBrowserWidget {
     /// does not belong in the list.
     ///
     /// The export side of the same rule lives in
-    /// [`crate::ui::grid_sql_export::writable_column_indices`], which is what
-    /// `SQL Inserts` — the one format meant to be RUN — names its columns
-    /// through. What an import will not offer is what an export must not name.
+    /// [`crate::ui::grid_sql_export::GridSqlSelection::restrict_to_writable_columns`],
+    /// which is what `SQL Inserts` — the one format meant to be RUN — narrows
+    /// its columns through. What an import will not offer is what an export
+    /// must not name.
     #[doc(hidden)]
     pub fn import_targets(
         db_type: crate::db::DatabaseType,

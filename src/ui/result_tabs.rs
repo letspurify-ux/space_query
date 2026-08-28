@@ -3054,12 +3054,17 @@ impl ResultTabsWidget {
     ///
     /// Returns the text directly when it was ready; `None` means a full fetch
     /// had to run first and the callback will fire when it finishes.
+    /// `generated_columns` is what the catalog says the server computes for the
+    /// base table, read before this was called. Only `SqlInserts` reads it, and
+    /// an empty list means "nothing is computed" — the road that could not ask
+    /// reports the failure rather than exporting.
     pub(crate) fn export_after_fetch_all(
         &self,
         format: ExportFormat,
         scope: ExportScope,
         destination: ExportDestination,
         dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
+        generated_columns: Vec<String>,
         callback: crate::ui::result_table::ExportReadyCallback,
     ) -> Option<crate::ui::result_export::ExportContent> {
         let table = self.current_table()?;
@@ -3068,7 +3073,8 @@ impl ResultTabsWidget {
             scope,
             destination,
             dialect,
-            table: Self::resolve_grid_export_table(&table),
+            table: Self::resolve_grid_export_table(&table, dialect),
+            generated_columns,
         };
         table.export_after_fetch_all(request, callback)
     }
@@ -3447,16 +3453,41 @@ impl ResultTabsWidget {
     ) -> Option<GridSqlSelection> {
         let table = self.current_table()?;
         let mut selection = table.sql_export_selection(dialect, None)?;
-        selection.table = Self::resolve_grid_export_table(&table);
+        selection.table = Self::resolve_grid_export_table(&table, Some(dialect));
         Some(selection)
     }
 
+    /// The base table the visible grid's generated SQL would name, if any.
+    ///
+    /// Just the NAME: the export road needs it before it renders anything, to
+    /// ask the catalog which of the table's columns the server computes, and
+    /// taking a whole selection snapshot to read one field would copy every
+    /// exported row for nothing.
+    pub(crate) fn sql_export_table(
+        &self,
+        dialect: crate::ui::grid_sql_export::SqlWriteDialect,
+    ) -> Option<String> {
+        Self::resolve_grid_export_table(&self.current_table()?, Some(dialect))
+    }
+
     /// The base table generated SQL should name for this grid, if one exists.
-    fn resolve_grid_export_table(table: &ResultTableWidget) -> Option<String> {
+    ///
+    /// `dialect` is `None` only where no `SQL Inserts` can be built, and that is
+    /// the one format that names a table — so there is nothing to resolve then.
+    /// Passing it in is also what lets the resolver quote the descriptor's
+    /// names: they are the ones the SERVER reported, and joining them into a
+    /// bare `schema.table` is what made an Oracle table declared `"emp"`
+    /// unnameable (`ORA-00942`).
+    fn resolve_grid_export_table(
+        table: &ResultTableWidget,
+        dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
+    ) -> Option<String> {
+        let dialect = dialect?;
         let descriptor_table = table
             .result_edit_descriptor_snapshot()
-            .map(|descriptor| format!("{}.{}", descriptor.schema_name, descriptor.table_name));
+            .map(|descriptor| (descriptor.schema_name, descriptor.table_name));
         crate::ui::grid_sql_export::resolve_export_table(
+            dialect.db_type(),
             descriptor_table,
             &table.source_sql_snapshot(),
         )

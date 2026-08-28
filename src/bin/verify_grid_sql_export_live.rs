@@ -483,7 +483,7 @@ fn verify(target: Target) -> Result<(), String> {
     //      export would fall back to the MY_TABLE placeholder.
     let start_sql = select_start_sql(&select_events)
         .ok_or_else(|| "SELECT produced no SelectStart statement text".to_string())?;
-    let resolved = resolve_export_table(None, &start_sql);
+    let resolved = resolve_export_table(db_type, None, &start_sql);
     let names_base_table = resolved.as_deref().is_some_and(|table| {
         table
             .rsplit('.')
@@ -528,8 +528,9 @@ fn verify(target: Target) -> Result<(), String> {
 
     // (3) SQL Updates must find the real composite primary key and hit exactly
     //     the rows it names.
-    let keys = ObjectBrowserWidget::load_primary_key_columns(&shared, None, BASE_TABLE)
-        .map_err(|e| format!("primary key lookup: {e}"))?;
+    let keys = ObjectBrowserWidget::load_generated_sql_table_facts(&shared, None, BASE_TABLE)
+        .map_err(|e| format!("primary key lookup: {e}"))?
+        .key_columns;
     println!("primary key columns: {keys:?}");
     let key_names: Vec<String> = keys.iter().map(|k| k.to_ascii_uppercase()).collect();
     if key_names != vec!["PART".to_string(), "SEQ".to_string()] {

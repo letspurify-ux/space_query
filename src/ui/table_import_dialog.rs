@@ -72,8 +72,8 @@ struct DialogState {
     parsed: Mutex<Result<ImportedTable, String>>,
     /// One Choice per file column: 0 is "skip", n+1 is target column n.
     mapping_choices: Mutex<Vec<Choice>>,
-    /// What the mapping area on screen was built for: the file's columns, or the
-    /// parse error it is showing instead.
+    /// What the mapping area on screen was built for: the file's columns and
+    /// whether the FILE named them, or the parse error it is showing instead.
     ///
     /// Rebuilding that area is what discards the user's picks, so it happens
     /// only when this changes. It used to happen on every reload, and a reload
@@ -81,7 +81,12 @@ struct DialogState {
     /// file's columns at all, so a hand-made mapping was thrown away by typing.
     /// The error is part of the key because the area SHOWS it: two different
     /// errors are two different things to draw.
-    mapped_columns: Mutex<Option<Result<Vec<String>, String>>>,
+    ///
+    /// "Did the file name them" is part of it because it chooses which mapping
+    /// the rows are built with. Leaving it out meant a file whose header happens
+    /// to spell `COLUMN_1, COLUMN_2, …` kept a by-NAME mapping after the header
+    /// checkbox was turned off: the key must hold every input to what was drawn.
+    mapped_columns: Mutex<Option<Result<(Vec<String>, bool), String>>>,
 }
 
 impl DialogState {
@@ -292,7 +297,7 @@ pub(crate) fn show(
             // them — including any target the user picked by hand.
             let columns = parsed
                 .as_ref()
-                .map(|data| data.columns.clone())
+                .map(|data| (data.columns.clone(), data.file_named_the_columns))
                 .map_err(String::clone);
             let rebuild = {
                 let mut built_for = state
@@ -306,7 +311,7 @@ pub(crate) fn show(
                 changed
             };
             if rebuild {
-                rebuild_mapping_rows(&state, &mut scroll, &parsed, options.has_header);
+                rebuild_mapping_rows(&state, &mut scroll, &parsed);
             }
             *state
                 .parsed
@@ -429,15 +434,22 @@ fn gate<W: WidgetExt>(widget: &mut W, active: bool) {
 
 /// Replace the mapping rows with one per file column.
 ///
-/// With a header the file names its columns, so they are matched to the table
-/// by name. Without one the names are positional placeholders, so the columns
-/// are matched by position instead — which is the only thing a header-less file
-/// can mean.
+/// A file that NAMED its columns is matched to the table by name; one whose
+/// column list this reader had to invent is matched by position, which is the
+/// only thing such a file can mean.
+///
+/// The parse says which — it is the only thing that can. This used to ask the
+/// "first row is a header" checkbox, which is one of three inputs to that
+/// answer and disagrees with the other two: an HTML table with `<th>` cells
+/// names its columns whatever the checkbox says, and for JSON, XML, Markdown
+/// and `SQL Inserts` the checkbox does not apply at all yet keeps whatever it
+/// was last left with. Both cases mapped named columns BY POSITION, which
+/// writes every value into the wrong column as soon as the file's order is not
+/// the table's.
 fn rebuild_mapping_rows(
     state: &DialogState,
     scroll: &mut Scroll,
     parsed: &Result<ImportedTable, String>,
-    has_header: bool,
 ) {
     scroll.clear();
     let mut choices: Vec<Choice> = Vec::new();
@@ -448,7 +460,7 @@ fn rebuild_mapping_rows(
     scroll.begin();
     match parsed {
         Ok(data) => {
-            let mapping = if has_header {
+            let mapping = if data.file_named_the_columns {
                 default_mapping(&data.columns, &state.targets)
             } else {
                 state.table_columns.positional_mapping(data.columns.len())

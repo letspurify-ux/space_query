@@ -100,6 +100,11 @@ const CSV: &str = "EMPNO,ENAME,HIREDATE,SAL\n\
                    7369,SMITH,1980-12-17,800\n\
                    7499,NULL,1981-02-20,1600\n";
 const HEADERLESS_CSV: &str = "7369,SMITH,1980-12-17,800\n";
+/// An HTML table that NAMES its columns with `<th>`, in an order that is not the
+/// table's — so mapping it by position writes every value into the wrong column
+/// and the generated SQL says which rule was used.
+const HTML_HEADED: &str = "<table><thead><tr><th>SAL</th><th>EMPNO</th></tr></thead>\
+                           <tbody><tr><td>800</td><td>7369</td></tr></tbody></table>";
 const JSON: &str = "[{\"EMPNO\": 7369, \"ENAME\": \"SMITH\", \"HIREDATE\": \"1980-12-17\", \
                     \"SAL\": null}]";
 
@@ -223,6 +228,40 @@ fn main() {
         }
         Ok(None) => failures.push("header-less CSV produced no script".to_string()),
         Err(err) => failures.push(format!("header-less CSV: {err}")),
+    }
+
+    // (4b) A `<th>` row NAMES the columns whatever the header checkbox says, so
+    //      the mapping follows the file, not the checkbox.
+    //
+    //      The checkbox is live for HTML, so this is one click away: unchecking
+    //      it used to switch the mapping to POSITION while the parse still
+    //      produced names, and every value landed in the wrong column. The
+    //      fixture's column order is not the table's precisely so the two rules
+    //      produce different SQL.
+    for header in [Some(true), Some(false)] {
+        match run(
+            HTML_HEADED,
+            ExportFormat::Csv,
+            ModalPlan {
+                format: Some("HTML"),
+                header,
+                ..ModalPlan::default()
+            },
+        ) {
+            Ok(Some((sql, _))) => {
+                if sql.contains("INTO HR.EMP (EMPNO, SAL) VALUES (7369, 800)") {
+                    say(&format!(
+                        "PASS: a <th> row maps by name with the header checkbox {header:?}"
+                    ));
+                } else {
+                    failures.push(format!(
+                        "HTML with <th> and header={header:?} produced {sql:?}"
+                    ));
+                }
+            }
+            Ok(None) => failures.push(format!("HTML with header={header:?} produced no script")),
+            Err(err) => failures.push(format!("HTML with header={header:?}: {err}")),
+        }
     }
 
     // (5b) A hand-made mapping survives a keystroke in the NULL text.

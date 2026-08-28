@@ -40,10 +40,31 @@ pub struct SqlWriteDialect {
 }
 
 impl SqlWriteDialect {
-    /// The rules the session on `info` actually runs under.
+    /// The rules a session on `info` runs under, as the CONNECTION was
+    /// configured.
     ///
     /// This is the constructor to reach for wherever a connection is in hand;
     /// it is the only one that can be right about `sql_mode`.
+    ///
+    /// Its honest limit: this reads the connection SETTING, which the app sends
+    /// as `SET SESSION sql_mode` at connect. A user who then runs
+    /// `SET SESSION sql_mode = '…NO_BACKSLASH_ESCAPES'` in a query tab moves
+    /// that tab's session out from under it, and nothing here notices — the app
+    /// adopts an in-session change of the isolation level and of the read/write
+    /// mode, but not of `sql_mode`. Two things follow, and only one of them is
+    /// harmful:
+    ///
+    /// * a `SQL Inserts` FILE is unaffected. Its literals and the rule it
+    ///   declares ([`sql_file_declares_no_backslash_escapes`]) both come from
+    ///   this one value, so the file is self-consistent and reads back exactly
+    ///   whatever it was written with;
+    /// * text that will RUN on the drifted session — an import script, a
+    ///   `Copy as SQL …` the user pastes back — is escaped for a rule that
+    ///   session no longer follows, and a value holding a backslash is stored
+    ///   with one too many or one too few.
+    ///
+    /// Closing that needs the session's own `sql_mode` to be tracked the way its
+    /// transaction state already is; it is not something a writer can decide.
     pub fn for_connection(info: &ConnectionInfo) -> Self {
         let db_type = info.db_type;
         Self {
@@ -193,13 +214,15 @@ impl GridSqlSelection {
     /// selected ones: a key is looked up by name, and picking the first match
     /// would key the statement on a column the user cannot see it chose.
     ///
-    /// Case-insensitively, which is not merely the convention the rest of this
-    /// module matches — it is what the emitted SQL means. The MySQL family
-    /// resolves a column name case-insensitively whatever the backticks say,
-    /// and [`quote_column_name`] writes an Oracle name that is a legal bare
-    /// identifier without quotes, so `ID` and `id` both reach the server as
-    /// `ID`. Two columns whose names differ only in case are therefore two
-    /// columns generated SQL cannot address apart either.
+    /// Case-insensitively, and deliberately for BOTH families. The MySQL family
+    /// resolves a column name case-insensitively whatever the backticks say, so
+    /// `ID` and `id` really are one column there and generated SQL cannot
+    /// address them apart. Oracle quotes a reported name exactly
+    /// ([`quote_column_name`]), so there the two ARE separable — this refuses
+    /// them all the same, because one rule that occasionally refuses a
+    /// selection it could have written is worth more than two rules, and a
+    /// refusal costs the user a rename while the alternative costs them a
+    /// statement that silently means something else.
     pub fn ambiguous_column_refusal(&self, key_columns: &[String]) -> Option<String> {
         let selected = self
             .selected_columns
@@ -223,6 +246,33 @@ impl GridSqlSelection {
         None
     }
 
+    /// Drop the columns the server COMPUTES from what a statement will name.
+    ///
+    /// The one place the rule is applied, and the reason
+    /// [`writable_column_indices`] has a single caller. A statement that gives a
+    /// value to a virtual, `GENERATED ALWAYS` or stored-generated column cannot
+    /// run — Oracle answers `ORA-54013` on an `INSERT` and `ORA-54017` on an
+    /// `UPDATE`, the MySQL family answers 3105 to both — so `SQL Inserts` and
+    /// `SQL Updates`, the two shapes meant to be RE-RUN, must not name one.
+    /// `Where Clause` READS, so it keeps every column and never calls this.
+    ///
+    /// `generated` is what the catalog reports, by name. An empty list narrows
+    /// nothing, which is what "this table computes no column" means; a caller
+    /// that could not read the catalog must say so rather than pass an empty
+    /// list, because the two are not the same answer.
+    ///
+    /// Applied to `selected_columns` alone: `all_columns` still carries every
+    /// value, so `SQL Updates` can still read a key from a column the user did
+    /// not select.
+    pub fn restrict_to_writable_columns(&mut self, generated: &[String]) {
+        if generated.is_empty() {
+            return;
+        }
+        let writable = writable_column_indices(&self.all_columns, generated);
+        self.selected_columns
+            .retain(|index| writable.contains(index));
+    }
+
     /// Column index for a name, matched case-insensitively the way SQL resolves
     /// unquoted identifiers.
     fn column_index(&self, name: &str) -> Option<usize> {
@@ -233,12 +283,14 @@ impl GridSqlSelection {
     }
 }
 
-/// The base table the generated SQL should name.
+/// Quote a possibly dot-qualified object name that is ALREADY spelled the way
+/// its provenance requires.
 ///
-/// The grid-edit descriptor already names the exact table, so it wins.
-/// Otherwise the table is resolved from the SQL that produced the grid, which
-/// handles CTEs and `alias.ROWID` select lists. `None` renders as `MY_TABLE`.
-/// Quote a possibly dot-qualified object name for `db_type`.
+/// Idempotent over a correctly quoted name, which is the only kind that should
+/// reach it: [`resolve_export_table`] and
+/// [`crate::ui::object_browser::ObjectBrowserWidget::qualified_object_name`]
+/// are the two places that decide how a name is spelled, because they are the
+/// two places that still know where it came from.
 pub fn quote_qualified_name(db_type: DatabaseType, name: &str) -> String {
     if db_type.is_mysql_or_mariadb() {
         // Quote-aware and idempotent: the name reaching here has often been
@@ -246,23 +298,85 @@ pub fn quote_qualified_name(db_type: DatabaseType, name: &str) -> String {
         // would re-quote those segments into a different name.
         crate::db::quote_mysql_qualified_name(name)
     } else {
-        // Oracle: legal unquoted identifiers stay unquoted, so generated SQL
-        // reads the way a person would write it.
+        // Oracle: a name that is already a legal bare identifier stays bare, so
+        // generated SQL reads the way a person would write it, and one that is
+        // already quoted is passed through.
         ResultTableWidget::quote_qualified_identifier(name)
     }
 }
 
-/// Quote a single column name for `db_type`.
+/// Quote a single name the SERVER reported — a catalog column, or a column of a
+/// result set as the driver named it.
+///
+/// Identity-preserving, which is a different rule from the one that suits a
+/// name the USER typed. Oracle's parser folds a bare identifier to upper case,
+/// so a column really called `id` — declared `"id"`, which is what every tool
+/// that quotes its DDL creates — is named by `"id"` and by nothing else:
+/// writing it bare asks for `ID` and the server answers `ORA-00904`. A reserved
+/// word (`"COMMENT"`) is the same story, and so is a name that needs quotes for
+/// any other reason. This used to go through
+/// [`ResultTableWidget::quote_identifier_segment`], whose rule is the right one
+/// for a name PARSED out of the user's SQL (`FROM emp` means `EMP`) and the
+/// wrong one here — so every statement `SQL Inserts`, `SQL Updates`,
+/// `Where Clause` and a file import wrote for such a table failed outright.
+///
+/// [`crate::db::DatabaseConnection::quote_oracle_identifier`] is the app's ONE
+/// answer to "how is an Oracle name the server reported written back", the same
+/// one the object browser qualifies a table with; the MySQL family always
+/// backticks, which is identity-preserving already.
+///
+/// Names are still COMPARED generously (case-insensitively, trimmed) wherever a
+/// file column is paired with a table column: matching generously to FIND a
+/// column and then naming it exactly as reported is the pair that works on
+/// every backend here.
 pub fn quote_column_name(db_type: DatabaseType, name: &str) -> String {
+    quote_reported_name(db_type, name)
+}
+
+/// Quote ONE name the server reported, whatever kind of object it names.
+///
+/// A column and a table segment need the identical rule — "spell it so the
+/// server names the same thing again" — so they share it rather than each
+/// picking a quoter. [`quote_column_name`] is the name the writers ask it by;
+/// [`resolve_export_table`] asks it for the two segments of a base table.
+fn quote_reported_name(db_type: DatabaseType, name: &str) -> String {
     if db_type.is_mysql_or_mariadb() {
         quote_mysql_identifier(name.trim())
     } else {
-        ResultTableWidget::quote_identifier_segment(name)
+        crate::db::DatabaseConnection::quote_oracle_identifier(name)
     }
 }
 
-pub fn resolve_export_table(descriptor_table: Option<String>, source_sql: &str) -> Option<String> {
+/// The base table the generated SQL should name, spelled for `db_type`.
+///
+/// TWO provenances meet here and they need OPPOSITE treatment, which is why
+/// this is the place that decides:
+///
+/// * `descriptor_table` is the schema and table of the grid-edit descriptor —
+///   the names the SERVER reported. They are quoted exactly, by
+///   [`quote_column_name`]'s rule, because a table created as `"emp"` is named
+///   by `"emp"` and a bare `emp` names `EMP`.
+/// * the fallback resolves the table out of the SQL that produced the grid,
+///   which handles CTEs and `alias.ROWID` select lists. That name is what the
+///   USER typed, so it is left to fold the way the parser folds it — quoting
+///   `FROM emp` as `"emp"` would name a table that does not exist.
+///
+/// `None` renders as `MY_TABLE`.
+pub fn resolve_export_table(
+    db_type: DatabaseType,
+    descriptor_table: Option<(String, String)>,
+    source_sql: &str,
+) -> Option<String> {
     descriptor_table
+        .filter(|(_, table)| !table.trim().is_empty())
+        .map(|(schema, table)| {
+            let table = quote_reported_name(db_type, &table);
+            if schema.trim().is_empty() {
+                table
+            } else {
+                format!("{}.{table}", quote_reported_name(db_type, &schema))
+            }
+        })
         .or_else(|| crate::ui::sql_editor::query_text::resolve_edit_target_table(source_sql).ok())
         .filter(|table| !table.trim().is_empty())
 }
@@ -306,7 +420,14 @@ pub fn ambiguous_column_message(name: &str) -> String {
     )
 }
 
-/// The columns an `INSERT` may name, as indexes into `all_columns`.
+/// The columns a statement may name, as indexes into `all_columns`.
+///
+/// Reached through [`GridSqlSelection::restrict_to_writable_columns`], which is
+/// the one place that applies it — a rule with two appliers is a rule the two
+/// can come to disagree about, and that is exactly what happened: the object
+/// tree's export applied it and the result grid's did not, so `Copy as SQL
+/// Inserts` and `Export ▸ SQL Inserts` on a table with a computed column wrote
+/// a script the server refuses.
 ///
 /// A column the server computes cannot be given a value — Oracle answers
 /// `ORA-54013: INSERT operation disallowed on virtual columns`, MySQL and
@@ -322,7 +443,7 @@ pub fn ambiguous_column_message(name: &str) -> String {
 ///
 /// Names are matched the way SQL resolves an unquoted identifier, because that
 /// is how the catalog and the result set are paired everywhere else here.
-pub fn writable_column_indices(all_columns: &[String], generated: &[String]) -> Vec<usize> {
+fn writable_column_indices(all_columns: &[String], generated: &[String]) -> Vec<usize> {
     (0..all_columns.len())
         .filter(|index| {
             let name = all_columns[*index].trim();
@@ -333,6 +454,106 @@ pub fn writable_column_indices(all_columns: &[String], generated: &[String]) -> 
         .collect()
 }
 
+/// The word a `SQL Inserts` build writes when its literals do NOT read a
+/// backslash as an escape.
+///
+/// The escaping rule is the one thing about a file of `INSERT` statements that
+/// cannot be read off the file itself. The literal `'a\b'` is the three
+/// characters `a`, `\`, `b` when the session that wrote it ran under
+/// `NO_BACKSLASH_ESCAPES`, and the two characters `a` and U+0008 under any
+/// other MySQL-family session — the same bytes, two meanings — so a reader that
+/// guesses is wrong for half the files. It guessed "escapes on" for anything
+/// holding a backtick, which turned this app's own export of `a\b` back into
+/// `a` + U+0008 and lost every statement after a value ending in a backslash.
+///
+/// So the FILE says it, in a comment, which is inert to run, ignored by every
+/// other tool, and — being a comment BEFORE the first statement — somewhere a
+/// VALUE can never appear.
+const NO_BACKSLASH_ESCAPES_MARK: &str = "NO_BACKSLASH_ESCAPES";
+
+/// What makes a leading comment a DECLARATION rather than prose.
+///
+/// The reader only looks past this, so a comment that merely mentions the mode
+/// — "this file does not use NO_BACKSLASH_ESCAPES" — cannot flip the rule.
+const SQL_MODE_DECLARATION: &str = "sql_mode:";
+
+/// What a `SQL Inserts` build starts with so it can be read back.
+///
+/// Written only when the rule differs from the one a reader assumes for the
+/// family, so an ordinary export is byte-for-byte what it always was.
+///
+/// Only `SQL Inserts` carries it, because only `SQL Inserts` is read back:
+/// `SQL Updates` and `Where Clause` are clipboard text this app never parses,
+/// and the import script [`crate::ui::table_import::build_insert_script`]
+/// writes runs straight back on the connection whose rule it was written with.
+///
+/// It DECLARES the rule; it does not impose it. Running the file on a session
+/// that follows the other rule still misreads the literals — that is true of
+/// every SQL file and is not something a comment can change. Making it a real
+/// `SET sql_mode` statement would fix that and move the user's session out from
+/// under them, which is a bigger surprise than the one it removes; a dump that
+/// wants both writes the statement and restores it, and this is not a dump.
+fn sql_inserts_dialect_preamble(dialect: SqlWriteDialect) -> &'static str {
+    if dialect.is_mysql_or_mariadb() && !dialect.backslash_escapes() {
+        concat!(
+            "-- sql_mode: NO_BACKSLASH_ESCAPES",
+            " (a backslash in a literal below is one character, not an escape)\n"
+        )
+    } else {
+        ""
+    }
+}
+
+/// Whether a file of `INSERT` statements DECLARES that its literals read a
+/// backslash as an ordinary character.
+///
+/// The exact inverse of [`sql_inserts_dialect_preamble`], and it lives beside it
+/// for the reason round 7 gave the other in-band marks this app writes: a mark
+/// has to be read WHERE it is written, or a value can forge one. This one is
+/// written in a comment ahead of every statement, so the scan stops at the first
+/// character that is neither whitespace nor a comment — before any statement
+/// exists, and therefore before any value does.
+///
+/// A file that declares nothing keeps its family's default, which is what every
+/// dump written by another tool follows.
+pub fn sql_file_declares_no_backslash_escapes(text: &str) -> bool {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start();
+        let (comment, tail) = if let Some(body) = rest.strip_prefix("--") {
+            body.split_once('\n').unwrap_or((body, ""))
+        } else if let Some(body) = rest.strip_prefix("/*") {
+            // An unterminated block comment runs to the end of the file, so
+            // everything left really is comment text.
+            body.split_once("*/").unwrap_or((body, ""))
+        } else {
+            return false;
+        };
+        if declares_no_backslash_escapes(comment) {
+            return true;
+        }
+        rest = tail;
+    }
+}
+
+/// Whether ONE comment is the declaration, and says that mode.
+///
+/// The mode is matched as a whole word so a longer name that merely starts the
+/// same way cannot answer for it.
+fn declares_no_backslash_escapes(comment: &str) -> bool {
+    let trimmed = comment.trim_start();
+    let Some(declared) = trimmed
+        .get(..SQL_MODE_DECLARATION.len())
+        .filter(|head| head.eq_ignore_ascii_case(SQL_MODE_DECLARATION))
+        .map(|head| &trimmed[head.len()..])
+    else {
+        return false;
+    };
+    declared
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|word| word.eq_ignore_ascii_case(NO_BACKSLASH_ESCAPES_MARK))
+}
+
 /// `INSERT INTO <table> (<selected columns>) VALUES (…);` per selected row.
 ///
 /// Every reason this can write nothing comes back as an
@@ -340,6 +561,10 @@ pub fn writable_column_indices(all_columns: &[String], generated: &[String]) -> 
 /// empty string, which a caller cannot tell from an empty result — and the
 /// callers then reported the INPUT row count for it, announcing an empty file
 /// as a full export.
+///
+/// The build starts with [`sql_inserts_dialect_preamble`] when the connection's
+/// escaping rule is not the one a reader would assume, so what this writes can
+/// be read back — by this app's own `SQL Inserts` import above all.
 pub fn build_sql_inserts(selection: &GridSqlSelection) -> ExportContent {
     if let Some(reason) = selection.ambiguous_column_refusal(&[]) {
         return ExportContent::Refused(reason);
@@ -358,7 +583,7 @@ pub fn build_sql_inserts(selection: &GridSqlSelection) -> ExportContent {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let mut out = String::new();
+    let mut out = String::from(sql_inserts_dialect_preamble(selection.dialect));
     let mut written = 0usize;
     for (row_index, row) in selection.rows.iter().enumerate() {
         let values = match selection
@@ -2270,6 +2495,227 @@ mod tests {
         );
         assert_eq!(first_repeated_column_name(["A", "B", "C"]), None);
         assert_eq!(first_repeated_column_name([]), None);
+    }
+
+    /// A VALUE cannot tell the reader what escaping rule the file follows.
+    ///
+    /// The lesson round 7 taught the other marks this app writes: a statement's
+    /// text INCLUDES its values, so a mark matched anywhere is a mark a value
+    /// can forge. This one is read only from the comments that come BEFORE the
+    /// first statement, where a value cannot be — and only from a comment that
+    /// DECLARES the mode, so prose that merely names it says nothing.
+    #[test]
+    fn only_a_leading_declaration_says_how_a_file_escapes() {
+        let declaration = sql_inserts_dialect_preamble(SqlWriteDialect::for_connection(&{
+            let mut info =
+                ConnectionInfo::new_with_type("m", "u", "p", "h", 3306, "db", DatabaseType::MySQL);
+            info.advanced.mysql_sql_mode = "NO_BACKSLASH_ESCAPES".to_string();
+            info
+        }));
+        assert!(!declaration.is_empty(), "the writer declares the mode");
+        assert!(sql_file_declares_no_backslash_escapes(declaration));
+        // Whitespace and other leading comments in front of it are still ahead
+        // of every statement.
+        assert!(sql_file_declares_no_backslash_escapes(&format!(
+            "\n-- exported by this app\n/* two */\n{declaration}INSERT INTO `t` (`a`) VALUES (1);\n"
+        )));
+
+        for forged in [
+            // The mark inside a VALUE, which is what a forgery would be.
+            "INSERT INTO `t` (`a`) VALUES ('-- sql_mode: NO_BACKSLASH_ESCAPES');\n",
+            // In a comment, but AFTER a statement has already been read.
+            "INSERT INTO `t` (`a`) VALUES (1);\n-- sql_mode: NO_BACKSLASH_ESCAPES\n",
+            // A leading comment that mentions the mode without declaring it.
+            "-- this file does not use NO_BACKSLASH_ESCAPES\nINSERT INTO `t` (`a`) VALUES (1);\n",
+            // A declaration of some OTHER mode.
+            "-- sql_mode: NO_AUTO_VALUE_ON_ZERO\nINSERT INTO `t` (`a`) VALUES (1);\n",
+            // A longer name that merely starts the same way.
+            "-- sql_mode: NO_BACKSLASH_ESCAPES_OFF\nINSERT INTO `t` (`a`) VALUES (1);\n",
+            "",
+        ] {
+            assert!(
+                !sql_file_declares_no_backslash_escapes(forged),
+                "a file must not be read as NO_BACKSLASH_ESCAPES for: {forged:?}"
+            );
+        }
+    }
+
+    /// A name the SERVER reported has to name the SAME object again.
+    ///
+    /// Stated as the property rather than as a spelling table: reading the
+    /// written identifier back the way the backend's parser reads one must give
+    /// the original name. Oracle folds a bare identifier to upper case, so
+    /// anything that is not already a legal upper-case word — a column declared
+    /// `"id"`, a reserved word, a name with a space or a non-ASCII letter — has
+    /// to come back quoted.
+    ///
+    /// Before this, every such name was written BARE, because the quoter used
+    /// here is the one that suits a name PARSED out of the user's SQL. A table
+    /// with an `"id"` column therefore answered `ORA-00904` to every statement
+    /// this module writes and to every file import, on both Oracle drivers,
+    /// while the MySQL family was unaffected — which is exactly the kind of
+    /// backend split this app exists to not have.
+    #[test]
+    fn a_reported_name_is_written_so_the_server_names_it_again() {
+        /// What a backend's parser makes of ONE written identifier.
+        fn denoted(db_type: DatabaseType, written: &str) -> String {
+            if db_type.is_mysql_or_mariadb() {
+                let inner = written
+                    .strip_prefix('`')
+                    .and_then(|rest| rest.strip_suffix('`'))
+                    .unwrap_or_else(|| {
+                        panic!("the MySQL family always backticks a reported name: {written}")
+                    });
+                return inner.replace("``", "`");
+            }
+            match written
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+            {
+                Some(inner) => inner.replace("\"\"", "\""),
+                // Oracle folds an unquoted identifier to upper case.
+                None => written.to_uppercase(),
+            }
+        }
+
+        for name in [
+            "ID", // already upper case: stays bare on Oracle
+            "id", // declared `"id"`: only quotes name it again
+            "Id", "COMMENT", // reserved: bare is a syntax error
+            "SELECT", "odd name",
+            "MY$COL", // `$` and `#` are legal in a bare Oracle identifier
+            "가격",   // a non-ASCII letter cannot start a bare one
+        ] {
+            for db_type in [
+                DatabaseType::Oracle,
+                DatabaseType::MySQL,
+                DatabaseType::MariaDB,
+            ] {
+                let written = quote_column_name(db_type, name);
+                assert_eq!(
+                    denoted(db_type, &written),
+                    name,
+                    "{db_type} wrote {name:?} as {written}, which names something else"
+                );
+            }
+        }
+        // The readable spelling is kept where it costs nothing.
+        assert_eq!(quote_column_name(DatabaseType::Oracle, "ID"), "ID");
+        assert_eq!(quote_column_name(DatabaseType::Oracle, "id"), "\"id\"");
+    }
+
+    /// The grid-edit descriptor names a table the way the SERVER does; the SQL
+    /// the grid came from names it the way the USER typed it. One quoter cannot
+    /// serve both, so the resolver spells each before anything downstream sees
+    /// it.
+    #[test]
+    fn a_resolved_table_is_spelled_for_where_the_name_came_from() {
+        // Reported: quoted exactly, because `emp` would name `EMP`.
+        assert_eq!(
+            resolve_export_table(
+                DatabaseType::Oracle,
+                Some(("HR".to_string(), "emp".to_string())),
+                "",
+            ),
+            Some("HR.\"emp\"".to_string())
+        );
+        assert_eq!(
+            resolve_export_table(
+                DatabaseType::MySQL,
+                Some(("app".to_string(), "orders".to_string())),
+                "",
+            ),
+            Some("`app`.`orders`".to_string())
+        );
+        // Parsed out of the user's SQL: left to fold the way the parser folds
+        // it. Quoting `emp` here would name a table that does not exist.
+        assert_eq!(
+            resolve_export_table(DatabaseType::Oracle, None, "SELECT * FROM hr.emp"),
+            Some("hr.emp".to_string())
+        );
+        // A descriptor with no table name is not a name; the SQL still answers.
+        assert_eq!(
+            resolve_export_table(
+                DatabaseType::Oracle,
+                Some(("HR".to_string(), "  ".to_string())),
+                "SELECT * FROM hr.emp",
+            ),
+            Some("hr.emp".to_string())
+        );
+        // Neither: the placeholder.
+        assert_eq!(resolve_export_table(DatabaseType::Oracle, None, ""), None);
+    }
+
+    /// A statement that WRITES never names a column the server computes; one
+    /// that READS keeps every column.
+    ///
+    /// The rule used to be applied by the object tree's export alone, so the
+    /// same table exported two different scripts and only the tree's could run:
+    /// `INSERT`/`UPDATE` into a virtual or always-generated column is
+    /// `ORA-54013`/`ORA-54017` on Oracle and 3105 on the MySQL family. Applying
+    /// it through one method on the selection is what keeps the roads together.
+    #[test]
+    fn only_the_statements_that_write_drop_a_computed_column() {
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+        ] {
+            let full = selection(
+                db_type,
+                &[
+                    ("ID", SqlValueKind::Number),
+                    ("TOTAL", SqlValueKind::Number),
+                    ("NAME", SqlValueKind::String),
+                ],
+                &[&["1", "9", "kim"]],
+            );
+            // `Where Clause` reads, so it is never narrowed and still names it.
+            assert!(
+                written(build_where_clause(&full)).contains("TOTAL"),
+                "{db_type}: a WHERE clause reads every selected column"
+            );
+
+            let mut narrowed = full.clone();
+            // Matched the way SQL resolves an unquoted name, and trimmed, which
+            // is how the catalog's spelling is paired with the result's.
+            narrowed.restrict_to_writable_columns(&[" total ".to_string()]);
+            let inserts = written(build_sql_inserts(&narrowed));
+            assert!(
+                !inserts.contains("TOTAL") && inserts.contains("ID") && inserts.contains("NAME"),
+                "{db_type}: an INSERT must not name a computed column: {inserts}"
+            );
+            let updates = written(build_sql_updates(&narrowed, &["ID".to_string()]));
+            assert!(
+                !updates.contains("TOTAL") && updates.contains("NAME"),
+                "{db_type}: an UPDATE must not set a computed column: {updates}"
+            );
+
+            // A key column is read from `all_columns`, which narrowing leaves
+            // alone, so the WHERE still finds its value.
+            assert!(
+                updates.contains("WHERE"),
+                "{db_type}: narrowing must not cost the statement its key"
+            );
+
+            // Nothing computed narrows nothing.
+            let mut untouched = full.clone();
+            untouched.restrict_to_writable_columns(&[]);
+            assert_eq!(untouched.selected_columns, full.selected_columns);
+
+            // Every column computed leaves a statement no column to name, and
+            // the builders say so rather than writing an empty file.
+            let mut nothing_writable = full.clone();
+            nothing_writable.restrict_to_writable_columns(&[
+                "ID".to_string(),
+                "TOTAL".to_string(),
+                "NAME".to_string(),
+            ]);
+            assert_eq!(
+                build_sql_inserts(&nothing_writable).refusal(),
+                Some(no_writable_column_message().as_str())
+            );
+        }
     }
 
     /// A column the server computes is never named by `SQL Inserts`.

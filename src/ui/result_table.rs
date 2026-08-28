@@ -237,6 +237,19 @@ pub(crate) struct ExportRequest {
     /// Only `SqlInserts` reads these; every other format is dialect-agnostic.
     pub dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
     pub table: Option<String>,
+    /// The columns of [`Self::table`] the server COMPUTES, as the catalog names
+    /// them, read before the export was started.
+    ///
+    /// Only `SqlInserts` reads them, because it is the one format that writes a
+    /// script meant to be RE-RUN: naming a virtual or always-generated column in
+    /// an `INSERT` is `ORA-54013` / MySQL 3105, so the file cannot run at all.
+    /// Every data format still writes every column, because that is what the
+    /// result HAS.
+    ///
+    /// Empty means "this table computes no column" — never "nobody asked". The
+    /// road that could not ask reports the failure instead of exporting, the
+    /// same way the object tree's own export does.
+    pub generated_columns: Vec<String>,
 }
 
 impl ExportRequest {
@@ -247,6 +260,7 @@ impl ExportRequest {
             destination: ExportDestination::File,
             dialect: None,
             table: None,
+            generated_columns: Vec::new(),
         }
     }
 }
@@ -10716,16 +10730,7 @@ impl ResultTableWidget {
         &self,
         callback: ExportReadyCallback,
     ) -> Option<ExportContent> {
-        self.export_after_fetch_all(
-            ExportRequest {
-                format: ExportFormat::Csv,
-                scope: ExportScope::All,
-                destination: ExportDestination::File,
-                dialect: None,
-                table: None,
-            },
-            callback,
-        )
+        self.export_after_fetch_all(ExportRequest::csv_file(), callback)
     }
 
     fn current_export_snapshot(&self, request: &ExportRequest) -> ExportContent {
@@ -10743,10 +10748,23 @@ impl ResultTableWidget {
         // both copy every exported row, and a large `SQL Inserts` export should
         // not also materialize a grid snapshot it will not read.
         if matches!(request.format, ExportFormat::SqlInserts) {
-            let sql_selection = request.dialect.and_then(|dialect| match request.scope {
-                ExportScope::All => self.sql_export_all_rows(dialect, request.table.clone()),
-                ExportScope::Selection => self.sql_export_selection(dialect, request.table.clone()),
-            });
+            let sql_selection = request
+                .dialect
+                .and_then(|dialect| match request.scope {
+                    ExportScope::All => self.sql_export_all_rows(dialect, request.table.clone()),
+                    ExportScope::Selection => {
+                        self.sql_export_selection(dialect, request.table.clone())
+                    }
+                })
+                .map(|mut selection| {
+                    // A script that will be RE-RUN must not name a column the
+                    // server computes. The same rule, through the same method,
+                    // as the object tree's `Export Data...` — which is what this
+                    // road never applied, so the two exports of one table
+                    // disagreed and only the tree's could run.
+                    selection.restrict_to_writable_columns(&request.generated_columns);
+                    selection
+                });
             return crate::ui::result_export::render_export_content(
                 request.format,
                 &ExportGrid::default(),
