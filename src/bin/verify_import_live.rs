@@ -42,7 +42,8 @@ use space_query::db::query::mysql_executor::MysqlObjectBrowser;
 use space_query::db::query::ObjectBrowser;
 use space_query::db::{
     ConnectionInfo, DatabaseConnection, DatabaseType, OracleDriverMode, QueryCell, QueryResult,
-    SqlValueKind, TableColumnDetail, TransactionAccessMode, TransactionIsolation, TransactionMode,
+    SessionBackslashRule, SqlValueKind, TableColumnDetail, TransactionAccessMode,
+    TransactionIsolation, TransactionMode,
 };
 use space_query::ui::grid_sql_export::{
     build_sql_inserts, sql_literal_for_value, GridSqlSelection, SqlWriteDialect,
@@ -2690,6 +2691,79 @@ fn verify_no_backslash_escapes(target: Target, h: &mut Harness) -> Result<(), St
         ));
     }
     println!("PASS: a SQL Inserts file written under NO_BACKSLASH_ESCAPES reads back exactly");
+
+    // The other half, and the one the CONNECTION setting cannot answer: a user
+    // who runs their own `SET SESSION sql_mode` moves the tab's session out from
+    // under every writer. The tab observes it, and the writers follow.
+    let observed = |h: &Harness| h.editor.tab_session_backslash_rule();
+    // From a session nothing has moved: the checks above ran their own
+    // `SET SESSION sql_mode` on this tab, and a belief is about a session.
+    let _ = h.editor.discard_pooled_session_for_close();
+    // Its own table, too: the checks above dropped theirs.
+    h.run(&format!("CREATE TABLE {table} (SEQ INT, V VARCHAR(50))"))
+        .map_err(|e| format!("create {table} for the observed-session check: {e}"))?;
+    let _ = h.run("COMMIT");
+
+    // The half the CONNECTION setting cannot answer: a user's own
+    // `SET SESSION sql_mode` moves how this session reads a backslash, and the
+    // tab has to stop believing the configured mode.
+    if observed(h).is_some() {
+        return Err(format!(
+            "a tab that has changed nothing must follow its connection: {:?}",
+            observed(h)
+        ));
+    }
+    let connection_info = target.connection_info();
+    let plain = SqlWriteDialect::for_session(&connection_info, observed(h));
+    if sql_literal_for_value(plain, SqlValueKind::String, "a\\b") != Ok(r"'a\\b'".to_string()) {
+        return Err("an unmoved tab must write the connection's own escaping".to_string());
+    }
+
+    h.run("SET SESSION sql_mode = 'TRADITIONAL,NO_BACKSLASH_ESCAPES'")
+        .map_err(|e| format!("set NO_BACKSLASH_ESCAPES through the tab: {e}"))?;
+    if observed(h) != Some(SessionBackslashRule::Unknown) {
+        return Err(format!(
+            "the tab must stop believing the configured mode after its own SET: {:?}",
+            observed(h)
+        ));
+    }
+    // The session really did move — this is what makes the belief necessary.
+    let events = h.run("SELECT @@session.sql_mode AS M")?;
+    let server = grid_view(&events)
+        .and_then(|(_, _, rows)| rows.first().and_then(|row| row.last().cloned()))
+        .unwrap_or_default();
+    if space_query::db::session_backslash_rule_for_sql_mode(&server)
+        != SessionBackslashRule::Literal
+    {
+        return Err(format!("the session did not take the mode: {server:?}"));
+    }
+    // And the writers refuse exactly the values whose meaning depends on it,
+    // rather than storing one backslash too many.
+    let moved = SqlWriteDialect::for_session(&connection_info, observed(h));
+    if sql_literal_for_value(moved, SqlValueKind::String, "plain").is_err() {
+        return Err("a value with no backslash must still be written".to_string());
+    }
+    if sql_literal_for_value(moved, SqlValueKind::String, "a\\b").is_ok() {
+        return Err(
+            "a backslash must be refused while the tab's own SET left the rule unknown".to_string(),
+        );
+    }
+    println!("PASS: a tab's own SET SESSION sql_mode stops the writers guessing");
+
+    // A session the tab no longer holds carries no belief either: the next one
+    // is prepared with the connection's own mode.
+    let _ = h.editor.discard_pooled_session_for_close();
+    if observed(h).is_some() {
+        return Err(format!(
+            "a belief must not outlive the session it is about: {:?}",
+            observed(h)
+        ));
+    }
+    println!("PASS: a belief about a session does not outlive it");
+
+    let _ = h.run("SET SESSION sql_mode = 'TRADITIONAL'");
+    let _ = h.run(&target.drop_sql(&table));
+    let _ = h.run("COMMIT");
     Ok(())
 }
 

@@ -100,6 +100,14 @@ pub enum SqlAction {
     ExportData(ObjectExportDelivery),
 }
 
+/// The tab's live backslash-rule pin, as a card holds it.
+///
+/// Passed by HANDLE and read at the moment it is needed, the way
+/// [`CardWriteRefusal`] is: a menu can be built long after the click, and the
+/// tab's session may have moved in between.
+type CardTabBackslashRule =
+    Arc<Mutex<Option<crate::ui::sql_editor::TabPin<crate::db::SessionBackslashRule>>>>;
+
 /// What the catalog says about one table that generated SQL has to respect.
 ///
 /// Both facts come from ONE structure read: see
@@ -1289,6 +1297,12 @@ pub struct ObjectBrowserWidget {
     object_cache: Arc<Mutex<ObjectCache>>,
     current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
     write_refusal: CardWriteRefusal,
+    /// The tab's own answer to "how does this session read a backslash in a
+    /// string literal", held as the TAB's live handle rather than as a copied
+    /// value: `Import Data...` builds a script that will RUN on that session,
+    /// and the connection's configured `sql_mode` stops being the answer the
+    /// moment a user sets their own. A preview card has no tab, so no pin.
+    tab_session_backslash_rule: CardTabBackslashRule,
     scope_options: Arc<Mutex<Vec<String>>>,
     selected_scope: Arc<Mutex<Option<String>>>,
     suppress_scope_events: Arc<Mutex<bool>>,
@@ -1427,6 +1441,7 @@ impl ObjectBrowserWidget {
             object_cache,
             current_db_type,
             write_refusal,
+            tab_session_backslash_rule: Arc::new(Mutex::new(None)),
             scope_options,
             selected_scope,
             suppress_scope_events,
@@ -1932,6 +1947,33 @@ impl ObjectBrowserWidget {
     /// `transaction_mode_refusal_for_statement` once the statement was built.
     pub fn set_tab_mode_refuses_writes(&self, refused: bool) {
         self.write_refusal.set_tab_mode(refused);
+    }
+
+    /// Hand this card the TAB's live backslash-rule pin.
+    ///
+    /// The handle, not a value: `Import Data...` reads it when it builds the
+    /// script, which can be long after this was set, and the tab's session may
+    /// have moved in between.
+    pub(crate) fn set_tab_session_backslash_rule(
+        &self,
+        pin: crate::ui::sql_editor::TabPin<crate::db::SessionBackslashRule>,
+    ) {
+        *self
+            .tab_session_backslash_rule
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pin);
+    }
+
+    /// What a card's pin says NOW, or `None` when it has no tab (a connection
+    /// preview) or the tab's session has never been observed.
+    fn tab_backslash_rule_now(
+        handle: &CardTabBackslashRule,
+    ) -> Option<crate::db::SessionBackslashRule> {
+        handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|pin| pin.get())
     }
 
     pub fn set_tab_local_scope_selection(&mut self, enabled: bool) {
@@ -3329,6 +3371,7 @@ impl ObjectBrowserWidget {
         let connection = self.connection.clone();
         let current_db_type = self.current_db_type.clone();
         let write_refusal = self.write_refusal.clone();
+        let tab_backslash_rule = Arc::clone(&self.tab_session_backslash_rule);
         let action_sender = self.action_sender.clone();
         let selected_scope = self.selected_scope.clone();
         let catalog = self.catalog.clone();
@@ -3352,6 +3395,7 @@ impl ObjectBrowserWidget {
             connection: SharedConnection,
             current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
             write_refusal: CardWriteRefusal,
+            tab_backslash_rule: CardTabBackslashRule,
             action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
             selected_scope: Arc<Mutex<Option<String>>>,
             catalog: CardCatalogState,
@@ -3767,6 +3811,7 @@ impl ObjectBrowserWidget {
                                     &connection,
                                     &current_db_type,
                                     &write_refusal,
+                                    &tab_backslash_rule,
                                     item,
                                     &sql_callback,
                                     &status_callback,
@@ -3895,6 +3940,7 @@ impl ObjectBrowserWidget {
                     connection.clone(),
                     current_db_type.clone(),
                     write_refusal.clone(),
+                    Arc::clone(&tab_backslash_rule),
                     action_sender.clone(),
                     selected_scope.clone(),
                     catalog.clone(),
@@ -3918,6 +3964,7 @@ impl ObjectBrowserWidget {
             connection,
             current_db_type,
             write_refusal,
+            tab_backslash_rule,
             action_sender,
             selected_scope,
             catalog,
@@ -3938,6 +3985,7 @@ impl ObjectBrowserWidget {
         let object_cache = self.object_cache.clone();
         let current_db_type = self.current_db_type.clone();
         let write_refusal = self.write_refusal.clone();
+        let tab_backslash_rule = Arc::clone(&self.tab_session_backslash_rule);
         let selected_scope = self.selected_scope.clone();
         let scope_generation = self.scope_generation.clone();
         let mut pending_drag_text: Option<String> = None;
@@ -3966,6 +4014,7 @@ impl ObjectBrowserWidget {
                                 &connection,
                                 &current_db_type,
                                 &write_refusal,
+                                &tab_backslash_rule,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -3978,6 +4027,7 @@ impl ObjectBrowserWidget {
                                 &connection,
                                 &current_db_type,
                                 &write_refusal,
+                                &tab_backslash_rule,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -7020,6 +7070,7 @@ impl ObjectBrowserWidget {
             &self.connection,
             &self.current_db_type,
             &self.write_refusal,
+            &self.tab_session_backslash_rule,
             resolved.item,
             &self.sql_callback,
             &self.status_callback,
@@ -7950,6 +8001,7 @@ impl ObjectBrowserWidget {
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
         write_refusal: &CardWriteRefusal,
+        tab_backslash_rule: &CardTabBackslashRule,
         item: &TreeItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -7968,6 +8020,7 @@ impl ObjectBrowserWidget {
                 connection,
                 current_db_type,
                 write_refusal,
+                tab_backslash_rule,
                 item_info,
                 sql_callback,
                 status_callback,
@@ -8214,6 +8267,7 @@ impl ObjectBrowserWidget {
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
         write_refusal: &CardWriteRefusal,
+        tab_backslash_rule: &CardTabBackslashRule,
         item_info: ObjectItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -8225,6 +8279,7 @@ impl ObjectBrowserWidget {
             connection,
             current_db_type,
             write_refusal,
+            tab_backslash_rule,
             item_info,
             sql_callback,
             status_callback,
@@ -8240,6 +8295,7 @@ impl ObjectBrowserWidget {
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
         write_refusal: &CardWriteRefusal,
+        tab_backslash_rule: &CardTabBackslashRule,
         item_info: ObjectItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -8483,6 +8539,10 @@ impl ObjectBrowserWidget {
                         let selected_scope = selected_scope.clone();
                         let qualified_for_thread = qualified_name.clone();
                         let file_label_for_thread = file_label.clone();
+                        // Read HERE, on the UI thread, from the tab's own pin:
+                        // the worker cannot reach the tab, and this is the
+                        // moment the user asked.
+                        let tab_backslash_rule = Self::tab_backslash_rule_now(tab_backslash_rule);
                         thread::spawn(move || {
                             let activity = format!("Loading table structure for {}", table_name);
                             let result = Self::run_object_action_work("Prepare import", || {
@@ -8492,13 +8552,20 @@ impl ObjectBrowserWidget {
                                         selected_scope.as_deref(),
                                         activity,
                                         |context, session| {
-                                            // Asked of the SESSION the columns
-                                            // were read on, so the literals the
-                                            // script writes match the sql_mode
-                                            // it will run under.
+                                            // Asked of the TAB, because that is
+                                            // the session this script will RUN
+                                            // on — and a `SET SESSION sql_mode`
+                                            // typed there moves how it reads a
+                                            // backslash, which the connection's
+                                            // configured mode cannot say. With
+                                            // nothing observed the connection's
+                                            // own mode is the answer, which it
+                                            // is for every session this app sets
+                                            // up until a user changes one.
                                             let dialect =
-                                                crate::ui::grid_sql_export::SqlWriteDialect::for_connection(
+                                                crate::ui::grid_sql_export::SqlWriteDialect::for_session(
                                                     &context.connection_info,
+                                                    tab_backslash_rule,
                                                 );
                                             object_browser_behavior_for(
                                                 context.connection_info.db_type,
@@ -12696,6 +12763,30 @@ impl MultiObjectBrowserWidget {
             return false;
         };
         browser.set_tab_mode_refuses_writes(refused);
+        true
+    }
+
+    /// Give the tab's card the tab's own backslash-rule pin.
+    ///
+    /// Idempotent and cheap, so it rides along with the sync that already
+    /// states the tab's other facts to the card. What it hands over is the live
+    /// handle: set once, right ever after.
+    pub(crate) fn set_tab_session_backslash_rule(
+        &mut self,
+        tab_id: QueryTabId,
+        pin: crate::ui::sql_editor::TabPin<crate::db::SessionBackslashRule>,
+    ) -> bool {
+        let browser = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|entry| entry.owner == BrowserOwner::Tab(tab_id))
+            .map(|entry| entry.browser.clone());
+        let Some(browser) = browser else {
+            return false;
+        };
+        browser.set_tab_session_backslash_rule(pin);
         true
     }
 

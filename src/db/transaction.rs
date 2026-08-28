@@ -3669,6 +3669,145 @@ impl SessionTransactionModeChange {
     }
 }
 
+/// How a session reads a backslash inside a string literal.
+///
+/// A MySQL-family session answers it from `sql_mode`, and the answer decides
+/// what every literal this app WRITES means: `'a\\b'` stores two characters
+/// under the default and three under `NO_BACKSLASH_ESCAPES`. Oracle has no such
+/// escape, so it is always [`Self::Literal`] there.
+///
+/// The third state is the honest one. This app sends `SET SESSION sql_mode` at
+/// connect and used to treat that as the answer forever after — but a user can
+/// move their tab's session with a `SET` of their own, and a value the reader
+/// cannot resolve (`CONCAT(@@sql_mode, …)`, `DEFAULT`, `@var`) leaves the rule
+/// genuinely unknown. Guessing there is how a backslash in a value gets stored
+/// with one too many or one too few; saying `Unknown` is what lets the writer
+/// refuse the one kind of value whose meaning depends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionBackslashRule {
+    /// `\` escapes the next character, which is every MySQL-family server's
+    /// default.
+    Escapes,
+    /// `\` is an ordinary character: `NO_BACKSLASH_ESCAPES`, and Oracle.
+    Literal,
+    /// The session's `sql_mode` moved somewhere this app could not read.
+    Unknown,
+}
+
+impl SessionBackslashRule {
+    /// Whether a literal written under this rule needs its backslashes doubled.
+    ///
+    /// `None` when the rule is not known, which is not the same as "no": a
+    /// caller that must write the literal anyway has to say so itself.
+    pub fn doubles_a_backslash(self) -> Option<bool> {
+        match self {
+            SessionBackslashRule::Escapes => Some(true),
+            SessionBackslashRule::Literal => Some(false),
+            SessionBackslashRule::Unknown => None,
+        }
+    }
+}
+
+/// The rule a MySQL-family `sql_mode` text spells out.
+///
+/// The ONE reader of that text. Only the explicit `NO_BACKSLASH_ESCAPES` token
+/// turns escaping off: none of the compound modes this app offers
+/// (`TRADITIONAL`, `ANSI`, `ANSI_QUOTES`, MariaDB's `ORACLE`) includes it, and
+/// a longer name that merely starts the same way is a different mode.
+pub fn session_backslash_rule_for_sql_mode(sql_mode: &str) -> SessionBackslashRule {
+    if sql_mode
+        .split(',')
+        .any(|mode| mode.trim().eq_ignore_ascii_case("NO_BACKSLASH_ESCAPES"))
+    {
+        SessionBackslashRule::Literal
+    } else {
+        SessionBackslashRule::Escapes
+    }
+}
+
+/// Whether a successful user statement moved how THIS session reads a backslash
+/// inside a string literal, so the tab can stop believing what the CONNECTION
+/// was configured with.
+///
+/// The sibling of [`session_transaction_mode_change_for_statement`], and it
+/// lives beside it because it asks the same question of the same statement: what
+/// did this do to the SESSION that outlives it.
+///
+/// It answers WHETHER, not WHAT, and deliberately: a belief is about a session,
+/// and this app has no identity for the one a tab holds. Measured on MySQL 8 —
+/// an ordinary run of statements leaves the user's own mode in force, while a
+/// session that is REPLACED comes back on the connection's configured one. A
+/// remembered mode is therefore right until the session is replaced and wrong
+/// afterwards, and both directions of a wrong belief corrupt a backslash: one
+/// too few and the server eats it, one too many and it stores two. So the tab
+/// records [`SessionBackslashRule::Unknown`], and the writer refuses the values
+/// whose meaning depends on it rather than guessing at one.
+///
+/// Only Oracle is exempt: it has no backslash escape to turn off, so nothing a
+/// statement does there can move the rule.
+///
+/// A `GLOBAL`/`PERSIST` assignment reaches past this session and is not it, and
+/// a user variable is not a system one; what is left is a session `sql_mode`
+/// assignment, whatever it sets it to.
+pub fn statement_moves_session_backslash_rule(db_type: DatabaseType, sql: &str) -> bool {
+    if !db_type.is_mysql_or_mariadb() {
+        return false;
+    }
+    fold_over_unit_statements(
+        db_type,
+        sql,
+        |statement| mysql_statement_moves_session_backslash_rule(db_type, statement),
+        |earlier, later| earlier || later,
+    )
+    .answer
+}
+
+fn mysql_statement_moves_session_backslash_rule(db_type: DatabaseType, sql: &str) -> bool {
+    let effective_sql = mysql_effective_statement_sql_for_db_type(db_type, sql);
+    let sql = effective_sql.as_ref();
+    let analysis = SqlStatementAnalysis::new_for_db_type(db_type, sql);
+    if analysis.leading_keyword() != Some("SET")
+        || mysql_set_account_ddl_statement(&analysis)
+        || mysql_set_body_starts_with_user_variable(sql)
+    {
+        return false;
+    }
+    let cleaned = mysql_statement_without_comments(sql);
+    let Some(assignments) = mysql_set_assignments_body(&cleaned) else {
+        return false;
+    };
+    let mut moved = false;
+    for assignment in mysql_split_unquoted_assignments(assignments) {
+        let Some((target, _value)) = mysql_set_assignment_target_and_value(assignment) else {
+            continue;
+        };
+        let target = mysql_normalized_set_assignment_target(target);
+        // A user variable is not a system one, and a scope that reaches past
+        // this session says nothing about how THIS session reads a literal.
+        if target.starts_with('@') && !target.starts_with("@@") {
+            continue;
+        }
+        if mysql_set_assignment_target_is_global_or_persist_scope(&target) {
+            continue;
+        }
+        // Every remaining spelling is session scope. Unlike a transaction
+        // characteristic, `sql_mode` has no one-shot form, so a bare `@@` is
+        // this session too.
+        let target = target
+            .strip_prefix("SESSION ")
+            .or_else(|| target.strip_prefix("LOCAL "))
+            .or_else(|| target.strip_prefix("@@SESSION."))
+            .or_else(|| target.strip_prefix("@@LOCAL."))
+            .or_else(|| target.strip_prefix("@@"))
+            .unwrap_or(&target);
+        if target != "SQL_MODE" {
+            continue;
+        }
+        moved = true;
+    }
+    moved
+}
+
 /// Session-persistent transaction-mode change made by a successful user
 /// statement, so the query tab's transaction-mode setting (and the toolbar
 /// controls) can mirror it. One-shot changes that end with the current or
@@ -12825,6 +12964,76 @@ mod tests {
         assert!(after_late_cancel.may_have_untracked_session_state());
         assert!(after_late_cancel.may_hold_named_lock());
         assert!(!after_late_cancel.may_hold_table_lock());
+    }
+
+    /// A statement that moves this session's `sql_mode` moves how every literal
+    /// this app writes for the tab is read.
+    ///
+    /// The app sends `SET SESSION sql_mode` at connect and used to treat that as
+    /// the answer forever after — so a user who set their own moved the session
+    /// out from under every writer, and a backslash in a value was then stored
+    /// with one character too many or too few. Session scope only, and WHETHER
+    /// rather than what: see the reader's own doc for why the mode it names is
+    /// deliberately not remembered.
+    #[test]
+    fn a_session_sql_mode_assignment_moves_the_backslash_rule() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let moves = |sql: &str| statement_moves_session_backslash_rule(db_type, sql);
+
+            // Every session spelling, including the bare `@@` one — `sql_mode`
+            // has no one-shot form, unlike a transaction characteristic — and
+            // whatever it sets it to, resolvable or not.
+            for sql in [
+                "SET sql_mode = 'NO_BACKSLASH_ESCAPES'",
+                "SET SESSION sql_mode = 'TRADITIONAL,NO_BACKSLASH_ESCAPES'",
+                "SET LOCAL sql_mode = 'ANSI'",
+                "SET @@sql_mode = ''",
+                "SET @@session.sql_mode = 'TRADITIONAL'",
+                "SET @@local.sql_mode = 'TRADITIONAL'",
+                "SET sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')",
+                "SET SESSION sql_mode = DEFAULT",
+                "SET sql_mode = @wanted",
+            ] {
+                assert!(moves(sql), "{db_type} {sql}");
+            }
+
+            // Not this session, or not this setting.
+            for sql in [
+                "SET GLOBAL sql_mode = 'NO_BACKSLASH_ESCAPES'",
+                "SET @@global.sql_mode = 'NO_BACKSLASH_ESCAPES'",
+                "SET PERSIST sql_mode = 'NO_BACKSLASH_ESCAPES'",
+                "SET @sql_mode = 'NO_BACKSLASH_ESCAPES'",
+                "SET SESSION transaction_isolation = 'SERIALIZABLE'",
+                "SELECT @@sql_mode",
+                "SET autocommit = 1",
+                // A setting named inside a VALUE is a value.
+                "INSERT INTO t (v) VALUES ('SET sql_mode = x')",
+            ] {
+                assert!(!moves(sql), "{db_type} {sql}");
+            }
+
+            // A unit can hold several statements, and one of them is enough.
+            assert!(moves("SELECT 1; SET sql_mode = 'ANSI'"));
+            assert!(!moves("SELECT 1; SELECT 2"));
+        }
+
+        // Oracle has no backslash escape to turn off.
+        assert!(!statement_moves_session_backslash_rule(
+            DatabaseType::Oracle,
+            "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY'"
+        ));
+
+        // And the reader of a `sql_mode` TEXT, which the connection's own
+        // configured mode still goes through: only the explicit token turns
+        // escaping off.
+        assert_eq!(
+            session_backslash_rule_for_sql_mode("TRADITIONAL"),
+            SessionBackslashRule::Escapes
+        );
+        assert_eq!(
+            session_backslash_rule_for_sql_mode("ansi,no_backslash_escapes"),
+            SessionBackslashRule::Literal
+        );
     }
 
     #[test]

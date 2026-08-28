@@ -2562,6 +2562,22 @@ impl AppState {
         self.editor_tabs.iter().position(|tab| tab.tab_id == tab_id)
     }
 
+    /// How the ACTIVE tab's session was last seen reading a backslash inside a
+    /// string literal.
+    ///
+    /// What every writer of MySQL-family literal text has to ask before it
+    /// writes one. The connection's configured `sql_mode` is only the answer
+    /// until a user runs a `SET` of their own in the tab, and the literal that
+    /// comes out — a `Copy as SQL …`, an export, an import script — either
+    /// doubles a backslash or does not.
+    fn active_tab_session_backslash_rule(&self) -> Option<crate::db::SessionBackslashRule> {
+        self.editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == self.active_editor_tab_id)?
+            .sql_editor
+            .tab_session_backslash_rule()
+    }
+
     fn result_tabs_for_tab(&self, tab_id: QueryTabId) -> Option<ResultTabsWidget> {
         self.editor_tabs
             .iter()
@@ -5343,6 +5359,13 @@ impl AppState {
             active_tab_id,
             is_connected && mode.access_mode == TransactionAccessMode::ReadOnly,
         );
+        // And the tab's backslash-rule pin, which `Import Data...` reads to
+        // write literals for the session its script will RUN on. The HANDLE is
+        // handed over, so this only has to happen once per card — it rides here
+        // because this is where the tab's other facts already reach it, and
+        // setting it again costs nothing.
+        self.object_browser
+            .set_tab_session_backslash_rule(active_tab_id, self.sql_editor.backslash_rule_pin());
 
         if is_connected && !self.transaction_mode_change_blocked_for_active_tab(db_type) {
             self.transaction_isolation_choice.activate();
@@ -8025,8 +8048,9 @@ impl MainWindow {
                 (
                     guard.active_connection_runtime().map(
                         |runtime| -> crate::ui::grid_sql_export::SqlWriteDialect {
-                            crate::ui::grid_sql_export::SqlWriteDialect::for_connection(
+                            crate::ui::grid_sql_export::SqlWriteDialect::for_session(
                                 &runtime.sanitized_info(),
+                                guard.active_tab_session_backslash_rule(),
                             )
                         },
                     ),
@@ -8392,8 +8416,10 @@ impl MainWindow {
         let Some(runtime) = s.active_connection_runtime() else {
             return;
         };
-        let dialect =
-            crate::ui::grid_sql_export::SqlWriteDialect::for_connection(&runtime.sanitized_info());
+        let dialect = crate::ui::grid_sql_export::SqlWriteDialect::for_session(
+            &runtime.sanitized_info(),
+            s.active_tab_session_backslash_rule(),
+        );
         let Some(selection) = s.result_tabs.sql_export_context(dialect) else {
             return;
         };

@@ -2931,9 +2931,14 @@ fn mysql_plain_use_statement_updates_scope_and_refreshes_metadata() {
         "the reader must ask every statement of the unit, and the LAST `USE` wins: {reader}"
     );
 
+    // Bounded by the FUNCTION, not by a byte count: a guard must fail when the
+    // shape changes, never when the code it guards grows a comment or a line —
+    // which is what a fixed window did the moment the step recorded one more
+    // thing about the session. `slice_to_end_of_fn` is what the rest of this
+    // file already uses for exactly that reason.
     let record = content
-        .find("fn record_successful_mysql_batch_statement(")
-        .map(|offset| slice_from(&content, offset, 3600))
+        .find("    fn record_successful_mysql_batch_statement(")
+        .map(|offset| slice_to_end_of_fn(&content, offset))
         .expect("one step must record what a successful statement changed");
     assert!(
         record.contains("Self::mysql_unit_moves_session_database(")

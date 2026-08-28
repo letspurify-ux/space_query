@@ -4431,6 +4431,17 @@ pub struct SqlEditorWidget {
     /// controls and successful session-scoped statements (`SET SESSION
     /// TRANSACTION ...`, `ALTER SESSION SET ISOLATION_LEVEL ...`) pin it.
     tab_transaction_mode_override: TabPin<TransactionMode>,
+    /// How this tab's SESSION last said it reads a backslash inside a string
+    /// literal. `None` means nothing has been observed, so the connection's
+    /// configured `sql_mode` is the answer — which it is for every session this
+    /// app sets up, until a user moves one with a `SET` of their own.
+    ///
+    /// Observed rather than chosen: no control sets it, and a successful
+    /// session `sql_mode` assignment is what moves it
+    /// ([`crate::db::session_backslash_rule_change_for_statement`]). Every
+    /// literal this app writes for the tab depends on it, so a stale answer
+    /// stores a backslash with one character too many or too few.
+    tab_session_backslash_rule: TabPin<crate::db::SessionBackslashRule>,
     /// The effective auto-commit value this tab's UI last displayed (status
     /// bar), or `None` while nothing has been shown. Execution startup
     /// cross-checks its own resolution against this and refuses to run on a
@@ -4990,6 +5001,42 @@ impl SqlEditorWidget {
     /// way it drives the transaction-mode controls.
     pub fn tab_auto_commit_override_value(&self) -> Option<bool> {
         self.tab_auto_commit_override.get()
+    }
+
+    /// How this tab's session was last seen reading a backslash in a literal.
+    ///
+    /// What every writer of MySQL-family literal text for this tab has to ask —
+    /// `Copy as SQL …`, `Export ▸ SQL Inserts`, and the script `Import Data...`
+    /// builds — because the connection's configured `sql_mode` stops being the
+    /// answer the moment the user sets their own.
+    pub fn tab_session_backslash_rule(&self) -> Option<crate::db::SessionBackslashRule> {
+        // A belief about a SESSION is only about the session the tab still
+        // HOLDS. Once that lease is gone the next statement runs on one the app
+        // prepares itself, with the connection's configured `sql_mode` — so the
+        // belief is not merely stale, it is about something that no longer
+        // exists, and keeping it would hand a NEW session the old one's rule.
+        // Measured: discarding the tab's session really does bring the
+        // configured mode back, while an ordinary run of statements leaves the
+        // user's own mode in force — which is exactly the lease being retained.
+        //
+        // Forgetting it HERE rather than at every place a session can end is
+        // what makes the rule hold for all of them: a lease can go on a close,
+        // a disconnect, a cancel or a stale connection generation, and this is
+        // the one door every reader comes through.
+        if self.pooled_db_session.snapshot().is_none() {
+            self.tab_session_backslash_rule.clear_from_ui();
+            return None;
+        }
+        self.tab_session_backslash_rule.get()
+    }
+
+    /// The pin itself, for a holder that has to read it LATER.
+    ///
+    /// The object-browser card takes this: `Import Data...` builds its script
+    /// long after the card was wired, and a value copied at wiring time would be
+    /// the session as it was then.
+    pub(crate) fn backslash_rule_pin(&self) -> TabPin<crate::db::SessionBackslashRule> {
+        self.tab_session_backslash_rule.clone()
     }
 
     /// The menu-toggle write path: pins this tab's auto-commit, exactly like a
@@ -5805,6 +5852,7 @@ impl SqlEditorWidget {
         let current_cancel_operation = Arc::new(Mutex::new(None));
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
         let tab_auto_commit_override = TabPin::new("auto-commit");
+        let tab_session_backslash_rule = TabPin::new("sql_mode backslash rule");
         let tab_transaction_mode_override = TabPin::new("transaction mode");
         let ui_displayed_auto_commit = Arc::new(Mutex::new(None));
         let ui_displayed_transaction_mode = Arc::new(Mutex::new(None));
@@ -5887,6 +5935,7 @@ impl SqlEditorWidget {
             current_cancel_operation,
             current_mysql_cancel_context,
             tab_auto_commit_override,
+            tab_session_backslash_rule,
             tab_transaction_mode_override,
             ui_displayed_auto_commit,
             ui_displayed_transaction_mode,
@@ -5935,6 +5984,13 @@ impl SqlEditorWidget {
     }
 
     pub fn release_pooled_db_session(&self) -> bool {
+        // What the tab believed about that session goes with it. A belief is
+        // about a SESSION — the next one is prepared with the connection's own
+        // configured `sql_mode`, so keeping the old one's would hand it a rule
+        // it does not follow. This is the door every release comes through
+        // (`discard_pooled_session_for_close` included), which is why the
+        // forgetting lives here rather than at each caller.
+        self.tab_session_backslash_rule.clear_from_ui();
         self.pooled_db_session.clear()
     }
 

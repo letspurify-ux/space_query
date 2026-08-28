@@ -9,7 +9,9 @@
 //! a `VARCHAR2` holding `2024-01-01` from being wrapped in `TO_DATE`, and a
 //! zero-padded code like `00123` from collapsing into a number.
 
-use crate::db::{quote_mysql_identifier, ConnectionInfo, DatabaseType, SqlValueKind};
+use crate::db::{
+    quote_mysql_identifier, ConnectionInfo, DatabaseType, SessionBackslashRule, SqlValueKind,
+};
 use crate::ui::result_export::{ExportCell, ExportContent};
 use crate::ui::result_table::ResultTableWidget;
 
@@ -34,9 +36,10 @@ const UNKNOWN_TABLE_NAME: &str = "MY_TABLE";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SqlWriteDialect {
     db_type: DatabaseType,
-    /// Whether a `\` inside a string literal escapes the next character.
-    /// Always false outside the MySQL family: Oracle has no such escape.
-    backslash_escapes: bool,
+    /// How a `\` inside a string literal is read. Always
+    /// [`SessionBackslashRule::Literal`] outside the MySQL family: Oracle has no
+    /// such escape.
+    backslash: SessionBackslashRule,
 }
 
 impl SqlWriteDialect {
@@ -66,11 +69,42 @@ impl SqlWriteDialect {
     /// Closing that needs the session's own `sql_mode` to be tracked the way its
     /// transaction state already is; it is not something a writer can decide.
     pub fn for_connection(info: &ConnectionInfo) -> Self {
+        Self::for_session(info, None)
+    }
+
+    /// The rules the session this text will run on ACTUALLY follows.
+    ///
+    /// `observed` is what that session was last seen running under — a tab's
+    /// own `SET SESSION sql_mode` moves it, and nothing about the connection
+    /// says so. `None` means nothing has been observed, so the connection's
+    /// configured mode is the best answer there is; it is also the right answer
+    /// for a session this app has only just set up, which is every session
+    /// until a user changes it.
+    ///
+    /// Reach for this wherever the tab is known. [`Self::for_connection`] is the
+    /// same thing with nothing observed, and it is the RIGHT answer for text
+    /// that carries its own rule rather than running on the tab: the object
+    /// tree's `SQL Inserts` export declares what it was written with
+    /// ([`sql_inserts_dialect_preamble`]), so it is self-consistent whatever a
+    /// tab's session is doing.
+    ///
+    /// An observed [`SessionBackslashRule::Unknown`] costs the values that hold
+    /// a backslash — including in a file, which could have declared a rule if
+    /// one were known. That is the price of not guessing, and it is paid only
+    /// by a tab whose session was moved by a `sql_mode` of its own.
+    pub fn for_session(info: &ConnectionInfo, observed: Option<SessionBackslashRule>) -> Self {
         let db_type = info.db_type;
+        if !db_type.is_mysql_or_mariadb() {
+            return Self {
+                db_type,
+                backslash: SessionBackslashRule::Literal,
+            };
+        }
         Self {
             db_type,
-            backslash_escapes: db_type.is_mysql_or_mariadb()
-                && !sql_mode_disables_backslash_escapes(&info.advanced.mysql_sql_mode),
+            backslash: observed.unwrap_or_else(|| {
+                crate::db::session_backslash_rule_for_sql_mode(&info.advanced.mysql_sql_mode)
+            }),
         }
     }
 
@@ -83,7 +117,11 @@ impl SqlWriteDialect {
     pub fn family_default(db_type: DatabaseType) -> Self {
         Self {
             db_type,
-            backslash_escapes: db_type.is_mysql_or_mariadb(),
+            backslash: if db_type.is_mysql_or_mariadb() {
+                SessionBackslashRule::Escapes
+            } else {
+                SessionBackslashRule::Literal
+            },
         }
     }
 
@@ -95,20 +133,11 @@ impl SqlWriteDialect {
         self.db_type.is_mysql_or_mariadb()
     }
 
-    fn backslash_escapes(self) -> bool {
-        self.backslash_escapes
+    /// Whether a literal written for this session doubles its backslashes, or
+    /// `None` when the session's rule is not known.
+    fn doubles_a_backslash(self) -> Option<bool> {
+        self.backslash.doubles_a_backslash()
     }
-}
-
-/// Whether a `sql_mode` list turns backslash escaping off.
-///
-/// Only the explicit `NO_BACKSLASH_ESCAPES` token does: none of the compound
-/// modes this app offers (`TRADITIONAL`, `ANSI`, `ANSI_QUOTES`, MariaDB's
-/// `ORACLE`) includes it.
-fn sql_mode_disables_backslash_escapes(sql_mode: &str) -> bool {
-    sql_mode
-        .split(',')
-        .any(|mode| mode.trim().eq_ignore_ascii_case("NO_BACKSLASH_ESCAPES"))
 }
 
 /// A snapshot of what the user selected in the grid.
@@ -494,7 +523,7 @@ const SQL_MODE_DECLARATION: &str = "sql_mode:";
 /// under them, which is a bigger surprise than the one it removes; a dump that
 /// wants both writes the statement and restores it, and this is not a dump.
 fn sql_inserts_dialect_preamble(dialect: SqlWriteDialect) -> &'static str {
-    if dialect.is_mysql_or_mariadb() && !dialect.backslash_escapes() {
+    if dialect.is_mysql_or_mariadb() && dialect.doubles_a_backslash() == Some(false) {
         concat!(
             "-- sql_mode: NO_BACKSLASH_ESCAPES",
             " (a backslash in a literal below is one character, not an escape)\n"
@@ -793,7 +822,7 @@ pub fn sql_literal_for_cell(
     dialect: SqlWriteDialect,
     kind: SqlValueKind,
     cell: &ExportCell,
-) -> Result<String, ValueTooLongForLiteral> {
+) -> Result<String, ValueCannotBeWritten> {
     match cell {
         None => Ok("NULL".to_string()),
         Some(value) => sql_literal_for_value(dialect, kind, value),
@@ -807,15 +836,15 @@ pub fn sql_literal_for_cell(
 /// applied — including the Oracle substitution defusing, so text that is safe
 /// to STORE is also safe to RUN.
 ///
-/// `Err` means no statement can carry this value: see
-/// [`ValueTooLongForLiteral`]. It is a `Result` rather than a lenient `String`
-/// because the alternative is writing SQL that is known to fail, which is the
-/// one thing a writer must not do quietly.
+/// `Err` means no statement can carry this value, for one of the two reasons
+/// [`ValueCannotBeWritten`] names. It is a `Result` rather than a lenient
+/// `String` because the alternative is writing SQL that is known to fail — or
+/// known to be ambiguous — which is the one thing a writer must not do quietly.
 pub fn sql_literal_for_value(
     dialect: SqlWriteDialect,
     kind: SqlValueKind,
     value: &str,
-) -> Result<String, ValueTooLongForLiteral> {
+) -> Result<String, ValueCannotBeWritten> {
     let mysql_family = dialect.is_mysql_or_mariadb();
     let literal = match kind {
         SqlValueKind::Number | SqlValueKind::Boolean => {
@@ -857,7 +886,11 @@ pub fn sql_literal_for_value(
 pub fn mysql_family_literal(kind: SqlValueKind, value: &str) -> String {
     let dialect = SqlWriteDialect::family_default(DatabaseType::MySQL);
     sql_literal_for_value(dialect, kind, value).unwrap_or_else(|_| {
-        debug_assert!(false, "the MySQL family has no per-literal limit");
+        debug_assert!(
+            false,
+            "the MySQL family has no per-literal limit, and the family default names a KNOWN \
+             escaping rule"
+        );
         // Unreachable, and if it ever were not, this is what the writer did
         // before the limit existed: quote it and let the server answer.
         format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
@@ -918,22 +951,35 @@ pub fn defuse_substitution(dialect: SqlWriteDialect, literal: &str) -> String {
 /// would refuse a full `RAW(2000)` that the server accepts.
 const ORACLE_MAX_LITERAL_BYTES: usize = 4000;
 
-/// A value that no single SQL literal can carry.
+/// Why a value cannot be written as a literal at all.
 ///
-/// The Oracle-only end of "this app never writes SQL it knows will fail". Text
-/// has a way out — [`oracle_text_literal`] writes it as a `TO_CLOB(…)||…`
-/// chain — and nothing else does: a `BLOB` reaches the grid as hex, and neither
-/// `HEXTORAW` nor any concatenation can build a `RAW` past its own limit. So
-/// the writer says so, by name and before anything runs, instead of handing the
-/// server a statement that answers `ORA-01704` halfway through an import.
+/// Both arms are "this app never writes SQL it knows may be wrong", and both are
+/// reported the same way: by name, with the row and the column, before anything
+/// runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ValueTooLongForLiteral {
-    /// Bytes the literal's content would need, escaping included.
-    pub literal_bytes: usize,
+pub enum ValueCannotBeWritten {
+    /// No single SQL literal can carry it.
+    ///
+    /// The Oracle-only arm. Text has a way out — [`oracle_text_literal`] writes
+    /// it as a `TO_CLOB(…)||…` chain — and nothing else does: a `BLOB` reaches
+    /// the grid as hex, and neither `HEXTORAW` nor any concatenation can build a
+    /// `RAW` past its own limit. Saying so beats handing the server a statement
+    /// that answers `ORA-01704` halfway through an import.
+    TooLongForOneLiteral {
+        /// Bytes the literal's content would need, escaping included.
+        literal_bytes: usize,
+    },
+    /// The value holds a backslash and the session's rule for one is unknown.
+    ///
+    /// The MySQL-family arm. A backslash is the one character whose meaning
+    /// inside a literal depends on `sql_mode` ([`SessionBackslashRule`]), so a
+    /// value without one is spelled identically under either rule and is never
+    /// refused for this.
+    UnknownBackslashRule,
 }
 
-impl ValueTooLongForLiteral {
-    pub fn limit() -> usize {
+impl ValueCannotBeWritten {
+    pub fn literal_limit() -> usize {
         ORACLE_MAX_LITERAL_BYTES
     }
 }
@@ -951,15 +997,22 @@ impl ValueTooLongForLiteral {
 pub fn value_too_long_message(
     column: &str,
     row_number: usize,
-    refusal: ValueTooLongForLiteral,
+    refusal: ValueCannotBeWritten,
 ) -> String {
-    format!(
-        "Row {row_number}, column {column}: this value needs {} bytes as a SQL literal and Oracle \
-         accepts at most {} in one. Only text can be written as a concatenation, and this value \
-         is not text, so no statement can carry it.",
-        refusal.literal_bytes,
-        ValueTooLongForLiteral::limit()
-    )
+    match refusal {
+        ValueCannotBeWritten::TooLongForOneLiteral { literal_bytes } => format!(
+            "Row {row_number}, column {column}: this value needs {literal_bytes} bytes as a SQL \
+             literal and Oracle accepts at most {} in one. Only text can be written as a \
+             concatenation, and this value is not text, so no statement can carry it.",
+            ValueCannotBeWritten::literal_limit()
+        ),
+        ValueCannotBeWritten::UnknownBackslashRule => format!(
+            "Row {row_number}, column {column}: this value contains a backslash, and this tab's \
+             session was moved by a sql_mode of its own — so this app can no longer tell whether \
+             the server will store one backslash or two, and it will not guess. Reconnect the \
+             tab, or close and reopen it, to get a session it can answer for."
+        ),
+    }
 }
 
 /// A text value as Oracle SQL, in as many literals as it takes.
@@ -985,7 +1038,7 @@ pub fn value_too_long_message(
 fn oracle_text_literal(
     value: &str,
     dialect: SqlWriteDialect,
-) -> Result<String, ValueTooLongForLiteral> {
+) -> Result<String, ValueCannotBeWritten> {
     // `TO_CLOB` is Oracle's, so the family that has no per-literal limit leaves
     // before the chunking exists — by returning, not by an assertion that a
     // release build would walk straight past into invalid SQL.
@@ -1057,7 +1110,7 @@ fn oracle_text_literal(
 fn oracle_binary_literal(
     value: &str,
     dialect: SqlWriteDialect,
-) -> Result<String, ValueTooLongForLiteral> {
+) -> Result<String, ValueCannotBeWritten> {
     let text = value.trim();
     if is_plain_hex_literal(text) {
         // A full `RAW(2000)` is exactly 4000 digits and inserts; a `LONG RAW`
@@ -1074,9 +1127,9 @@ fn oracle_binary_literal(
 /// `TO_TIMESTAMP` wrap a literal, they do not replace one. Stated once so the
 /// two calls that splice proven text cannot come to disagree with
 /// [`quoted_string`], which is where every other literal is measured.
-fn spliced_literal_content(text: &str) -> Result<&str, ValueTooLongForLiteral> {
+fn spliced_literal_content(text: &str) -> Result<&str, ValueCannotBeWritten> {
     if text.len() > ORACLE_MAX_LITERAL_BYTES {
-        return Err(ValueTooLongForLiteral {
+        return Err(ValueCannotBeWritten::TooLongForOneLiteral {
             literal_bytes: text.len(),
         });
     }
@@ -1116,7 +1169,7 @@ fn numeric_literal_or_quoted(
     value: &str,
     kind: SqlValueKind,
     dialect: SqlWriteDialect,
-) -> Result<String, ValueTooLongForLiteral> {
+) -> Result<String, ValueCannotBeWritten> {
     let trimmed = value.trim();
     let provable = is_plain_numeric_literal(trimmed)
         // `TRUE`/`FALSE` are how a boolean is written where one exists, and
@@ -1188,18 +1241,28 @@ pub(crate) fn is_plain_numeric_literal(text: &str) -> bool {
 ///
 /// The MySQL family has no per-literal limit; what bites there is the packet,
 /// which [`crate::ui::table_import::MAX_BATCH_BYTES`] bounds.
-fn quoted_string(value: &str, dialect: SqlWriteDialect) -> Result<String, ValueTooLongForLiteral> {
+fn quoted_string(value: &str, dialect: SqlWriteDialect) -> Result<String, ValueCannotBeWritten> {
     // A doubled quote is how EVERY dialect here spells one inside a literal.
-    // The backslash is the only disagreement, and the dialect — not the family
-    // — answers it, because a MySQL-family connection running with
-    // `NO_BACKSLASH_ESCAPES` stores a doubled backslash as two characters.
-    let escaped = if dialect.backslash_escapes() {
-        value.replace('\\', "\\\\").replace('\'', "''")
-    } else {
-        value.replace('\'', "''")
+    // The backslash is the only disagreement, and the SESSION answers it — not
+    // the family, and not the connection's configured mode: a MySQL-family
+    // session running with `NO_BACKSLASH_ESCAPES` stores a doubled backslash as
+    // two characters, and a tab can be moved into or out of that mode by a `SET`
+    // of its own.
+    let escaped = match dialect.doubles_a_backslash() {
+        Some(true) => value.replace('\\', "\\\\").replace('\'', "''"),
+        Some(false) => value.replace('\'', "''"),
+        // The rule is unknown, so a value holding a backslash has two possible
+        // meanings and this writer may not pick one. Every other value is
+        // spelled identically under both rules and is written as it always was.
+        None => {
+            if value.contains('\\') {
+                return Err(ValueCannotBeWritten::UnknownBackslashRule);
+            }
+            value.replace('\'', "''")
+        }
     };
     if !dialect.is_mysql_or_mariadb() && escaped.len() > ORACLE_MAX_LITERAL_BYTES {
-        return Err(ValueTooLongForLiteral {
+        return Err(ValueCannotBeWritten::TooLongForOneLiteral {
             literal_bytes: escaped.len(),
         });
     }
@@ -1214,7 +1277,7 @@ fn quoted_string(value: &str, dialect: SqlWriteDialect) -> Result<String, ValueT
 fn oracle_temporal_literal(
     value: &str,
     dialect: SqlWriteDialect,
-) -> Result<String, ValueTooLongForLiteral> {
+) -> Result<String, ValueCannotBeWritten> {
     let text = value.trim();
     let (datetime, zone) = split_timezone_suffix(text);
     let (date_part, time_part) = match datetime.split_once(' ') {
@@ -2048,16 +2111,26 @@ mod tests {
         // Oracle has no such escape whatever the mode says.
         let oracle =
             ConnectionInfo::new_with_type("o", "u", "p", "h", 1521, "s", DatabaseType::Oracle);
-        assert!(!SqlWriteDialect::for_connection(&oracle).backslash_escapes());
+        assert_eq!(
+            SqlWriteDialect::for_connection(&oracle).doubles_a_backslash(),
+            Some(false)
+        );
     }
 
     /// Only the explicit token turns it off; none of the compound modes this
     /// app offers includes it.
+    ///
+    /// The rule moved into `db::session_backslash_rule_for_sql_mode`, which is
+    /// now the ONE reader of a `sql_mode` text: the connection's configured mode
+    /// and a `SET` a user types in a tab are the same question asked of two
+    /// sources, and two readers would answer them differently.
     #[test]
     fn only_the_named_mode_turns_backslash_escaping_off() {
+        use crate::db::session_backslash_rule_for_sql_mode as rule_for;
         for mode in ["TRADITIONAL", "ANSI", "ANSI_QUOTES", "ORACLE", ""] {
-            assert!(
-                !sql_mode_disables_backslash_escapes(mode),
+            assert_eq!(
+                rule_for(mode),
+                SessionBackslashRule::Escapes,
                 "{mode} does not include NO_BACKSLASH_ESCAPES"
             );
         }
@@ -2066,7 +2139,7 @@ mod tests {
             "traditional, no_backslash_escapes",
             "ANSI,NO_BACKSLASH_ESCAPES,ONLY_FULL_GROUP_BY",
         ] {
-            assert!(sql_mode_disables_backslash_escapes(mode), "{mode}");
+            assert_eq!(rule_for(mode), SessionBackslashRule::Literal, "{mode}");
         }
     }
 
@@ -2326,7 +2399,7 @@ mod tests {
         let too_long = format!("{at_limit}CD");
         assert_eq!(
             sql_literal_for_value(oracle, SqlValueKind::Binary, &too_long),
-            Err(ValueTooLongForLiteral {
+            Err(ValueCannotBeWritten::TooLongForOneLiteral {
                 literal_bytes: too_long.len()
             })
         );
@@ -2383,7 +2456,7 @@ mod tests {
         let message = value_too_long_message(
             "PHOTO",
             7,
-            ValueTooLongForLiteral {
+            ValueCannotBeWritten::TooLongForOneLiteral {
                 literal_bytes: 6000,
             },
         );
@@ -2495,6 +2568,88 @@ mod tests {
         );
         assert_eq!(first_repeated_column_name(["A", "B", "C"]), None);
         assert_eq!(first_repeated_column_name([]), None);
+    }
+
+    /// A session whose escaping rule is UNKNOWN refuses exactly the values whose
+    /// meaning depends on it, and writes every other one as before.
+    ///
+    /// The rule is a property of the SESSION, and this app only knows the one it
+    /// configured: a user's own `SET SESSION sql_mode` moves the tab's session
+    /// out from under every writer, and a value this reader cannot resolve
+    /// leaves it genuinely unnamed. A backslash is the one character that means
+    /// two different things then — so it is refused, by name, and nothing else
+    /// is.
+    #[test]
+    fn an_unknown_escaping_rule_refuses_only_a_value_that_depends_on_it() {
+        let unknown = |db_type| {
+            let mut info = ConnectionInfo::new_with_type("m", "u", "p", "h", 3306, "db", db_type);
+            info.advanced.mysql_sql_mode = "TRADITIONAL".to_string();
+            SqlWriteDialect::for_session(&info, Some(SessionBackslashRule::Unknown))
+        };
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let dialect = unknown(db_type);
+            // Nothing else changes: a value with no backslash is spelled the
+            // same under either rule.
+            assert_eq!(
+                sql_literal_for_value(dialect, SqlValueKind::String, "it's plain"),
+                Ok("'it''s plain'".to_string()),
+                "{db_type}"
+            );
+            assert_eq!(
+                sql_literal_for_value(dialect, SqlValueKind::Number, "42"),
+                Ok("42".to_string()),
+                "{db_type}"
+            );
+            // And the one that does is refused rather than guessed.
+            assert_eq!(
+                sql_literal_for_value(dialect, SqlValueKind::String, r"C:\path"),
+                Err(ValueCannotBeWritten::UnknownBackslashRule),
+                "{db_type}"
+            );
+            let message =
+                value_too_long_message("PATH", 3, ValueCannotBeWritten::UnknownBackslashRule);
+            assert!(message.contains("Row 3"), "{message}");
+            assert!(message.contains("PATH"), "{message}");
+            assert!(message.contains("sql_mode"), "{message}");
+            // A builder handed one refuses the WHOLE build, the way it does for
+            // a value no literal can hold.
+            let mut selection =
+                selection(db_type, &[("V", SqlValueKind::String)], &[&[r"C:\path"]]);
+            selection.dialect = dialect;
+            assert!(
+                build_sql_inserts(&selection)
+                    .refusal()
+                    .is_some_and(|reason| reason.contains("PATH") || reason.contains("V")),
+                "{db_type}: the build must refuse and name the cell"
+            );
+        }
+
+        // A KNOWN rule is unaffected, whichever it is.
+        for (mode, expected) in [
+            ("TRADITIONAL", r"'C:\\path'"),
+            ("TRADITIONAL,NO_BACKSLASH_ESCAPES", r"'C:\path'"),
+        ] {
+            let mut info =
+                ConnectionInfo::new_with_type("m", "u", "p", "h", 3306, "db", DatabaseType::MySQL);
+            info.advanced.mysql_sql_mode = mode.to_string();
+            assert_eq!(
+                sql_literal_for_value(
+                    SqlWriteDialect::for_connection(&info),
+                    SqlValueKind::String,
+                    r"C:\path"
+                ),
+                Ok(expected.to_string()),
+                "{mode}"
+            );
+        }
+        // Oracle never has an unknown rule: it has no backslash escape at all.
+        let oracle =
+            ConnectionInfo::new_with_type("o", "u", "p", "h", 1521, "s", DatabaseType::Oracle);
+        assert_eq!(
+            SqlWriteDialect::for_session(&oracle, Some(SessionBackslashRule::Unknown))
+                .doubles_a_backslash(),
+            Some(false)
+        );
     }
 
     /// A VALUE cannot tell the reader what escaping rule the file follows.

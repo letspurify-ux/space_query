@@ -789,6 +789,7 @@ struct MySqlTabSessionSlots<'a> {
     active_transaction_mode: &'a std::cell::Cell<crate::db::TransactionMode>,
     tab_transaction_mode_override: &'a super::TabPin<crate::db::TransactionMode>,
     tab_auto_commit_override: &'a super::TabPin<bool>,
+    tab_session_backslash_rule: &'a super::TabPin<crate::db::SessionBackslashRule>,
     current_operation_autocommit: Option<&'a super::TabOperationAutoCommit>,
     /// Which execution these slots belong to. Carried WITH them, because the
     /// pins are the TAB's and a batch keeps running after the tab has left it:
@@ -1532,6 +1533,11 @@ struct ExecutionWorkerContext<'a> {
     pooled_db_session: &'a SharedDbSessionLease,
     tab_auto_commit_override: &'a super::TabPin<bool>,
     tab_transaction_mode_override: &'a super::TabPin<crate::db::TransactionMode>,
+    /// Observed, not chosen: how this tab's SESSION last said it reads a
+    /// backslash in a literal. Rides with the two pins because it is the same
+    /// kind of fact — what the tab's session is, rather than what the connection
+    /// was configured with.
+    tab_session_backslash_rule: &'a super::TabPin<crate::db::SessionBackslashRule>,
     active_lazy_fetch: &'a Arc<Mutex<Option<LazyFetchHandle>>>,
     next_lazy_fetch_session_id: &'a Arc<AtomicU64>,
     current_oracle_thin_cancel_context: &'a Arc<Mutex<Option<OracleThinCancelHandle>>>,
@@ -1638,6 +1644,9 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             pooled_db_session,
             tab_auto_commit_override,
             tab_transaction_mode_override,
+            // Oracle has no backslash escape to turn off, so nothing this
+            // branch runs can move the rule.
+            tab_session_backslash_rule: _,
             active_lazy_fetch,
             next_lazy_fetch_session_id,
             current_oracle_thin_cancel_context,
@@ -2403,6 +2412,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             pooled_db_session,
             tab_auto_commit_override,
             tab_transaction_mode_override,
+            tab_session_backslash_rule,
             active_lazy_fetch,
             next_lazy_fetch_session_id,
             current_query_cancel_handle,
@@ -2505,6 +2515,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             pooled_db_session,
             tab_auto_commit_override,
             tab_transaction_mode_override,
+            tab_session_backslash_rule,
             active_lazy_fetch,
             next_lazy_fetch_session_id,
             current_mysql_cancel_context,
@@ -9660,6 +9671,7 @@ impl SqlEditorWidget {
         pooled_db_session: &SharedDbSessionLease,
         tab_auto_commit_override: &super::TabPin<bool>,
         tab_transaction_mode_override: &super::TabPin<crate::db::TransactionMode>,
+        tab_session_backslash_rule: &super::TabPin<crate::db::SessionBackslashRule>,
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         next_lazy_fetch_session_id: &Arc<AtomicU64>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
@@ -9768,6 +9780,7 @@ impl SqlEditorWidget {
             active_transaction_mode: &active_transaction_mode,
             tab_transaction_mode_override,
             tab_auto_commit_override,
+            tab_session_backslash_rule,
             current_operation_autocommit,
             tab_owner: tab_owner.clone(),
         };
@@ -12546,6 +12559,7 @@ impl SqlEditorWidget {
         let current_operation_autocommit = self.current_operation_autocommit.clone();
         let current_cancel_operation = self.current_cancel_operation.clone();
         let tab_auto_commit_override = self.tab_auto_commit_override.clone();
+        let tab_session_backslash_rule = self.tab_session_backslash_rule.clone();
         let tab_transaction_mode_override = self.tab_transaction_mode_override.clone();
         let ui_displayed_auto_commit = self.ui_displayed_auto_commit.clone();
         let ui_displayed_transaction_mode = self.ui_displayed_transaction_mode.clone();
@@ -12779,6 +12793,7 @@ impl SqlEditorWidget {
                         pooled_db_session: &pooled_db_session,
                         tab_auto_commit_override: &tab_auto_commit_override,
                         tab_transaction_mode_override: &tab_transaction_mode_override,
+                        tab_session_backslash_rule: &tab_session_backslash_rule,
                         active_lazy_fetch: &active_lazy_fetch,
                         next_lazy_fetch_session_id: &next_lazy_fetch_session_id,
                         current_oracle_thin_cancel_context: &current_oracle_thin_cancel_context,
@@ -25528,6 +25543,32 @@ impl SqlEditorWidget {
             );
         }
 
+        // A user's own `SET SESSION sql_mode` moves how THIS session reads a
+        // backslash inside a literal, and every literal this app writes for the
+        // tab depends on it — so the tab has to stop believing the connection's
+        // configured mode.
+        //
+        // What is recorded is `Unknown`, not the mode the statement named, and
+        // the reason is worth stating: a belief is about a SESSION, and this app
+        // has no identity for the one a tab holds. Measured on MySQL 8 — an
+        // ordinary run of statements leaves the user's mode in force, while a
+        // session that is REPLACED comes back on the connection's configured
+        // one. Believing the named mode is therefore right until the session is
+        // replaced and wrong afterwards, and BOTH directions of a wrong belief
+        // corrupt a backslash: one too few and the server eats it, one too many
+        // and it stores two. `Unknown` is the only answer that cannot be wrong,
+        // and it costs exactly the values whose meaning depends on it — which
+        // the writer refuses BY NAME
+        // ([`crate::ui::grid_sql_export::ValueCannotBeWritten::UnknownBackslashRule`]).
+        // Reading the mode back off the session it ran on would let this be
+        // precise; that needs a round trip per acquisition, and a session
+        // identity to pin it to.
+        if crate::db::statement_moves_session_backslash_rule(db_type, sql) {
+            slots
+                .tab_session_backslash_rule
+                .record_for_batch(&slots.tab_owner, crate::db::SessionBackslashRule::Unknown);
+        }
+
         let mut adopted_transaction_mode = slots.active_transaction_mode.get();
         if Self::adopt_session_transaction_mode_change_after_statement(
             db_type,
@@ -30802,11 +30843,13 @@ mod mysql_batch_scope_tests {
         let active_transaction_mode = Cell::new(TransactionMode::default());
         let tab_transaction_mode_override = TabPin::with_value("transaction mode", None);
         let tab_auto_commit_override = TabPin::with_value("auto-commit", None);
+        let tab_session_backslash_rule = TabPin::with_value("sql_mode backslash rule", None);
         let slots = MySqlTabSessionSlots {
             sender: &sender,
             active_transaction_mode: &active_transaction_mode,
             tab_transaction_mode_override: &tab_transaction_mode_override,
             tab_auto_commit_override: &tab_auto_commit_override,
+            tab_session_backslash_rule: &tab_session_backslash_rule,
             current_operation_autocommit: None,
             tab_owner: TabOperationOwnership::untracked(),
         };
@@ -42131,6 +42174,7 @@ mod mysql_batch_execution_regression_tests {
         pooled_db_session: crate::db::SharedDbSessionLease,
         tab_auto_commit_override: super::TabPin<bool>,
         tab_transaction_mode_override: super::TabPin<TransactionMode>,
+        tab_session_backslash_rule: super::TabPin<crate::db::SessionBackslashRule>,
         active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
         next_lazy_fetch_session_id: Arc<AtomicU64>,
         cancel_flag: Arc<Mutex<bool>>,
@@ -42190,6 +42234,7 @@ mod mysql_batch_execution_regression_tests {
                 pooled_db_session: crate::db::SharedDbSessionLease::new(),
                 tab_auto_commit_override: super::TabPin::new("auto-commit"),
                 tab_transaction_mode_override: super::TabPin::new("transaction mode"),
+                tab_session_backslash_rule: super::TabPin::new("sql_mode backslash rule"),
                 active_lazy_fetch: Arc::new(Mutex::new(None)),
                 next_lazy_fetch_session_id: Arc::new(AtomicU64::new(1)),
                 cancel_flag: Arc::new(Mutex::new(false)),
@@ -42257,6 +42302,7 @@ mod mysql_batch_execution_regression_tests {
                 &self.pooled_db_session,
                 &self.tab_auto_commit_override,
                 &self.tab_transaction_mode_override,
+                &self.tab_session_backslash_rule,
                 &self.active_lazy_fetch,
                 &self.next_lazy_fetch_session_id,
                 &self.current_mysql_cancel_context,
@@ -42369,6 +42415,7 @@ mod mysql_batch_execution_regression_tests {
             pooled_db_session,
             tab_auto_commit_override,
             &tab_transaction_mode_override,
+            &super::TabPin::with_value("sql_mode backslash rule", None),
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
@@ -42992,6 +43039,7 @@ mod mysql_batch_execution_regression_tests {
             &pooled_db_session,
             &tab_auto_commit_override,
             &tab_transaction_mode_override,
+            &super::TabPin::with_value("sql_mode backslash rule", None),
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
@@ -43123,6 +43171,7 @@ mod mysql_batch_execution_regression_tests {
             &pooled_db_session,
             &tab_auto_commit_override,
             &tab_transaction_mode_override,
+            &super::TabPin::with_value("sql_mode backslash rule", None),
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
@@ -43431,6 +43480,7 @@ mod mysql_batch_execution_regression_tests {
                 &pooled_db_session,
                 &tab_auto_commit_override,
                 &tab_transaction_mode_override,
+                &super::TabPin::with_value("sql_mode backslash rule", None),
                 &active_lazy_fetch,
                 &next_lazy_fetch_session_id,
                 &current_mysql_cancel_context,
@@ -43523,6 +43573,7 @@ mod mysql_batch_execution_regression_tests {
                 &pooled_db_session,
                 &tab_auto_commit_override,
                 &tab_transaction_mode_override,
+                &super::TabPin::with_value("sql_mode backslash rule", None),
                 &active_lazy_fetch,
                 &next_lazy_fetch_session_id,
                 &current_mysql_cancel_context,
@@ -44104,6 +44155,7 @@ SELECT 'FINAL_STATUS' AS section_name,
             &pooled_db_session,
             &tab_auto_commit_override,
             &tab_transaction_mode_override,
+            &super::TabPin::with_value("sql_mode backslash rule", None),
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
