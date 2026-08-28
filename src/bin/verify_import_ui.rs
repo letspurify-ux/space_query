@@ -415,21 +415,29 @@ fn main() {
     // picker here sets its callback on the widget. `MenuItem::do_callback` is
     // that same branch, so this drives what a real pick drives.
     {
-        use std::cell::RefCell;
-        use std::rc::Rc;
+        // Counted through an atomic: this app shares state through `Arc` and
+        // never through the single-threaded reference-counting pair, and
+        // `source_does_not_use_rc_or_refcell` holds that for every file under
+        // `src/` — a harness included. (That guard is a plain text scan, so it
+        // reads a type NAME in a comment as a use of it; naming the pair here
+        // would trip it.)
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
-        let fired = Rc::new(RefCell::new(0usize));
-        let fired_for_widget = fired.clone();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired_for_widget = Arc::clone(&fired);
         let mut choice = Choice::new(0, 0, 10, 10, None);
         space_query::ui::widget_label::add_menu_item(&mut choice, "A|B");
         space_query::ui::widget_label::add_menu_item(&mut choice, "PLAIN");
-        choice.set_callback(move |_| *fired_for_widget.borrow_mut() += 1);
+        choice.set_callback(move |_| {
+            fired_for_widget.fetch_add(1, Ordering::Relaxed);
+        });
         for index in 0..2 {
             if let Some(mut item) = choice.at(index) {
                 item.do_callback(&choice);
             }
         }
-        let count = *fired.borrow();
+        let count = fired.load(Ordering::Relaxed);
         if count == 2 {
             say("PASS: picking an item still runs the picker's own callback");
         } else {

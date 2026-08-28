@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Expr, ExprCall, ExprMethodCall, ItemFn, ItemMod, Macro};
+use syn::{
+    Expr, ExprCall, ExprMethodCall, ImplItemFn, ItemFn, ItemImpl, ItemMod, Macro, TraitItemFn,
+};
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -196,6 +198,37 @@ impl Visit<'_> for PanicSyntaxVisitor<'_> {
         visit::visit_item_fn(self, node);
     }
 
+    /// `#[cfg(test)]` marks test code wherever it is written.
+    ///
+    /// The two rules above exempt a test-only MODULE and a test-only FREE
+    /// function, which is where most test helpers live. A helper written as an
+    /// ASSOCIATED function — beside the production code it inverts, which is
+    /// why this codebase writes some of them that way — is an `ImplItemFn` to
+    /// `syn` and reached none of them, so its `.expect()` was reported as a
+    /// panic a release build could hit. It cannot: `#[cfg(test)]` deletes the
+    /// function before the build sees it. These three are the remaining places
+    /// a function BODY can sit behind that attribute.
+    fn visit_impl_item_fn(&mut self, node: &ImplItemFn) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        visit::visit_impl_item_fn(self, node);
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &TraitItemFn) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        visit::visit_trait_item_fn(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &ItemImpl) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        visit::visit_item_impl(self, node);
+    }
+
     fn visit_macro(&mut self, node: &Macro) {
         if let Some(syntax) = macro_panic_syntax(node) {
             self.push_offender(node.span().start().line, syntax);
@@ -329,6 +362,62 @@ fn panic_syntax_detector_covers_common_panic_forms() {
         "panic syntax detector missed expected forms: {:?}",
         matched
     );
+}
+
+/// A `#[cfg(test)]` ASSOCIATED function is test code, like a test-only module
+/// or free function.
+///
+/// It reached neither exemption — `syn` calls it an `ImplItemFn` — so a
+/// test-only helper written beside the production code it inverts was read as
+/// production source and its `.expect()` reported as a reachable panic. That is
+/// what turned this guard red, and with it `cargo test` in CI.
+#[test]
+fn panic_syntax_detector_exempts_test_only_associated_functions() {
+    let parsed = syn::parse_file(
+        r#"
+        impl Widget {
+            /// Test-only, and beside the writer it inverts.
+            #[cfg(test)]
+            fn unescape(path: &str) -> String {
+                path.split('/').next().expect("one segment").to_string()
+            }
+        }
+
+        #[cfg(test)]
+        impl OnlyForTests {
+            fn helper(&self) -> usize {
+                self.value.unwrap()
+            }
+        }
+
+        trait Reader {
+            #[cfg(test)]
+            fn probe(&self) -> usize {
+                self.value.unwrap()
+            }
+        }
+        "#,
+    )
+    .expect("parse test-only associated function sample");
+    let mut visitor = PanicSyntaxVisitor::new("sample.rs");
+    visitor.visit_file(&parsed);
+    assert!(visitor.offenders.is_empty(), "{:?}", visitor.offenders);
+
+    // And a method that is NOT test-only is still caught, which is the point of
+    // the guard.
+    let parsed = syn::parse_file(
+        r#"
+        impl Widget {
+            fn unescape(path: &str) -> String {
+                path.split('/').next().expect("one segment").to_string()
+            }
+        }
+        "#,
+    )
+    .expect("parse production associated function sample");
+    let mut visitor = PanicSyntaxVisitor::new("sample.rs");
+    visitor.visit_file(&parsed);
+    assert_eq!(visitor.offenders.len(), 1, "{:?}", visitor.offenders);
 }
 
 #[test]

@@ -27,8 +27,8 @@ use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    BinOp, Expr, ExprBinary, ExprCall, ExprLet, ExprMatch, ExprMethodCall, ImplItem, Item, ItemFn,
-    ItemMod, LitStr, Macro, Pat, TraitItem, Type,
+    Attribute, BinOp, Expr, ExprBinary, ExprCall, ExprLet, ExprMatch, ExprMethodCall, ImplItem,
+    Item, ItemFn, ItemMod, LitStr, Macro, Pat, TraitItem, Type,
 };
 
 #[allow(dead_code)]
@@ -1170,6 +1170,22 @@ impl Visit<'_> for DriverErrorMarkerLiteralVisitor<'_> {
             return;
         }
         visit::visit_item_fn(self, node);
+    }
+
+    /// A doc comment is PROSE, not classification.
+    ///
+    /// `syn` desugars `/// …` into `#[doc = "…"]`, whose value is a `LitStr`
+    /// like any other — so this guard read every sentence of documentation as
+    /// if it were a comparison against a driver's message. What it is looking
+    /// for is a marker a running statement matches on; a `#[doc]` string never
+    /// reaches runtime, and naming the exact server error a rule exists for is
+    /// how the rules in this codebase are written down. Only `doc` is skipped:
+    /// any other attribute is still walked.
+    fn visit_attribute(&mut self, node: &Attribute) {
+        if node.path().is_ident("doc") {
+            return;
+        }
+        visit::visit_attribute(self, node);
     }
 
     fn visit_lit_str(&mut self, node: &LitStr) {
@@ -2708,6 +2724,39 @@ fn guard_detects_driver_error_marker_literal() {
         r#"
         fn is_cancel(message: &str) -> bool {
             message.to_ascii_lowercase().contains("ora-01013")
+        }
+        "#,
+        "snippet.rs",
+    );
+    assert_eq!(offenders.len(), 1, "offenders: {:?}", offenders);
+}
+
+/// The marker this guard hunts is one a running statement compares against.
+/// A doc comment naming the same error is documentation — and this codebase
+/// documents every rule by the server error it exists for, so reading those as
+/// offenders made the guard impossible to satisfy and left it red.
+#[test]
+fn guard_allows_driver_error_marker_named_in_a_doc_comment() {
+    let offenders = collect_driver_error_marker_literal_offenders(
+        r#"
+        /// Oracle answers `ORA-01013` when the user cancels.
+        ///
+        /// Documented, not matched on.
+        #[doc = "and ORA-00904 for a name it cannot resolve"]
+        fn is_cancel(message: &str) -> bool {
+            crate::db::session_policy::message_indicates_query_cancel(db_type, message)
+        }
+        "#,
+        "snippet.rs",
+    );
+    assert!(offenders.is_empty(), "offenders: {:?}", offenders);
+
+    // And the same text in CODE is still an offender, which is the whole point.
+    let offenders = collect_driver_error_marker_literal_offenders(
+        r#"
+        /// Oracle answers `ORA-01013` when the user cancels.
+        fn is_cancel(message: &str) -> bool {
+            message.contains("ORA-01013")
         }
         "#,
         "snippet.rs",
