@@ -931,6 +931,7 @@ fn verify(target: Target) -> Result<(), String> {
 
     println!("\n----- round 10: a column name the server reported -----");
     verify_reported_column_names(target, &mut h)?;
+
     Ok(())
 }
 

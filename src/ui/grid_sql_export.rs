@@ -293,13 +293,24 @@ impl GridSqlSelection {
     /// Applied to `selected_columns` alone: `all_columns` still carries every
     /// value, so `SQL Updates` can still read a key from a column the user did
     /// not select.
-    pub fn restrict_to_writable_columns(&mut self, generated: &[String]) {
+    /// Answers the names it dropped, so a caller can say what it left out
+    /// rather than quietly writing fewer columns than the user selected.
+    pub fn restrict_to_writable_columns(&mut self, generated: &[String]) -> Vec<String> {
         if generated.is_empty() {
-            return;
+            return Vec::new();
         }
         let writable = writable_column_indices(&self.all_columns, generated);
-        self.selected_columns
-            .retain(|index| writable.contains(index));
+        let mut dropped = Vec::new();
+        self.selected_columns.retain(|index| {
+            if writable.contains(index) {
+                return true;
+            }
+            if let Some(name) = self.all_columns.get(*index) {
+                dropped.push(name.clone());
+            }
+            false
+        });
+        dropped
     }
 
     /// Column index for a name, matched case-insensitively the way SQL resolves
@@ -729,6 +740,14 @@ pub fn build_where_clause(selection: &GridSqlSelection) -> ExportContent {
     }
 
     let mut groups: Vec<String> = Vec::new();
+    // Kept beside the list rather than asked OF it: `Vec::contains` is a scan,
+    // and a scan per row makes this quadratic in the SELECTION. Measured before
+    // the set existed — 2 000 rows 35 ms, 4 000 128 ms, 8 000 473 ms, 16 000
+    // 1.73 s, a clean x4 per doubling, extrapolating to a minute for a hundred
+    // thousand — and it runs on the UI thread, under the app-state lock, for a
+    // `Ctrl+A` and one menu pick. The set changes no output: the first spelling
+    // of a group still wins and the order is still the rows'.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (row_index, row) in selection.rows.iter().enumerate() {
         let group = match selection
             .selected_columns
@@ -739,7 +758,7 @@ pub fn build_where_clause(selection: &GridSqlSelection) -> ExportContent {
             Ok(parts) => parts.join(" AND "),
             Err(reason) => return ExportContent::Refused(reason),
         };
-        if !group.is_empty() && !groups.contains(&group) {
+        if !group.is_empty() && seen.insert(group.clone()) {
             groups.push(group);
         }
     }
@@ -765,6 +784,9 @@ pub fn build_where_clause(selection: &GridSqlSelection) -> ExportContent {
 fn single_column_where(selection: &GridSqlSelection, column: usize) -> ExportContent {
     let name = selection.quote_column(column);
     let mut values: Vec<String> = Vec::new();
+    // The same set, for the same reason as the row groups above: an `IN` list
+    // built with a scan per row is quadratic in the selection.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut has_null = false;
     for (row_index, row) in selection.rows.iter().enumerate() {
         if selection.is_null(row, column) {
@@ -775,7 +797,7 @@ fn single_column_where(selection: &GridSqlSelection, column: usize) -> ExportCon
             Ok(literal) => literal,
             Err(reason) => return ExportContent::Refused(reason),
         };
-        if !values.contains(&literal) {
+        if seen.insert(literal.clone()) {
             values.push(literal);
         }
     }
@@ -2568,6 +2590,53 @@ mod tests {
         );
         assert_eq!(first_repeated_column_name(["A", "B", "C"]), None);
         assert_eq!(first_repeated_column_name([]), None);
+    }
+
+    /// A `Where Clause` of a big selection is LINEAR in its rows.
+    ///
+    /// Both shapes de-duplicate — row groups on the multi-column road, values
+    /// in the `IN` list on the single-column one — and both used to ask
+    /// `Vec::contains`, which is a scan per row. Measured before the set:
+    /// 2 000 rows 35 ms, 4 000 128 ms, 8 000 473 ms, 16 000 1.73 s, a clean x4
+    /// per doubling, extrapolating to about a minute for a hundred thousand.
+    /// It runs on the UI thread under the app-state lock, and `Ctrl+A` plus one
+    /// menu pick is all it takes to ask for it.
+    #[test]
+    fn a_where_clause_of_a_big_selection_stays_linear() {
+        let build = |rows: usize, columns: usize| {
+            let selection = GridSqlSelection {
+                dialect: SqlWriteDialect::family_default(DatabaseType::Oracle),
+                table: Some("HR.EMP".to_string()),
+                all_columns: (0..columns).map(|c| format!("C{c}")).collect(),
+                column_kinds: vec![SqlValueKind::String; columns],
+                selected_columns: (0..columns).collect(),
+                // Every value distinct, which is the worst case for a dedup
+                // that scans: nothing is ever found early.
+                rows: (0..rows)
+                    .map(|r| (0..columns).map(|c| Some(format!("v{r}-{c}"))).collect())
+                    .collect(),
+            };
+            let start = std::time::Instant::now();
+            let built = build_where_clause(&selection);
+            assert_eq!(built.rows(), rows);
+            (start.elapsed().as_secs_f64(), built.text().len())
+        };
+
+        for columns in [1usize, 3] {
+            // Warm the allocator so the first measurement is not the odd one.
+            let _ = build(4_000, columns);
+            let (small, small_bytes) = build(4_000, columns);
+            let (large, large_bytes) = build(8_000, columns);
+            assert!(
+                large_bytes > small_bytes,
+                "{columns} column(s): the fixture must really grow"
+            );
+            assert!(
+                large < small * 2.5 + 0.05,
+                "{columns} column(s): twice the rows took {large:.4}s against {small:.4}s for \
+                 half — that is the scan-per-row dedup, not linear work"
+            );
+        }
     }
 
     /// A session whose escaping rule is UNKNOWN refuses exactly the values whose

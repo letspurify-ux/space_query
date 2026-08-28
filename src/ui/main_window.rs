@@ -8514,8 +8514,19 @@ impl MainWindow {
                     // A statement that will be RE-RUN must not name a column the
                     // server computes: the same rule the object tree's export
                     // has always applied, now applied on this road too and
-                    // through the same method.
-                    selection.restrict_to_writable_columns(&facts.generated_columns);
+                    // through the same method. What it left out is SAID — the
+                    // user selected those columns, and a copy that quietly
+                    // holds fewer than they asked for is the kind of silence
+                    // this app reports rather than keeps.
+                    let left_out = selection.restrict_to_writable_columns(&facts.generated_columns);
+                    let computed_note = if left_out.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " ({} left out: computed by the server)",
+                            left_out.join(", ")
+                        )
+                    };
                     if is_update {
                         // The KEY is resolved by name too, and only here —
                         // the catalog answer is what says whether that name
@@ -8530,11 +8541,14 @@ impl MainWindow {
                         .map(|(sql, written)| {
                             let message = if facts.key_columns.is_empty() {
                                 format!(
-                                    "Copied {written} UPDATE statements \
-                                     (no primary key — WHERE omitted)"
+                                    "Copied {written} UPDATE statements (no primary key — \
+                                     WHERE omitted){computed_note}"
                                 )
                             } else {
-                                format!("Copied {written} UPDATE statements to clipboard")
+                                format!(
+                                    "Copied {written} UPDATE statements to \
+                                     clipboard{computed_note}"
+                                )
                             };
                             (sql, message)
                         })
@@ -8544,7 +8558,10 @@ impl MainWindow {
                             .map(|(sql, written)| {
                                 (
                                     sql,
-                                    format!("Copied {written} INSERT statements to clipboard"),
+                                    format!(
+                                        "Copied {written} INSERT statements to \
+                                         clipboard{computed_note}"
+                                    ),
                                 )
                             })
                     }

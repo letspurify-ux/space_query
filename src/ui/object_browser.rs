@@ -100,6 +100,48 @@ pub enum SqlAction {
     ExportData(ObjectExportDelivery),
 }
 
+/// The schema and table a qualified name NAMES, as the CATALOG spells them.
+///
+/// The name arriving at a catalog read has usually been spelled for SQL — the
+/// result grid's own resolver quotes what the server reported, and the MySQL
+/// family always backticks — and a name spelled for SQL is not a name the
+/// catalog knows: `INFORMATION_SCHEMA.COLUMNS` is queried with `TABLE_NAME = ?`
+/// bound literally, so `` `orders` `` finds nothing at all. Measured: a
+/// generated `UPDATE` lost its `WHERE` clause on every MySQL-family grid, and
+/// `SQL Inserts` stopped leaving out the columns the server computes.
+///
+/// The split is quote-aware, so a dot inside a quoted segment is part of the
+/// name rather than a separator; each half then gives up its quotes. A name
+/// that was never quoted passes through unchanged.
+fn split_qualified_catalog_name(qualified: &str) -> (Option<String>, String) {
+    let trimmed = qualified.trim();
+    let mut quote: Option<char> = None;
+    let mut separator: Option<usize> = None;
+    for (index, ch) in trimmed.char_indices() {
+        match quote {
+            Some(open) => {
+                if ch == open {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '`' => quote = Some(ch),
+                '.' => separator = Some(index),
+                _ => {}
+            },
+        }
+    }
+    let unquote = |part: &str| crate::sql_text::strip_identifier_quotes(part.trim());
+    match separator {
+        Some(at) => {
+            let schema = unquote(&trimmed[..at]);
+            let table = unquote(&trimmed[at + 1..]);
+            ((!schema.is_empty()).then_some(schema), table)
+        }
+        None => (None, unquote(trimmed)),
+    }
+}
+
 /// The tab's live backslash-rule pin, as a card holds it.
 ///
 /// Passed by HANDLE and read at the moment it is needed, the way
@@ -4315,14 +4357,10 @@ impl ObjectBrowserWidget {
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<GeneratedSqlTableFacts, String> {
-        let (scope, table_name) = match table_name.trim().rsplit_once('.') {
-            Some((schema, table)) if !schema.trim().is_empty() && !table.trim().is_empty() => {
-                (Some(schema.trim().to_string()), table.trim().to_string())
-            }
-            _ => (
-                selected_scope.map(str::to_string),
-                table_name.trim().to_string(),
-            ),
+        let (schema, table) = split_qualified_catalog_name(table_name);
+        let (scope, table_name) = match schema {
+            Some(schema) if !table.is_empty() => (Some(schema), table),
+            _ => (selected_scope.map(str::to_string), table),
         };
         let activity = format!("Reading the structure of {}", table_name);
         // The db_type comes back with the columns because the literal kinds
@@ -14262,6 +14300,35 @@ mod tests {
     ///
     /// `Export Data...` writes every column of a table, so the file a user is
     /// most likely to import names the generated ones — and `default_mapping`
+    /// A name spelled for SQL is not a name the CATALOG knows.
+    ///
+    /// The result grid resolves its base table through
+    /// `grid_sql_export::resolve_export_table`, which spells what the server
+    /// reported the way SQL needs it — and the MySQL family always backticks.
+    /// The catalog binds `TABLE_NAME = ?` literally, so that spelling finds
+    /// nothing: measured live, `Copy as SQL Updates` from a table-browse grid
+    /// answered "no primary key — WHERE omitted" for a table that has one, and
+    /// `SQL Inserts` stopped leaving out the columns the server computes.
+    #[test]
+    fn a_catalog_read_takes_the_name_the_way_this_app_spells_it() {
+        let parts = |name: &str| {
+            let (schema, table) = super::split_qualified_catalog_name(name);
+            (schema.unwrap_or_default(), table)
+        };
+        // What the two families' quoters produce.
+        assert_eq!(parts("`app`.`orders`"), ("app".into(), "orders".into()));
+        assert_eq!(parts("HR.\"emp\""), ("HR".into(), "emp".into()));
+        assert_eq!(parts("\"HR\".\"Mixed\""), ("HR".into(), "Mixed".into()));
+        // A raw name is unchanged, which is what the object tree's own reads
+        // hand over.
+        assert_eq!(parts("HR.EMP"), ("HR".into(), "EMP".into()));
+        assert_eq!(parts("EMP"), (String::new(), "EMP".into()));
+        // A dot INSIDE a quoted segment is part of the name, not a separator.
+        assert_eq!(parts("`app`.`ord.ers`"), ("app".into(), "ord.ers".into()));
+        // And a doubled delimiter is one character of the name.
+        assert_eq!(parts("`zr``tick`"), (String::new(), "zr`tick".into()));
+    }
+
     /// matches by name, so they mapped themselves and the whole script was
     /// rejected: every backend here refuses an explicit value for a column it
     /// computes itself.

@@ -537,6 +537,25 @@ fn verify(target: Target) -> Result<(), String> {
         return Err(format!("expected composite key [PART, SEQ], got {keys:?}"));
     }
 
+    // And the name the GRID hands that lookup is the one `resolve_export_table`
+    // produced from the grid-edit descriptor — which is spelled for SQL. A name
+    // spelled for SQL is not a name the catalog knows, and the MySQL family
+    // always backticks one, so this is the road `Copy as SQL Updates` and
+    // `Copy as SQL Inserts` really take.
+    let grid_name =
+        resolve_export_table(db_type, Some((String::new(), BASE_TABLE.to_string())), "")
+            .ok_or_else(|| "the grid resolved no base table".to_string())?;
+    println!("the grid names the table {grid_name:?}");
+    let grid_facts = ObjectBrowserWidget::load_generated_sql_table_facts(&shared, None, &grid_name)
+        .map_err(|e| format!("primary key lookup through the grid's name: {e}"))?;
+    if grid_facts.key_columns != keys {
+        return Err(format!(
+            "the catalog answered {:?} for the grid's spelling {grid_name:?} but {keys:?} for the \
+             raw name — a generated UPDATE would lose its WHERE clause",
+            grid_facts.key_columns
+        ));
+    }
+
     let name_index = column_index(&columns, "NAME")?;
     let mut updated_rows = rows.clone();
     updated_rows[0][name_index] = "UPDATED'X".to_string();

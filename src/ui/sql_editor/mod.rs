@@ -5010,23 +5010,14 @@ impl SqlEditorWidget {
     /// builds — because the connection's configured `sql_mode` stops being the
     /// answer the moment the user sets their own.
     pub fn tab_session_backslash_rule(&self) -> Option<crate::db::SessionBackslashRule> {
-        // A belief about a SESSION is only about the session the tab still
-        // HOLDS. Once that lease is gone the next statement runs on one the app
-        // prepares itself, with the connection's configured `sql_mode` — so the
-        // belief is not merely stale, it is about something that no longer
-        // exists, and keeping it would hand a NEW session the old one's rule.
-        // Measured: discarding the tab's session really does bring the
-        // configured mode back, while an ordinary run of statements leaves the
-        // user's own mode in force — which is exactly the lease being retained.
-        //
-        // Forgetting it HERE rather than at every place a session can end is
-        // what makes the rule hold for all of them: a lease can go on a close,
-        // a disconnect, a cancel or a stale connection generation, and this is
-        // the one door every reader comes through.
-        if self.pooled_db_session.snapshot().is_none() {
-            self.tab_session_backslash_rule.clear_from_ui();
-            return None;
-        }
+        // Forgotten where the session it describes is RELEASED
+        // ([`Self::release_pooled_db_session`]), not here. A reader that also
+        // forgot on "no lease right now" would answer differently from the
+        // object browser's card, which holds the same pin and asks it directly
+        // — and two roads that answer one question two ways is the shape this
+        // module exists to not have. The belief is only ever `Unknown` anyway,
+        // so the worst a late one can do is refuse a value it could have
+        // written, never write one wrongly.
         self.tab_session_backslash_rule.get()
     }
 
