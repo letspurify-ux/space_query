@@ -460,6 +460,49 @@ pub fn ambiguous_column_message(name: &str) -> String {
     )
 }
 
+/// What to tell a user whose result does not carry the key an `UPDATE` would
+/// match a row by.
+///
+/// One sentence, in the family of the two above, because the fact it reports is
+/// the same shape: generated SQL addresses a row by NAME, and a name the result
+/// does not carry cannot address anything.
+pub fn missing_key_message(missing: &[String]) -> String {
+    let names = missing.join(", ");
+    // Two remedies, because there are two ways a key column can be absent from
+    // what this builder sees: the query left it out, or the Columns dialog
+    // hides it (a hidden column is dropped from the exportable set). The
+    // builder cannot tell which, so the sentence offers both.
+    format!(
+        "This result does not carry {names}, which is how a generated UPDATE finds the row \
+         each value came from. Without it the statement would change every row it cannot \
+         narrow, so nothing was written — add {names} to the query (or unhide it in the \
+         Columns dialog), or copy a Where Clause instead."
+    )
+}
+
+/// What to append to a report whose generated SQL left columns out.
+///
+/// [`GridSqlSelection::restrict_to_writable_columns`] answers the names it
+/// dropped so its caller can SAY what was left out — and three callers apply
+/// it: the grid's `Copy as SQL …`, the grid's `Export Data...`, and the object
+/// tree's. Only the first used to say anything, so a `SQL Inserts` FILE
+/// quietly held fewer columns than the grid the user exported showed. One
+/// sentence here, appended to each road's own report, so what the three say
+/// cannot drift apart.
+///
+/// Empty for an empty list, because that is the ordinary export and its report
+/// is complete as it stands.
+pub fn left_out_generated_columns_note(left_out: &[String]) -> String {
+    if left_out.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({} left out: computed by the server)",
+            left_out.join(", ")
+        )
+    }
+}
+
 /// The columns a statement may name, as indexes into `all_columns`.
 ///
 /// Reached through [`GridSqlSelection::restrict_to_writable_columns`], which is
@@ -655,20 +698,47 @@ pub fn build_sql_updates(selection: &GridSqlSelection, key_columns: &[String]) -
         return ExportContent::Refused(reason);
     }
 
+    // Its own sentence, not [`no_writable_column_message`]'s: a refusal
+    // describes the statement it refused, and that one is about an INSERT.
+    // Defense in depth either way — the grid answers an empty selection with
+    // `None` before a builder ever sees it.
     if selection.selected_columns.is_empty() {
-        return ExportContent::Refused(no_writable_column_message());
+        return ExportContent::Refused(
+            "This selection covers no column an UPDATE could assign.".to_string(),
+        );
     }
     if selection.rows.is_empty() {
         return ExportContent::nothing();
     }
     let table = selection.table_name();
 
-    // A key column absent from the result set has no value to compare, so it
-    // cannot take part in the WHERE clause.
-    let keys: Vec<usize> = key_columns
-        .iter()
-        .filter_map(|name| selection.column_index(name))
-        .collect();
+    // The key, resolved and CHECKED in one pass, so what this statement matches
+    // on and what the user is told about it cannot come from two readings.
+    //
+    // A named key column the result does not carry used to be dropped here in
+    // silence: `SELECT ename, sal FROM emp` against a table keyed on `EMPNO`
+    // produced `UPDATE EMP SET ENAME = …, SAL = …;` — no WHERE at all, which is
+    // every row — and a half-carried composite key produced a WHERE that
+    // matches more rows than the one its values came from. The caller could not
+    // say so either: it knew only whether the TABLE has a key, not whether this
+    // RESULT carries it, so both came back as "Copied N UPDATE statements".
+    //
+    // An empty `key_columns` is the other thing entirely and still writes a
+    // keyless statement: the caller passes it when the table HAS no key (or no
+    // table was resolved) and says so in the same breath. That is the only way
+    // a WHERE can be missing now, which is what makes the caller's sentence
+    // true by construction.
+    let mut keys: Vec<usize> = Vec::with_capacity(key_columns.len());
+    let mut missing: Vec<String> = Vec::new();
+    for name in key_columns {
+        match selection.column_index(name) {
+            Some(index) => keys.push(index),
+            None => missing.push(name.trim().to_string()),
+        }
+    }
+    if !missing.is_empty() {
+        return ExportContent::Refused(missing_key_message(&missing));
+    }
 
     let mut assigned: Vec<usize> = selection
         .selected_columns
@@ -728,8 +798,14 @@ pub fn build_where_clause(selection: &GridSqlSelection) -> ExportContent {
     if let Some(reason) = selection.ambiguous_column_refusal(&[]) {
         return ExportContent::Refused(reason);
     }
+    // Its own sentence, not [`no_writable_column_message`]'s: a WHERE clause
+    // READS, and a refusal about "written into an INSERT" describes a
+    // statement this builder never writes. Defense in depth — the grid
+    // answers an empty selection with `None` before a builder ever sees it.
     if selection.selected_columns.is_empty() {
-        return ExportContent::Refused(no_writable_column_message());
+        return ExportContent::Refused(
+            "This selection covers no column a WHERE clause could compare.".to_string(),
+        );
     }
     if selection.rows.is_empty() {
         return ExportContent::nothing();
@@ -1813,7 +1889,9 @@ mod tests {
     /// It used to write nothing and say nothing, which the callers then
     /// reported as a full export of the input's row count — an empty file
     /// announced as "N rows". Both halves are pinned: the text is still empty,
-    /// and the refusal now says why.
+    /// and the refusal now says why — in each builder's OWN words, because two
+    /// of the three used to borrow the INSERT sentence for a statement shape
+    /// it does not describe (a WHERE clause writes nothing into anything).
     #[test]
     fn a_selection_that_covers_no_column_is_refused_and_writes_nothing() {
         let mut selection = selection(
@@ -1822,15 +1900,36 @@ mod tests {
             &[&["1"]],
         );
         selection.selected_columns.clear();
-        for built in [
-            build_sql_inserts(&selection),
-            build_sql_updates(&selection, &["ID".to_string()]),
-            build_where_clause(&selection),
+        for (built, wanted) in [
+            (build_sql_inserts(&selection), no_writable_column_message()),
+            (
+                build_sql_updates(&selection, &["ID".to_string()]),
+                "This selection covers no column an UPDATE could assign.".to_string(),
+            ),
+            (
+                build_where_clause(&selection),
+                "This selection covers no column a WHERE clause could compare.".to_string(),
+            ),
         ] {
-            assert_eq!(built.refusal(), Some(no_writable_column_message().as_str()));
+            assert_eq!(built.refusal(), Some(wanted.as_str()));
             assert!(built.text().is_empty());
             assert_eq!(built.rows(), 0);
         }
+    }
+
+    /// The one sentence every road appends when generated SQL left columns out
+    /// — and silence when nothing was.
+    #[test]
+    fn the_left_out_note_names_the_columns_or_says_nothing() {
+        assert_eq!(left_out_generated_columns_note(&[]), "");
+        assert_eq!(
+            left_out_generated_columns_note(&["TOTAL".to_string()]),
+            " (TOTAL left out: computed by the server)"
+        );
+        assert_eq!(
+            left_out_generated_columns_note(&["A".to_string(), "B".to_string()]),
+            " (A, B left out: computed by the server)"
+        );
     }
 
     /// A selection with columns but no ROWS is not a refusal: there is simply
@@ -1919,16 +2018,71 @@ mod tests {
         );
     }
 
+    /// A key the result does not carry refuses the UPDATE — it does not write
+    /// one without it.
+    ///
+    /// This test replaces one that asserted the opposite, and the fact behind
+    /// both is the same: a key column with no value in the row cannot be
+    /// compared, so it cannot take part in the WHERE clause. What changed is
+    /// what follows from that. Writing the statement anyway produced
+    /// `UPDATE HR.EMP SET NAME = 'SMITH';` — a statement that changes EVERY row
+    /// — and nothing said so: the caller can only see whether the TABLE has a
+    /// key (`facts.key_columns`), not whether this RESULT carries it, so a
+    /// `SELECT ename, sal FROM emp` on a table keyed by `EMPNO` reported
+    /// "Copied 2 UPDATE statements to clipboard" for two unqualified UPDATEs.
+    /// A half-carried composite key was worse still, because the WHERE it wrote
+    /// looked complete.
+    ///
+    /// Refusing keeps the original fact (no value, no comparison) and drops the
+    /// conclusion that made it dangerous, which is the rule this module already
+    /// follows for a repeated column name: a refusal costs the user a rerun,
+    /// and the alternative costs them a statement that silently means something
+    /// else.
     #[test]
-    fn updates_omit_where_when_the_key_is_not_in_the_result_set() {
-        let selection = selection(
+    fn updates_refuse_a_key_the_result_does_not_carry() {
+        let keyless = selection(
             DatabaseType::Oracle,
             &[("NAME", SqlValueKind::String)],
             &[&["SMITH"]],
         );
+        let refusal = build_sql_updates(&keyless, &["ID".to_string()])
+            .refusal()
+            .map(str::to_string)
+            .expect("a key this result does not carry must refuse the UPDATE");
+        assert!(
+            refusal.contains("ID"),
+            "the refusal has to name the missing key: {refusal}"
+        );
         assert_eq!(
-            written(build_sql_updates(&selection, &["ID".to_string()])),
-            "UPDATE HR.EMP SET NAME = 'SMITH';\n"
+            build_sql_updates(&keyless, &["ID".to_string()]).text(),
+            "",
+            "a refusal writes nothing"
+        );
+
+        // A composite key that is only HALF carried is the same defect wearing
+        // a WHERE clause: it matches every row sharing the half that is there.
+        let composite = selection(
+            DatabaseType::Oracle,
+            &[
+                ("PART", SqlValueKind::String),
+                ("NAME", SqlValueKind::String),
+            ],
+            &[&["A-1", "SMITH"]],
+        );
+        let refusal = build_sql_updates(&composite, &["PART".to_string(), "SEQ".to_string()])
+            .refusal()
+            .map(str::to_string)
+            .expect("a half-carried composite key must refuse the UPDATE");
+        assert!(
+            refusal.contains("SEQ") && !refusal.contains("PART,"),
+            "the refusal has to name the half that is missing: {refusal}"
+        );
+
+        // And the key that IS carried still writes, so this refuses a missing
+        // key rather than keys in general.
+        assert_eq!(
+            written(build_sql_updates(&composite, &["PART".to_string()])),
+            "UPDATE HR.EMP SET NAME = 'SMITH' WHERE PART = 'A-1';\n"
         );
     }
 

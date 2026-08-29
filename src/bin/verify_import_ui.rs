@@ -27,6 +27,7 @@ use fltk::{
     prelude::*,
     window::Window,
 };
+use space_query::db::DEFAULT_NULL_TEXT;
 use space_query::db::{DatabaseType, TableColumnDetail};
 use space_query::ui::result_export::ExportFormat;
 use space_query::ui::{MainWindow, ObjectBrowserWidget};
@@ -349,6 +350,35 @@ fn main() {
         Err(err) => failures.push(format!("cancel: {err}")),
     }
 
+    // (7b) The NULL text the modal starts with is the TAB's, not a constant.
+    //
+    //      `SET NULL '-'` moves what a tab's result grid draws for a NULL and
+    //      therefore what its `Export Data...` writes into a CSV. The dialog
+    //      offered a hard-coded `NULL` back, so the app's own export re-imported
+    //      those cells as the two characters that spell it. Nothing here touches
+    //      the NULL-text input: the value under test is the one the card read
+    //      off the tab.
+    let moved_null_csv = "EMPNO,ENAME,HIREDATE,SAL\n7369,-,1980-12-17,800\n";
+    match run_against(
+        moved_null_csv,
+        ExportFormat::Csv,
+        ModalPlan::default(),
+        catalog(),
+        "-",
+    ) {
+        Ok(Some((sql, _))) => {
+            if sql.contains("VALUES (7369, NULL, TO_DATE(") {
+                say("PASS: the modal starts on the tab's own NULL text");
+            } else {
+                failures.push(format!(
+                    "a cell holding the tab's NULL text did not import as NULL: {sql:?}"
+                ));
+            }
+        }
+        Ok(None) => failures.push("the tab's NULL text run imported nothing".to_string()),
+        Err(err) => failures.push(format!("tab NULL text: {err}")),
+    }
+
     // (8) A file the chosen format cannot read says so in the modal instead of
     //     producing a script.
     match run("not json at all", ExportFormat::Json, ModalPlan::default()) {
@@ -388,6 +418,7 @@ fn main() {
         ExportFormat::Csv,
         ModalPlan::default(),
         hostile_columns.clone(),
+        DEFAULT_NULL_TEXT,
     ) {
         Ok(Some((sql, _))) => {
             let labels = state_mapping();
@@ -433,6 +464,7 @@ fn main() {
             ..ModalPlan::default()
         },
         hostile_columns.clone(),
+        DEFAULT_NULL_TEXT,
     ) {
         Ok(Some((sql, _))) => {
             if sql.contains("(\"A|B\", \"C/D\", \"E&F_G\") VALUES (2, 'x', 'y')") {
@@ -505,15 +537,19 @@ fn run(
     format: ExportFormat,
     wanted: ModalPlan,
 ) -> Result<Option<(String, String)>, String> {
-    run_against(text, format, wanted, catalog())
+    run_against(text, format, wanted, catalog(), DEFAULT_NULL_TEXT)
 }
 
-/// The same, against a catalog the caller chooses.
+/// The same, against a catalog and a session NULL text the caller chooses.
+///
+/// `session_null_text` is what the TAB writes for a NULL — the value the card
+/// reads off the tab when the user clicks `Import Data...`.
 fn run_against(
     text: &str,
     format: ExportFormat,
     mut wanted: ModalPlan,
     columns: Vec<TableColumnDetail>,
+    session_null_text: &str,
 ) -> Result<Option<(String, String)>, String> {
     wanted.driven = false;
     wanted.refused = false;
@@ -539,6 +575,7 @@ fn run_against(
         space_query::ui::grid_sql_export::SqlWriteDialect::family_default(DatabaseType::Oracle),
         &columns,
         format,
+        session_null_text,
     );
     pump(200);
 

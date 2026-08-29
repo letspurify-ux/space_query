@@ -72,6 +72,22 @@ struct DialogState {
     parsed: Mutex<Result<ImportedTable, String>>,
     /// One Choice per file column: 0 is "skip", n+1 is target column n.
     mapping_choices: Mutex<Vec<Choice>>,
+    /// The line under the mapping rows. Held here so a mapping row can refresh
+    /// it without a way of reaching back into the closure that built it.
+    ///
+    /// A plain handle (an FLTK widget clone IS the widget), so the summary
+    /// belongs to THIS dialog. It used to be a process-global slot holding a
+    /// closure, whose premise was one modal per process — which two
+    /// object-browser cards can break: each card polls on its own timer, and a
+    /// modal pumps the event loop those timers fire on, so the slot answered
+    /// for whichever modal opened last.
+    ///
+    /// What keeps a refresh from deadlocking is NOT that nothing is locked —
+    /// [`update_summary`] holds the (non-reentrant) `parsed` lock while it
+    /// runs — but that it pumps no events: it sets a label and marks damage,
+    /// so no callback can fire inside it and no second refresh can start
+    /// under the first.
+    summary: Frame,
     /// What the mapping area on screen was built for: the file's columns and
     /// whether the FILE named them, or the parse error it is showing instead.
     ///
@@ -98,6 +114,19 @@ impl DialogState {
         }
     }
 
+    /// Redraw the summary line for whatever the dialog now says.
+    ///
+    /// [`update_summary`] holds the `parsed` lock while it runs, so this must
+    /// not be re-entered — and it cannot be: update_summary pumps no events
+    /// (set a label, mark damage), so no widget callback can fire inside it
+    /// and ask for another refresh. Anything added there that runs a nested
+    /// event loop — an alert, an `app::wait` — would break that, which is why
+    /// the summary reports errors as label text instead of raising one.
+    fn refresh_summary(&self) {
+        let mut summary = self.summary.clone();
+        update_summary(self, &mut summary);
+    }
+
     /// The mapping the Choice widgets currently express.
     fn mapping(&self) -> ColumnMapping {
         self.mapping_choices
@@ -119,13 +148,20 @@ impl DialogState {
 /// Ask how to import `text` into `table_label`.
 ///
 /// `initial_format` is what the file's extension suggested; the user can pick
-/// another. Returns `None` when the dialog is cancelled.
+/// another. `null_text` is the text the TAB this import will run on writes for
+/// a SQL NULL — the same one its `Export Data...` and its result grid write, so
+/// a file this app produced reads back with its NULLs intact. It is offered,
+/// not imposed: a file from anywhere else spells NULL however it likes and the
+/// user says so here.
+///
+/// Returns `None` when the dialog is cancelled.
 pub(crate) fn show(
     file_label: &str,
     text: &str,
     table_label: &str,
     table_columns: &ImportTargets,
     initial_format: ExportFormat,
+    null_text: &str,
 ) -> Option<ImportOutcome> {
     let targets = table_columns.writable();
     let generated_columns = table_columns.generated_names();
@@ -203,7 +239,7 @@ pub(crate) fn show(
     null_label.set_label_color(theme::text_primary());
     null_row.fixed(&null_label, FORM_LABEL_WIDTH);
     let mut null_input = Input::default();
-    null_input.set_value(&ImportOptions::default().null_text);
+    null_input.set_value(null_text);
     null_input.set_color(theme::input_bg());
     null_input.set_text_color(theme::text_primary());
     theme::apply_text_input_inset(&mut null_input);
@@ -260,6 +296,7 @@ pub(crate) fn show(
     fltk::group::Group::set_current(current_group.as_ref());
 
     let state = Arc::new(DialogState {
+        summary: summary.clone(),
         text: text.to_string(),
         table_columns: table_columns.clone(),
         targets,
@@ -279,7 +316,6 @@ pub(crate) fn show(
         let mut header_check_for_gating = header_check.clone();
         let mut null_input_for_gating = null_input.clone();
         let mut scroll = scroll.clone();
-        let mut summary = summary.clone();
         move || {
             let format = state
                 .formats
@@ -317,18 +353,9 @@ pub(crate) fn show(
                 .parsed
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = parsed;
-            update_summary(&state, &mut summary);
+            state.refresh_summary();
         }
     };
-
-    let refresh_summary = {
-        let state = Arc::clone(&state);
-        let mut summary = summary.clone();
-        move || update_summary(&state, &mut summary)
-    };
-    *SUMMARY_REFRESH
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(refresh_summary));
 
     {
         let mut reload_on_change = reload.clone();
@@ -397,9 +424,6 @@ pub(crate) fn show(
         app::wait();
     }
 
-    *SUMMARY_REFRESH
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     Window::delete(dialog);
 
     let outcome = outcome
@@ -447,7 +471,7 @@ fn gate<W: WidgetExt>(widget: &mut W, active: bool) {
 /// writes every value into the wrong column as soon as the file's order is not
 /// the table's.
 fn rebuild_mapping_rows(
-    state: &DialogState,
+    state: &Arc<DialogState>,
     scroll: &mut Scroll,
     parsed: &Result<ImportedTable, String>,
 ) {
@@ -505,7 +529,13 @@ fn rebuild_mapping_rows(
                 );
                 theme::style_choice(&mut choice);
                 theme::install_choice_hover(&mut choice);
-                choice.set_callback(|_| notify_summary_refresh());
+                {
+                    // The state the row was built from, so the summary is
+                    // refreshed by the dialog this row belongs to — a global
+                    // slot answered for whichever modal opened last.
+                    let state = Arc::clone(state);
+                    choice.set_callback(move |_| state.refresh_summary());
+                }
                 choices.push(choice);
 
                 y += MAPPING_ROW_HEIGHT + 2;
@@ -580,70 +610,12 @@ fn elide(text: &str, limit: usize) -> String {
     out
 }
 
-/// A mapping Choice has to refresh the summary, but the summary lives in the
-/// closure that built it. One modal is open at a time, so a slot holding that
-/// closure for the life of the dialog is enough.
-type SummaryRefresh = Box<dyn FnMut() + Send>;
-static SUMMARY_REFRESH: Mutex<Option<SummaryRefresh>> = Mutex::new(None);
-
-fn notify_summary_refresh() {
-    // take → unlock → invoke → restore, like every other callback slot: the
-    // guard may not be held while the closure runs, or a refresh that asks
-    // for another refresh deadlocks the UI thread on this slot.
-    let mut refresh = SUMMARY_REFRESH
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    if let Some(refresh) = refresh.as_mut() {
-        refresh();
-    }
-    let mut slot = SUMMARY_REFRESH
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if slot.is_none() {
-        *slot = refresh;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{mpsc, Arc};
-    use std::time::Duration;
-
-    /// The slot's guard may not be held while the refresh closure runs: a
-    /// refresh that (transitively) asks for another refresh would deadlock the
-    /// UI thread on this slot. Runs on a worker thread so a regression fails
-    /// this test by timeout instead of hanging the whole run.
-    #[test]
-    fn summary_refresh_slot_is_not_held_while_the_refresh_closure_runs() {
-        let (done_sender, done_receiver) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let reentered = Arc::new(AtomicBool::new(false));
-            let reentered_in_refresh = Arc::clone(&reentered);
-            *SUMMARY_REFRESH
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move || {
-                // Once, not recursively: the point is one nested call.
-                if !reentered_in_refresh.swap(true, Ordering::AcqRel) {
-                    notify_summary_refresh();
-                }
-            }));
-            notify_summary_refresh();
-            let _ = done_sender.send(());
-        });
-        done_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("a re-entrant summary refresh must not deadlock on the slot lock");
-        worker.join().expect("summary refresh worker");
-        let mut slot = SUMMARY_REFRESH
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert!(
-            slot.is_some(),
-            "the refresh closure must be back in the slot after the call"
-        );
-        *slot = None;
-    }
-}
+// No unit tests here any more, and that is the change rather than an omission.
+// The one test this module had asserted a discipline the process-global summary
+// slot needed — take → unlock → invoke → restore, so a refresh raised from
+// inside a refresh could not deadlock the UI thread on it. The slot is gone:
+// `DialogState` holds the summary widget itself and `refresh_summary` takes no
+// lock, so there is no discipline left to get wrong and nothing left to assert
+// that is not the absence of a field. What the dialog DOES is driven end to end
+// by `verify_import_ui`, on the process main thread, because FLTK will not
+// build a widget anywhere else.

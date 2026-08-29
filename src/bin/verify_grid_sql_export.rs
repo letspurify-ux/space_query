@@ -163,6 +163,25 @@ fn main() {
         &mut failures,
     );
 
+    // A key the RESULT does not carry is not the same thing as a table with no
+    // key, and the difference is a statement that changes every row. The grid
+    // here holds ID, so the missing key is invented — which is exactly the
+    // shape `SELECT ename, sal FROM emp` produces against a table keyed by
+    // EMPNO.
+    match build_sql_updates(&oracle, &["EMPNO".to_string()]).into_parts() {
+        Err(reason) if reason.contains("EMPNO") => {
+            println!("--- Oracle SQL Updates (key not in the result) ---");
+            println!("{reason}");
+            println!("PASS: a key the result does not carry refuses the UPDATE");
+        }
+        Err(reason) => failures.push(format!(
+            "the refusal does not name the missing key: {reason}"
+        )),
+        Ok((sql, _)) => failures.push(format!(
+            "an UPDATE was written for a key the result does not carry: {sql:?}"
+        )),
+    }
+
     check_clipboard(
         "Oracle SQL Updates (no PK)",
         build_sql_updates(&oracle, &[]),

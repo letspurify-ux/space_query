@@ -35,9 +35,10 @@ use fltk::{
     prelude::*,
     window::Window,
 };
-use space_query::db::{ColumnInfo, QueryResult, SqlValueKind};
+use space_query::db::{ColumnInfo, DatabaseType, QueryResult, SqlValueKind};
+use space_query::ui::grid_sql_export::{build_sql_inserts, SqlWriteDialect};
 use space_query::ui::result_export::{
-    render, ExportContent, ExportFormat, ExportGrid, ExportScope,
+    render, ExportFormat, ExportGrid, ExportPayload, ExportScope,
 };
 use space_query::ui::result_table::{ExportAbandonReason, LazyFetchCallback};
 use space_query::ui::{MainWindow, ResultTableWidget};
@@ -270,6 +271,7 @@ fn main() {
 
     verify_a_repeated_column_name_is_refused(&mut failures);
     verify_a_new_result_does_not_inherit_a_queued_export(&mut failures);
+    verify_a_sql_inserts_export_writes_the_rows_it_started_with(&mut failures);
 
     if failures.is_empty() {
         say("\nResult export verified end to end through the running application.");
@@ -326,6 +328,55 @@ fn verify_a_repeated_column_name_is_refused(failures: &mut Vec<String>) {
     }
 }
 
+/// A `SQL Inserts` export writes the rows it was STARTED with.
+///
+/// It is the one format that cannot be finished where the rows are read: it
+/// must not name a column the server computes, and only the catalog knows which
+/// those are — a round trip. The grid therefore hands back a SNAPSHOT
+/// (`ExportPayload::Sql`) and the script is built when the answer lands.
+///
+/// What must not happen in between is the grid changing the file. The road used
+/// to re-resolve which grid to render when the catalog answered, and it asked
+/// only whether that grid still showed the same TABLE — which a re-run of the
+/// same query, another result tab on the same table, and a changed selection all
+/// answer yes to. This drives the production snapshot on a real widget, replaces
+/// the result underneath it, and builds from the snapshot afterwards.
+fn verify_a_sql_inserts_export_writes_the_rows_it_started_with(failures: &mut Vec<String>) {
+    let dialect = SqlWriteDialect::family_default(DatabaseType::MySQL);
+    let mut grid = ResultTableWidget::new();
+    grid.start_streaming(&["ID".to_string()]);
+    grid.append_rows(vec![vec!["1".to_string()]]);
+    grid.finish_streaming();
+    grid.capture_tour_select_range(0, 0, 0, 0);
+
+    // The production snapshot, taken exactly where the export road takes it.
+    let Some(selection) = grid.sql_export_selection(dialect, Some("APP.T".to_string())) else {
+        failures.push("the grid produced no SQL Inserts snapshot to export".to_string());
+        return;
+    };
+
+    // The catalog read is in flight; the user re-runs the same query, and the
+    // grid takes a new result of the SAME table.
+    grid.start_streaming(&["ID".to_string()]);
+    grid.append_rows(vec![vec!["999".to_string()]]);
+    grid.finish_streaming();
+    grid.capture_tour_select_range(0, 0, 0, 0);
+
+    let built = build_sql_inserts(&selection);
+    let text = built.text().to_string();
+    // Either spelling of the value: a streamed grid reports no column kinds, so
+    // the literal is quoted. What matters is WHICH row it holds.
+    let wrote_its_own_row = text.contains("VALUES ('1')") || text.contains("VALUES (1)");
+    if wrote_its_own_row && !text.contains("999") && built.rows() == 1 {
+        say("PASS: a SQL Inserts export writes the rows it was started with");
+    } else {
+        failures.push(format!(
+            "the export followed the grid to its new result instead of writing its own rows: \
+             {text:?}"
+        ));
+    }
+}
+
 /// A queued export belongs to the result it was queued against.
 ///
 /// An "All rows" export of a grid with an open lazy fetch queues itself behind
@@ -352,7 +403,9 @@ fn verify_a_new_result_does_not_inherit_a_queued_export(failures: &mut Vec<Strin
     grid.set_lazy_fetch_callback(callback);
     grid.set_lazy_fetch_session(4242);
 
-    type Outcome = Result<ExportContent, ExportAbandonReason>;
+    // The payload, not the finished bytes: a ready grid hands back what the
+    // export will be built FROM, which for a data format is already its text.
+    type Outcome = Result<ExportPayload, ExportAbandonReason>;
     let outcome: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
     let outcome_for_callback = outcome.clone();
     let queued = grid.capture_tour_export_after_fetch_all(Box::new(move |ready| {
@@ -383,11 +436,14 @@ fn verify_a_new_result_does_not_inherit_a_queued_export(failures: &mut Vec<Strin
         Some(Err(other)) => failures.push(format!(
             "the queued export was abandoned, but reported {other:?} rather than a replacement"
         )),
-        Some(Ok(built)) => failures.push(format!(
+        Some(Ok(ExportPayload::Data(built))) => failures.push(format!(
             "the queued export rendered the NEW result: {} rows, {:?}",
             built.rows(),
             built.text()
         )),
+        Some(Ok(ExportPayload::Sql(_))) => failures.push(
+            "a CSV export handed back a SQL Inserts snapshot, which it can never build".to_string(),
+        ),
         None => failures.push(
             "the queued export was neither run nor abandoned — the caller waits forever"
                 .to_string(),
@@ -397,10 +453,10 @@ fn verify_a_new_result_does_not_inherit_a_queued_export(failures: &mut Vec<Strin
     // And the completion of the old session must not resurrect it.
     grid.clear_lazy_fetch_session(4242, true);
     let after_close = outcome.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    if let Some(Ok(built)) = after_close {
+    if let Some(Ok(payload)) = after_close {
         failures.push(format!(
             "closing the old session ran the abandoned export after all: {:?}",
-            built.text()
+            payload.data().map(|built| built.text().to_string())
         ));
     }
 }

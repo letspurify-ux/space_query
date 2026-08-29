@@ -5359,13 +5359,18 @@ impl AppState {
             active_tab_id,
             is_connected && mode.access_mode == TransactionAccessMode::ReadOnly,
         );
-        // And the tab's backslash-rule pin, which `Import Data...` reads to
-        // write literals for the session its script will RUN on. The HANDLE is
-        // handed over, so this only has to happen once per card — it rides here
-        // because this is where the tab's other facts already reach it, and
-        // setting it again costs nothing.
-        self.object_browser
-            .set_tab_session_backslash_rule(active_tab_id, self.sql_editor.backslash_rule_pin());
+        // And the tab facts the card reads LATE: the backslash-rule pin
+        // `Import Data...` writes its literals by, and the session state both
+        // `Import Data...` and `Export Data...` read the NULL display text out
+        // of. HANDLES are handed over, so this only has to happen once per card
+        // — it rides here because this is where the tab's other facts already
+        // reach it, and setting them again costs nothing. One call, so a card
+        // cannot end up with one of them and not the other.
+        self.object_browser.set_tab_facts(
+            active_tab_id,
+            self.sql_editor.backslash_rule_pin(),
+            self.sql_editor.session_state_handle(),
+        );
 
         if is_connected && !self.transaction_mode_change_blocked_for_active_tab(db_type) {
             self.transaction_isolation_choice.activate();
@@ -6825,6 +6830,30 @@ enum ConnectionResult {
     },
 }
 
+/// Where a finished export goes.
+///
+/// One value, rather than an `Option<PathBuf>` beside the [`ExportDestination`]
+/// the dialog returned: they are the same fact, and two of them can disagree —
+/// the byte-order-mark rule reads one while the writer reads the other. A path
+/// that says "file" next to a destination that says "clipboard" cannot be built
+/// from this.
+#[derive(Clone, Debug)]
+enum ExportTarget {
+    File(PathBuf),
+    Clipboard,
+}
+
+impl ExportTarget {
+    /// The same fact in the export dialog's own vocabulary, which is what the
+    /// byte-order-mark rule is stated in.
+    fn destination(&self) -> ExportDestination {
+        match self {
+            ExportTarget::File(_) => ExportDestination::File,
+            ExportTarget::Clipboard => ExportDestination::Clipboard,
+        }
+    }
+}
+
 enum FileActionResult {
     OpenInNewTab {
         path: PathBuf,
@@ -6834,6 +6863,10 @@ enum FileActionResult {
     Export {
         path: PathBuf,
         row_count: usize,
+        /// Appended to the success report: what a `SQL Inserts` build left out
+        /// ([`crate::ui::grid_sql_export::left_out_generated_columns_note`]),
+        /// empty for every other export.
+        note: String,
         result: Result<(), String>,
     },
     /// Export text bound for the clipboard: generated SQL that had to read
@@ -6843,23 +6876,20 @@ enum FileActionResult {
     CopyToClipboard {
         result: Result<(String, String), String>,
     },
-    /// The catalog facts a `SQL Inserts` export had to read before it could
-    /// name its columns, on their way back to the main thread.
+    /// A `SQL Inserts` export waiting on the one thing the grid could not
+    /// answer: which of its table's columns the server computes.
     ///
-    /// The read is a round trip, so it runs on a worker; everything after it —
-    /// queueing behind a full fetch, rendering, writing — has to run on the main
-    /// thread, so the answer comes back through this channel and
-    /// [`MainWindow::run_result_export`] picks the export up where it left off.
-    ExportTableFacts {
+    /// The read is a round trip, so it runs on a worker and the answer comes
+    /// back here. The ROWS travel with it: they were snapshotted before the read
+    /// started, so what lands in the file is what the user asked for, whatever
+    /// the grid has done since. Nothing on this road reads a grid again — the
+    /// resume used to, and it asked "is this still the same table?", which two
+    /// results of one table both answer yes to.
+    ExportSqlInserts {
         choice: ExportChoice,
-        dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
-        destination: Option<PathBuf>,
-        /// The table the facts describe. The grid can take a different result
-        /// while the read is in flight, and facts about one table say nothing
-        /// about another's columns — so the resume checks this still names what
-        /// the grid names, and abandons the export rather than writing a script
-        /// whose column list was decided for something else.
-        table: String,
+        target: ExportTarget,
+        /// The rows and columns the script will be built from.
+        selection: Box<crate::ui::grid_sql_export::GridSqlSelection>,
         /// The columns the server computes, or why they could not be read.
         result: Result<Vec<String>, String>,
     },
@@ -7834,9 +7864,8 @@ impl MainWindow {
         state: &Arc<Mutex<AppState>>,
         choice: ExportChoice,
         dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
-        generated_columns: Vec<String>,
         callback: crate::ui::result_table::ExportReadyCallback,
-    ) -> Result<Option<crate::ui::result_export::ExportContent>, String> {
+    ) -> Result<Option<crate::ui::result_export::ExportPayload>, String> {
         let result_tabs = {
             let guard = state
                 .lock()
@@ -7852,7 +7881,6 @@ impl MainWindow {
             choice.scope,
             choice.destination,
             dialect,
-            generated_columns,
             callback,
         ))
     }
@@ -8040,7 +8068,7 @@ impl MainWindow {
         // The refusal is decided under the guard and SAID after it: an alert
         // runs a nested FLTK event loop, and callbacks firing inside it must
         // never find the app state mutex still held.
-        let Some((dialect, has_selection, sql_export_possible, export_refusal)) = ({
+        let Some((dialect, catalog, has_selection, sql_export_possible, export_refusal)) = ({
             let guard = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -8054,6 +8082,20 @@ impl MainWindow {
                             )
                         },
                     ),
+                    // What the one catalog read a `SQL Inserts` export still
+                    // needs will be asked on. Taken HERE, with the rest, for the
+                    // same reason the dialect is: this is the moment the user
+                    // asked, and the road that asks the question runs later —
+                    // possibly from inside a deferred callback, where the state
+                    // lock is already held and cannot be taken again.
+                    guard.active_connection_runtime().map(|runtime| {
+                        (
+                            runtime.connection(),
+                            guard.active_connection_id().and_then(|id| {
+                                guard.object_browser.selected_scope_for_connection(id)
+                            }),
+                        )
+                    }),
                     guard.result_tabs.has_grid_selection(),
                     guard.result_tabs.has_sql_exportable_columns(),
                     guard.result_tabs.export_refusal(),
@@ -8105,128 +8147,54 @@ impl MainWindow {
             }
         }
 
-        let destination = match choice.destination {
-            ExportDestination::Clipboard => None,
+        let target = match choice.destination {
+            ExportDestination::Clipboard => ExportTarget::Clipboard,
             ExportDestination::File => {
                 let Some(path) = Self::ask_export_file_path(choice.format) else {
                     return;
                 };
-                Some(path)
+                ExportTarget::File(path)
             }
         };
 
-        // `SQL Inserts` writes a script meant to be RE-RUN, so it must not name
-        // a column the server computes — and only the catalog knows which those
-        // are. The read is a round trip, so it happens on a worker and the rest
-        // of the export resumes when the answer lands in the file channel;
-        // everything else is exported straight away.
-        //
-        // With no base table there is nothing to ask about: the statements name
-        // the `MY_TABLE` placeholder, which the user edits anyway.
-        let sql_inserts_read = match (choice.format, dialect) {
-            (ExportFormat::SqlInserts, Some(dialect)) => {
-                let guard = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.result_tabs.sql_export_table(dialect).map(|table| {
-                    let scope = guard
-                        .active_connection_id()
-                        .and_then(|id| guard.object_browser.selected_scope_for_connection(id));
-                    (
-                        table,
-                        guard.active_connection_runtime().map(|r| r.connection()),
-                        scope,
-                        dialect,
-                    )
-                })
-            }
-            _ => None,
-        };
-        if let Some((table, connection, scope, dialect)) = sql_inserts_read {
-            // There is a table to ask about, so it gets asked. A connection that
-            // went away between the dialog and here leaves the question
-            // unanswerable, and an unanswered question is not the same as "this
-            // table computes nothing" — exporting anyway is how the rule came to
-            // be skipped on this road in the first place.
-            let Some(connection) = connection else {
-                crate::ui::alert_on_main(&format!(
-                    "Failed to read the structure of {table} for SQL Inserts: the connection is \
-                     no longer available."
-                ));
-                return;
-            };
-            let sender = file_sender.clone();
-            thread::spawn(move || {
-                let result = ObjectBrowserWidget::load_generated_sql_table_facts(
-                    &connection,
-                    scope.as_deref(),
-                    &table,
-                )
-                .map(|facts| facts.generated_columns)
-                // Fails CLOSED, the way the object tree's own structure read
-                // does: writing a script this app cannot promise the server will
-                // accept is the one thing it must not do quietly.
-                .map_err(|err| {
-                    format!("Failed to read the structure of {table} for SQL Inserts: {err}")
-                });
-                let _ = sender.send(FileActionResult::ExportTableFacts {
-                    choice,
-                    dialect: Some(dialect),
-                    destination,
-                    table,
-                    result,
-                });
-                app::awake();
-            });
-            return;
-        }
-
-        Self::run_result_export(state, file_sender, choice, dialect, destination, Vec::new());
+        Self::run_result_export(state, file_sender, choice, dialect, target, catalog);
     }
 
-    /// Render the visible result and send it to the destination the user chose.
+    /// Take the snapshot the export will be built from and send it on its way.
     ///
-    /// Split out of [`Self::export_current_results`] because a `SQL Inserts`
-    /// export has to read the catalog first, and that read is a round trip: it
-    /// runs on a worker and this is what resumes when the answer comes back, so
-    /// both roads render and deliver through exactly the same code.
+    /// Split out of [`Self::export_current_results`] because the snapshot can
+    /// arrive later than the click: an "All rows" export of a grid with an open
+    /// lazy fetch waits for the rest of the rows first. Both roads — the one
+    /// that has the rows now and the one that is handed them later — go through
+    /// [`Self::deliver_export_payload`], so what reaches the file cannot depend
+    /// on which of them ran.
     ///
-    /// `generated_columns` is what the server computes for the base table.
+    /// `catalog` is what the one read a `SQL Inserts` export still needs will
+    /// run on, taken when the user asked.
     fn run_result_export(
         state: &Arc<Mutex<AppState>>,
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
         choice: ExportChoice,
         dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
-        destination: Option<PathBuf>,
-        generated_columns: Vec<String>,
+        target: ExportTarget,
+        catalog: Option<(SharedConnection, Option<String>)>,
     ) {
         let sender = file_sender.clone();
         let deferred_sender = sender.clone();
-        let deferred_destination = destination.clone();
-        let format = choice.format;
+        let deferred_target = target.clone();
+        let deferred_catalog = catalog.clone();
         let export = match MainWindow::prepare_result_export(
             state,
             choice,
             dialect,
-            generated_columns,
             Box::new(move |ready| match ready {
-                Ok(built) => match built.into_parts() {
-                    Ok((content, row_count)) => Self::deliver_export(
-                        &deferred_sender,
-                        deferred_destination.clone(),
-                        format,
-                        content,
-                        row_count,
-                    ),
-                    // A refusal reaches the user the same way an abandonment
-                    // does, and for the same reason: this runs with the
-                    // app-state mutex held, where an alert would open a nested
-                    // FLTK loop under it.
-                    Err(reason) => {
-                        let _ = deferred_sender.send(FileActionResult::Notice { message: reason });
-                        app::awake();
-                    }
-                },
+                Ok(payload) => Self::deliver_export_payload(
+                    &deferred_sender,
+                    choice,
+                    deferred_target.clone(),
+                    deferred_catalog.clone(),
+                    payload,
+                ),
                 // The user has already chosen a format and a file name by now,
                 // so an export that says nothing would look like it had quietly
                 // succeeded. The reason comes with the abandonment because the
@@ -8262,18 +8230,149 @@ impl MainWindow {
                 return;
             }
         };
-        let Some(built) = export else {
+        let Some(payload) = export else {
             return;
         };
-        match built.into_parts() {
-            Ok((content, row_count)) => {
-                Self::deliver_export(&sender, destination, format, content, row_count);
+        Self::deliver_export_payload(&sender, choice, target, catalog, payload);
+    }
+
+    /// Send a finished export on its way, or start the one round trip a
+    /// `SQL Inserts` export still needs.
+    ///
+    /// No grid is read here, and that is the whole point: `payload` already
+    /// holds every row the file will contain. The catalog read below is
+    /// asynchronous, and asking the grid for its rows again once it answered is
+    /// how an export came to cover a result the user had replaced in the
+    /// meantime — the check that stood in its way asked whether the grid still
+    /// showed the same TABLE, which two results of one table both answer yes to.
+    ///
+    /// Reports through the file channel rather than alerting: one of its two
+    /// callers is a deferred lazy-fetch callback, which runs with the app-state
+    /// mutex held, and an alert there would open a nested FLTK loop under it.
+    fn deliver_export_payload(
+        sender: &std::sync::mpsc::Sender<FileActionResult>,
+        choice: ExportChoice,
+        target: ExportTarget,
+        catalog: Option<(SharedConnection, Option<String>)>,
+        payload: crate::ui::result_export::ExportPayload,
+    ) {
+        let selection = match payload {
+            crate::ui::result_export::ExportPayload::Data(content) => {
+                // A data format writes every column the grid shows, so there is
+                // never anything left out to note.
+                return Self::deliver_export_content(
+                    sender,
+                    target,
+                    choice.format,
+                    content,
+                    String::new(),
+                );
             }
-            // Nothing was written, so nothing is delivered — and the file the
-            // user just named is left alone rather than truncated to an empty
-            // one that looks like a finished export.
-            Err(reason) => crate::ui::alert_on_main(&reason),
+            crate::ui::result_export::ExportPayload::Sql(selection) => selection,
+        };
+        // With no base table there is nothing to ask the catalog about: the
+        // statements name the `MY_TABLE` placeholder, which the user edits
+        // anyway, and no column of it is computed by anything.
+        let Some(table) = selection.table.clone() else {
+            return Self::deliver_sql_inserts(sender, choice, target, selection, &[]);
+        };
+        // There is a table to ask about, so it gets asked. A connection that
+        // went away leaves the question unanswerable, and an unanswered question
+        // is not the same as "this table computes nothing" — exporting anyway is
+        // how the rule came to be skipped on this road in the first place.
+        let Some((connection, scope)) = catalog else {
+            Self::send_export_notice(
+                sender,
+                format!(
+                    "Failed to read the structure of {table} for SQL Inserts: the connection is \
+                     no longer available."
+                ),
+            );
+            return;
+        };
+        let sender = sender.clone();
+        thread::spawn(move || {
+            let result = ObjectBrowserWidget::load_generated_sql_table_facts(
+                &connection,
+                scope.as_deref(),
+                &table,
+            )
+            .map(|facts| facts.generated_columns)
+            // Fails CLOSED, the way the object tree's own structure read does:
+            // writing a script this app cannot promise the server will accept is
+            // the one thing it must not do quietly.
+            .map_err(|err| {
+                format!("Failed to read the structure of {table} for SQL Inserts: {err}")
+            });
+            let _ = sender.send(FileActionResult::ExportSqlInserts {
+                choice,
+                target,
+                selection: Box::new(selection),
+                result,
+            });
+            app::awake();
+        });
+    }
+
+    /// Build the `SQL Inserts` script from the snapshot and deliver it.
+    ///
+    /// `generated` is what the catalog says the server computes for the table
+    /// the snapshot names; an empty list means "this table computes no column",
+    /// never "nobody asked" — the road that could not ask reports instead.
+    fn deliver_sql_inserts(
+        sender: &std::sync::mpsc::Sender<FileActionResult>,
+        choice: ExportChoice,
+        target: ExportTarget,
+        mut selection: crate::ui::grid_sql_export::GridSqlSelection,
+        generated: &[String],
+    ) {
+        // A script that will be RE-RUN must not name a column the server
+        // computes. The same rule, through the same method, as the object
+        // tree's `Export Data...` — and what it dropped is SAID in the report,
+        // because the user exported the columns the grid showed and a file
+        // that quietly holds fewer is the kind of silence this app reports.
+        let left_out = selection.restrict_to_writable_columns(generated);
+        let note = crate::ui::grid_sql_export::left_out_generated_columns_note(&left_out);
+        let content = crate::ui::grid_sql_export::build_sql_inserts(&selection).map_text(|text| {
+            crate::ui::result_export::with_destination_prelude(
+                choice.format,
+                target.destination(),
+                text,
+            )
+        });
+        Self::deliver_export_content(sender, target, choice.format, content, note);
+    }
+
+    /// Hand a built export to its target, or report why nothing was written.
+    ///
+    /// The refusal reaches the user the same way an abandonment does, and for
+    /// the same reason: a caller may be holding the app-state mutex. Nothing is
+    /// delivered for one, so the file the user named is left alone rather than
+    /// truncated to an empty one that looks like a finished export.
+    ///
+    /// `note` rides along to the success report — what a `SQL Inserts` build
+    /// left out, empty everywhere else. A refusal drops it: nothing was
+    /// written, so there is nothing the note could be ABOUT.
+    fn deliver_export_content(
+        sender: &std::sync::mpsc::Sender<FileActionResult>,
+        target: ExportTarget,
+        format: ExportFormat,
+        content: crate::ui::result_export::ExportContent,
+        note: String,
+    ) {
+        match content.into_parts() {
+            Ok((text, row_count)) => {
+                Self::deliver_export(sender, target, format, text, row_count, note)
+            }
+            Err(reason) => Self::send_export_notice(sender, reason),
         }
+    }
+
+    /// Say something about an export through the channel that drains on the
+    /// main thread.
+    fn send_export_notice(sender: &std::sync::mpsc::Sender<FileActionResult>, message: String) {
+        let _ = sender.send(FileActionResult::Notice { message });
+        app::awake();
     }
 
     /// Where the exported text should go. `None` means the user cancelled the
@@ -8286,25 +8385,27 @@ impl MainWindow {
         sender: &std::sync::mpsc::Sender<FileActionResult>,
         delivery: crate::ui::object_browser::ObjectExportDelivery,
     ) {
-        let destination = match delivery.destination {
-            ExportDestination::Clipboard => None,
+        let target = match delivery.destination {
+            ExportDestination::Clipboard => ExportTarget::Clipboard,
             ExportDestination::File => {
                 let Some(path) =
                     Self::ask_export_file_path_named(delivery.format, &delivery.suggested_name)
                 else {
                     return;
                 };
-                Some(path)
+                ExportTarget::File(path)
             }
         };
-        match delivery.content.into_parts() {
-            Ok((text, row_count)) => {
-                Self::deliver_export(sender, destination, delivery.format, text, row_count);
-            }
-            // Reached only if a refusal slipped past the object browser's own
-            // report; the file the user just named stays untouched either way.
-            Err(reason) => crate::ui::alert_on_main(&reason),
-        }
+        // Through the grid export's own deliverer: a refusal here is only
+        // reached if one slipped past the object browser's own report, and the
+        // file the user just named stays untouched either way.
+        Self::deliver_export_content(
+            sender,
+            target,
+            delivery.format,
+            delivery.content,
+            delivery.left_out_note,
+        );
     }
 
     fn ask_export_file_path(format: ExportFormat) -> Option<PathBuf> {
@@ -8332,30 +8433,38 @@ impl MainWindow {
         ))
     }
 
-    /// Hand finished export text to its destination. Writing runs off the main
+    /// Hand finished export text to its target. Writing runs off the main
     /// thread; the clipboard copy is queued so it happens on it.
+    ///
+    /// `note` is appended to whichever report the target gets, so both ends of
+    /// an export say the same thing about what its script left out.
     fn deliver_export(
         sender: &std::sync::mpsc::Sender<FileActionResult>,
-        destination: Option<PathBuf>,
+        target: ExportTarget,
         format: ExportFormat,
         content: String,
         row_count: usize,
+        note: String,
     ) {
-        match destination {
-            Some(path) => {
+        match target {
+            ExportTarget::File(path) => {
                 let sender = sender.clone();
                 thread::spawn(move || {
-                    let result = fs::write(&path, content).map_err(|err| err.to_string());
+                    let result = crate::utils::fs_atomic::write_file_atomically(&path, &content);
                     let _ = sender.send(FileActionResult::Export {
                         path,
                         row_count,
+                        note,
                         result,
                     });
                     app::awake();
                 });
             }
-            None => {
-                let message = format!("Copied {row_count} rows to clipboard as {}", format.label());
+            ExportTarget::Clipboard => {
+                let message = format!(
+                    "Copied {row_count} rows to clipboard as {}{note}",
+                    format.label()
+                );
                 let _ = sender.send(FileActionResult::CopyToClipboard {
                     result: Ok((content, message)),
                 });
@@ -8519,14 +8628,8 @@ impl MainWindow {
                     // holds fewer than they asked for is the kind of silence
                     // this app reports rather than keeps.
                     let left_out = selection.restrict_to_writable_columns(&facts.generated_columns);
-                    let computed_note = if left_out.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            " ({} left out: computed by the server)",
-                            left_out.join(", ")
-                        )
-                    };
+                    let computed_note =
+                        crate::ui::grid_sql_export::left_out_generated_columns_note(&left_out);
                     if is_update {
                         // The KEY is resolved by name too, and only here —
                         // the catalog answer is what says whether that name
@@ -8539,6 +8642,12 @@ impl MainWindow {
                         )
                         .into_parts()
                         .map(|(sql, written)| {
+                            // True by construction now: a statement without a
+                            // WHERE can only come from a table that HAS no key,
+                            // because the builder refuses a key this result does
+                            // not carry rather than dropping it. This used to be
+                            // the only thing said about the key, and it was
+                            // silent about the other way one can go missing.
                             let message = if facts.key_columns.is_empty() {
                                 format!(
                                     "Copied {written} UPDATE statements (no primary key — \
@@ -17038,8 +17147,12 @@ impl MainWindow {
                 return;
             };
             let mut created_tabs = Vec::new();
-            let mut sql_to_execute: Option<String> = None;
-            let mut script_to_execute: Option<String> = None;
+            // Paired with the tab that raised the action, the way the table
+            // browse request below already is: a statement belongs to the tab
+            // that asked for it, and this closure runs long enough after the
+            // click for "whichever tab is active now" to be a different one.
+            let mut sql_to_execute: Option<(QueryTabId, String)> = None;
+            let mut script_to_execute: Option<(QueryTabId, String)> = None;
             let mut table_browse_to_execute: Option<(QueryTabId, TableBrowsePageRequest)> = None;
             let mut export_excludes_uncommitted_work = false;
             let mut export_to_deliver: Option<crate::ui::object_browser::ObjectExportDelivery> =
@@ -17084,7 +17197,7 @@ impl MainWindow {
                         }
                     }
                     SqlAction::Execute(sql) => {
-                        sql_to_execute = Some(sql);
+                        sql_to_execute = Some((source_tab_id, sql));
                     }
                     SqlAction::ExportData(delivery) => {
                         // Deferred like the two above: the save panel and the
@@ -17108,7 +17221,7 @@ impl MainWindow {
                         export_to_deliver = Some(delivery);
                     }
                     SqlAction::ExecuteScript(sql) => {
-                        script_to_execute = Some(sql);
+                        script_to_execute = Some((source_tab_id, sql));
                     }
                     SqlAction::BrowseTable(target) => {
                         let Some(tab) =
@@ -17174,14 +17287,22 @@ impl MainWindow {
                 );
             }
 
-            if let Some(sql) = sql_to_execute {
-                if let Some(editor) = acquire_sql_editor_if_idle(&state_for_browser) {
+            // On the tab that RAISED the action, never on whichever is active
+            // when it lands. The two are the same tab today only because
+            // selecting the source tab above made it the active one, and that
+            // is a side effect, not the rule: an object-browser action can be
+            // delivered long after the click — `Import Data...` reads a file and
+            // loads the target's columns first — and a statement belongs to the
+            // tab that asked for it, whose transaction, auto-commit and READ
+            // ONLY pin it will run under.
+            if let Some((tab_id, sql)) = sql_to_execute {
+                if let Some(editor) = acquire_tab_sql_editor_if_idle(&state_for_browser, tab_id) {
                     editor.execute_sql_text(&sql);
                 }
             }
 
-            if let Some(sql) = script_to_execute {
-                if let Some(editor) = acquire_sql_editor_if_idle(&state_for_browser) {
+            if let Some((tab_id, sql)) = script_to_execute {
+                if let Some(editor) = acquire_tab_sql_editor_if_idle(&state_for_browser, tab_id) {
                     editor.execute_script_text(&sql);
                 }
             }
@@ -17840,14 +17961,16 @@ impl MainWindow {
             // poll is what re-enters through it — raising one while still
             // holding the channel this loop drains is the shape that hangs.
             let mut deferred_alerts: Vec<String> = Vec::new();
-            // An export that had to read the catalog first resumes here, and it
-            // resumes AFTER the receiver guard is released for the same reason
-            // the alerts do: it can raise one, and an alert runs a nested FLTK
-            // event loop that re-enters this poll.
+            // A `SQL Inserts` export that had to read the catalog first is built
+            // here, and it is built AFTER the receiver guard is released for the
+            // same reason the alerts are raised there: building can report a
+            // refusal, and that runs a nested FLTK event loop which re-enters
+            // this poll. It is also the one piece of real work on this road, and
+            // the app-state lock has nothing to do with it.
             type ResumedExport = (
                 ExportChoice,
-                Option<crate::ui::grid_sql_export::SqlWriteDialect>,
-                Option<PathBuf>,
+                ExportTarget,
+                Box<crate::ui::grid_sql_export::GridSqlSelection>,
                 Vec<String>,
             );
             let mut resumed_exports: Vec<ResumedExport> = Vec::new();
@@ -17906,6 +18029,7 @@ impl MainWindow {
                                 FileActionResult::Export {
                                     path,
                                     row_count,
+                                    note,
                                     result,
                                 } => match result {
                                     Ok(()) => {
@@ -17918,8 +18042,8 @@ impl MainWindow {
                                             .clone();
                                         s.status_bar.set_label(&format_status(
                                             &format!(
-                                                "Exported {} rows to {}",
-                                                row_count, file_label
+                                                "Exported {} rows to {}{}",
+                                                row_count, file_label, note
                                             ),
                                             &conn_info,
                                         ));
@@ -17929,36 +18053,24 @@ impl MainWindow {
                                             Some(format!("Failed to export results: {}", err));
                                     }
                                 },
-                                FileActionResult::ExportTableFacts {
+                                FileActionResult::ExportSqlInserts {
                                     choice,
-                                    dialect,
-                                    destination,
-                                    table,
+                                    target,
+                                    selection,
                                     result,
                                 } => match result {
+                                    // No grid is consulted: `selection` holds
+                                    // the rows this export was started for, so
+                                    // whatever the grid has done since — a
+                                    // re-run, another result tab, a changed
+                                    // selection — cannot redirect the file.
                                     Ok(generated_columns) => {
-                                        // Facts about one table decide nothing
-                                        // about another's columns, and the grid
-                                        // may have taken a new result while the
-                                        // read was in flight.
-                                        let still_the_same = dialect.is_some_and(|dialect| {
-                                            s.result_tabs.sql_export_table(dialect).as_deref()
-                                                == Some(table.as_str())
-                                        });
-                                        if still_the_same {
-                                            resumed_exports.push((
-                                                choice,
-                                                dialect,
-                                                destination,
-                                                generated_columns,
-                                            ));
-                                        } else {
-                                            deferred_alert = Some(format!(
-                                                "The export was not written: the result grid no \
-                                                 longer shows {table}. Run that query again and \
-                                                 export it."
-                                            ));
-                                        }
+                                        resumed_exports.push((
+                                            choice,
+                                            target,
+                                            selection,
+                                            generated_columns,
+                                        ));
                                     }
                                     // The read failed, so nothing is written:
                                     // the file the user just named stays
@@ -18018,14 +18130,13 @@ impl MainWindow {
                 crate::ui::alert_on_main(&alert_msg);
             }
 
-            for (choice, dialect, destination, generated_columns) in resumed_exports {
-                MainWindow::run_result_export(
-                    &state,
+            for (choice, target, selection, generated_columns) in resumed_exports {
+                MainWindow::deliver_sql_inserts(
                     &file_sender,
                     choice,
-                    dialect,
-                    destination,
-                    generated_columns,
+                    target,
+                    *selection,
+                    &generated_columns,
                 );
             }
 
@@ -19217,6 +19328,9 @@ impl MainWindow {
             "HR.EMP",
             &crate::ui::table_import::ImportTargets::all_writable(targets),
             ExportFormat::Csv,
+            // A capture has no tab to ask, so it shows what an untouched
+            // session writes.
+            crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT,
         );
     }
 
@@ -22870,9 +22984,8 @@ mod tests {
             scope: crate::ui::result_export::ExportScope::All,
             destination: ExportDestination::File,
         };
-        let export =
-            MainWindow::prepare_result_export(&state, choice, None, Vec::new(), Box::new(|_| {}))
-                .expect("prepare export should succeed");
+        let export = MainWindow::prepare_result_export(&state, choice, None, Box::new(|_| {}))
+            .expect("prepare export should succeed");
 
         assert!(export.is_none());
         assert_eq!(

@@ -100,6 +100,15 @@ fn spool_path_owners() -> std::sync::MutexGuard<'static, HashMap<PathBuf, u64>> 
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The text a session shows for a SQL NULL until `SET NULL` says otherwise.
+///
+/// ONE home, because three things have to agree about it and one of them is a
+/// round trip: a result grid draws a NULL with it, `Export Data...` writes it
+/// into a delimited file, and the import dialog offers it as the text that
+/// MEANS null. They each held their own copy of the literal, which was harmless
+/// only for as long as nobody moved theirs.
+pub const DEFAULT_NULL_TEXT: &str = "NULL";
+
 #[derive(Debug)]
 pub struct SessionState {
     pub db_type: DatabaseType,
@@ -178,7 +187,7 @@ impl Default for SessionState {
             sqlblanklines_enabled: false,
             tab_enabled: true,
             colsep: " | ".to_string(),
-            null_text: "NULL".to_string(),
+            null_text: DEFAULT_NULL_TEXT.to_string(),
             break_column: None,
             compute: None,
             spool_path: None,

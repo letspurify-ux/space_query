@@ -587,6 +587,68 @@ fn verify(target: Target) -> Result<(), String> {
     }
     println!("PASS: SQL Updates matched rows by primary key and applied exactly");
 
+    // (3b) A result that does not carry the key the CATALOG reports is refused,
+    //      rather than written as an UPDATE with no WHERE at all.
+    //
+    //      This is the `SELECT ename, sal FROM emp` shape: the table is keyed
+    //      and the query left the key out. It used to produce
+    //      `UPDATE t SET … ;` — every row — and report it as an ordinary copy,
+    //      because the caller can only see whether the TABLE has a key. Live,
+    //      because the key here is the one the server's own catalog reported.
+    let keyless_columns: Vec<String> = columns
+        .iter()
+        .filter(|name| !keys.iter().any(|key| key.eq_ignore_ascii_case(name)))
+        .cloned()
+        .collect();
+    if keyless_columns.is_empty() {
+        return Err("the fixture has no non-key column to build a keyless result from".into());
+    }
+    let keyless_kinds: Vec<SqlValueKind> = keyless_columns
+        .iter()
+        .map(|name| {
+            column_index(&columns, name)
+                .map(|index| kinds[index])
+                .unwrap_or(SqlValueKind::Unknown)
+        })
+        .collect();
+    let keyless_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            keyless_columns
+                .iter()
+                .filter_map(|name| {
+                    column_index(&columns, name)
+                        .ok()
+                        .map(|index| row[index].clone())
+                })
+                .collect()
+        })
+        .collect();
+    let keyless_selection = selection(
+        db_type,
+        BASE_TABLE,
+        &keyless_columns,
+        &keyless_kinds,
+        &keyless_rows,
+        (0..keyless_columns.len()).collect(),
+        vec![0],
+    );
+    match build_sql_updates(&keyless_selection, &keys).into_parts() {
+        Err(reason) if keys.iter().any(|key| reason.contains(key.as_str())) => {
+            println!("PASS: a key the result does not carry refuses the UPDATE — {reason}");
+        }
+        Err(reason) => {
+            return Err(format!(
+                "the refusal does not name the catalog's key {keys:?}: {reason}"
+            ))
+        }
+        Ok((sql, _)) => {
+            return Err(format!(
+                "an UPDATE was written for a result that carries none of {keys:?}: {sql:?}"
+            ))
+        }
+    }
+
     // (4) Where Clause must select exactly the rows it was built from.
     let part_index = column_index(&columns, "PART")?;
     let seq_index = column_index(&columns, "SEQ")?;

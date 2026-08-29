@@ -3064,9 +3064,8 @@ impl ResultTabsWidget {
         scope: ExportScope,
         destination: ExportDestination,
         dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
-        generated_columns: Vec<String>,
         callback: crate::ui::result_table::ExportReadyCallback,
-    ) -> Option<crate::ui::result_export::ExportContent> {
+    ) -> Option<crate::ui::result_export::ExportPayload> {
         let table = self.current_table()?;
         let request = ExportRequest {
             format,
@@ -3074,7 +3073,6 @@ impl ResultTabsWidget {
             destination,
             dialect,
             table: Self::resolve_grid_export_table(&table, dialect),
-            generated_columns,
         };
         table.export_after_fetch_all(request, callback)
     }
@@ -3455,19 +3453,6 @@ impl ResultTabsWidget {
         let mut selection = table.sql_export_selection(dialect, None)?;
         selection.table = Self::resolve_grid_export_table(&table, Some(dialect));
         Some(selection)
-    }
-
-    /// The base table the visible grid's generated SQL would name, if any.
-    ///
-    /// Just the NAME: the export road needs it before it renders anything, to
-    /// ask the catalog which of the table's columns the server computes, and
-    /// taking a whole selection snapshot to read one field would copy every
-    /// exported row for nothing.
-    pub(crate) fn sql_export_table(
-        &self,
-        dialect: crate::ui::grid_sql_export::SqlWriteDialect,
-    ) -> Option<String> {
-        Self::resolve_grid_export_table(&self.current_table()?, Some(dialect))
     }
 
     /// The base table generated SQL should name for this grid, if one exists.

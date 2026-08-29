@@ -30,7 +30,7 @@ use crate::ui::grid_sort::{compare_cell_values, NullOrdering, SortColumn};
 use crate::ui::grid_sql_export::GridSqlSelection;
 use crate::ui::grid_value_filter::GridValueFilter;
 use crate::ui::result_export::{
-    ExportContent, ExportDestination, ExportFormat, ExportGrid, ExportScope,
+    ExportContent, ExportDestination, ExportFormat, ExportGrid, ExportPayload, ExportScope,
 };
 use crate::ui::selection_summary::{summarize_selection, SelectionSummary};
 use crate::ui::sql_editor::LazyFetchRequest;
@@ -156,9 +156,13 @@ enum LazyFetchPendingAction {
     Export(ExportRequest, ExportReadyCallback),
 }
 
-/// What a deferred export reports back: the rendered bytes and their row count,
-/// or why it will not happen.
-pub(crate) type ExportReadyCallback = Box<dyn FnMut(Result<ExportContent, ExportAbandonReason>)>;
+/// What a deferred export reports back: everything the file will contain, or
+/// why it will not happen.
+///
+/// The payload rather than the rendered bytes, because `SQL Inserts` still owes
+/// the catalog a question at this point — see [`ExportPayload`], whose whole
+/// reason for existing is that nothing may read the grid again afterwards.
+pub(crate) type ExportReadyCallback = Box<dyn FnMut(Result<ExportPayload, ExportAbandonReason>)>;
 
 /// Why a queued export will not happen.
 ///
@@ -237,19 +241,6 @@ pub(crate) struct ExportRequest {
     /// Only `SqlInserts` reads these; every other format is dialect-agnostic.
     pub dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
     pub table: Option<String>,
-    /// The columns of [`Self::table`] the server COMPUTES, as the catalog names
-    /// them, read before the export was started.
-    ///
-    /// Only `SqlInserts` reads them, because it is the one format that writes a
-    /// script meant to be RE-RUN: naming a virtual or always-generated column in
-    /// an `INSERT` is `ORA-54013` / MySQL 3105, so the file cannot run at all.
-    /// Every data format still writes every column, because that is what the
-    /// result HAS.
-    ///
-    /// Empty means "this table computes no column" — never "nobody asked". The
-    /// road that could not ask reports the failure instead of exporting, the
-    /// same way the object tree's own export does.
-    pub generated_columns: Vec<String>,
 }
 
 impl ExportRequest {
@@ -260,7 +251,6 @@ impl ExportRequest {
             destination: ExportDestination::File,
             dialect: None,
             table: None,
-            generated_columns: Vec::new(),
         }
     }
 }
@@ -996,9 +986,11 @@ impl ResultTableWidget {
     /// What a grid shows for SQL NULL until a session's `SET NULL` says
     /// otherwise.
     ///
-    /// Exported so a path with no grid to ask — the object browser's table
-    /// export — writes the same word the grid would have written.
-    pub(crate) const DEFAULT_NULL_TEXT: &'static str = "NULL";
+    /// The SESSION's own constant, re-exported here: the grid draws with it,
+    /// the object browser's table export writes it into a delimited file, and
+    /// the import dialog offers it back — and a road with no session to ask
+    /// has to land on the same word the others would have used.
+    pub const DEFAULT_NULL_TEXT: &'static str = crate::db::DEFAULT_NULL_TEXT;
 
     fn current_null_text(&self) -> String {
         self.null_text
@@ -10127,9 +10119,11 @@ impl ResultTableWidget {
     /// The rows and columns an export covers, as the grid shows them.
     ///
     /// Column filtering is deliberately looser than
-    /// [`Self::sql_export_selection`]: what the user sees is what a data format
-    /// gets, so only the hidden auto-ROWID column is dropped. Generated SQL
-    /// needs legal column names and keeps the stricter rule.
+    /// [`Self::sql_export_selection`]: what the user SEES is what a data format
+    /// gets, so the only columns dropped are the ones the grid is not drawing —
+    /// the technical ROWID column it hides itself, and any the user hid through
+    /// the Columns dialog. Generated SQL needs legal column names and keeps the
+    /// stricter rule.
     fn export_grid_snapshot(&self, scope: ExportScope) -> ExportGrid {
         let hidden_col = self.hidden_columns();
         let headers = self
@@ -10226,7 +10220,7 @@ impl ResultTableWidget {
     pub fn export_to_csv_after_fetch_all(
         &self,
         callback: ExportReadyCallback,
-    ) -> Option<ExportContent> {
+    ) -> Option<ExportPayload> {
         self.export_after_fetch_all(ExportRequest::csv_file(), callback)
     }
 
@@ -10703,7 +10697,7 @@ impl ResultTableWidget {
         &self,
         request: ExportRequest,
         callback: ExportReadyCallback,
-    ) -> Option<ExportContent> {
+    ) -> Option<ExportPayload> {
         match request.scope {
             ExportScope::Selection => Some(self.current_export_snapshot(&request)),
             ExportScope::All => {
@@ -10729,53 +10723,54 @@ impl ResultTableWidget {
     pub fn capture_tour_export_after_fetch_all(
         &self,
         callback: ExportReadyCallback,
-    ) -> Option<ExportContent> {
+    ) -> Option<ExportPayload> {
         self.export_after_fetch_all(ExportRequest::csv_file(), callback)
     }
 
-    fn current_export_snapshot(&self, request: &ExportRequest) -> ExportContent {
-        self.render_export(request).map_text(|text| {
-            crate::ui::result_export::with_destination_prelude(
-                request.format,
-                request.destination,
-                text,
-            )
-        })
+    fn current_export_snapshot(&self, request: &ExportRequest) -> ExportPayload {
+        match self.render_export(request) {
+            ExportPayload::Data(content) => ExportPayload::Data(content.map_text(|text| {
+                crate::ui::result_export::with_destination_prelude(
+                    request.format,
+                    request.destination,
+                    text,
+                )
+            })),
+            // A `SQL Inserts` snapshot is not text yet. Its prelude is applied
+            // where its text is finished, through the same function, by the one
+            // caller that finishes it.
+            payload => payload,
+        }
     }
 
-    fn render_export(&self, request: &ExportRequest) -> ExportContent {
+    fn render_export(&self, request: &ExportRequest) -> ExportPayload {
         // The two snapshots are built separately and only one is ever taken:
         // both copy every exported row, and a large `SQL Inserts` export should
         // not also materialize a grid snapshot it will not read.
+        //
+        // `SQL Inserts` is not rendered here at all. A script that will be
+        // RE-RUN must not name a column the server computes, and only the
+        // catalog knows which those are — a round trip. Handing the rows back
+        // as a snapshot is what lets that read happen with them already in
+        // hand, so no one has to come back and ask this grid for them again.
         if matches!(request.format, ExportFormat::SqlInserts) {
-            let sql_selection = request
-                .dialect
-                .and_then(|dialect| match request.scope {
-                    ExportScope::All => self.sql_export_all_rows(dialect, request.table.clone()),
-                    ExportScope::Selection => {
-                        self.sql_export_selection(dialect, request.table.clone())
-                    }
-                })
-                .map(|mut selection| {
-                    // A script that will be RE-RUN must not name a column the
-                    // server computes. The same rule, through the same method,
-                    // as the object tree's `Export Data...` — which is what this
-                    // road never applied, so the two exports of one table
-                    // disagreed and only the tree's could run.
-                    selection.restrict_to_writable_columns(&request.generated_columns);
-                    selection
-                });
-            return crate::ui::result_export::render_export_content(
-                request.format,
-                &ExportGrid::default(),
-                sql_selection.as_ref(),
-            );
+            let selection = request.dialect.and_then(|dialect| match request.scope {
+                ExportScope::All => self.sql_export_all_rows(dialect, request.table.clone()),
+                ExportScope::Selection => self.sql_export_selection(dialect, request.table.clone()),
+            });
+            return match selection {
+                Some(selection) => ExportPayload::Sql(selection),
+                // No connection to name a dialect, no rows, or no column a
+                // statement may name: nothing to write and nothing to complain
+                // about, which is exactly what an empty write is.
+                None => ExportPayload::Data(ExportContent::nothing()),
+            };
         }
-        crate::ui::result_export::render_export_content(
+        ExportPayload::Data(crate::ui::result_export::render_export_content(
             request.format,
             &self.export_grid_snapshot(request.scope),
             None,
-        )
+        ))
     }
 
     /// Escape a cell for tab-separated clipboard output so spreadsheet apps
@@ -17722,8 +17717,10 @@ mod tests {
         let abandoned_for_callback = abandoned.clone();
         assert!(widget
             .export_to_csv_after_fetch_all(Box::new(move |ready| match ready {
-                Ok(built) => {
-                    let (csv, row_count) = built
+                Ok(payload) => {
+                    let (csv, row_count) = payload
+                        .data()
+                        .expect("a CSV export is always finished text, never a SQL snapshot")
                         .into_parts()
                         .expect("a CSV export of a plain grid is never refused");
                     *exported_for_callback

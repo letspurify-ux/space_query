@@ -150,6 +150,82 @@ fn split_qualified_catalog_name(qualified: &str) -> (Option<String>, String) {
 type CardTabBackslashRule =
     Arc<Mutex<Option<crate::ui::sql_editor::TabPin<crate::db::SessionBackslashRule>>>>;
 
+/// The tab's live SQL*Plus session state, as a card holds it.
+///
+/// The HANDLE, for the same reason as [`CardTabBackslashRule`]: `SET NULL`
+/// moves the tab's NULL display text at any time, and the export and import
+/// roads read it when the user acts, which can be long after the card was
+/// wired. Exactly one fact is ever read out of it —
+/// [`CardTabFacts::null_text_now`] — because a copy of that fact would be a
+/// second source of truth for a value the tab already owns.
+type CardTabSessionState = Arc<Mutex<Option<Arc<Mutex<crate::db::SessionState>>>>>;
+
+/// Everything a card knows about its TAB that it must read at the moment it
+/// acts, never at the moment it was wired.
+///
+/// One value rather than a handle per fact: every one of them is late-read for
+/// the same reason, and every road that needs one needs the others, so a second
+/// parameter is a second thing a call site can forget to pass on.
+#[derive(Clone, Default)]
+struct CardTabFacts {
+    backslash: CardTabBackslashRule,
+    session: CardTabSessionState,
+}
+
+impl CardTabFacts {
+    /// What the tab's backslash pin says NOW, or `None` when the card has no
+    /// tab (a connection preview) or the tab's session has never been observed.
+    fn backslash_rule_now(&self) -> Option<crate::db::SessionBackslashRule> {
+        self.backslash
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|pin| pin.get())
+    }
+
+    /// The text this tab writes for a SQL NULL right now.
+    ///
+    /// ONE answer for both ends of a delimited round trip: `Export Data...`
+    /// writes it for a NULL, and `Import Data...` offers it as the text that
+    /// MEANS null. They used to be a session fact on one side (the result grid
+    /// writes what it SHOWS, which `SET NULL` moves) and a hard-coded `NULL` on
+    /// the other — so a tab that had run `SET NULL '-'` exported `-` for every
+    /// NULL and then read those same cells back as the STRING `-`, silently, on
+    /// every backend.
+    ///
+    /// A card with no tab — a connection preview — has no session to ask, and
+    /// the grid's own default is what it would have shown.
+    ///
+    /// The honest limit, which is the session's and not this reader's: a NULL
+    /// is written into a grid's rows AS this text when the rows arrive
+    /// (`apply_null_text_to_row`), so a result already on screen keeps the text
+    /// it was fetched with. A user who runs `SET NULL` BETWEEN a query and a
+    /// grid export of that same result therefore gets a file spelling NULL the
+    /// old way and a dialog offering the new one. Answering with the session is
+    /// still the better default of the two available — it is exactly right for
+    /// `Export Data...`, which reads its rows now, and for every grid export of
+    /// a result fetched since the last `SET NULL` — and the dialog's field is
+    /// there for the rest. Being right in both cases needs the grid to keep the
+    /// driver's NULL marker instead of the text, which is the same change the
+    /// grid export's "a value that spells the NULL text" limit waits on.
+    fn null_text_now(&self) -> String {
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|session| {
+                session
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .null_text
+                    .clone()
+            })
+            .unwrap_or_else(|| {
+                crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT.to_string()
+            })
+    }
+}
+
 /// What the catalog says about one table that generated SQL has to respect.
 ///
 /// Both facts come from ONE structure read: see
@@ -177,6 +253,12 @@ pub struct ObjectExportDelivery {
     pub destination: crate::ui::result_export::ExportDestination,
     /// Base name to offer in the save panel, without an extension.
     pub suggested_name: String,
+    /// What the render left out of a `SQL Inserts` script, ready to append to
+    /// the delivery report — [`crate::ui::grid_sql_export::left_out_generated_columns_note`]'s
+    /// sentence, empty for every other format and for a table that computes no
+    /// column. Carried with the content because the drop happens where the
+    /// content is rendered, and the report is written where it is delivered.
+    pub left_out_note: String,
 }
 
 /// The object-browser actions that destroy something.
@@ -1201,6 +1283,13 @@ enum ObjectActionResult {
         qualified_name: String,
         file_label: String,
         format: crate::ui::result_export::ExportFormat,
+        /// The text the TAB shows for a SQL NULL, read when the user asked.
+        ///
+        /// The import dialog offers it as the text that means null, so a file
+        /// this app exported reads back with its NULLs intact — which a
+        /// hard-coded `NULL` could not promise for a tab that had run
+        /// `SET NULL`. See [`CardTabFacts::null_text_now`].
+        null_text: String,
         /// The file's text, the table's columns, and the SQL-writing rules of
         /// the connection they were read on, loaded together so one failure
         /// reports one message and so the script cannot be written for a
@@ -1266,6 +1355,10 @@ enum ObjectActionResult {
     ExportedTable {
         qualified_name: String,
         choice: crate::ui::result_export_dialog::ExportChoice,
+        /// The text the TAB shows for a SQL NULL, read when the user asked —
+        /// the same value the import dialog will offer, and the same one this
+        /// tab's own result grid writes into a delimited export.
+        null_text: String,
         /// The rows, the columns no statement may write into, and the
         /// SQL-writing rules of the connection they came from.
         ///
@@ -1344,7 +1437,7 @@ pub struct ObjectBrowserWidget {
     /// value: `Import Data...` builds a script that will RUN on that session,
     /// and the connection's configured `sql_mode` stops being the answer the
     /// moment a user sets their own. A preview card has no tab, so no pin.
-    tab_session_backslash_rule: CardTabBackslashRule,
+    tab_facts: CardTabFacts,
     scope_options: Arc<Mutex<Vec<String>>>,
     selected_scope: Arc<Mutex<Option<String>>>,
     suppress_scope_events: Arc<Mutex<bool>>,
@@ -1483,7 +1576,7 @@ impl ObjectBrowserWidget {
             object_cache,
             current_db_type,
             write_refusal,
-            tab_session_backslash_rule: Arc::new(Mutex::new(None)),
+            tab_facts: CardTabFacts::default(),
             scope_options,
             selected_scope,
             suppress_scope_events,
@@ -1991,31 +2084,31 @@ impl ObjectBrowserWidget {
         self.write_refusal.set_tab_mode(refused);
     }
 
-    /// Hand this card the TAB's live backslash-rule pin.
+    /// Hand this card the TAB's live facts.
     ///
-    /// The handle, not a value: `Import Data...` reads it when it builds the
-    /// script, which can be long after this was set, and the tab's session may
-    /// have moved in between.
-    pub(crate) fn set_tab_session_backslash_rule(
+    /// HANDLES, not values: every one of them is read when the user acts —
+    /// `Import Data...` builds its script and `Export Data...` writes its file
+    /// long after this was called — and the tab's session can move in between.
+    ///
+    /// One door for all of them on purpose. They are wired at one moment, from
+    /// one tab, for one reason; two doors is two things a future sync site can
+    /// hand over half of, and the half it forgot is the one that silently falls
+    /// back to a default.
+    pub(crate) fn set_tab_facts(
         &self,
-        pin: crate::ui::sql_editor::TabPin<crate::db::SessionBackslashRule>,
+        backslash: crate::ui::sql_editor::TabPin<crate::db::SessionBackslashRule>,
+        session: Arc<Mutex<crate::db::SessionState>>,
     ) {
         *self
-            .tab_session_backslash_rule
+            .tab_facts
+            .backslash
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pin);
-    }
-
-    /// What a card's pin says NOW, or `None` when it has no tab (a connection
-    /// preview) or the tab's session has never been observed.
-    fn tab_backslash_rule_now(
-        handle: &CardTabBackslashRule,
-    ) -> Option<crate::db::SessionBackslashRule> {
-        handle
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(backslash);
+        *self
+            .tab_facts
+            .session
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .and_then(|pin| pin.get())
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(session);
     }
 
     pub fn set_tab_local_scope_selection(&mut self, enabled: bool) {
@@ -3413,7 +3506,7 @@ impl ObjectBrowserWidget {
         let connection = self.connection.clone();
         let current_db_type = self.current_db_type.clone();
         let write_refusal = self.write_refusal.clone();
-        let tab_backslash_rule = Arc::clone(&self.tab_session_backslash_rule);
+        let tab_facts = self.tab_facts.clone();
         let action_sender = self.action_sender.clone();
         let selected_scope = self.selected_scope.clone();
         let catalog = self.catalog.clone();
@@ -3437,7 +3530,7 @@ impl ObjectBrowserWidget {
             connection: SharedConnection,
             current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
             write_refusal: CardWriteRefusal,
-            tab_backslash_rule: CardTabBackslashRule,
+            tab_facts: CardTabFacts,
             action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
             selected_scope: Arc<Mutex<Option<String>>>,
             catalog: CardCatalogState,
@@ -3497,6 +3590,7 @@ impl ObjectBrowserWidget {
                         ObjectActionResult::ExportedTable {
                             qualified_name,
                             choice,
+                            null_text,
                             result,
                         } => match result {
                             Ok((query_result, generated, dialect)) => {
@@ -3506,6 +3600,7 @@ impl ObjectBrowserWidget {
                                     choice,
                                     &query_result,
                                     &generated,
+                                    &null_text,
                                 );
                                 // Said only for an export that HAS rows: a
                                 // refusal is the user's answer, and announcing
@@ -3521,9 +3616,10 @@ impl ObjectBrowserWidget {
                                 ObjectBrowserWidget::emit_status_callback(
                                     &status_callback,
                                     &format!(
-                                        "Exporting {qualified_name}: {} rows as {}",
+                                        "Exporting {qualified_name}: {} rows as {}{}",
                                         delivery.content.rows(),
-                                        choice.format.label()
+                                        choice.format.label(),
+                                        delivery.left_out_note
                                     ),
                                 );
                                 ObjectBrowserWidget::emit_sql_callback(
@@ -3541,6 +3637,7 @@ impl ObjectBrowserWidget {
                             qualified_name,
                             file_label,
                             format,
+                            null_text,
                             result,
                         } => match result {
                             Ok((text, columns, dialect)) => {
@@ -3552,6 +3649,7 @@ impl ObjectBrowserWidget {
                                         dialect,
                                         &columns,
                                         format,
+                                        &null_text,
                                     )
                                 {
                                     ObjectBrowserWidget::emit_status_callback(
@@ -3853,7 +3951,7 @@ impl ObjectBrowserWidget {
                                     &connection,
                                     &current_db_type,
                                     &write_refusal,
-                                    &tab_backslash_rule,
+                                    &tab_facts,
                                     item,
                                     &sql_callback,
                                     &status_callback,
@@ -3982,7 +4080,7 @@ impl ObjectBrowserWidget {
                     connection.clone(),
                     current_db_type.clone(),
                     write_refusal.clone(),
-                    Arc::clone(&tab_backslash_rule),
+                    tab_facts.clone(),
                     action_sender.clone(),
                     selected_scope.clone(),
                     catalog.clone(),
@@ -4006,7 +4104,7 @@ impl ObjectBrowserWidget {
             connection,
             current_db_type,
             write_refusal,
-            tab_backslash_rule,
+            tab_facts,
             action_sender,
             selected_scope,
             catalog,
@@ -4027,7 +4125,7 @@ impl ObjectBrowserWidget {
         let object_cache = self.object_cache.clone();
         let current_db_type = self.current_db_type.clone();
         let write_refusal = self.write_refusal.clone();
-        let tab_backslash_rule = Arc::clone(&self.tab_session_backslash_rule);
+        let tab_facts = self.tab_facts.clone();
         let selected_scope = self.selected_scope.clone();
         let scope_generation = self.scope_generation.clone();
         let mut pending_drag_text: Option<String> = None;
@@ -4056,7 +4154,7 @@ impl ObjectBrowserWidget {
                                 &connection,
                                 &current_db_type,
                                 &write_refusal,
-                                &tab_backslash_rule,
+                                &tab_facts,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -4069,7 +4167,7 @@ impl ObjectBrowserWidget {
                                 &connection,
                                 &current_db_type,
                                 &write_refusal,
-                                &tab_backslash_rule,
+                                &tab_facts,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -7108,7 +7206,7 @@ impl ObjectBrowserWidget {
             &self.connection,
             &self.current_db_type,
             &self.write_refusal,
-            &self.tab_session_backslash_rule,
+            &self.tab_facts,
             resolved.item,
             &self.sql_callback,
             &self.status_callback,
@@ -8039,7 +8137,7 @@ impl ObjectBrowserWidget {
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
         write_refusal: &CardWriteRefusal,
-        tab_backslash_rule: &CardTabBackslashRule,
+        tab_facts: &CardTabFacts,
         item: &TreeItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -8058,7 +8156,7 @@ impl ObjectBrowserWidget {
                 connection,
                 current_db_type,
                 write_refusal,
-                tab_backslash_rule,
+                tab_facts,
                 item_info,
                 sql_callback,
                 status_callback,
@@ -8102,11 +8200,15 @@ impl ObjectBrowserWidget {
         choice: crate::ui::result_export_dialog::ExportChoice,
         result: &crate::db::QueryResult,
         generated_columns: &[String],
+        null_text: &str,
     ) -> ObjectExportDelivery {
-        // Only CSV and TSV read this: they dump what a grid would SHOW, and no
-        // grid here means the text a grid starts with. A session `SET NULL`
-        // cannot reach this path.
-        let null_text = crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT.to_string();
+        // Only CSV and TSV read this: they dump what a grid would SHOW, and the
+        // grid this table has no rows in is the TAB's — so the text is the
+        // tab's, the one its own result grid would have written and the one its
+        // import dialog will read back. It used to be a hard-coded `NULL` here
+        // while the grid export used the session's, so the same table exported
+        // two ways gave two different files for a tab that had run `SET NULL`.
+        let null_text = null_text.to_string();
         let columns: Vec<String> = result
             .columns
             .iter()
@@ -8125,31 +8227,52 @@ impl ObjectBrowserWidget {
                     .collect()
             })
             .collect();
-        let grid = crate::ui::result_export::ExportGrid {
-            columns: columns.clone(),
-            column_kinds: column_kinds.clone(),
-            rows: rows.clone(),
-            null_text,
-        };
-        let mut sql_selection = crate::ui::grid_sql_export::GridSqlSelection {
-            dialect,
-            table: Some(qualified_name.to_string()),
-            selected_columns: (0..columns.len()).collect(),
-            all_columns: columns,
-            column_kinds,
-            rows,
-        };
-        // Every data format writes every column, because that is what the table
-        // HAS. `SQL Inserts` alone writes a script that will be RUN, so it names
-        // only the columns a statement may write into — the caller passes an
-        // empty `generated_columns` for every other format, which narrows
-        // nothing. Applied through the same method the result grid's roads use,
-        // so the two ends of this rule cannot drift apart again.
-        sql_selection.restrict_to_writable_columns(generated_columns);
+        // ONE of the two snapshots, never both: each holds every exported row,
+        // and this is the export that reads a WHOLE TABLE — the one place a
+        // second copy of the rows is worth the most memory in the app. The
+        // result grid's own renderer has always built only the one its format
+        // reads; this built both and threw one away.
+        //
+        // Which one is still decided in a single place — `render_export_content`
+        // is the only thing that knows a format's renderer — so this chooses
+        // what to MATERIALIZE, not what to render with.
+        let sql_inserts = choice.format == crate::ui::result_export::ExportFormat::SqlInserts;
+        let mut grid = crate::ui::result_export::ExportGrid::default();
+        let mut sql_selection = None;
+        let mut left_out_note = String::new();
+        if sql_inserts {
+            let mut selection = crate::ui::grid_sql_export::GridSqlSelection {
+                dialect,
+                table: Some(qualified_name.to_string()),
+                selected_columns: (0..columns.len()).collect(),
+                all_columns: columns,
+                column_kinds,
+                rows,
+            };
+            // Every data format writes every column, because that is what the
+            // table HAS. `SQL Inserts` alone writes a script that will be RUN,
+            // so it names only the columns a statement may write into — the
+            // caller passes an empty `generated_columns` for every other
+            // format, which narrows nothing. Applied through the same method
+            // the result grid's roads use, so the two ends of this rule cannot
+            // drift apart again. What it dropped travels with the delivery, so
+            // the report can say the file holds fewer columns than the table.
+            left_out_note = crate::ui::grid_sql_export::left_out_generated_columns_note(
+                &selection.restrict_to_writable_columns(generated_columns),
+            );
+            sql_selection = Some(selection);
+        } else {
+            grid = crate::ui::result_export::ExportGrid {
+                columns,
+                column_kinds,
+                rows,
+                null_text,
+            };
+        }
         let content = crate::ui::result_export::render_export_content(
             choice.format,
             &grid,
-            Some(&sql_selection),
+            sql_selection.as_ref(),
         )
         .map_text(|text| {
             crate::ui::result_export::with_destination_prelude(
@@ -8163,6 +8286,7 @@ impl ObjectBrowserWidget {
             format: choice.format,
             destination: choice.destination,
             suggested_name: Self::export_file_stem(qualified_name),
+            left_out_note,
         }
     }
 
@@ -8195,6 +8319,7 @@ impl ObjectBrowserWidget {
         dialect: crate::ui::grid_sql_export::SqlWriteDialect,
         columns: &[TableColumnDetail],
         format: crate::ui::result_export::ExportFormat,
+        null_text: &str,
     ) -> Option<(String, String)> {
         let table_columns = Self::import_targets(dialect.db_type(), columns);
         let targets = table_columns.writable();
@@ -8204,6 +8329,7 @@ impl ObjectBrowserWidget {
             qualified_name,
             &table_columns,
             format,
+            null_text,
         )?;
         let request = crate::ui::table_import::ImportRequest {
             dialect,
@@ -8305,7 +8431,7 @@ impl ObjectBrowserWidget {
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
         write_refusal: &CardWriteRefusal,
-        tab_backslash_rule: &CardTabBackslashRule,
+        tab_facts: &CardTabFacts,
         item_info: ObjectItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -8317,7 +8443,7 @@ impl ObjectBrowserWidget {
             connection,
             current_db_type,
             write_refusal,
-            tab_backslash_rule,
+            tab_facts,
             item_info,
             sql_callback,
             status_callback,
@@ -8333,7 +8459,7 @@ impl ObjectBrowserWidget {
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
         write_refusal: &CardWriteRefusal,
-        tab_backslash_rule: &CardTabBackslashRule,
+        tab_facts: &CardTabFacts,
         item_info: ObjectItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -8580,7 +8706,11 @@ impl ObjectBrowserWidget {
                         // Read HERE, on the UI thread, from the tab's own pin:
                         // the worker cannot reach the tab, and this is the
                         // moment the user asked.
-                        let tab_backslash_rule = Self::tab_backslash_rule_now(tab_backslash_rule);
+                        let tab_backslash_rule = tab_facts.backslash_rule_now();
+                        // The tab's NULL text, read at the same moment and for
+                        // the same reason: this is when the user asked, and the
+                        // dialog that offers it opens later.
+                        let tab_null_text = tab_facts.null_text_now();
                         thread::spawn(move || {
                             let activity = format!("Loading table structure for {}", table_name);
                             let result = Self::run_object_action_work("Prepare import", || {
@@ -8624,6 +8754,7 @@ impl ObjectBrowserWidget {
                                 qualified_name: qualified_for_thread,
                                 file_label: file_label_for_thread,
                                 format,
+                                null_text: tab_null_text,
                                 result,
                             });
                             app::awake();
@@ -8649,6 +8780,11 @@ impl ObjectBrowserWidget {
                         let table_name = object_name.clone();
                         let selected_scope = selected_scope.clone();
                         let qualified_for_thread = qualified_name.clone();
+                        // Read HERE, on the UI thread, from the tab's own
+                        // session: the worker cannot reach the tab, and this is
+                        // the moment the user asked. The same value the import
+                        // dialog will offer as "the text that means null".
+                        let tab_null_text = tab_facts.null_text_now();
                         Self::emit_status_callback(
                             status_callback,
                             &format!("Reading {} for export", qualified_name),
@@ -8704,6 +8840,7 @@ impl ObjectBrowserWidget {
                             let _ = sender.send(ObjectActionResult::ExportedTable {
                                 qualified_name: qualified_for_thread,
                                 choice,
+                                null_text: tab_null_text,
                                 result,
                             });
                             app::awake();
@@ -12804,28 +12941,32 @@ impl MultiObjectBrowserWidget {
         true
     }
 
-    /// Give the tab's card the tab's own backslash-rule pin.
+    /// Give the tab's card the tab's own late-read facts.
     ///
     /// Idempotent and cheap, so it rides along with the sync that already
-    /// states the tab's other facts to the card. What it hands over is the live
-    /// handle: set once, right ever after.
-    pub(crate) fn set_tab_session_backslash_rule(
+    /// states the tab's other facts to the card. What it hands over are the
+    /// live handles: set once, right ever after.
+    pub(crate) fn set_tab_facts(
         &mut self,
         tab_id: QueryTabId,
-        pin: crate::ui::sql_editor::TabPin<crate::db::SessionBackslashRule>,
+        backslash: crate::ui::sql_editor::TabPin<crate::db::SessionBackslashRule>,
+        session: Arc<Mutex<crate::db::SessionState>>,
     ) -> bool {
-        let browser = self
-            .entries
+        let Some(browser) = self.card_for_tab(tab_id) else {
+            return false;
+        };
+        browser.set_tab_facts(backslash, session);
+        true
+    }
+
+    /// The card a tab owns, if it has one.
+    fn card_for_tab(&self, tab_id: QueryTabId) -> Option<ObjectBrowserWidget> {
+        self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .find(|entry| entry.owner == BrowserOwner::Tab(tab_id))
-            .map(|entry| entry.browser.clone());
-        let Some(browser) = browser else {
-            return false;
-        };
-        browser.set_tab_session_backslash_rule(pin);
-        true
+            .map(|entry| entry.browser.clone())
     }
 
     pub fn set_selected_scope_for_tab(
@@ -13144,11 +13285,11 @@ fn read_import_file(path: &std::path::Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        consume_owned_key_up, copy_text_for_object_item, CardWriteRefusal, DestructiveObjectAction,
-        MultiObjectBrowserWidget, ObjectBrowserDbBehavior, ObjectBrowserMetadataSnapshot,
-        ObjectBrowserWidget, ObjectCache, ObjectDefaultAction, ObjectItem, OracleRoutineScript,
-        OracleSqlScopeShape, RoutineScriptOutcome, ScopeSwitchPreflightCallback,
-        MYSQL_OBJECT_BROWSER_BEHAVIOR, SCOPE_SELECTOR_ROW_HEIGHT,
+        consume_owned_key_up, copy_text_for_object_item, CardTabFacts, CardWriteRefusal,
+        DestructiveObjectAction, MultiObjectBrowserWidget, ObjectBrowserDbBehavior,
+        ObjectBrowserMetadataSnapshot, ObjectBrowserWidget, ObjectCache, ObjectDefaultAction,
+        ObjectItem, OracleRoutineScript, OracleSqlScopeShape, RoutineScriptOutcome,
+        ScopeSwitchPreflightCallback, MYSQL_OBJECT_BROWSER_BEHAVIOR, SCOPE_SELECTOR_ROW_HEIGHT,
         SCOPE_SELECTOR_TABLE_VERTICAL_PADDING,
     };
     use crate::db::{DatabaseType, OracleDriverMode};
@@ -14150,6 +14291,126 @@ mod tests {
         assert_eq!(ObjectBrowserWidget::export_file_stem("..."), "export");
     }
 
+    /// A card answers with its TAB's NULL text, and with the default only when
+    /// it has no tab to ask.
+    ///
+    /// The reader half of the round-trip fix: `Export Data...` writes what this
+    /// says and `Import Data...` offers it back, so a hard-coded answer here is
+    /// the same defect in a different place. A connection-preview card owns no
+    /// tab and has to land on the text a grid would have shown.
+    #[test]
+    fn a_card_reads_its_tab_s_null_text_and_falls_back_only_without_one() {
+        let facts = CardTabFacts::default();
+        assert_eq!(
+            facts.null_text_now(),
+            crate::db::DEFAULT_NULL_TEXT,
+            "a card with no tab must answer with the default"
+        );
+
+        let session: Arc<Mutex<crate::db::SessionState>> =
+            Arc::new(Mutex::new(crate::db::SessionState::default()));
+        *facts
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&session));
+        assert_eq!(
+            facts.null_text_now(),
+            crate::db::DEFAULT_NULL_TEXT,
+            "a tab that has said nothing still shows the default"
+        );
+
+        // What `SET NULL '-'` does to the tab's session.
+        session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .null_text = "-".to_string();
+        assert_eq!(
+            facts.null_text_now(),
+            "-",
+            "the card read a COPY of the tab\'s text instead of the tab\'s own"
+        );
+    }
+
+    /// Both ends of a delimited round trip use the TAB's NULL text.
+    ///
+    /// The tree export wrote a hard-coded `NULL` while the result grid wrote
+    /// what it SHOWS — which `SET NULL` moves — and the import dialog offered a
+    /// hard-coded `NULL` back. So a tab that had run `SET NULL '-'` exported `-`
+    /// for every NULL from its grid and then read those cells back as the STRING
+    /// `-`, silently, on every backend. One value now reaches all three.
+    #[test]
+    fn a_tree_export_writes_the_tab_s_null_text_and_the_import_reads_it_back() {
+        use crate::db::{ColumnInfo, DatabaseType, QueryCell, QueryResult, SqlValueKind};
+        use crate::ui::result_export::{ExportDestination, ExportFormat, ExportScope};
+        use crate::ui::result_export_dialog::ExportChoice;
+        use crate::ui::result_import::{parse, ImportOptions};
+
+        // The tab moved its NULL display text, the way `SET NULL '-'` does.
+        let tab_null_text = "-";
+        let result = QueryResult::new_select(
+            "SELECT * FROM HR.EMP",
+            vec![
+                ColumnInfo {
+                    name: "EMPNO".to_string(),
+                    data_type: "NUMBER".to_string(),
+                    kind: SqlValueKind::Number,
+                },
+                ColumnInfo {
+                    name: "ENAME".to_string(),
+                    data_type: "VARCHAR2".to_string(),
+                    kind: SqlValueKind::String,
+                },
+            ],
+            vec![
+                vec!["7369".to_string(), "SMITH".to_string()],
+                vec!["7499".to_string(), QueryCell::null_result_text()],
+            ],
+            std::time::Duration::from_millis(1),
+        );
+
+        let delivery = ObjectBrowserWidget::render_table_export(
+            "HR.EMP",
+            crate::ui::grid_sql_export::SqlWriteDialect::family_default(DatabaseType::Oracle),
+            ExportChoice {
+                format: ExportFormat::Csv,
+                scope: ExportScope::All,
+                destination: ExportDestination::Clipboard,
+            },
+            &result,
+            &[],
+            tab_null_text,
+        );
+        let csv = delivery.content.text().to_string();
+        assert!(
+            csv.contains(&format!("7499,{tab_null_text}")),
+            "the export wrote a NULL as something other than the tab\'s text: {csv:?}"
+        );
+        assert!(
+            !csv.contains("7499,NULL"),
+            "the export wrote the DEFAULT text for a tab that had moved it: {csv:?}"
+        );
+
+        // And the import dialog is offered the same text, so the round trip
+        // gives back a NULL rather than the two characters that spell it.
+        let parsed = parse(
+            &csv,
+            &ImportOptions {
+                format: ExportFormat::Csv,
+                has_header: true,
+                null_text: tab_null_text.to_string(),
+            },
+        )
+        .expect("the app\'s own export parses");
+        assert_eq!(
+            parsed.rows,
+            vec![
+                vec![Some("7369".to_string()), Some("SMITH".to_string())],
+                vec![Some("7499".to_string()), None],
+            ],
+            "a NULL exported under the tab\'s text did not read back as a NULL"
+        );
+    }
+
     #[test]
     fn a_tree_export_renders_the_same_bytes_a_grid_export_would() {
         use crate::db::{ColumnInfo, DatabaseType, QueryCell, QueryResult, SqlValueKind};
@@ -14189,6 +14450,7 @@ mod tests {
                 },
                 &result,
                 &[],
+                crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT,
             );
             let grid = ExportGrid {
                 columns: vec!["EMPNO".to_string(), "ENAME".to_string()],
@@ -14271,6 +14533,7 @@ mod tests {
                 },
                 &result,
                 &[],
+                crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT,
             )
             .content
             .into_parts()
@@ -14404,6 +14667,7 @@ mod tests {
             choice(ExportDestination::File),
             &result,
             &[],
+            crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT,
         );
         let to_clipboard = ObjectBrowserWidget::render_table_export(
             "HR.EMP",
@@ -14411,6 +14675,7 @@ mod tests {
             choice(ExportDestination::Clipboard),
             &result,
             &[],
+            crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT,
         );
         assert_eq!(&to_file.content.text().as_bytes()[..3], &[0xEF, 0xBB, 0xBF]);
         assert!(!to_clipboard.content.text().starts_with('\u{feff}'));
@@ -14506,22 +14771,42 @@ mod tests {
                 },
                 &result,
                 generated,
+                crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT,
             )
-            .content
-            .into_parts()
-            .expect("this fixture is exportable")
-            .0
+        };
+        let text_of = |delivery: &super::ObjectExportDelivery| {
+            delivery
+                .content
+                .clone()
+                .into_parts()
+                .expect("this fixture is exportable")
+                .0
         };
 
         let generated = vec!["TOTAL".to_string()];
         let inserts = render(ExportFormat::SqlInserts, &generated);
         assert_eq!(
-            inserts, "INSERT INTO APP.T (A) VALUES (5);\n",
+            text_of(&inserts),
+            "INSERT INTO APP.T (A) VALUES (5);\n",
             "SQL Inserts must not name a computed column"
+        );
+        // And the delivery SAYS what the script left out: the user asked for a
+        // table of two columns and got a file of one, which used to go
+        // unmentioned on this road.
+        assert_eq!(
+            inserts.left_out_note,
+            crate::ui::grid_sql_export::left_out_generated_columns_note(&generated),
+            "a SQL Inserts export that dropped a column must carry the note"
+        );
+        assert!(
+            inserts.left_out_note.contains("TOTAL"),
+            "the note names the column: {:?}",
+            inserts.left_out_note
         );
 
         // Every other format is a picture of the table, computed columns
-        // included — the generated list must not reach them.
+        // included — the generated list must not reach them, and there is
+        // nothing left out to note.
         for format in [
             ExportFormat::Csv,
             ExportFormat::Tsv,
@@ -14530,7 +14815,8 @@ mod tests {
             ExportFormat::Html,
             ExportFormat::Markdown,
         ] {
-            let text = render(format, &generated);
+            let delivery = render(format, &generated);
+            let text = text_of(&delivery);
             assert!(
                 text.contains("TOTAL") && text.contains("10"),
                 "{} dropped the computed column: {text}",
@@ -14538,9 +14824,15 @@ mod tests {
             );
             assert_eq!(
                 text,
-                render(format, &[]),
+                text_of(&render(format, &[])),
                 "{} must not read the generated list at all",
                 format.label()
+            );
+            assert!(
+                delivery.left_out_note.is_empty(),
+                "{} left nothing out, so it has nothing to note: {:?}",
+                format.label(),
+                delivery.left_out_note
             );
         }
     }

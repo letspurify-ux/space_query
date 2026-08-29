@@ -115,9 +115,12 @@ impl Default for ImportOptions {
         Self {
             format: ExportFormat::Csv,
             has_header: true,
-            // What `SessionState` shows for NULL out of the box, so a file this
-            // app exported reads back with its NULLs intact.
-            null_text: "NULL".to_string(),
+            // What a session shows for NULL out of the box. The import dialog
+            // does not use this: it is handed the text the TAB writes, which is
+            // this until that tab runs `SET NULL`. This is for a caller with no
+            // session in reach — a unit test, or a parse of a file nobody said
+            // anything about.
+            null_text: crate::db::DEFAULT_NULL_TEXT.to_string(),
         }
     }
 }

@@ -170,6 +170,43 @@ impl ExportContent {
     }
 }
 
+/// What a grid hands back once it is ready to be exported.
+///
+/// Two shapes, because one format cannot be finished where the rows are read.
+/// A `SQL Inserts` script is meant to be RE-RUN, so it must not name a column
+/// the server computes — and only the catalog knows which those are, which is a
+/// round trip. So the grid hands back the SNAPSHOT it would build from instead
+/// of the text, and the round trip happens with the rows already in hand.
+///
+/// The point is what happens AFTER this value exists: nothing reads the grid
+/// again. The export road used to re-resolve *which grid* when the catalog
+/// answered, and it asked by TABLE NAME — so a re-run of the same query, a
+/// click on another result tab showing the same table, or a changed selection
+/// during that round trip silently redirected the file the user had already
+/// named. A payload cannot be redirected: it holds exactly what the file will
+/// contain.
+#[derive(Clone, Debug)]
+pub enum ExportPayload {
+    /// Rendered text, ready for its destination.
+    Data(ExportContent),
+    /// The rows and columns a `SQL Inserts` build will use once the catalog has
+    /// answered which columns the server computes.
+    Sql(crate::ui::grid_sql_export::GridSqlSelection),
+}
+
+impl ExportPayload {
+    /// The finished bytes, for a caller that only ever asks for a data format.
+    ///
+    /// `None` says the payload is a `SQL Inserts` snapshot, which is not text
+    /// yet — a caller that gets one asked for a format it does not handle.
+    pub fn data(self) -> Option<ExportContent> {
+        match self {
+            ExportPayload::Data(content) => Some(content),
+            ExportPayload::Sql(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExportScope {
     All,
@@ -892,9 +929,14 @@ mod tests {
         let padded = ExportGrid {
             columns: vec!["CODE".to_string()],
             column_kinds: vec![SqlValueKind::Number],
-            // A zero-padded code and Oracle's leading-dot rendering of 0.5;
-            // `1.2E+10` is deliberately alongside them because exponent notation
-            // *is* a JSON number and must stay unquoted.
+            // A zero-padded code and a bare `.5`, which the JSON grammar does
+            // not accept as a number. (It is not what either Oracle driver
+            // writes for 0.5 — ODPI-C spells the leading zero itself
+            // (`dpiDataBuffer__fromOracleNumberAsText`) and the thin decoder
+            // inserts one, so both say `0.5`. It is here as text no reader
+            // should silently turn into a number.) `1.2E+10` is deliberately
+            // alongside them because exponent notation *is* a JSON number and
+            // must stay unquoted.
             rows: cells(&[&["00123"], &[".5"], &["1.2E+10"]]),
             null_text: "NULL".to_string(),
         };

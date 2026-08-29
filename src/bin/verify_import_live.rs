@@ -43,7 +43,7 @@ use space_query::db::query::ObjectBrowser;
 use space_query::db::{
     ConnectionInfo, DatabaseConnection, DatabaseType, OracleDriverMode, QueryCell, QueryResult,
     SessionBackslashRule, SqlValueKind, TableColumnDetail, TransactionAccessMode,
-    TransactionIsolation, TransactionMode,
+    TransactionIsolation, TransactionMode, DEFAULT_NULL_TEXT,
 };
 use space_query::ui::grid_sql_export::{
     build_sql_inserts, sql_literal_for_value, GridSqlSelection, SqlWriteDialect,
@@ -449,6 +449,28 @@ fn first_error(events: &[QueryProgress]) -> Option<String> {
     })
 }
 
+/// The variant names of `events`, for a failure message.
+///
+/// A run that ends with the WRONG events used to report only what was missing
+/// ("SELECT produced no grid columns"), which left a one-off failure
+/// undiagnosable: the interesting fact is what the harness DID receive — once,
+/// a lone stale `BatchFinished` that a disconnect fail-safe had announced for
+/// the previous statement.
+fn event_shapes(events: &[QueryProgress]) -> String {
+    let shapes: Vec<&str> = events
+        .iter()
+        .map(|event| match progress_inner(event) {
+            QueryProgress::BatchStart { .. } => "BatchStart",
+            QueryProgress::SelectStart { .. } => "SelectStart",
+            QueryProgress::Rows { .. } => "Rows",
+            QueryProgress::StatementFinished { .. } => "StatementFinished",
+            QueryProgress::BatchFinished => "BatchFinished",
+            _ => "other",
+        })
+        .collect();
+    format!("[{}]", shapes.join(", "))
+}
+
 /// Columns, kinds, and rows exactly as the grid would receive them, with the
 /// internal columns the grid never exports dropped.
 fn grid_view(events: &[QueryProgress]) -> Option<GridView> {
@@ -627,8 +649,12 @@ fn verify(target: Target) -> Result<(), String> {
     let select_events = h
         .run(&target.select_sql(SOURCE_TABLE))
         .map_err(|e| format!("select source: {e}"))?;
-    let (columns, kinds, rows) =
-        grid_view(&select_events).ok_or_else(|| "SELECT produced no grid columns".to_string())?;
+    let (columns, kinds, rows) = grid_view(&select_events).ok_or_else(|| {
+        format!(
+            "SELECT produced no grid columns; the events received were {}",
+            event_shapes(&select_events)
+        )
+    })?;
     if rows.len() != 4 {
         return Err(format!("expected 4 source rows, got {}", rows.len()));
     }
@@ -1047,6 +1073,7 @@ fn verify_reported_column_names(target: Target, h: &mut Harness) -> Result<(), S
         },
         &read_back,
         &[],
+        DEFAULT_NULL_TEXT,
     );
     let exported = delivery
         .content
@@ -1289,6 +1316,7 @@ fn verify_null_text_and_blank_lines(target: Target, h: &mut Harness) -> Result<(
             },
             &result,
             &[],
+            DEFAULT_NULL_TEXT,
         );
         let body = delivery
             .content
@@ -1399,8 +1427,137 @@ fn verify_null_text_and_blank_lines(target: Target, h: &mut Harness) -> Result<(
         );
     }
 
+    verify_a_moved_null_text_round_trips(target, h, &result)?;
+
     let _ = h.run(&target.drop_sql(NULL_TEXT_TABLE));
     let _ = h.run("COMMIT");
+    Ok(())
+}
+
+/// A tab that moved its NULL text still round-trips its own files.
+///
+/// `SET NULL '<null>'` moves what the tab's result grid DRAWS for a NULL, and
+/// therefore what its `Export Data...` writes into a delimited file. The import
+/// dialog offered a hard-coded `NULL` back, so this app read its own export's
+/// NULL cells as the six characters that spell `<null>` — silently, on every
+/// backend. The value has one home now: the tab's session, which is what the
+/// object-browser card reads for both ends.
+///
+/// Live because only a server can say that the tool command really moved the
+/// session the grid draws from, and only a server can be asked afterwards
+/// whether the row it stored is NULL.
+fn verify_a_moved_null_text_round_trips(
+    target: Target,
+    h: &mut Harness,
+    rows: &QueryResult,
+) -> Result<(), String> {
+    const MOVED: &str = "<null>";
+
+    h.run(&format!("SET NULL '{MOVED}'"))
+        .map_err(|e| format!("SET NULL through the tab: {e}"))?;
+    // The tab's own grid is what proves the session moved: it draws a NULL with
+    // exactly this text now.
+    let events = h.run(&format!("SELECT V FROM {NULL_TEXT_TABLE} WHERE SEQ = 3"))?;
+    let drawn = grid_view(&events)
+        .and_then(|(_, _, rows)| rows.first().and_then(|row| row.last().cloned()))
+        .unwrap_or_default();
+    if drawn != MOVED {
+        let _ = h.run(&format!("SET NULL '{DEFAULT_NULL_TEXT}'"));
+        return Err(format!(
+            "the tab\'s grid drew a NULL as {drawn:?} after SET NULL — the session did not move"
+        ));
+    }
+
+    // What the card reads off that session, and hands to BOTH ends.
+    let tab_null_text = MOVED;
+    let delivery = ObjectBrowserWidget::render_table_export(
+        NULL_TEXT_TABLE,
+        SqlWriteDialect::for_connection(&target.connection_info()),
+        ExportChoice {
+            format: ExportFormat::Csv,
+            scope: ExportScope::All,
+            destination: ExportDestination::File,
+        },
+        rows,
+        &[],
+        tab_null_text,
+    );
+    let body = delivery
+        .content
+        .into_parts()
+        .map_err(|reason| format!("the moved-NULL export was refused: {reason}"))?
+        .0;
+    if !body.contains(&format!("3,{MOVED}")) {
+        let _ = h.run(&format!("SET NULL '{DEFAULT_NULL_TEXT}'"));
+        return Err(format!(
+            "the export did not write the tab\'s NULL text: {body:?}"
+        ));
+    }
+
+    let parsed = parse(
+        &body,
+        &ImportOptions {
+            format: ExportFormat::Csv,
+            has_header: true,
+            null_text: tab_null_text.to_string(),
+        },
+    )
+    .map_err(|e| format!("parse the moved-NULL export: {e}"))?;
+
+    let targets = vec![
+        TargetColumn {
+            name: "SEQ".to_string(),
+            kind: SqlValueKind::Number,
+            nullable: true,
+        },
+        TargetColumn {
+            name: "V".to_string(),
+            kind: SqlValueKind::String,
+            nullable: true,
+        },
+    ];
+    let mapping = default_mapping(&parsed.columns, &targets);
+    let script = build_insert_script(&ImportRequest {
+        dialect: SqlWriteDialect::for_connection(&target.connection_info()),
+        table: NULL_TEXT_TABLE,
+        targets: &targets,
+        mapping: &mapping,
+        data: &parsed,
+        batch_rows: BATCH_ROWS,
+    })
+    .map_err(|e| format!("build the moved-NULL script: {e}"))?;
+    h.run(&target.delete_sql(NULL_TEXT_TABLE))
+        .map_err(|e| format!("clear before the moved-NULL import: {e}"))?;
+    h.run_script(&script)
+        .map_err(|e| format!("moved-NULL import: {e}"))?;
+    let _ = h.run("COMMIT");
+
+    // Back to the default before anything is asserted, so a failure below does
+    // not leave the tab drawing a NULL as something the next check does not
+    // expect.
+    h.run(&format!("SET NULL '{DEFAULT_NULL_TEXT}'"))
+        .map_err(|e| format!("restore SET NULL: {e}"))?;
+
+    let counted = h.run(&format!(
+        "SELECT COUNT(*) AS N FROM {NULL_TEXT_TABLE} WHERE V IS NULL"
+    ))?;
+    if single_count(&counted).as_deref() != Some("1") {
+        return Err(format!(
+            "the server sees {:?} NULL rows after re-importing a file written with the tab\'s \
+             own NULL text, expected exactly 1",
+            single_count(&counted)
+        ));
+    }
+    let counted = h.run(&format!(
+        "SELECT COUNT(*) AS N FROM {NULL_TEXT_TABLE} WHERE V = '{MOVED}'"
+    ))?;
+    if single_count(&counted).as_deref() != Some("0") {
+        return Err(format!(
+            "a NULL came back as the {MOVED:?} the tab draws it with: {:?} such rows",
+            single_count(&counted)
+        ));
+    }
+    println!("PASS: a tab that moved its NULL text still round-trips its own export");
     Ok(())
 }
 

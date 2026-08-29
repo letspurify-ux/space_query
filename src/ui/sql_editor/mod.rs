@@ -5030,6 +5030,19 @@ impl SqlEditorWidget {
         self.tab_session_backslash_rule.clone()
     }
 
+    /// This tab's SQL*Plus session state, for a holder that has to read it
+    /// LATER.
+    ///
+    /// The object-browser card takes this for the same reason it takes the pin
+    /// above: `Export Data...` and `Import Data...` need the tab's NULL display
+    /// text, `SET NULL` moves it at any time, and a value copied when the card
+    /// was wired would be the session as it was then. The HANDLE survives a
+    /// rebind — `TabConnectionBinding::bind` replaces the state's CONTENTS, not
+    /// the `Arc` — so it is right for the life of the tab.
+    pub(crate) fn session_state_handle(&self) -> Arc<Mutex<crate::db::SessionState>> {
+        self.connection_binding.session_state()
+    }
+
     /// The menu-toggle write path: pins this tab's auto-commit, exactly like a
     /// script `SET AUTOCOMMIT` does.
     pub fn set_tab_auto_commit(&self, enabled: bool) {
@@ -7479,6 +7492,22 @@ impl SqlEditorWidget {
         // Wrap receiver in Arc<Mutex> to share across timeout callbacks
         let receiver: Arc<Mutex<mpsc::Receiver<QueryProgress>>> =
             Arc::new(Mutex::new(progress_receiver));
+        // Whether THIS channel's real `BatchFinished` has been delivered.
+        //
+        // `BatchFinished` is the batch's one terminal announcement, and every
+        // downstream consumer treats it that way. The disconnect fail-safe
+        // below exists for a worker that DIED without sending it — but the
+        // channel of a batch that finished normally also disconnects, one poll
+        // later, and announcing a second `BatchFinished` there is a terminal
+        // event for a batch that already ended. Delivered late enough (the
+        // worker still held the sender when the real one was drained, and the
+        // extra poll interval crossed into whatever the app is doing next),
+        // that stale announcement lands on the NEXT operation — the same
+        // stale-terminal shape the result-grid routing had to be hardened
+        // against, and what made a verify harness read an empty event list as
+        // a finished statement. Shared across poll passes because the real
+        // event and the disconnect are usually seen by different ones.
+        let batch_finished_delivered = Arc::new(Mutex::new(false));
 
         fn schedule_poll(
             receiver: Arc<Mutex<mpsc::Receiver<QueryProgress>>>,
@@ -7488,6 +7517,7 @@ impl SqlEditorWidget {
             cancel_flag: Arc<Mutex<bool>>,
             lifecycle_group: Flex,
             intellisense_data: Arc<Mutex<IntellisenseData>>,
+            batch_finished_delivered: Arc<Mutex<bool>>,
         ) {
             if lifecycle_group.was_deleted() {
                 return;
@@ -7585,6 +7615,9 @@ impl SqlEditorWidget {
                                 );
                             }
                             QueryProgress::BatchFinished => {
+                                // The real terminal event arrived, so the
+                                // disconnect fail-safe has nothing left to say.
+                                store_mutex_bool(&batch_finished_delivered, true);
                                 // A newer operation may start before this queued terminal event is
                                 // polled. Do not let the stale event reset that operation's cursor.
                                 if !load_mutex_bool(&query_running) {
@@ -7622,6 +7655,7 @@ impl SqlEditorWidget {
                     &progress_callback,
                     &query_running,
                     &cancel_flag,
+                    load_mutex_bool(&batch_finished_delivered),
                 );
                 return;
             }
@@ -7642,6 +7676,7 @@ impl SqlEditorWidget {
                     cancel_flag.clone(),
                     lifecycle_group.clone(),
                     intellisense_data.clone(),
+                    batch_finished_delivered.clone(),
                 );
             });
         }
@@ -7655,6 +7690,7 @@ impl SqlEditorWidget {
             cancel_flag,
             lifecycle_group,
             intellisense_data,
+            batch_finished_delivered,
         );
     }
 
@@ -7668,10 +7704,22 @@ impl SqlEditorWidget {
         )
     }
 
+    /// The poll's disconnect fail-safe: unstick the execution state, and stand
+    /// in for a terminal event that never came.
+    ///
+    /// `batch_finished_delivered` says whether this channel's real
+    /// `BatchFinished` already reached the callback. A batch that finished
+    /// normally still disconnects its channel — usually one poll later — and a
+    /// second `BatchFinished` there is a terminal announcement for a batch that
+    /// already ended, delivered late enough to land on whatever runs next. So
+    /// the fail-safe announces only when it is actually standing in for the
+    /// worker; the state and cursor cleanup stays unconditional, because it is
+    /// idempotent and a stuck cursor is worth clearing on every road.
     fn handle_progress_channel_disconnected(
         progress_callback: &Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
         query_running: &Arc<Mutex<bool>>,
         cancel_flag: &Arc<Mutex<bool>>,
+        batch_finished_delivered: bool,
     ) {
         SqlEditorWidget::finalize_execution_state(query_running, cancel_flag);
         // Guard UI-thread-only calls so this function is safe to call from
@@ -7680,7 +7728,12 @@ impl SqlEditorWidget {
             set_cursor(Cursor::Default);
             app::flush();
         }
-        SqlEditorWidget::invoke_progress_callback(progress_callback, QueryProgress::BatchFinished);
+        if !batch_finished_delivered {
+            SqlEditorWidget::invoke_progress_callback(
+                progress_callback,
+                QueryProgress::BatchFinished,
+            );
+        }
     }
 
     fn setup_ui_action_handler(&self, ui_action_receiver: mpsc::Receiver<UiActionResult>) {
@@ -12111,33 +12164,53 @@ mod execution_state_tests {
         assert!(load_mutex_bool(&query_running));
     }
 
+    /// The disconnect fail-safe stands in for a terminal event that never came
+    /// — and ONLY for one that never came.
+    ///
+    /// A batch that finished normally still disconnects its channel one poll
+    /// later, and the fail-safe used to announce `BatchFinished` there too: a
+    /// second terminal event for a batch that already ended, delivered late
+    /// enough to land on whatever operation runs next (measured once as a
+    /// verify harness reading an empty event list as a finished statement).
+    /// The state cleanup stays unconditional either way.
     #[test]
-    fn handle_progress_channel_disconnected_finalizes_and_emits_batch_finished() {
-        let query_running = Arc::new(Mutex::new(true));
-        let cancel_flag = Arc::new(Mutex::new(true));
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let observed_for_callback = observed.clone();
-        let progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>> =
-            Arc::new(Mutex::new(Some(Box::new(move |progress| {
-                observed_for_callback
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(progress);
-            }))));
+    fn the_disconnect_fail_safe_announces_batch_finished_only_when_it_never_arrived() {
+        for already_delivered in [false, true] {
+            let query_running = Arc::new(Mutex::new(true));
+            let cancel_flag = Arc::new(Mutex::new(true));
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let observed_for_callback = observed.clone();
+            let progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>> =
+                Arc::new(Mutex::new(Some(Box::new(move |progress| {
+                    observed_for_callback
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(progress);
+                }))));
 
-        SqlEditorWidget::handle_progress_channel_disconnected(
-            &progress_callback,
-            &query_running,
-            &cancel_flag,
-        );
+            SqlEditorWidget::handle_progress_channel_disconnected(
+                &progress_callback,
+                &query_running,
+                &cancel_flag,
+                already_delivered,
+            );
 
-        assert!(!load_mutex_bool(&query_running));
-        assert!(!load_mutex_bool(&cancel_flag));
-        let callbacks = observed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(callbacks.len(), 1);
-        assert!(matches!(callbacks[0], QueryProgress::BatchFinished));
+            assert!(!load_mutex_bool(&query_running));
+            assert!(!load_mutex_bool(&cancel_flag));
+            let callbacks = observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if already_delivered {
+                assert!(
+                    callbacks.is_empty(),
+                    "the fail-safe announced a SECOND BatchFinished for a batch \
+                     whose real one was already delivered"
+                );
+            } else {
+                assert_eq!(callbacks.len(), 1);
+                assert!(matches!(callbacks[0], QueryProgress::BatchFinished));
+            }
+        }
     }
 
     #[test]
