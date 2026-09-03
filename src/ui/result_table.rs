@@ -1,6 +1,6 @@
 use fltk::{
     app, draw,
-    enums::{Align, CallbackTrigger, Event, Font, FrameType, Key, Shortcut},
+    enums::{Align, CallbackTrigger, Cursor, Event, Font, FrameType, Key, Shortcut},
     group::Group,
     input::Input,
     menu::MenuButton,
@@ -1310,12 +1310,43 @@ impl ResultTableWidget {
             return;
         };
 
-        let mut input = active_editor.input;
-        if !input.was_deleted() {
-            input.hide();
-            if app::is_ui_thread() {
-                Input::delete(input);
+        Self::dispose_inline_editor(active_editor.input);
+    }
+
+    /// Take the inline editor off the screen and hand the mouse pointer back.
+    ///
+    /// `Fl_Input` hides the pointer on every keystroke it handles while it is
+    /// the widget below the mouse, and FLTK gives the pointer back only
+    /// through an event delivered TO that input - `FL_MOVE`, `FL_LEAVE` or
+    /// `FL_UNFOCUS` in `Fl_Input_::handletext`. A widget that is hidden or
+    /// destroyed receives none of them: `fl_throw_focus()` clears
+    /// `belowmouse_` by assignment. `Fl_Table` does not repair it either - it
+    /// re-issues a cursor only when the one it wants differs from the last one
+    /// IT set, which is still the default - so on Windows the `SetCursor(NULL)`
+    /// the editor left behind stands, and the pointer stays invisible over the
+    /// grid until it crosses a widget that asks for a different shape. (macOS
+    /// hides it too; the view's own arrow cursor rect puts it back on the first
+    /// move, which is why this only ever showed up on Windows.)
+    ///
+    /// So the editor gives the pointer back itself before it goes away: the
+    /// grid's idle cursor, which is also the one `Fl_Table` believes is on
+    /// screen. Restoring first also leaves room for the `FL_ENTER` that hiding
+    /// and deleting send through `fl_fix_focus()` to re-assert whatever else
+    /// the pointer has come to rest on.
+    fn dispose_inline_editor(mut input: Input) {
+        if input.was_deleted() {
+            return;
+        }
+        // The pointer and the widget are both the UI thread's to touch.
+        let on_ui_thread = app::is_ui_thread();
+        if on_ui_thread {
+            if let Some(mut window) = input.top_window() {
+                window.set_cursor(Cursor::Default);
             }
+        }
+        input.hide();
+        if on_ui_thread {
+            Input::delete(input);
         }
     }
 
@@ -1360,8 +1391,14 @@ impl ResultTableWidget {
         input.redraw();
     }
 
+    /// The inline editor covers its cell exactly.
+    ///
+    /// Any inset here would make the editor a different size from the cell it
+    /// stands in for; the text inside it is lined up with the cell's own text
+    /// by the frame's padding (`theme::apply_grid_cell_input_inset`), not by
+    /// shrinking the widget.
     fn inline_editor_geometry(x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
-        (x + 1, y, (w - 2).max(24), h)
+        (x, y, w, h)
     }
 
     /// Returns the display column count for `text` using byte-level UTF-8 analysis.
@@ -4028,7 +4065,7 @@ impl ResultTableWidget {
 
         input.set_color(theme::input_bg());
         input.set_text_color(theme::text_primary());
-        theme::apply_text_input_inset(&mut input);
+        theme::apply_grid_cell_input_inset(&mut input);
         input.set_text_font(font_profile.normal);
         input.set_text_size(font_size as i32);
         input.set_value(current_value);
@@ -4149,9 +4186,7 @@ impl ResultTableWidget {
         *active_inline_edit
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        if !input.was_deleted() && app::is_ui_thread() {
-            Input::delete(input);
-        }
+        Self::dispose_inline_editor(input);
         let mut table = table.clone();
         if !table.was_deleted() {
             let _ = table.take_focus();
@@ -4489,11 +4524,7 @@ impl ResultTableWidget {
                 }
             }
 
-            let mut input = active_editor.input;
-            input.hide();
-            if app::is_ui_thread() {
-                Input::delete(input);
-            }
+            Self::dispose_inline_editor(active_editor.input);
         }
 
         *active_inline_edit
@@ -17076,15 +17107,31 @@ mod tests {
     }
 
     #[test]
-    fn inline_editor_matches_the_table_row_height() {
+    fn inline_editor_covers_its_cell_exactly() {
         assert_eq!(
             ResultTableWidget::inline_editor_geometry(10, 20, 100, 40),
-            (11, 20, 98, 40)
+            (10, 20, 100, 40)
         );
+        // A narrow column too: a minimum width would make the editor wider
+        // than the cell it is standing in.
         assert_eq!(
             ResultTableWidget::inline_editor_geometry(10, 20, 20, TABLE_ROW_HEIGHT),
-            (11, 20, 24, TABLE_ROW_HEIGHT)
+            (10, 20, 20, TABLE_ROW_HEIGHT)
         );
+    }
+
+    #[test]
+    fn inline_editor_text_starts_where_the_cell_drew_it() {
+        theme::register_text_input_frames();
+        let frame = theme::grid_cell_input_frame();
+        // `Fl_Input_::drawtext` starts one pixel right of the frame's own
+        // left inset, and the grid draws a cell's text at `TABLE_CELL_PADDING`.
+        assert_eq!(frame.dx() + 1, TABLE_CELL_PADDING);
+        assert_eq!(frame.dy(), 0);
+        // The value keeps the same padding at the right edge, and the editor
+        // is exactly as tall as the cell.
+        assert_eq!(frame.dw() - frame.dx(), TABLE_CELL_PADDING);
+        assert_eq!(frame.dh(), 0);
     }
 
     #[test]

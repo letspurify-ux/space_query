@@ -2388,7 +2388,7 @@ fn main() {
     app::foreground(fg_r, fg_g, fg_b);
     app::set_frame_type2(FrameType::UpBox, FrameType::RFlatBox);
     app::set_frame_type2(FrameType::DownBox, FrameType::RFlatBox);
-    theme::register_text_input_frame();
+    theme::register_text_input_frames();
     app::set_frame_border_radius_max(8);
 
     let mut main_window = MainWindow::new_with_config(config.clone());

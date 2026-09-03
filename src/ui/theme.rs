@@ -10,6 +10,7 @@ use fltk::{
     valuator::Scrollbar,
 };
 
+use crate::ui::constants::TABLE_CELL_PADDING;
 use crate::utils::arithmetic::safe_div;
 
 // Windows 11-inspired dark palette tuned for FLTK widgets.
@@ -20,11 +21,37 @@ const INPUT_TEXT_RIGHT_PADDING: i32 = 6;
 const INPUT_FRAME_LEFT_INSET: i32 = CHOICE_TEXT_LEFT_PADDING - INPUT_NATIVE_TEXT_LEFT_OFFSET;
 const INPUT_FRAME_WIDTH_INSET: i32 = INPUT_FRAME_LEFT_INSET + INPUT_TEXT_RIGHT_PADDING;
 
+/// The box slot the grid's inline cell editor wears.
+///
+/// FLTK names exactly one free box type and the dialog inputs above already
+/// spend it, but the table it indexes runs to `FL_MAX_BOXTYPE` (255) and
+/// every slot from `FL_FREE_BOXTYPE` (56) upwards is unclaimed. 57 is the
+/// next one.
+const GRID_CELL_INPUT_FRAME_SLOT: i32 = 57;
+
+/// A cell editor covers the cell it replaces exactly, so its text has to
+/// start where the cell had drawn it: `TABLE_CELL_PADDING` from the cell's
+/// left edge, less the one pixel `Fl_Input_::drawtext` adds on its own. The
+/// same padding closes the right side, so the value does not shift when the
+/// editor opens or when it hands the cell back.
+const GRID_CELL_INPUT_FRAME_LEFT_INSET: i32 = TABLE_CELL_PADDING - INPUT_NATIVE_TEXT_LEFT_OFFSET;
+const GRID_CELL_INPUT_FRAME_WIDTH_INSET: i32 =
+    GRID_CELL_INPUT_FRAME_LEFT_INSET + TABLE_CELL_PADDING;
+
 fn draw_text_input_box(x: i32, y: i32, w: i32, h: i32, color: Color) {
     draw_box(FrameType::RFlatBox, x, y, w, h, color);
 }
 
-pub fn register_text_input_frame() {
+/// Square, like the cell underneath it: a rounded box laid over a rectangular
+/// cell leaves the old cell's pixels showing through the corners, which reads
+/// as an editor smaller than the cell it stands on.
+fn draw_grid_cell_input_box(x: i32, y: i32, w: i32, h: i32, color: Color) {
+    draw_box(FrameType::FlatBox, x, y, w, h, color);
+}
+
+/// The frame every text input in this app wears, registered in one call so no
+/// entry point can bring up half of them.
+pub fn register_text_input_frames() {
     app::set_frame_type_cb(
         FrameType::FreeBoxType,
         draw_text_input_box,
@@ -33,10 +60,31 @@ pub fn register_text_input_frame() {
         INPUT_FRAME_WIDTH_INSET,
         0,
     );
+    app::set_frame_type_cb(
+        grid_cell_input_frame(),
+        draw_grid_cell_input_box,
+        GRID_CELL_INPUT_FRAME_LEFT_INSET,
+        0,
+        GRID_CELL_INPUT_FRAME_WIDTH_INSET,
+        0,
+    );
+}
+
+/// The frame slot `register_text_input_frames` fills for the grid cell editor.
+pub fn grid_cell_input_frame() -> FrameType {
+    // SAFETY: `from_i32` only reads the value back out; a slot above the named
+    // ones becomes a `UserFrameType`, which is what `set_frame_type_cb` above
+    // defines and what `set_frame` then asks FLTK to draw.
+    unsafe { FrameType::from_i32(GRID_CELL_INPUT_FRAME_SLOT) }
 }
 
 pub fn apply_text_input_inset<W: WidgetExt>(input: &mut W) {
     input.set_frame(FrameType::FreeBoxType);
+}
+
+/// Pad a grid cell editor's text the way the grid pads a drawn cell.
+pub fn apply_grid_cell_input_inset<W: WidgetExt>(input: &mut W) {
+    input.set_frame(grid_cell_input_frame());
 }
 
 pub fn app_background() -> Color {
