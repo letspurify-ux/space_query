@@ -69,7 +69,15 @@ impl SqlWriteDialect {
     /// Closing that needs the session's own `sql_mode` to be tracked the way its
     /// transaction state already is; it is not something a writer can decide.
     pub fn for_connection(info: &ConnectionInfo) -> Self {
-        Self::for_session(info, None)
+        let db_type = info.db_type;
+        Self {
+            db_type,
+            backslash: if db_type.is_mysql_or_mariadb() {
+                crate::db::session_backslash_rule_for_sql_mode(&info.advanced.mysql_sql_mode)
+            } else {
+                SessionBackslashRule::Literal
+            },
+        }
     }
 
     /// The rules the session this text will run on ACTUALLY follows.
@@ -93,18 +101,32 @@ impl SqlWriteDialect {
     /// one were known. That is the price of not guessing, and it is paid only
     /// by a tab whose session was moved by a `sql_mode` of its own.
     pub fn for_session(info: &ConnectionInfo, observed: Option<SessionBackslashRule>) -> Self {
-        let db_type = info.db_type;
-        if !db_type.is_mysql_or_mariadb() {
-            return Self {
-                db_type,
-                backslash: SessionBackslashRule::Literal,
-            };
+        Self::for_connection(info).with_observed_backslash_rule(observed)
+    }
+
+    /// This dialect with the rule the tab's session was last SEEN running
+    /// under, for text that will RUN on that tab.
+    ///
+    /// Call it AT THE MOMENT THE TEXT IS WRITTEN, never earlier. The observed
+    /// rule is the one input here that can move while the app waits on the
+    /// user — the import road reads it once at the click, and its mapping
+    /// dialog then stays open for as long as the user thinks, while a script
+    /// already running on the tab can finish with a `SET SESSION sql_mode` of
+    /// its own. A script escaped under that stale rule stores every backslash
+    /// wrong, silently, and even the [`ValueCannotBeWritten::UnknownBackslashRule`]
+    /// refusal cannot catch it: the stale value is a definite rule, not an
+    /// unknown one.
+    ///
+    /// `None` keeps the configured rule, which is the right answer for a
+    /// session this app set up and nobody has moved — and a no-op outside the
+    /// MySQL family, where no `sql_mode` exists to move.
+    pub fn with_observed_backslash_rule(self, observed: Option<SessionBackslashRule>) -> Self {
+        if !self.is_mysql_or_mariadb() {
+            return self;
         }
-        Self {
-            db_type,
-            backslash: observed.unwrap_or_else(|| {
-                crate::db::session_backslash_rule_for_sql_mode(&info.advanced.mysql_sql_mode)
-            }),
+        match observed {
+            Some(backslash) => Self { backslash, ..self },
+            None => self,
         }
     }
 
@@ -2873,6 +2895,55 @@ mod tests {
                 .doubles_a_backslash(),
             Some(false)
         );
+    }
+
+    /// The observed rule is OVERLAID on the configured dialect, and the overlay
+    /// is the same answer `for_session` has always given.
+    ///
+    /// The overlay exists so a road that learned the configured rules early can
+    /// read the tab's rule AT THE MOMENT it writes the text — the import road's
+    /// mapping dialog sits between the click and the build, and a rule captured
+    /// at the click can be a session's old one by then. One rule, one place:
+    /// `for_session` itself goes through the overlay, so the two cannot drift.
+    #[test]
+    fn an_observed_rule_overlays_the_configured_dialect_the_way_for_session_reads_it() {
+        let observations = [
+            None,
+            Some(SessionBackslashRule::Escapes),
+            Some(SessionBackslashRule::Literal),
+            Some(SessionBackslashRule::Unknown),
+        ];
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            for mode in ["TRADITIONAL", "TRADITIONAL,NO_BACKSLASH_ESCAPES"] {
+                let mut info =
+                    ConnectionInfo::new_with_type("m", "u", "p", "h", 3306, "db", db_type);
+                info.advanced.mysql_sql_mode = mode.to_string();
+                for observed in observations {
+                    assert_eq!(
+                        SqlWriteDialect::for_connection(&info)
+                            .with_observed_backslash_rule(observed),
+                        SqlWriteDialect::for_session(&info, observed),
+                        "{db_type} {mode} {observed:?}"
+                    );
+                }
+                // Nothing observed keeps the connection's configured rule.
+                assert_eq!(
+                    SqlWriteDialect::for_connection(&info).with_observed_backslash_rule(None),
+                    SqlWriteDialect::for_connection(&info),
+                    "{db_type} {mode}"
+                );
+            }
+        }
+        // Oracle has no rule to move: every observation is inert.
+        let oracle =
+            ConnectionInfo::new_with_type("o", "u", "p", "h", 1521, "s", DatabaseType::Oracle);
+        for observed in observations {
+            assert_eq!(
+                SqlWriteDialect::for_connection(&oracle).with_observed_backslash_rule(observed),
+                SqlWriteDialect::for_connection(&oracle),
+                "{observed:?}"
+            );
+        }
     }
 
     /// A VALUE cannot tell the reader what escaping rule the file follows.

@@ -272,6 +272,8 @@ fn main() {
     verify_a_repeated_column_name_is_refused(&mut failures);
     verify_a_new_result_does_not_inherit_a_queued_export(&mut failures);
     verify_a_sql_inserts_export_writes_the_rows_it_started_with(&mut failures);
+    verify_an_export_covers_the_result_the_user_asked_on(&mut main_window, &mut failures);
+    verify_an_export_whose_result_closed_is_refused(&mut main_window, &mut failures);
 
     if failures.is_empty() {
         say("\nResult export verified end to end through the running application.");
@@ -459,6 +461,221 @@ fn verify_a_new_result_does_not_inherit_a_queued_export(failures: &mut Vec<Strin
             payload.data().map(|built| built.text().to_string())
         ));
     }
+}
+
+/// A result another statement of a running batch delivers — one distinctive
+/// value, so a clipboard that followed the wrong grid names itself.
+fn stolen_result() -> QueryResult {
+    QueryResult {
+        sql: "SELECT B FROM OTHER".into(),
+        row_count: 1,
+        execution_time: std::time::Duration::from_millis(3),
+        message: "1 row selected".into(),
+        is_select: true,
+        success: true,
+        columns: vec![column("B", SqlValueKind::String)],
+        rows: vec![vec!["stolen".into()]],
+    }
+}
+
+/// An export covers the result the user ASKED on, whatever the modals let
+/// happen underneath them.
+///
+/// Between the click and the confirm, two modal loops run — the format dialog
+/// and (for a file) the save chooser — and the app is live under both: a later
+/// statement of a still-running batch creates and SELECTS its own result tab
+/// through the same channel polls the modal pumps. The flow used to resolve
+/// "which grid" through `current_table()` at the confirm, so the export
+/// silently wrote whichever result was active by then. The grid is pinned by
+/// tab id at the click now, and this drives the whole road — menu, modal, a
+/// result landing under it, confirm — and reads the clipboard back.
+fn verify_an_export_covers_the_result_the_user_asked_on(
+    main_window: &mut MainWindow,
+    failures: &mut Vec<String>,
+) {
+    // Both scopes: "All rows" proves the pin resolves the right GRID, and
+    // "Selected rows" proves the pinned grid's own selection — widget-local
+    // state — survives another tab taking the active slot.
+    for scope in [ExportScope::All, ExportScope::Selection] {
+        if let Err(err) =
+            main_window.capture_tour_show_result("Result", sample_result(), false, None)
+        {
+            failures.push(format!(
+                "mid-modal arrival ({scope:?}): could not show the fixture: {err}"
+            ));
+            return;
+        }
+        pump(400);
+        if scope == ExportScope::Selection {
+            main_window.capture_tour_select_result_range(0, 0, 1, 2);
+        } else {
+            main_window.capture_tour_clear_result_selection();
+        }
+        pump(200);
+
+        set_clipboard("");
+        {
+            let mut plan = plan()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            plan.format = ExportFormat::Csv;
+            plan.scope = scope;
+            plan.cancel = false;
+            plan.driven = false;
+            plan.refused = false;
+            plan.attempts = 0;
+        }
+
+        // Inside the modal's own event loop, before Export is clicked: a later
+        // statement finishes and its tab takes the active slot.
+        let arrival = main_window.capture_tour_result_arrival_handle();
+        app::add_timeout3(0.15, move |_| arrival.land("Result 2", stolen_result()));
+        app::add_timeout3(0.45, |_| drive_modal());
+        if let Err(err) = trigger_export_menu() {
+            failures.push(format!("mid-modal arrival ({scope:?}): {err}"));
+            return;
+        }
+        pump(1500);
+
+        if !plan()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .driven
+        {
+            failures.push(format!(
+                "mid-modal arrival ({scope:?}): the export modal never appeared"
+            ));
+            return;
+        }
+        let clipboard = read_clipboard();
+        let expected = render(ExportFormat::Csv, &expected_grid(scope));
+        if clipboard == expected {
+            say(&format!(
+                "PASS: a {scope:?} export covers the result the user asked on, not the tab a \
+                 batch selected"
+            ));
+        } else if clipboard.contains("stolen") {
+            failures.push(format!(
+                "the {scope:?} export followed the active tab to a result that arrived under \
+                 the modal"
+            ));
+        } else {
+            failures.push(format!(
+                "mid-modal arrival ({scope:?}): clipboard held {clipboard:?}, expected the \
+                 pinned result's CSV"
+            ));
+        }
+    }
+}
+
+/// An export whose result is GONE by the confirm refuses loudly and writes
+/// nothing.
+///
+/// The pinned grid resolves by tab id; a workspace that lost its results while
+/// the dialogs were open answers with a sentence, never with whatever result
+/// took its place — and never with a file that looks like a finished export.
+fn verify_an_export_whose_result_closed_is_refused(
+    main_window: &mut MainWindow,
+    failures: &mut Vec<String>,
+) {
+    if let Err(err) = main_window.capture_tour_show_result("Result", sample_result(), false, None) {
+        failures.push(format!(
+            "closed-result export: could not show the fixture: {err}"
+        ));
+        return;
+    }
+    pump(400);
+    main_window.capture_tour_clear_result_selection();
+    pump(200);
+
+    set_clipboard("sentinel-gone");
+    {
+        let mut plan = plan()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        plan.format = ExportFormat::Csv;
+        plan.scope = ExportScope::All;
+        plan.cancel = false;
+        plan.driven = false;
+        plan.refused = false;
+        plan.attempts = 0;
+    }
+
+    // The workspace loses every result while the modal is open; another one
+    // lands in its place, so "some grid is visible" cannot mask the loss.
+    let arrival = main_window.capture_tour_result_arrival_handle();
+    app::add_timeout3(0.15, move |_| {
+        arrival.replace_all("Result 2", stolen_result());
+    });
+    app::add_timeout3(0.45, |_| drive_modal());
+    // The refusal is an alert raised AFTER the export dialog closes; dismiss it
+    // and record what it said.
+    let alert_outcome: Arc<Mutex<(bool, bool)>> = Arc::new(Mutex::new((false, false)));
+    {
+        let alert_outcome = alert_outcome.clone();
+        app::add_timeout3(0.60, move |_| {
+            dismiss_result_gone_alert(alert_outcome.clone(), 0);
+        });
+    }
+    if let Err(err) = trigger_export_menu() {
+        failures.push(format!("closed-result export: {err}"));
+        return;
+    }
+    pump(2000);
+
+    let (seen, right_sentence) = *alert_outcome
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !seen {
+        failures
+            .push("the export of a result closed under the modal said nothing at all".to_string());
+    } else if !right_sentence {
+        failures
+            .push("the closed-result refusal did not say the result is no longer open".to_string());
+    } else {
+        say("PASS: an export whose result closed under the modal refuses and says so");
+    }
+    let clipboard = read_clipboard();
+    if clipboard != "sentinel-gone" {
+        failures.push(format!(
+            "the refused export still wrote to the clipboard: {clipboard:?}"
+        ));
+    } else {
+        say("PASS: the refused export wrote nothing");
+    }
+}
+
+/// Find the refusal alert, record whether it names the closed result, and
+/// dismiss it so the run can go on.
+fn dismiss_result_gone_alert(outcome: Arc<Mutex<(bool, bool)>>, attempts: u32) {
+    let Some(alert) = window_by_label("Alert") else {
+        if attempts < 60 {
+            app::add_timeout3(0.05, move |_| {
+                dismiss_result_gone_alert(outcome.clone(), attempts + 1);
+            });
+        }
+        return;
+    };
+    let mut widgets = Vec::new();
+    if let Some(group) = alert.as_group() {
+        collect_widgets(&group, &mut widgets);
+    }
+    let right_sentence = widgets
+        .iter()
+        .any(|widget| widget.label().contains("no longer open"));
+    *outcome
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = (true, right_sentence);
+    for widget in &widgets {
+        if let Some(mut button) = Button::from_dyn_widget(widget) {
+            if button.label() == "Close" {
+                button.do_callback();
+                return;
+            }
+        }
+    }
+    let mut alert = alert;
+    alert.hide();
 }
 
 /// Start an export from the application's own menu, drive the modal it opens,

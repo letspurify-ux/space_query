@@ -6800,6 +6800,47 @@ impl DecidedSessionTeardown {
     }
 }
 
+/// Lands results in the active workspace from a timeout, the way a finishing
+/// statement's delivery does — its tab created and SELECTED.
+///
+/// Exists for `verify_result_export_ui`, which must reproduce a statement
+/// arriving while the export dialogs are open: the harness's own frame is
+/// blocked inside the modal's event loop, so only a timeout can act, and a
+/// timeout cannot borrow the `MainWindow`. Holds the state weakly — the
+/// harness outliving the window must not keep the app alive. Not part of the
+/// supported surface.
+#[doc(hidden)]
+pub struct CaptureTourResultArrival {
+    state: std::sync::Weak<Mutex<AppState>>,
+}
+
+impl CaptureTourResultArrival {
+    /// Land `result` beside the results already open, selecting its tab —
+    /// what a later statement of a running batch does.
+    pub fn land(&self, label: &str, result: crate::db::QueryResult) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        MainWindow::append_capture_result(&mut state, label, result);
+    }
+
+    /// Replace every open result with `result` — a workspace losing the
+    /// results it held.
+    pub fn replace_all(&self, label: &str, result: crate::db::QueryResult) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.result_tabs.clear();
+        MainWindow::append_capture_result(&mut state, label, result);
+    }
+}
+
 pub struct MainWindow {
     state: Arc<Mutex<AppState>>,
 }
@@ -7860,31 +7901,6 @@ impl MainWindow {
         Ok(guard.result_tabs.clone())
     }
 
-    fn prepare_result_export(
-        state: &Arc<Mutex<AppState>>,
-        choice: ExportChoice,
-        dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
-        callback: crate::ui::result_table::ExportReadyCallback,
-    ) -> Result<Option<crate::ui::result_export::ExportPayload>, String> {
-        let result_tabs = {
-            let guard = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !guard.result_tabs.has_data() {
-                return Err("No results to export".to_string());
-            }
-            guard.result_tabs.clone()
-        };
-
-        Ok(result_tabs.export_after_fetch_all(
-            choice.format,
-            choice.scope,
-            choice.destination,
-            dialect,
-            callback,
-        ))
-    }
-
     fn sync_recent_sql_file_menu(recent_sql_files: &[PathBuf]) {
         let recent_sql_files = recent_sql_files.to_vec();
         crate::ui::ui_timeout::schedule(0.0, move || {
@@ -8068,39 +8084,51 @@ impl MainWindow {
         // The refusal is decided under the guard and SAID after it: an alert
         // runs a nested FLTK event loop, and callbacks firing inside it must
         // never find the app state mutex still held.
-        let Some((dialect, catalog, has_selection, sql_export_possible, export_refusal)) = ({
+        //
+        // Everything read here is a CLICK-time fact, and the grid they were
+        // read from is PINNED in the same breath: the dialogs that follow pump
+        // the event loop, and a later statement of a still-running batch can
+        // select its own result tab under them. Every question asked after
+        // this block goes through the pin, so it is answered by this grid.
+        let Some((pin, dialect, catalog, has_selection, sql_export_possible, export_refusal)) = ({
             let guard = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.result_tabs.has_data().then(|| {
-                (
-                    guard.active_connection_runtime().map(
-                        |runtime| -> crate::ui::grid_sql_export::SqlWriteDialect {
-                            crate::ui::grid_sql_export::SqlWriteDialect::for_session(
-                                &runtime.sanitized_info(),
-                                guard.active_tab_session_backslash_rule(),
+            if guard.result_tabs.has_data() {
+                guard.result_tabs.pin_visible_export().map(|pin| {
+                    (
+                        pin,
+                        guard.active_connection_runtime().map(
+                            |runtime| -> crate::ui::grid_sql_export::SqlWriteDialect {
+                                crate::ui::grid_sql_export::SqlWriteDialect::for_session(
+                                    &runtime.sanitized_info(),
+                                    guard.active_tab_session_backslash_rule(),
+                                )
+                            },
+                        ),
+                        // What the one catalog read a `SQL Inserts` export still
+                        // needs will be asked on. Taken HERE, with the rest, for
+                        // the same reason the dialect is: this is the moment the
+                        // user asked, and the road that asks the question runs
+                        // later — possibly from inside a deferred callback,
+                        // where the state lock is already held and cannot be
+                        // taken again.
+                        guard.active_connection_runtime().map(|runtime| {
+                            (
+                                runtime.connection(),
+                                guard.active_connection_id().and_then(|id| {
+                                    guard.object_browser.selected_scope_for_connection(id)
+                                }),
                             )
-                        },
-                    ),
-                    // What the one catalog read a `SQL Inserts` export still
-                    // needs will be asked on. Taken HERE, with the rest, for the
-                    // same reason the dialect is: this is the moment the user
-                    // asked, and the road that asks the question runs later —
-                    // possibly from inside a deferred callback, where the state
-                    // lock is already held and cannot be taken again.
-                    guard.active_connection_runtime().map(|runtime| {
-                        (
-                            runtime.connection(),
-                            guard.active_connection_id().and_then(|id| {
-                                guard.object_browser.selected_scope_for_connection(id)
-                            }),
-                        )
-                    }),
-                    guard.result_tabs.has_grid_selection(),
-                    guard.result_tabs.has_sql_exportable_columns(),
-                    guard.result_tabs.export_refusal(),
-                )
-            })
+                        }),
+                        guard.result_tabs.has_grid_selection(),
+                        guard.result_tabs.has_sql_exportable_columns(),
+                        guard.result_tabs.export_refusal(),
+                    )
+                })
+            } else {
+                None
+            }
         }) else {
             crate::ui::alert_on_main("No results to export");
             return;
@@ -8134,14 +8162,13 @@ impl MainWindow {
         // either scope can hold TWO columns of one name — both only knowable
         // once the scope is chosen, and both asked of one reader so the sentence
         // the user reads is the same one `Copy as SQL …` gives.
+        //
+        // Through the PIN, without the state lock: a modal has run since the
+        // click, so "the visible grid" may already be another statement's — and
+        // the pin holds the widget handles itself, so nothing here needs the
+        // app state.
         if choice.format == ExportFormat::SqlInserts {
-            let refusal = {
-                let guard = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.result_tabs.sql_export_refusal(choice.scope)
-            };
-            if let Some(reason) = refusal {
+            if let Some(reason) = pin.sql_export_refusal(choice.scope) {
                 crate::ui::alert_on_main(&reason);
                 return;
             }
@@ -8157,7 +8184,7 @@ impl MainWindow {
             }
         };
 
-        Self::run_result_export(state, file_sender, choice, dialect, target, catalog);
+        Self::run_result_export(file_sender, choice, dialect, target, catalog, pin);
     }
 
     /// Take the snapshot the export will be built from and send it on its way.
@@ -8170,22 +8197,28 @@ impl MainWindow {
     /// on which of them ran.
     ///
     /// `catalog` is what the one read a `SQL Inserts` export still needs will
-    /// run on, taken when the user asked.
+    /// run on, taken when the user asked. `pin` is the grid the user asked ON,
+    /// taken in the same breath — the snapshot below is the pin's to take, and
+    /// its refusals are its to re-ask, because two modals have run since the
+    /// click. Nothing here touches the app state: the pin holds the widget
+    /// handles itself, so the state lock cannot be held when a deferred
+    /// lazy-fetch callback needs it.
     fn run_result_export(
-        state: &Arc<Mutex<AppState>>,
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
         choice: ExportChoice,
         dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
         target: ExportTarget,
         catalog: Option<(SharedConnection, Option<String>)>,
+        pin: crate::ui::result_tabs::PinnedResultExport,
     ) {
         let sender = file_sender.clone();
         let deferred_sender = sender.clone();
         let deferred_target = target.clone();
         let deferred_catalog = catalog.clone();
-        let export = match MainWindow::prepare_result_export(
-            state,
-            choice,
+        let export = match pin.export_after_fetch_all(
+            choice.format,
+            choice.scope,
+            choice.destination,
             dialect,
             Box::new(move |ready| match ready {
                 Ok(payload) => Self::deliver_export_payload(
@@ -18889,6 +18922,16 @@ impl MainWindow {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::append_capture_result(&mut state, label, result);
+    }
+
+    /// Land one capture-tour result in the active workspace, the way a
+    /// finishing statement's delivery does: its tab is created and SELECTED.
+    ///
+    /// The one body behind [`Self::capture_tour_append_result`] and
+    /// [`CaptureTourResultArrival`], so the two cannot come to land results
+    /// differently.
+    fn append_capture_result(state: &mut AppState, label: &str, result: crate::db::QueryResult) {
         let execution_origin = state
             .editor_tabs
             .iter()
@@ -18901,6 +18944,16 @@ impl MainWindow {
         });
         state.refresh_result_edit_controls();
         state.window.redraw();
+    }
+
+    /// A handle that can land or replace results while a modal is open, for the
+    /// harness that reproduces a statement finishing under the export dialogs.
+    /// Not part of the supported surface.
+    #[doc(hidden)]
+    pub fn capture_tour_result_arrival_handle(&self) -> CaptureTourResultArrival {
+        CaptureTourResultArrival {
+            state: Arc::downgrade(&self.state),
+        }
     }
 
     /// Tag a registered example connection, for the scene about connection
@@ -22926,19 +22979,27 @@ mod tests {
         assert_eq!(state.active_connection_id(), Some(connection_id));
     }
 
+    /// The app-state lock is free when a deferred export's lazy-fetch request
+    /// fires.
+    ///
+    /// This pinned the old `prepare_result_export`'s discipline of dropping the
+    /// guard before asking the grid. The export road now goes through
+    /// [`crate::ui::result_tabs::PinnedResultExport`], which holds the widget
+    /// handles itself and never touches the app state — the invariant holds by
+    /// construction, and the callback's `try_lock` still proves it end to end.
     #[test]
     #[cfg_attr(
         any(target_os = "macos", target_os = "linux"),
         ignore = "FLTK widget tests require a native UI test environment"
     )]
-    fn prepare_result_export_releases_app_state_lock_before_lazy_fetch_request() {
+    fn a_pinned_export_defers_behind_a_lazy_fetch_with_the_app_state_lock_free() {
         let _app = fltk::app::App::default();
         configure_fltk_globals(&AppConfig::default());
         let window = MainWindow::new_with_config(AppConfig::default());
         let state = window.state.clone();
         let lock_visible = Arc::new(Mutex::new(None::<bool>));
 
-        {
+        let pin = {
             let mut guard = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -22977,15 +23038,21 @@ mod tests {
                     true
                 }))));
             guard.result_tabs.set_lazy_fetch_callback(callback);
-        }
-
-        let choice = ExportChoice {
-            format: ExportFormat::Csv,
-            scope: crate::ui::result_export::ExportScope::All,
-            destination: ExportDestination::File,
+            guard
+                .result_tabs
+                .pin_visible_export()
+                .expect("a visible result tab to pin")
         };
-        let export = MainWindow::prepare_result_export(&state, choice, None, Box::new(|_| {}))
-            .expect("prepare export should succeed");
+
+        let export = pin
+            .export_after_fetch_all(
+                ExportFormat::Csv,
+                crate::ui::result_export::ExportScope::All,
+                ExportDestination::File,
+                None,
+                Box::new(|_| {}),
+            )
+            .expect("a pinned export over an open lazy fetch defers, it does not refuse");
 
         assert!(export.is_none());
         assert_eq!(

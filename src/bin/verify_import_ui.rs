@@ -519,6 +519,68 @@ fn main() {
         }
     }
 
+    // The dialect an import script is written under is read when the script is
+    // BUILT — after the mapping dialog closes — never captured when the road
+    // was entered. The tab's own `SET SESSION sql_mode` can move the session's
+    // backslash rule while the dialog is open; a script escaped under the
+    // click-time rule then stores every backslash wrong, silently. The flip
+    // below fires INSIDE the modal's own event loop, before Import is clicked,
+    // standing in for exactly that: a script finishing on the tab while the
+    // user is still mapping columns.
+    {
+        use space_query::db::SessionBackslashRule;
+        use space_query::ui::grid_sql_export::SqlWriteDialect;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        *plan()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ModalPlan::default();
+
+        let moved = Arc::new(AtomicBool::new(false));
+        let moved_in_modal = Arc::clone(&moved);
+        app::add_timeout3(0.10, move |_| {
+            moved_in_modal.store(true, Ordering::Relaxed);
+        });
+        app::add_timeout3(0.30, |_| drive_modal());
+        app::add_timeout3(0.90, |_| close_if_refused(0));
+
+        let outcome = ObjectBrowserWidget::build_import_script_from_dialog(
+            "sample",
+            "NAME\nc:\\dir\n",
+            "app.t",
+            space_query::ui::ImportScriptRules {
+                // Configured as every MySQL-family session starts: backslash
+                // escapes ON, so a stale read doubles the backslash.
+                configured: SqlWriteDialect::family_default(DatabaseType::MySQL),
+                // The live read the card hands the builder. Until the flip it
+                // answers the configured rule; after it, the session runs
+                // NO_BACKSLASH_ESCAPES.
+                observed_backslash_rule_now: &|| {
+                    Some(if moved.load(Ordering::Relaxed) {
+                        SessionBackslashRule::Literal
+                    } else {
+                        SessionBackslashRule::Escapes
+                    })
+                },
+            },
+            &[detail("NAME", "VARCHAR", true)],
+            ExportFormat::Csv,
+            DEFAULT_NULL_TEXT,
+        );
+        pump(200);
+        match outcome {
+            Some((sql, _)) if sql.contains("('c:\\dir')") => {
+                say("PASS: the import dialect is read when the script is built, after the modal");
+            }
+            Some((sql, _)) => failures.push(format!(
+                "the import script was escaped under the rule captured before the modal \
+                 opened: {sql:?}"
+            )),
+            None => failures.push("the dialect-timing case produced no script".to_string()),
+        }
+    }
+
     if failures.is_empty() {
         say("\nImport verified end to end through the production modal.");
     } else {
@@ -572,7 +634,15 @@ fn run_against(
         "sample",
         text,
         TABLE,
-        space_query::ui::grid_sql_export::SqlWriteDialect::family_default(DatabaseType::Oracle),
+        space_query::ui::ImportScriptRules {
+            configured: space_query::ui::grid_sql_export::SqlWriteDialect::family_default(
+                DatabaseType::Oracle,
+            ),
+            // Nothing observed keeps the configured rule — and Oracle has no
+            // rule to move anyway. The moment of this read is pinned by its
+            // own case below, on the family where it matters.
+            observed_backslash_rule_now: &|| None,
+        },
         &columns,
         format,
         session_null_text,

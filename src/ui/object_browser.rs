@@ -226,6 +226,48 @@ impl CardTabFacts {
     }
 }
 
+/// The SQL-writing rules for an import script, split into the half that is
+/// stable and the half that must be read at the moment the script is WRITTEN.
+///
+/// An import script RUNS on the card's tab, and between the click that asked
+/// for it and the build sits the mapping dialog — open for as long as the user
+/// thinks — plus the file read and a catalog round trip before it. A script
+/// already running on that tab can finish with a `SET SESSION sql_mode` of its
+/// own in that window, which moves how the session reads a backslash. The rule
+/// used to be captured at the CLICK and baked into a finished dialect, so the
+/// script was escaped for a session that no longer existed — and stored every
+/// backslash wrong, silently, because the stale value was a definite rule the
+/// `UnknownBackslashRule` refusal could not catch.
+///
+/// So the observed rule travels as a READ, not as a value: the builder calls
+/// `observed_backslash_rule_now` after its modal returns, and a caller cannot
+/// resolve it early because only the builder knows when that moment is. This
+/// is [`CardTabFacts`]' own contract — "read at the moment it acts, never at
+/// the moment it was wired" — enforced where the acting happens.
+pub struct ImportScriptRules<'a> {
+    /// The connection's configured rules, read with the table's structure on
+    /// the worker. Stable: nothing moves them under a dialog.
+    pub configured: crate::ui::grid_sql_export::SqlWriteDialect,
+    /// The tab's backslash rule as pinned NOW. The card's handler passes the
+    /// live [`CardTabFacts`] read; a harness passes whatever moment it is
+    /// staging.
+    pub observed_backslash_rule_now: &'a dyn Fn() -> Option<crate::db::SessionBackslashRule>,
+}
+
+impl ImportScriptRules<'_> {
+    /// The stable half: which backend the script is written for.
+    fn db_type(&self) -> crate::db::DatabaseType {
+        self.configured.db_type()
+    }
+
+    /// The dialect the script must be written under, resolved at the moment of
+    /// the build.
+    fn resolve_at_build_time(&self) -> crate::ui::grid_sql_export::SqlWriteDialect {
+        self.configured
+            .with_observed_backslash_rule((self.observed_backslash_rule_now)())
+    }
+}
+
 /// What the catalog says about one table that generated SQL has to respect.
 ///
 /// Both facts come from ONE structure read: see
@@ -1290,10 +1332,15 @@ enum ObjectActionResult {
         /// hard-coded `NULL` could not promise for a tab that had run
         /// `SET NULL`. See [`CardTabFacts::null_text_now`].
         null_text: String,
-        /// The file's text, the table's columns, and the SQL-writing rules of
-        /// the connection they were read on, loaded together so one failure
-        /// reports one message and so the script cannot be written for a
-        /// different connection than the one it was prepared against.
+        /// The file's text, the table's columns, and the CONFIGURED SQL-writing
+        /// rules of the connection they were read on, loaded together so one
+        /// failure reports one message and so the script cannot be written for
+        /// a different connection than the one it was prepared against.
+        ///
+        /// Configured only: the tab's observed backslash rule is deliberately
+        /// NOT here. It can move while the mapping dialog is open, so it is
+        /// read where the script is built ([`ImportScriptRules`]), never
+        /// carried through this message.
         result: Result<
             (
                 String,
@@ -3640,13 +3687,26 @@ impl ObjectBrowserWidget {
                             null_text,
                             result,
                         } => match result {
-                            Ok((text, columns, dialect)) => {
+                            Ok((text, columns, configured_dialect)) => {
                                 if let Some((sql, summary)) =
                                     ObjectBrowserWidget::build_import_script_from_dialog(
                                         &file_label,
                                         &text,
                                         &qualified_name,
-                                        dialect,
+                                        ImportScriptRules {
+                                            configured: configured_dialect,
+                                            // The card's LIVE handle: the
+                                            // builder reads it after its modal
+                                            // returns, which is the moment the
+                                            // script is written — and this
+                                            // card's tab is the tab the script
+                                            // is routed to, so the rule and the
+                                            // session it describes are the same
+                                            // tab's, read at the same moment.
+                                            observed_backslash_rule_now: &|| {
+                                                tab_facts.backslash_rule_now()
+                                            },
+                                        },
                                         &columns,
                                         format,
                                         &null_text,
@@ -8170,14 +8230,6 @@ impl ObjectBrowserWidget {
         }
     }
 
-    /// Ask how to import, then build the script that does it.
-    ///
-    /// `None` means the user cancelled, or said yes to something the builder
-    /// refused — either way nothing runs.
-    ///
-    /// Public only so `verify_import_ui` can drive the production modal; not
-    /// part of the supported surface.
-    #[doc(hidden)]
     /// Turn a freshly read table into export bytes.
     ///
     /// Goes through the same `render_export_content` the result grid uses, so a
@@ -8312,16 +8364,28 @@ impl ObjectBrowserWidget {
         }
     }
 
+    /// Ask how to import, then build the script that does it.
+    ///
+    /// `None` means the user cancelled, or said yes to something the builder
+    /// refused — either way nothing runs.
+    ///
+    /// The dialect the script is written under is resolved AFTER the modal
+    /// returns, through [`ImportScriptRules`]: the modal is open for as long as
+    /// the user thinks, and the tab's backslash rule can move underneath it.
+    ///
+    /// Public only so `verify_import_ui` can drive the production modal; not
+    /// part of the supported surface.
+    #[doc(hidden)]
     pub fn build_import_script_from_dialog(
         file_label: &str,
         text: &str,
         qualified_name: &str,
-        dialect: crate::ui::grid_sql_export::SqlWriteDialect,
+        rules: ImportScriptRules<'_>,
         columns: &[TableColumnDetail],
         format: crate::ui::result_export::ExportFormat,
         null_text: &str,
     ) -> Option<(String, String)> {
-        let table_columns = Self::import_targets(dialect.db_type(), columns);
+        let table_columns = Self::import_targets(rules.db_type(), columns);
         let targets = table_columns.writable();
         let outcome = crate::ui::table_import_dialog::show(
             file_label,
@@ -8331,6 +8395,10 @@ impl ObjectBrowserWidget {
             format,
             null_text,
         )?;
+        // The moment the script is written, which is the only moment the tab's
+        // rule may be read for it — the modal above just closed, and the user
+        // may have held it open across a script that moved the session.
+        let dialect = rules.resolve_at_build_time();
         let request = crate::ui::table_import::ImportRequest {
             dialect,
             table: qualified_name,
@@ -8703,13 +8771,14 @@ impl ObjectBrowserWidget {
                         let selected_scope = selected_scope.clone();
                         let qualified_for_thread = qualified_name.clone();
                         let file_label_for_thread = file_label.clone();
-                        // Read HERE, on the UI thread, from the tab's own pin:
-                        // the worker cannot reach the tab, and this is the
-                        // moment the user asked.
-                        let tab_backslash_rule = tab_facts.backslash_rule_now();
-                        // The tab's NULL text, read at the same moment and for
-                        // the same reason: this is when the user asked, and the
-                        // dialog that offers it opens later.
+                        // The tab's NULL text, read HERE on the UI thread: this
+                        // is when the user asked, and it is the dialog's
+                        // OFFER — shown in an editable field, so a user who
+                        // held the dialog open across a `SET NULL` sees and
+                        // can correct it. The backslash rule gets no such
+                        // capture: it is invisible in the dialog, so it is
+                        // read where the script is BUILT, through
+                        // [`ImportScriptRules`].
                         let tab_null_text = tab_facts.null_text_now();
                         thread::spawn(move || {
                             let activity = format!("Loading table structure for {}", table_name);
@@ -8720,20 +8789,16 @@ impl ObjectBrowserWidget {
                                         selected_scope.as_deref(),
                                         activity,
                                         |context, session| {
-                                            // Asked of the TAB, because that is
-                                            // the session this script will RUN
-                                            // on — and a `SET SESSION sql_mode`
-                                            // typed there moves how it reads a
-                                            // backslash, which the connection's
-                                            // configured mode cannot say. With
-                                            // nothing observed the connection's
-                                            // own mode is the answer, which it
-                                            // is for every session this app sets
-                                            // up until a user changes one.
+                                            // The CONFIGURED rules only. The
+                                            // script runs on the TAB, whose own
+                                            // `SET SESSION sql_mode` can move
+                                            // the backslash rule while the
+                                            // mapping dialog is open — so that
+                                            // half is overlaid where the script
+                                            // is BUILT, not captured here.
                                             let dialect =
-                                                crate::ui::grid_sql_export::SqlWriteDialect::for_session(
+                                                crate::ui::grid_sql_export::SqlWriteDialect::for_connection(
                                                     &context.connection_info,
-                                                    tab_backslash_rule,
                                                 );
                                             object_browser_behavior_for(
                                                 context.connection_info.db_type,

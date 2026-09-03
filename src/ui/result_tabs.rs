@@ -3050,31 +3050,28 @@ impl ResultTabsWidget {
             .unwrap_or_default()
     }
 
-    /// Render the visible grid in `format` and hand the text to `callback`.
+    /// Pin the visible grid for an export the user just asked for, or `None`
+    /// when no result tab is visible.
     ///
-    /// Returns the text directly when it was ready; `None` means a full fetch
-    /// had to run first and the callback will fire when it finishes.
-    /// `generated_columns` is what the catalog says the server computes for the
-    /// base table, read before this was called. Only `SqlInserts` reads it, and
-    /// an empty list means "nothing is computed" — the road that could not ask
-    /// reports the failure rather than exporting.
-    pub(crate) fn export_after_fetch_all(
-        &self,
-        format: ExportFormat,
-        scope: ExportScope,
-        destination: ExportDestination,
-        dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
-        callback: crate::ui::result_table::ExportReadyCallback,
-    ) -> Option<crate::ui::result_export::ExportPayload> {
-        let table = self.current_table()?;
-        let request = ExportRequest {
-            format,
-            scope,
-            destination,
-            dialect,
-            table: Self::resolve_grid_export_table(&table, dialect),
-        };
-        table.export_after_fetch_all(request, callback)
+    /// Called at the CLICK, before any dialog opens. Everything the export flow
+    /// asks after that goes through the returned [`PinnedResultExport`], which
+    /// resolves the grid BY THIS TAB'S ID — never by whichever tab is active
+    /// when a modal closes.
+    pub(crate) fn pin_visible_export(&self) -> Option<PinnedResultExport> {
+        self.visible_result_tab_id().map(|id| PinnedResultExport {
+            tabs: self.clone(),
+            id,
+        })
+    }
+
+    /// The grid belonging to `id`, or `None` when that result is gone.
+    fn table_for_result_tab_id(&self, id: ResultTabId) -> Option<ResultTableWidget> {
+        let index = self.result_tab_index_for_id(id)?;
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .map(|tab| tab.table.clone())
     }
 
     /// Find text in the rows the active result grid is already showing.
@@ -3110,13 +3107,6 @@ impl ResultTabsWidget {
     pub(crate) fn export_refusal(&self) -> Option<String> {
         self.current_table()
             .and_then(|table| table.export_refusal())
-    }
-
-    /// Why generated SQL cannot be written for the visible result at `scope`,
-    /// or `None`.
-    pub(crate) fn sql_export_refusal(&self, scope: ExportScope) -> Option<String> {
-        self.current_table()
-            .and_then(|table| table.sql_export_refusal(scope))
     }
 
     /// Whether a `SQL Inserts` export of the whole result could name a column.
@@ -3748,6 +3738,101 @@ impl ResultTabsWidget {
 impl Default for ResultTabsWidget {
     fn default() -> Self {
         Self::new(0, 0, 100, 100)
+    }
+}
+
+/// The grid a result export covers, pinned by tab id at the CLICK.
+///
+/// Between the click and the rows being taken, the export flow runs two modal
+/// loops — the format dialog and the save chooser — and the app is live under
+/// both: channel polls fire, and a later statement of a still-running batch
+/// creates and SELECTS its own result tab. The flow used to resolve "which
+/// grid" through `current_table()` at the confirm, so the file the user had
+/// named for one result silently held whichever result was active by then —
+/// half-streamed included, because the streaming refusal had only been asked at
+/// the click.
+///
+/// This value is the one resolver for everything asked after the click: the
+/// grid is found BY THE PINNED ID, its refusals are asked AGAIN at the moment
+/// they matter, and a tab that is gone answers with a sentence instead of with
+/// another tab's rows. The identity of WHAT is exported is a click-time fact;
+/// the modals only decide the format and the destination.
+pub(crate) struct PinnedResultExport {
+    tabs: ResultTabsWidget,
+    id: ResultTabId,
+}
+
+impl PinnedResultExport {
+    /// The pinned grid, or the sentence saying that result is gone.
+    ///
+    /// Resolved through the tab LIST, never through a stored widget handle: a
+    /// closed tab's widgets are deleted, and a handle would dangle where this
+    /// answers honestly.
+    fn table(&self) -> Result<ResultTableWidget, String> {
+        self.tabs
+            .table_for_result_tab_id(self.id)
+            .ok_or_else(Self::result_gone_message)
+    }
+
+    /// What to tell a user whose export lost the result it covered.
+    ///
+    /// Its own sentence, not [`crate::ui::result_table::ExportAbandonReason`]'s:
+    /// those describe a DEFERRED export whose rows stopped arriving, while this
+    /// one never took a row — the result went away while the dialogs were open.
+    fn result_gone_message() -> String {
+        "The export was not written: the result it covered is no longer open. \
+         Run the query again and export the new result."
+            .to_string()
+    }
+
+    /// Why generated SQL cannot be written for the pinned grid at `scope`, or
+    /// `None`.
+    ///
+    /// Asked between the two modals, so it goes through the pin like everything
+    /// else after the click — the active grid may already be another one.
+    pub(crate) fn sql_export_refusal(&self, scope: ExportScope) -> Option<String> {
+        match self.table() {
+            Ok(table) => table.sql_export_refusal(scope),
+            Err(gone) => Some(gone),
+        }
+    }
+
+    /// Render the pinned grid in `format`, or say why the export cannot happen.
+    ///
+    /// `Ok(None)` means a full fetch had to run first and `callback` will fire
+    /// when it finishes — on the pinned grid, whose queue already abandons the
+    /// export loudly if a new result takes that grid or the fetch stops.
+    ///
+    /// The click-time gates are asked AGAIN here, at the moment the rows are
+    /// actually taken, because the app was live under the dialogs: the pinned
+    /// result can be gone, and its grid can have re-entered streaming.
+    pub(crate) fn export_after_fetch_all(
+        &self,
+        format: ExportFormat,
+        scope: ExportScope,
+        destination: ExportDestination,
+        dialect: Option<crate::ui::grid_sql_export::SqlWriteDialect>,
+        callback: crate::ui::result_table::ExportReadyCallback,
+    ) -> Result<Option<crate::ui::result_export::ExportPayload>, String> {
+        let table = self.table()?;
+        if let Some(reason) = table.export_refusal() {
+            return Err(reason);
+        }
+        // Defense in depth: the click only offers an export on a grid with
+        // data, and rows cannot vanish from a live tab while the dialogs are
+        // up — but an empty grid here must still refuse rather than write an
+        // empty file that looks like a finished export.
+        if !table.has_data() {
+            return Err("No results to export".to_string());
+        }
+        let request = ExportRequest {
+            format,
+            scope,
+            destination,
+            dialect,
+            table: ResultTabsWidget::resolve_grid_export_table(&table, dialect),
+        };
+        Ok(table.export_after_fetch_all(request, callback))
     }
 }
 
