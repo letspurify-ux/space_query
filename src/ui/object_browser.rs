@@ -14743,7 +14743,10 @@ mod tests {
             &[],
             crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT,
         );
-        assert_eq!(&delivered_text(&to_file).as_bytes()[..3], &[0xEF, 0xBB, 0xBF]);
+        assert_eq!(
+            &delivered_text(&to_file).as_bytes()[..3],
+            &[0xEF, 0xBB, 0xBF]
+        );
         assert!(!delivered_text(&to_clipboard).starts_with('\u{feff}'));
     }
 

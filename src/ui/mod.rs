@@ -33,8 +33,8 @@ pub(crate) mod macos_window_state;
 pub mod main_window;
 pub mod menu;
 pub mod object_browser;
-pub(crate) mod parquet_export;
 pub(crate) mod object_drag_payload;
+pub(crate) mod parquet_export;
 #[doc(hidden)]
 pub mod widget_label;
 // Public only so the verification binaries can drive the same ranking and the

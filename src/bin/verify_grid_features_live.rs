@@ -785,7 +785,11 @@ fn check_parquet_types(h: &mut Harness, target: Target) -> Result<(), String> {
     let _ = h.run("COMMIT");
     let (all_columns, all_kinds, all_rows) = selected?;
     if all_rows.len() != inserts.len() {
-        return Err(format!("expected {} rows, got {}", inserts.len(), all_rows.len()));
+        return Err(format!(
+            "expected {} rows, got {}",
+            inserts.len(),
+            all_rows.len()
+        ));
     }
     // By name: Oracle's editable-grid path puts a ROWID column first, which the
     // grid hides and its own export snapshot leaves out.
@@ -806,15 +810,15 @@ fn check_parquet_types(h: &mut Harness, target: Target) -> Result<(), String> {
         rows: export_cells(&rows),
         null_text: NULL_TEXT.to_string(),
     };
-    let (body, row_count) = space_query::ui::result_export::render_export_content(
-        ExportFormat::Parquet,
-        &grid,
-        None,
-    )
-    .into_parts()
-    .map_err(|reason| format!("Parquet was refused: {reason}"))?;
+    let (body, row_count) =
+        space_query::ui::result_export::render_export_content(ExportFormat::Parquet, &grid, None)
+            .into_parts()
+            .map_err(|reason| format!("Parquet was refused: {reason}"))?;
     if row_count != rows.len() {
-        return Err(format!("Parquet reported {row_count} rows, the grid has {}", rows.len()));
+        return Err(format!(
+            "Parquet reported {row_count} rows, the grid has {}",
+            rows.len()
+        ));
     }
     let path = std::env::temp_dir().join(format!(
         "space-query-grid-features-{}-{}.parquet",
@@ -830,9 +834,14 @@ fn check_parquet_types(h: &mut Harness, target: Target) -> Result<(), String> {
     for (index, (name, want)) in expected.iter().enumerate() {
         let got = parquet_type_label(schema.column(index).as_ref());
         let shown: Vec<&str> = rows.iter().map(|row| row[index].as_str()).collect();
-        println!("  {name:<7} {:<10} {got:<15} rendered {shown:?}", format!("{:?}", kinds[index]));
+        println!(
+            "  {name:<7} {:<10} {got:<15} rendered {shown:?}",
+            format!("{:?}", kinds[index])
+        );
         if got != *want {
-            problems.push(format!("{name}: typed {got}, expected {want} (rendered {shown:?})"));
+            problems.push(format!(
+                "{name}: typed {got}, expected {want} (rendered {shown:?})"
+            ));
         }
     }
 
@@ -842,7 +851,11 @@ fn check_parquet_types(h: &mut Harness, target: Target) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| err.to_string())?;
     if read_rows.len() != rows.len() {
-        problems.push(format!("read {} rows, wrote {}", read_rows.len(), rows.len()));
+        problems.push(format!(
+            "read {} rows, wrote {}",
+            read_rows.len(),
+            rows.len()
+        ));
     }
     for (row_index, (read, shown)) in read_rows.iter().zip(&rows).enumerate() {
         for (col, (_, field)) in read.get_column_iter().enumerate() {
@@ -908,12 +921,16 @@ fn field_as_grid_text(field: &parquet::record::Field) -> Option<String> {
         Field::Decimal(decimal) => {
             let bytes: [u8; 16] = decimal.data().try_into().ok()?;
             let unscaled = i128::from_be_bytes(bytes);
-            Some(canonical_number(&scaled_decimal_text(unscaled, decimal.scale() as usize)))
+            Some(canonical_number(&scaled_decimal_text(
+                unscaled,
+                decimal.scale() as usize,
+            )))
         }
         Field::Date(days) => Some(
-            (chrono::NaiveDate::from_ymd_opt(1970, 1, 1)? + chrono::Duration::days(i64::from(*days)))
-                .format("%Y-%m-%d")
-                .to_string(),
+            (chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?
+                + chrono::Duration::days(i64::from(*days)))
+            .format("%Y-%m-%d")
+            .to_string(),
         ),
         Field::TimestampMicros(micros) => Some(canonical_moment(
             &chrono::DateTime::from_timestamp_micros(*micros)?
@@ -946,7 +963,9 @@ fn canonical_grid_text(shown: &str) -> String {
     }
     let unsigned = shown.strip_prefix('-').unwrap_or(shown);
     if !unsigned.is_empty()
-        && unsigned.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+        && unsigned
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
         && unsigned.bytes().filter(|byte| *byte == b'.').count() <= 1
     {
         return canonical_number(shown);

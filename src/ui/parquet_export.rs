@@ -82,9 +82,7 @@ fn render_in_row_groups(grid: &ExportGrid, rows_per_group: usize) -> ExportConte
     let names = unique_field_names(grid.columns.clone());
     match write_file(&names, &columns, grid.rows.len(), rows_per_group.max(1)) {
         Ok(bytes) => ExportContent::written(bytes, grid.rows.len()),
-        Err(err) => {
-            ExportContent::Refused(format!("The Parquet file could not be written: {err}"))
-        }
+        Err(err) => ExportContent::Refused(format!("The Parquet file could not be written: {err}")),
     }
 }
 
@@ -99,7 +97,11 @@ fn write_file(
         .zip(columns)
         .map(|(name, column)| column.field(name).map(Arc::new))
         .collect::<ParquetResult<Vec<_>>>()?;
-    let schema = Arc::new(Type::group_type_builder("schema").with_fields(fields).build()?);
+    let schema = Arc::new(
+        Type::group_type_builder("schema")
+            .with_fields(fields)
+            .build()?,
+    );
     // Snappy is what most Parquet writers default to and every reader decodes.
     let properties = Arc::new(
         WriterProperties::builder()
@@ -191,10 +193,7 @@ impl<'a> Column<'a> {
                     .with_length(DECIMAL_BYTES as i32)
                     .with_precision(precision)
                     .with_scale(scale)
-                    .with_logical_type(Some(LogicalType::Decimal(DecimalType {
-                        scale,
-                        precision,
-                    })))
+                    .with_logical_type(Some(LogicalType::Decimal(DecimalType { scale, precision })))
             }
             Column::Date(_) => Type::primitive_type_builder(name, PhysicalType::INT32)
                 .with_logical_type(Some(LogicalType::Date)),
@@ -214,7 +213,11 @@ impl<'a> Column<'a> {
     }
 
     /// Write the rows in `rows` of this column into one column chunk.
-    fn write(&self, rows: Range<usize>, writer: &mut SerializedColumnWriter<'_>) -> ParquetResult<()> {
+    fn write(
+        &self,
+        rows: Range<usize>,
+        writer: &mut SerializedColumnWriter<'_>,
+    ) -> ParquetResult<()> {
         match self {
             Column::Text(values) => {
                 write_optional::<ByteArrayType, _>(writer, &values[rows], |text| {
@@ -256,7 +259,10 @@ fn write_optional<T: DataType, V>(
 
 /// Convert every value with `convert`, keeping NULLs; `None` as soon as one
 /// value does not convert.
-fn convert_all<T, U>(cells: &[Option<T>], convert: impl Fn(&T) -> Option<U>) -> Option<Vec<Option<U>>> {
+fn convert_all<T, U>(
+    cells: &[Option<T>],
+    convert: impl Fn(&T) -> Option<U>,
+) -> Option<Vec<Option<U>>> {
     cells
         .iter()
         .map(|cell| match cell {
@@ -345,7 +351,9 @@ impl<'a> PlainDecimal<'a> {
         };
         let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
         let all_digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
-        if (integer.is_empty() && fraction.is_empty()) || !all_digits(integer) || !all_digits(fraction)
+        if (integer.is_empty() && fraction.is_empty())
+            || !all_digits(integer)
+            || !all_digits(fraction)
         {
             return None;
         }
@@ -461,9 +469,10 @@ fn parse_date(text: &str) -> Option<NaiveDate> {
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return None;
     }
-    let year = bytes[0..4]
-        .iter()
-        .try_fold(0i32, |year, byte| byte.is_ascii_digit().then(|| year * 10 + i32::from(byte - b'0')))?;
+    let year = bytes[0..4].iter().try_fold(0i32, |year, byte| {
+        byte.is_ascii_digit()
+            .then(|| year * 10 + i32::from(byte - b'0'))
+    })?;
     NaiveDate::from_ymd_opt(year, two_digits(&bytes[5..7])?, two_digits(&bytes[8..10])?)
 }
 
@@ -522,7 +531,10 @@ mod tests {
     #[test]
     fn integers_that_fit_64_bits_are_int64() {
         assert_eq!(
-            converted(SqlValueKind::Number, &[Some("1"), None, Some("-42"), Some("007")]),
+            converted(
+                SqlValueKind::Number,
+                &[Some("1"), None, Some("-42"), Some("007")]
+            ),
             Column::Int64(vec![Some(1), None, Some(-42), Some(7)])
         );
         assert_eq!(
@@ -534,7 +546,10 @@ mod tests {
     #[test]
     fn a_column_with_a_fraction_is_a_decimal_at_its_widest_scale() {
         assert_eq!(
-            converted(SqlValueKind::Number, &[Some("1.5"), Some("-.25"), Some("3"), None]),
+            converted(
+                SqlValueKind::Number,
+                &[Some("1.5"), Some("-.25"), Some("3"), None]
+            ),
             Column::Decimal {
                 scale: 2,
                 values: vec![Some(150), Some(-25), Some(300), None],
@@ -608,7 +623,10 @@ mod tests {
     #[test]
     fn dates_alone_are_a_date_column() {
         assert_eq!(
-            converted(SqlValueKind::Temporal, &[Some("1970-01-02"), Some("1969-12-31"), None]),
+            converted(
+                SqlValueKind::Temporal,
+                &[Some("1970-01-02"), Some("1969-12-31"), None]
+            ),
             Column::Date(vec![Some(1), Some(-1), None])
         );
     }
@@ -627,7 +645,10 @@ mod tests {
         );
         // Trailing zeros are not precision: `.123456000` still fits micros.
         assert_eq!(
-            converted(SqlValueKind::Temporal, &[Some("1970-01-01 00:00:00.123456000")]),
+            converted(
+                SqlValueKind::Temporal,
+                &[Some("1970-01-01 00:00:00.123456000")]
+            ),
             Column::Timestamp {
                 unit: TimestampUnit::Micros,
                 values: vec![Some(123_456)],
@@ -640,7 +661,10 @@ mod tests {
         assert_eq!(
             converted(
                 SqlValueKind::Temporal,
-                &[Some("1970-01-01 00:00:00.000000001"), Some("1970-01-01 00:00:01")]
+                &[
+                    Some("1970-01-01 00:00:00.000000001"),
+                    Some("1970-01-01 00:00:01")
+                ]
             ),
             Column::Timestamp {
                 unit: TimestampUnit::Nanos,
@@ -680,7 +704,11 @@ mod tests {
 
     #[test]
     fn text_kinds_and_columns_without_a_value_stay_text() {
-        for kind in [SqlValueKind::String, SqlValueKind::Binary, SqlValueKind::Unknown] {
+        for kind in [
+            SqlValueKind::String,
+            SqlValueKind::Binary,
+            SqlValueKind::Unknown,
+        ] {
             assert_eq!(
                 converted(kind, &[Some("1")]),
                 Column::Text(vec![Some("1")]),
@@ -732,7 +760,10 @@ mod tests {
         let rows = read_rows(written(&grid));
         assert_eq!(rows.len(), 2);
         let names: Vec<&str> = rows[0].iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, ["ID", "PRICE", "NAME", "ACTIVE", "BORN", "SEEN", "BLOB"]);
+        assert_eq!(
+            names,
+            ["ID", "PRICE", "NAME", "ACTIVE", "BORN", "SEEN", "BLOB"]
+        );
         let first: Vec<&Field> = rows[0].iter().map(|(_, field)| field).collect();
         assert_eq!(first[0], &Field::Long(1));
         match first[1] {
@@ -765,7 +796,10 @@ mod tests {
         let reader = reader(written(&grid));
         let schema = reader.metadata().file_metadata().schema_descr();
         let column = schema.column(0);
-        assert_eq!(column.self_type().get_basic_info().repetition(), Repetition::OPTIONAL);
+        assert_eq!(
+            column.self_type().get_basic_info().repetition(),
+            Repetition::OPTIONAL
+        );
         assert_eq!(
             column.logical_type_ref(),
             Some(&LogicalType::Timestamp(TimestampType {
@@ -811,7 +845,14 @@ mod tests {
         assert_eq!(content.rows(), 0);
         let reader = reader(content.into_parts().expect("written").0);
         assert_eq!(reader.num_row_groups(), 0);
-        assert_eq!(reader.metadata().file_metadata().schema_descr().num_columns(), 1);
+        assert_eq!(
+            reader
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .num_columns(),
+            1
+        );
     }
 
     #[test]

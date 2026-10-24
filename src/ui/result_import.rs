@@ -188,7 +188,10 @@ pub fn parse(text: &str, options: &ImportOptions) -> Result<ImportedTable, Strin
         // Not in `import_formats`, so no dialog offers it; said rather than
         // misparsed if a caller passes it anyway.
         ExportFormat::Parquet => {
-            return Err(format!("{} files cannot be imported.", options.format.label()))
+            return Err(format!(
+                "{} files cannot be imported.",
+                options.format.label()
+            ))
         }
     };
     validate(table)

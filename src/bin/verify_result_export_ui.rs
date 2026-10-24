@@ -272,11 +272,16 @@ fn main() {
     say(&format!("      formats offered: {}", offered.join(", ")));
 
     // A binary format is offered, and the modal will only pair it with a file.
-    if !offered.iter().any(|label| label == ExportFormat::Parquet.label()) {
+    if !offered
+        .iter()
+        .any(|label| label == ExportFormat::Parquet.label())
+    {
         failures.push("the modal did not offer Parquet".to_string());
     }
     match probe_file_only(&mut main_window) {
-        Ok(()) => say("PASS: Parquet disables Clipboard and selects File; a text format restores it"),
+        Ok(()) => {
+            say("PASS: Parquet disables Clipboard and selects File; a text format restores it")
+        }
         Err(err) => failures.push(format!("Parquet destination: {err}")),
     }
 
@@ -483,7 +488,9 @@ fn verify_a_new_result_does_not_inherit_a_queued_export(failures: &mut Vec<Strin
     if let Some(Ok(payload)) = after_close {
         failures.push(format!(
             "closing the old session ran the abandoned export after all: {:?}",
-            payload.data().map(|built| built.into_parts().map(|(body, _)| body))
+            payload
+                .data()
+                .map(|built| built.into_parts().map(|(body, _)| body))
         ));
     }
 }

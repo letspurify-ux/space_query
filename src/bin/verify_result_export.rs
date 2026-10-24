@@ -224,7 +224,9 @@ fn check_parquet(grid: &ExportGrid, dir: &Path) -> Result<bool, String> {
     // so they come back INT64; every other column holds a value no type takes
     // exactly (`00123` beside an empty string, `1.2E+10`) or is text by kind,
     // so it comes back as the text the grid showed.
-    let hostile_types = ["int64", "string", "string", "int64", "string", "string", "string"];
+    let hostile_types = [
+        "int64", "string", "string", "int64", "string", "string", "string",
+    ];
     let hostile_rows: Vec<Vec<Option<String>>> = rows()
         .iter()
         .enumerate()
@@ -236,11 +238,25 @@ fn check_parquet(grid: &ExportGrid, dir: &Path) -> Result<bool, String> {
                 .collect()
         })
         .collect();
-    let hostile_names: Vec<String> = ["ID", "FULL NAME", "COUNT(*)", "ID_2", "2024_TOTAL", "", "NOTE"]
-        .iter()
-        .map(|name| name.to_string())
-        .collect();
-    if !read_back_parquet(grid, &dir.join("result.parquet"), &hostile_names, &hostile_types, &hostile_rows)? {
+    let hostile_names: Vec<String> = [
+        "ID",
+        "FULL NAME",
+        "COUNT(*)",
+        "ID_2",
+        "2024_TOTAL",
+        "",
+        "NOTE",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect();
+    if !read_back_parquet(
+        grid,
+        &dir.join("result.parquet"),
+        &hostile_names,
+        &hostile_types,
+        &hostile_rows,
+    )? {
         return Ok(false);
     }
 
@@ -298,7 +314,10 @@ fn check_parquet(grid: &ExportGrid, dir: &Path) -> Result<bool, String> {
         [None, None, None, None, None, None, None],
     ];
     let typed = ExportGrid {
-        columns: typed_columns.iter().map(|(name, _, _)| name.to_string()).collect(),
+        columns: typed_columns
+            .iter()
+            .map(|(name, _, _)| name.to_string())
+            .collect(),
         column_kinds: typed_columns.iter().map(|(_, kind, _)| *kind).collect(),
         rows: written
             .iter()
@@ -306,13 +325,22 @@ fn check_parquet(grid: &ExportGrid, dir: &Path) -> Result<bool, String> {
             .collect(),
         null_text: NULL_TEXT.to_string(),
     };
-    let typed_names: Vec<String> = typed_columns.iter().map(|(name, _, _)| name.to_string()).collect();
+    let typed_names: Vec<String> = typed_columns
+        .iter()
+        .map(|(name, _, _)| name.to_string())
+        .collect();
     let typed_types: Vec<&str> = typed_columns.iter().map(|(_, _, ty)| *ty).collect();
     let typed_rows: Vec<Vec<Option<String>>> = read
         .iter()
         .map(|row| row.iter().map(|cell| cell.map(str::to_string)).collect())
         .collect();
-    read_back_parquet(&typed, &dir.join("typed.parquet"), &typed_names, &typed_types, &typed_rows)
+    read_back_parquet(
+        &typed,
+        &dir.join("typed.parquet"),
+        &typed_names,
+        &typed_types,
+        &typed_rows,
+    )
 }
 
 /// Write `grid` as the app does, then have pyarrow read the file and say each
@@ -324,11 +352,16 @@ fn read_back_parquet(
     types: &[&str],
     rows: &[Vec<Option<String>>],
 ) -> Result<bool, String> {
-    let (body, row_count) = render_export_content(ExportFormat::Parquet, grid, None).into_parts()?;
+    let (body, row_count) =
+        render_export_content(ExportFormat::Parquet, grid, None).into_parts()?;
     if row_count != grid.rows.len() {
-        return Err(format!("reported {row_count} rows for a grid of {}", grid.rows.len()));
+        return Err(format!(
+            "reported {row_count} rows for a grid of {}",
+            grid.rows.len()
+        ));
     }
-    std::fs::write(path, body.as_bytes()).map_err(|err| format!("write {}: {err}", path.display()))?;
+    std::fs::write(path, body.as_bytes())
+        .map_err(|err| format!("write {}: {err}", path.display()))?;
     // Exit code 3 is "pyarrow is missing"; the path travels as argv so the
     // script stays a fixed string.
     const SCRIPT: &str = "import json, sys\n\
@@ -370,7 +403,11 @@ fn read_back_parquet(
         return Err(format!("types read {:?}, expected {types:?}", back.types));
     }
     if back.rows.len() != rows.len() {
-        return Err(format!("pyarrow read {} rows, {} were written", back.rows.len(), rows.len()));
+        return Err(format!(
+            "pyarrow read {} rows, {} were written",
+            back.rows.len(),
+            rows.len()
+        ));
     }
     for (index, (got, want)) in back.rows.iter().zip(rows).enumerate() {
         if got != want {
