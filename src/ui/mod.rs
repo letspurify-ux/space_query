@@ -33,6 +33,7 @@ pub(crate) mod macos_window_state;
 pub mod main_window;
 pub mod menu;
 pub mod object_browser;
+pub(crate) mod parquet_export;
 pub(crate) mod object_drag_payload;
 #[doc(hidden)]
 pub mod widget_label;

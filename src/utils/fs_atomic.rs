@@ -42,12 +42,12 @@ use std::path::{Path, PathBuf};
 ///   renaming onto the resolved one, which is a different file by the time the
 ///   rename runs — the check would be worth less than the honesty of not making
 ///   it.
-pub fn write_file_atomically(path: &Path, contents: &str) -> Result<(), String> {
+pub fn write_file_atomically(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), String> {
     let tmp_path = temporary_path_for(path);
 
     let write_result = (|| -> Result<(), String> {
         let mut file = fs::File::create(&tmp_path).map_err(|err| err.to_string())?;
-        file.write_all(contents.as_bytes())
+        file.write_all(contents.as_ref())
             .map_err(|err| err.to_string())?;
         file.flush().map_err(|err| err.to_string())?;
         // The rename below is atomic, but only about which name points at which

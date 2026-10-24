@@ -20,8 +20,13 @@
 //   * The column layout (item 6) physically permutes stored columns, so this
 //     checks the values still travel with their headers after a rearrangement.
 //   * The tree export (item 26) renders through the same code the grid uses;
-//     this round-trips every format back through the import parser and compares
-//     cell by cell, with the file actually written to disk.
+//     this round-trips every text format back through the import parser and
+//     compares cell by cell, with the file actually written to disk.
+//   * The Parquet export types a column only when every value the DRIVER
+//     rendered converts exactly. Which columns that is depends on how each
+//     driver renders numbers, booleans and dates, so this exports a table of
+//     every such column, reads the file back with the `parquet` crate's own
+//     reader, and checks each column's type and every value against the grid.
 //
 // Usage: verify_grid_features_live <thin|oci|mysql|mariadb|all>
 // Env: see docs/oracle.md, docs/mysql.md, docs/mariadb.md.
@@ -558,14 +563,17 @@ fn check_export_round_trip(target: Target, view: &GridView) -> Result<(), String
     ));
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
 
-    for format in ExportFormat::ALL {
-        let (text, row_count) = space_query::ui::result_export::render_export_content(
+    for format in result_import::import_formats() {
+        let (body, row_count) = space_query::ui::result_export::render_export_content(
             format,
             &grid,
             Some(&sql_selection),
         )
         .into_parts()
         .map_err(|reason| format!("{format:?} was refused: {reason}"))?;
+        let text = body
+            .into_text()
+            .ok_or_else(|| format!("{format:?} is a text format but wrote bytes"))?;
         if row_count != rows.len() {
             return Err(format!(
                 "{format:?} reported {row_count} rows, the grid has {}",
@@ -663,7 +671,323 @@ fn verify(target: Target) -> Result<(), String> {
 
     let _ = h.run(&target.drop_sql());
     let _ = h.run("COMMIT");
+
+    check_parquet_types(&mut h, target)?;
     Ok(())
+}
+
+const PARQUET_TABLE: &str = "OQT_GRID_PARQUET";
+
+/// Every column kind the Parquet export may type, with the type each driver's
+/// rendering earns it — `(column, expected type)` — and the table's DDL and
+/// rows.
+fn parquet_fixture(target: Target) -> (Vec<(&'static str, &'static str)>, String, Vec<String>) {
+    if target.is_oracle() {
+        (
+            vec![
+                ("ID", "int64"),
+                // NUMBER renders without trailing zeros; the widest shown scale wins.
+                ("AMOUNT", "decimal(38,4)"),
+                // 30 digits: past 64 bits, inside 38.
+                ("BIG", "decimal(38,0)"),
+                ("FLAG", "bool"),
+                // The app's default NLS formats: `yyyy-mm-dd hh24:mi:ss[.ff6]`.
+                ("D", "timestamp[us]"),
+                ("TS", "timestamp[us]"),
+                // A zone is not a wall-clock time: kept as text.
+                ("TSTZ", "string"),
+                ("NOTE", "string"),
+            ],
+            format!(
+                "CREATE TABLE {PARQUET_TABLE} (ID NUMBER(10) PRIMARY KEY, AMOUNT NUMBER(20,4), \
+                 BIG NUMBER(30), FLAG BOOLEAN, D DATE, TS TIMESTAMP(6), \
+                 TSTZ TIMESTAMP WITH TIME ZONE, NOTE VARCHAR2(30))"
+            ),
+            vec![
+                format!(
+                    "INSERT INTO {PARQUET_TABLE} VALUES (1, 12.5, 123456789012345678901234567890, \
+                     TRUE, TO_DATE('2024-02-29 13:45:01', 'YYYY-MM-DD HH24:MI:SS'), \
+                     TIMESTAMP '2024-02-29 13:45:01.123456', \
+                     TIMESTAMP '2024-02-29 13:45:01 +09:00', 'first')"
+                ),
+                format!(
+                    "INSERT INTO {PARQUET_TABLE} VALUES (2, -0.0001, 1, FALSE, \
+                     TO_DATE('1970-01-01', 'YYYY-MM-DD'), TIMESTAMP '1969-12-31 23:59:59.5', \
+                     TIMESTAMP '1970-01-01 00:00:00 +00:00', NULL)"
+                ),
+                format!(
+                    "INSERT INTO {PARQUET_TABLE} VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, 'x')"
+                ),
+            ],
+        )
+    } else {
+        (
+            vec![
+                ("ID", "int64"),
+                // DECIMAL renders every declared fraction digit.
+                ("AMOUNT", "decimal(38,4)"),
+                ("BIG", "decimal(38,0)"),
+                // BOOLEAN is TINYINT(1): a number, rendered 1 and 0.
+                ("FLAG", "int64"),
+                ("D", "date"),
+                // A DATETIME at midnight renders as a date alone; still exact.
+                ("TS", "timestamp[us]"),
+                // A duration, not a time of day: kept as text.
+                ("T", "string"),
+                ("NOTE", "string"),
+            ],
+            format!(
+                "CREATE TABLE {PARQUET_TABLE} (ID INT PRIMARY KEY, AMOUNT DECIMAL(20,4), \
+                 BIG DECIMAL(30,0), FLAG BOOLEAN, D DATE, TS DATETIME(6), T TIME, \
+                 NOTE VARCHAR(30))"
+            ),
+            vec![
+                format!(
+                    "INSERT INTO {PARQUET_TABLE} VALUES (1, 12.5, 123456789012345678901234567890, \
+                     TRUE, '2024-02-29', '2024-02-29 13:45:01.123456', '13:45:01', 'first')"
+                ),
+                format!(
+                    "INSERT INTO {PARQUET_TABLE} VALUES (2, -0.0001, 1, FALSE, '1970-01-01', \
+                     '1970-01-01 00:00:00', '-01:00:00', NULL)"
+                ),
+                format!(
+                    "INSERT INTO {PARQUET_TABLE} VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, '')"
+                ),
+            ],
+        )
+    }
+}
+
+/// Export a table of every typable column kind as Parquet, exactly as the
+/// grid would, and read the file back with a reader that is not the writer.
+fn check_parquet_types(h: &mut Harness, target: Target) -> Result<(), String> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    println!("\nParquet export of driver-rendered values:");
+    let drop = if target.is_oracle() {
+        format!("BEGIN EXECUTE IMMEDIATE 'DROP TABLE {PARQUET_TABLE}'; EXCEPTION WHEN OTHERS THEN NULL; END;")
+    } else {
+        format!("DROP TABLE IF EXISTS {PARQUET_TABLE}")
+    };
+    let (expected, create, inserts) = parquet_fixture(target);
+    let _ = h.run(&drop);
+    h.run(&create).map_err(|e| format!("parquet create: {e}"))?;
+    for sql in &inserts {
+        h.run(sql).map_err(|e| format!("parquet seed: {e}"))?;
+    }
+    let _ = h.run("COMMIT");
+    let names: Vec<&str> = expected.iter().map(|(name, _)| *name).collect();
+    let selected = h.select(&format!(
+        "SELECT {} FROM {PARQUET_TABLE} ORDER BY ID",
+        names.join(", ")
+    ));
+    let _ = h.run(&drop);
+    let _ = h.run("COMMIT");
+    let (all_columns, all_kinds, all_rows) = selected?;
+    if all_rows.len() != inserts.len() {
+        return Err(format!("expected {} rows, got {}", inserts.len(), all_rows.len()));
+    }
+    // By name: Oracle's editable-grid path puts a ROWID column first, which the
+    // grid hides and its own export snapshot leaves out.
+    let indices = names
+        .iter()
+        .map(|name| column_index(&all_columns, name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let columns: Vec<String> = indices.iter().map(|i| all_columns[*i].clone()).collect();
+    let kinds: Vec<SqlValueKind> = indices.iter().map(|i| all_kinds[*i]).collect();
+    let rows: Vec<Vec<String>> = all_rows
+        .iter()
+        .map(|row| indices.iter().map(|i| row[*i].clone()).collect())
+        .collect();
+
+    let grid = ExportGrid {
+        columns: columns.clone(),
+        column_kinds: kinds.clone(),
+        rows: export_cells(&rows),
+        null_text: NULL_TEXT.to_string(),
+    };
+    let (body, row_count) = space_query::ui::result_export::render_export_content(
+        ExportFormat::Parquet,
+        &grid,
+        None,
+    )
+    .into_parts()
+    .map_err(|reason| format!("Parquet was refused: {reason}"))?;
+    if row_count != rows.len() {
+        return Err(format!("Parquet reported {row_count} rows, the grid has {}", rows.len()));
+    }
+    let path = std::env::temp_dir().join(format!(
+        "space-query-grid-features-{}-{}.parquet",
+        std::process::id(),
+        target.label().replace(' ', "-")
+    ));
+    fs::write(&path, body.as_bytes()).map_err(|err| err.to_string())?;
+    let file = fs::File::open(&path).map_err(|err| err.to_string())?;
+    let reader = SerializedFileReader::new(file).map_err(|err| format!("unreadable: {err}"))?;
+    let schema = reader.metadata().file_metadata().schema_descr_ptr();
+
+    let mut problems: Vec<String> = Vec::new();
+    for (index, (name, want)) in expected.iter().enumerate() {
+        let got = parquet_type_label(schema.column(index).as_ref());
+        let shown: Vec<&str> = rows.iter().map(|row| row[index].as_str()).collect();
+        println!("  {name:<7} {:<10} {got:<15} rendered {shown:?}", format!("{:?}", kinds[index]));
+        if got != *want {
+            problems.push(format!("{name}: typed {got}, expected {want} (rendered {shown:?})"));
+        }
+    }
+
+    let read_rows = reader
+        .get_row_iter(None)
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    if read_rows.len() != rows.len() {
+        problems.push(format!("read {} rows, wrote {}", read_rows.len(), rows.len()));
+    }
+    for (row_index, (read, shown)) in read_rows.iter().zip(&rows).enumerate() {
+        for (col, (_, field)) in read.get_column_iter().enumerate() {
+            let shown = shown[col].as_str();
+            let back = field_as_grid_text(field);
+            // Text must come back as shown, byte for byte; a typed value only
+            // has to be the same VALUE.
+            let want = match field {
+                _ if shown == NULL_TEXT => None,
+                parquet::record::Field::Str(_) => Some(shown.to_string()),
+                _ => Some(canonical_grid_text(shown)),
+            };
+            if back != want {
+                problems.push(format!(
+                    "row {row_index} {}: read {back:?}, the grid showed {shown:?}",
+                    columns[col]
+                ));
+            }
+        }
+    }
+    let _ = fs::remove_file(&path);
+    if problems.is_empty() {
+        println!("  every column typed as expected; every value reads back as shown");
+        Ok(())
+    } else {
+        Err(format!("Parquet: {}", problems.join("; ")))
+    }
+}
+
+/// A short name for a Parquet column's type, in the vocabulary of `expected`.
+fn parquet_type_label(column: &parquet::schema::types::ColumnDescriptor) -> String {
+    use parquet::basic::{LogicalType, TimeUnit, Type as PhysicalType};
+    match (column.physical_type(), column.logical_type_ref()) {
+        (PhysicalType::INT64, None) => "int64".to_string(),
+        (PhysicalType::BOOLEAN, None) => "bool".to_string(),
+        (PhysicalType::BYTE_ARRAY, Some(LogicalType::String)) => "string".to_string(),
+        (_, Some(LogicalType::Decimal(decimal))) => {
+            format!("decimal({},{})", decimal.precision, decimal.scale)
+        }
+        (PhysicalType::INT32, Some(LogicalType::Date)) => "date".to_string(),
+        (PhysicalType::INT64, Some(LogicalType::Timestamp(timestamp)))
+            if !timestamp.is_adjusted_to_u_t_c =>
+        {
+            match timestamp.unit {
+                TimeUnit::MICROS => "timestamp[us]".to_string(),
+                TimeUnit::NANOS => "timestamp[ns]".to_string(),
+                TimeUnit::MILLIS => "timestamp[ms]".to_string(),
+            }
+        }
+        (physical, logical) => format!("{physical:?}/{logical:?}"),
+    }
+}
+
+/// A value read back from the file, spelled the way [`canonical_grid_text`]
+/// spells what the grid showed: `None` for null.
+fn field_as_grid_text(field: &parquet::record::Field) -> Option<String> {
+    use parquet::record::Field;
+    match field {
+        Field::Null => None,
+        Field::Bool(value) => Some(value.to_string()),
+        Field::Long(value) => Some(value.to_string()),
+        Field::Str(text) => Some(text.clone()),
+        Field::Decimal(decimal) => {
+            let bytes: [u8; 16] = decimal.data().try_into().ok()?;
+            let unscaled = i128::from_be_bytes(bytes);
+            Some(canonical_number(&scaled_decimal_text(unscaled, decimal.scale() as usize)))
+        }
+        Field::Date(days) => Some(
+            (chrono::NaiveDate::from_ymd_opt(1970, 1, 1)? + chrono::Duration::days(i64::from(*days)))
+                .format("%Y-%m-%d")
+                .to_string(),
+        ),
+        Field::TimestampMicros(micros) => Some(canonical_moment(
+            &chrono::DateTime::from_timestamp_micros(*micros)?
+                .naive_utc()
+                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .to_string(),
+        )),
+        other => Some(format!("{other:?}")),
+    }
+}
+
+fn scaled_decimal_text(unscaled: i128, scale: usize) -> String {
+    let digits = format!("{:0>width$}", unscaled.unsigned_abs(), width = scale + 1);
+    let (integer, fraction) = digits.split_at(digits.len() - scale);
+    let sign = if unscaled < 0 { "-" } else { "" };
+    if scale == 0 {
+        format!("{sign}{integer}")
+    } else {
+        format!("{sign}{integer}.{fraction}")
+    }
+}
+
+/// What the grid showed, normalized the way a typed read-back spells it, so
+/// the comparison is about the VALUE: a plain number loses leading and
+/// trailing zeros, a boolean its case, a date-and-time trailing fraction zeros
+/// and a midnight time of day.
+fn canonical_grid_text(shown: &str) -> String {
+    if shown.eq_ignore_ascii_case("true") || shown.eq_ignore_ascii_case("false") {
+        return shown.to_ascii_lowercase();
+    }
+    let unsigned = shown.strip_prefix('-').unwrap_or(shown);
+    if !unsigned.is_empty()
+        && unsigned.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+        && unsigned.bytes().filter(|byte| *byte == b'.').count() <= 1
+    {
+        return canonical_number(shown);
+    }
+    canonical_moment(shown)
+}
+
+fn canonical_number(text: &str) -> String {
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let integer = match integer.trim_start_matches('0') {
+        "" => "0",
+        digits => digits,
+    };
+    let fraction = fraction.trim_end_matches('0');
+    let zero = integer == "0" && fraction.is_empty();
+    let sign = if negative && !zero { "-" } else { "" };
+    if fraction.is_empty() {
+        format!("{sign}{integer}")
+    } else {
+        format!("{sign}{integer}.{fraction}")
+    }
+}
+
+/// MySQL renders a DATETIME at midnight as the date alone, which the file
+/// holds as that midnight; both spell it as the date here.
+fn canonical_moment(text: &str) -> String {
+    let trimmed = match text.split_once('.') {
+        Some((whole, fraction)) => match fraction.trim_end_matches('0') {
+            "" => whole.to_string(),
+            fraction => format!("{whole}.{fraction}"),
+        },
+        None => text.to_string(),
+    };
+    match trimmed.strip_suffix(" 00:00:00") {
+        Some(date) => date.to_string(),
+        None => trimmed,
+    }
 }
 
 fn main() {

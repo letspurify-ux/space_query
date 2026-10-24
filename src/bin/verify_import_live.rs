@@ -54,7 +54,9 @@ use space_query::ui::result_export::{
 };
 use space_query::ui::result_export_dialog::ExportChoice;
 use space_query::ui::result_import::ImportedTable;
-use space_query::ui::result_import::{detect_format, parse, ImportCell, ImportOptions};
+use space_query::ui::result_import::{
+    detect_format, import_formats, parse, ImportCell, ImportOptions,
+};
 use space_query::ui::sql_editor::{QueryProgress, SqlEditorWidget};
 use space_query::ui::table_import::{
     build_insert_script, default_mapping, describe, ImportRequest, TargetColumn, DEFAULT_BATCH_ROWS,
@@ -719,7 +721,7 @@ fn verify(target: Target) -> Result<(), String> {
 
     // Kept so the read-only scenario below can re-run a real import script.
     let mut last_script: Option<String> = None;
-    for format in ExportFormat::ALL {
+    for format in import_formats() {
         println!("\n----- {} -----", format.label());
 
         // Write the file exactly the way the app writes it.
@@ -1079,7 +1081,9 @@ fn verify_reported_column_names(target: Target, h: &mut Harness) -> Result<(), S
         .content
         .into_parts()
         .map_err(|reason| format!("the SQL Inserts export was refused: {reason}"))?
-        .0;
+        .0
+        .into_text()
+        .ok_or("the SQL Inserts export was not text")?;
     println!("  SQL Inserts export: {}", exported.trim());
     let export_ran = h
         .run_script(&exported)
@@ -1322,7 +1326,9 @@ fn verify_null_text_and_blank_lines(target: Target, h: &mut Harness) -> Result<(
             .content
             .into_parts()
             .map_err(|reason| format!("{}: {reason}", format.label()))?
-            .0;
+            .0
+            .into_text()
+            .ok_or_else(|| format!("{} was not text", format.label()))?;
         // A file that ends with a blank line — what an editor leaves behind.
         // The byte-order mark goes the way `parse` strips it.
         let text = format!("{body}\n");
@@ -1486,7 +1492,9 @@ fn verify_a_moved_null_text_round_trips(
         .content
         .into_parts()
         .map_err(|reason| format!("the moved-NULL export was refused: {reason}"))?
-        .0;
+        .0
+        .into_text()
+        .ok_or("the moved-NULL export was not text")?;
     if !body.contains(&format!("3,{MOVED}")) {
         let _ = h.run(&format!("SET NULL '{DEFAULT_NULL_TEXT}'"));
         return Err(format!(

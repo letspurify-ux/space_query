@@ -38,6 +38,10 @@ pub struct ExportChoice {
 /// dialect. `has_selection` false leaves the "Selected rows" option visible but
 /// disabled, so the choice is discoverable before there is a selection to use it
 /// on.
+///
+/// A binary format (Parquet) can only be written to a file. While one is
+/// selected the "Clipboard" option is disabled the same way, and the choice
+/// this returns never pairs the two.
 pub(crate) fn show(formats: &[ExportFormat], has_selection: bool) -> Option<ExportChoice> {
     if formats.is_empty() {
         return None;
@@ -93,10 +97,39 @@ pub(crate) fn show(formats: &[ExportFormat], has_selection: bool) -> Option<Expo
     rows_row.end();
     form.fixed(&rows_row, row_h);
 
-    let (destination_row, to_file, _to_clipboard) =
+    let (destination_row, to_file, to_clipboard) =
         radio_row("Destination:", "File", "Clipboard", row_h);
     destination_row.end();
     form.fixed(&destination_row, row_h);
+    let mut offer_destinations = {
+        let mut to_file = to_file.clone();
+        let mut to_clipboard = to_clipboard.clone();
+        move |format: ExportFormat| match format.clipboard_refusal() {
+            None => {
+                to_clipboard.activate();
+                to_clipboard.set_tooltip("");
+            }
+            Some(reason) => {
+                // A radio pair does not clear its sibling on `set_value`.
+                to_file.set_value(true);
+                to_clipboard.set_value(false);
+                to_clipboard.deactivate();
+                to_clipboard.set_tooltip(&reason);
+            }
+        }
+    };
+    if let Some(format) = formats.first() {
+        offer_destinations(*format);
+    }
+    {
+        let formats = formats.to_vec();
+        format_choice.set_callback(move |choice| {
+            let selected = usize::try_from(choice.value().max(0)).unwrap_or_default();
+            if let Some(format) = formats.get(selected) {
+                offer_destinations(*format);
+            }
+        });
+    }
 
     let mut button_row = Flex::default().with_size(0, BUTTON_ROW_HEIGHT);
     button_row.set_type(FlexType::Row);
@@ -145,7 +178,9 @@ pub(crate) fn show(formats: &[ExportFormat], has_selection: bool) -> Option<Expo
             } else {
                 ExportScope::Selection
             },
-            destination: if to_file.is_set() {
+            // The radio already says File for a binary format; asked of the
+            // format too, so the pairing cannot be built here at all.
+            destination: if to_file.is_set() || !format.writes_text() {
                 ExportDestination::File
             } else {
                 ExportDestination::Clipboard

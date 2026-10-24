@@ -21,6 +21,11 @@
 //   HTML      Python html.parser  (cells)
 //   CSV/TSV   Python csv module   (cells, via the excel dialects)
 //   Markdown  cell-count and unescape round-trip
+//   Parquet   pyarrow             (schema types + every cell, NULL as null)
+//
+// pyarrow is not part of a stock Python. Without it the Parquet check is
+// reported as SKIPPED — never as passed — and the run says which validator was
+// missing.
 //
 // Each file is written the way the app writes it, byte-order mark included, so
 // what the parsers see is what a user would open.
@@ -35,7 +40,7 @@
 // Usage: cargo run --bin verify_result_export
 
 use space_query::db::SqlValueKind;
-use space_query::ui::result_export::{render, ExportFormat, ExportGrid};
+use space_query::ui::result_export::{render, render_export_content, ExportFormat, ExportGrid};
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
@@ -148,8 +153,20 @@ fn main() {
         std::process::exit(1);
     }
 
+    let mut skipped: Vec<String> = Vec::new();
     for format in ExportFormat::ALL {
         if format == ExportFormat::SqlInserts {
+            continue;
+        }
+        if format == ExportFormat::Parquet {
+            // Not text: built through the one fork that routes every format,
+            // and read back by a reader that is not the one that wrote it.
+            println!("\n=== Parquet -> {} ===", dir.display());
+            match check_parquet(&grid, &dir) {
+                Ok(true) => println!("PASS: Parquet reads back typed, cell for cell"),
+                Ok(false) => skipped.push("Parquet (pyarrow is not installed)".to_string()),
+                Err(err) => failures.push(format!("Parquet: {err}")),
+            }
             continue;
         }
         // What the app writes to disk: the rendered text behind the format's
@@ -173,7 +190,8 @@ fn main() {
             ExportFormat::Csv => check_delimited(&text, ",", "excel"),
             ExportFormat::Tsv => check_delimited(&text, "\t", "excel-tab"),
             ExportFormat::Markdown => check_markdown(&text),
-            ExportFormat::SqlInserts => Ok(()),
+            // Both handled above.
+            ExportFormat::SqlInserts | ExportFormat::Parquet => Ok(()),
         };
         match outcome {
             Ok(()) => println!("PASS: {} is well-formed and round-trips", format.label()),
@@ -181,8 +199,13 @@ fn main() {
         }
     }
 
-    if failures.is_empty() {
+    if failures.is_empty() && skipped.is_empty() {
         println!("\nAll export formats verified with real parsers.");
+    } else if failures.is_empty() {
+        println!("\nEvery format that was checked passed. NOT checked:");
+        for skip in &skipped {
+            println!("  - {skip}");
+        }
     } else {
         eprintln!("\nFAILURES:");
         for failure in &failures {
@@ -190,6 +213,177 @@ fn main() {
         }
         std::process::exit(1);
     }
+}
+
+/// Write `grid` and a grid of every Parquet type the way the app does, and
+/// read both back with pyarrow.
+///
+/// `Ok(false)` says pyarrow is not installed, so nothing was checked.
+fn check_parquet(grid: &ExportGrid, dir: &Path) -> Result<bool, String> {
+    // The hostile grid: `ID` and the duplicate `ID` are integers on every row,
+    // so they come back INT64; every other column holds a value no type takes
+    // exactly (`00123` beside an empty string, `1.2E+10`) or is text by kind,
+    // so it comes back as the text the grid showed.
+    let hostile_types = ["int64", "string", "string", "int64", "string", "string", "string"];
+    let hostile_rows: Vec<Vec<Option<String>>> = rows()
+        .iter()
+        .enumerate()
+        .map(|(row, values)| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(col, value)| (!is_null_cell(row, col)).then(|| value.clone()))
+                .collect()
+        })
+        .collect();
+    let hostile_names: Vec<String> = ["ID", "FULL NAME", "COUNT(*)", "ID_2", "2024_TOTAL", "", "NOTE"]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    if !read_back_parquet(grid, &dir.join("result.parquet"), &hostile_names, &hostile_types, &hostile_rows)? {
+        return Ok(false);
+    }
+
+    // Every type the writer can choose, with the text pyarrow's own
+    // cast-to-string gives back for each value.
+    let typed_columns = [
+        ("INT", SqlValueKind::Number, "int64"),
+        ("DEC", SqlValueKind::Number, "decimal128(38, 2)"),
+        ("BIG", SqlValueKind::Number, "decimal128(38, 0)"),
+        ("FLAG", SqlValueKind::Boolean, "bool"),
+        ("DAY", SqlValueKind::Temporal, "date32[day]"),
+        ("AT", SqlValueKind::Temporal, "timestamp[us]"),
+        ("NS", SqlValueKind::Temporal, "timestamp[ns]"),
+    ];
+    let written: [[Option<&str>; 7]; 3] = [
+        [
+            Some("1"),
+            Some("12.50"),
+            Some("12345678901234567890123"),
+            Some("TRUE"),
+            Some("2024-02-29"),
+            Some("2024-02-29 13:45:01.123456"),
+            Some("2024-02-29 13:45:01.123456789"),
+        ],
+        [
+            Some("-2"),
+            Some("-.05"),
+            Some("1"),
+            Some("false"),
+            Some("1969-12-31"),
+            Some("1970-01-01"),
+            Some("2024-01-01 00:00:00"),
+        ],
+        [None, None, None, None, None, None, None],
+    ];
+    let read: [[Option<&str>; 7]; 3] = [
+        [
+            Some("1"),
+            Some("12.50"),
+            Some("12345678901234567890123"),
+            Some("true"),
+            Some("2024-02-29"),
+            Some("2024-02-29 13:45:01.123456"),
+            Some("2024-02-29 13:45:01.123456789"),
+        ],
+        [
+            Some("-2"),
+            Some("-0.05"),
+            Some("1"),
+            Some("false"),
+            Some("1969-12-31"),
+            Some("1970-01-01 00:00:00.000000"),
+            Some("2024-01-01 00:00:00.000000000"),
+        ],
+        [None, None, None, None, None, None, None],
+    ];
+    let typed = ExportGrid {
+        columns: typed_columns.iter().map(|(name, _, _)| name.to_string()).collect(),
+        column_kinds: typed_columns.iter().map(|(_, kind, _)| *kind).collect(),
+        rows: written
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.map(str::to_string)).collect())
+            .collect(),
+        null_text: NULL_TEXT.to_string(),
+    };
+    let typed_names: Vec<String> = typed_columns.iter().map(|(name, _, _)| name.to_string()).collect();
+    let typed_types: Vec<&str> = typed_columns.iter().map(|(_, _, ty)| *ty).collect();
+    let typed_rows: Vec<Vec<Option<String>>> = read
+        .iter()
+        .map(|row| row.iter().map(|cell| cell.map(str::to_string)).collect())
+        .collect();
+    read_back_parquet(&typed, &dir.join("typed.parquet"), &typed_names, &typed_types, &typed_rows)
+}
+
+/// Write `grid` as the app does, then have pyarrow read the file and say each
+/// column's name and type and every cell as text (NULL as null).
+fn read_back_parquet(
+    grid: &ExportGrid,
+    path: &Path,
+    names: &[String],
+    types: &[&str],
+    rows: &[Vec<Option<String>>],
+) -> Result<bool, String> {
+    let (body, row_count) = render_export_content(ExportFormat::Parquet, grid, None).into_parts()?;
+    if row_count != grid.rows.len() {
+        return Err(format!("reported {row_count} rows for a grid of {}", grid.rows.len()));
+    }
+    std::fs::write(path, body.as_bytes()).map_err(|err| format!("write {}: {err}", path.display()))?;
+    // Exit code 3 is "pyarrow is missing"; the path travels as argv so the
+    // script stays a fixed string.
+    const SCRIPT: &str = "import json, sys\n\
+         try:\n    import pyarrow as pa, pyarrow.compute as pc, pyarrow.parquet as pq\n\
+         except ImportError:\n    sys.exit(3)\n\
+         t = pq.read_table(sys.argv[1])\n\
+         cols = [pc.cast(c, pa.string()).to_pylist() for c in t.columns]\n\
+         json.dump({'names': t.column_names, 'types': [str(f.type) for f in t.schema],\n\
+                    'rows': [list(r) for r in zip(*cols)] if cols else []}, sys.stdout)\n";
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg(path)
+        .output()
+        .map_err(|err| format!("could not run python3: {err}"))?;
+    if output.status.code() == Some(3) {
+        println!("  SKIPPED: pyarrow is not installed (pip install pyarrow)");
+        return Ok(false);
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "pyarrow could not read {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    #[derive(serde::Deserialize)]
+    struct ReadBack {
+        names: Vec<String>,
+        types: Vec<String>,
+        rows: Vec<Vec<Option<String>>>,
+    }
+    let back: ReadBack = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("could not read the pyarrow result: {err}"))?;
+    if back.names != names {
+        return Err(format!("names read {:?}, wrote {names:?}", back.names));
+    }
+    if back.types != types {
+        return Err(format!("types read {:?}, expected {types:?}", back.types));
+    }
+    if back.rows.len() != rows.len() {
+        return Err(format!("pyarrow read {} rows, {} were written", back.rows.len(), rows.len()));
+    }
+    for (index, (got, want)) in back.rows.iter().zip(rows).enumerate() {
+        if got != want {
+            return Err(format!("row {index}: read {got:?}, expected {want:?}"));
+        }
+    }
+    println!(
+        "  pyarrow read {} ({} rows, types {:?}) with matching cells",
+        path.display(),
+        rows.len(),
+        back.types
+    );
+    Ok(true)
 }
 
 /// Parse the JSON with `serde_json` and compare every cell back to the grid.

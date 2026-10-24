@@ -290,7 +290,7 @@ pub struct ObjectExportDelivery {
     /// one fact: `SQL Inserts` of a table whose every column the server
     /// computes writes nothing, and the count taken from the input announced
     /// that empty file as a full export.
-    pub content: crate::ui::result_export::ExportContent,
+    pub content: crate::ui::result_export::ExportContent<crate::ui::result_export::ExportBody>,
     pub format: crate::ui::result_export::ExportFormat,
     pub destination: crate::ui::result_export::ExportDestination,
     /// Base name to offer in the save panel, without an extension.
@@ -13367,6 +13367,18 @@ mod tests {
 
     use tns_thin::exec::StatementRequest as OracleThinStatementRequest;
 
+    /// The text a tree export of a text format delivers.
+    fn delivered_text(delivery: &super::ObjectExportDelivery) -> String {
+        delivery
+            .content
+            .clone()
+            .into_parts()
+            .expect("this fixture is exportable")
+            .0
+            .into_text()
+            .expect("a text format")
+    }
+
     #[test]
     fn neither_source_of_a_write_refusal_can_erase_the_other() {
         // The connection's read-only flag is re-stated for EVERY card whenever
@@ -14445,7 +14457,7 @@ mod tests {
             &[],
             tab_null_text,
         );
-        let csv = delivery.content.text().to_string();
+        let csv = delivered_text(&delivery);
         assert!(
             csv.contains(&format!("7499,{tab_null_text}")),
             "the export wrote a NULL as something other than the tab\'s text: {csv:?}"
@@ -14541,21 +14553,8 @@ mod tests {
             };
             let expected =
                 crate::ui::result_export::render_export_content(format, &grid, Some(&selection));
-            assert_eq!(
-                delivery.content.text(),
-                expected.text(),
-                "{format:?} bytes differ"
-            );
-            assert_eq!(
-                delivery.content.rows(),
-                expected.rows(),
-                "{format:?} row count differs"
-            );
-            assert_eq!(
-                delivery.content.refusal(),
-                expected.refusal(),
-                "{format:?} refusal differs"
-            );
+            // Body, row count and refusal alike — and for Parquet, the bytes.
+            assert_eq!(delivery.content, expected, "{format:?} differs");
         }
     }
 
@@ -14604,6 +14603,8 @@ mod tests {
             .into_parts()
             .expect("this fixture is exportable in every format")
             .0
+            .into_text()
+            .expect("a text format")
         };
 
         let sql = render(ExportFormat::SqlInserts);
@@ -14742,8 +14743,8 @@ mod tests {
             &[],
             crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT,
         );
-        assert_eq!(&to_file.content.text().as_bytes()[..3], &[0xEF, 0xBB, 0xBF]);
-        assert!(!to_clipboard.content.text().starts_with('\u{feff}'));
+        assert_eq!(&delivered_text(&to_file).as_bytes()[..3], &[0xEF, 0xBB, 0xBF]);
+        assert!(!delivered_text(&to_clipboard).starts_with('\u{feff}'));
     }
 
     /// An object's name is ONE node of the tree, whatever is in it.
@@ -14839,14 +14840,7 @@ mod tests {
                 crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT,
             )
         };
-        let text_of = |delivery: &super::ObjectExportDelivery| {
-            delivery
-                .content
-                .clone()
-                .into_parts()
-                .expect("this fixture is exportable")
-                .0
-        };
+        let text_of = delivered_text;
 
         let generated = vec!["TOTAL".to_string()];
         let inserts = render(ExportFormat::SqlInserts, &generated);

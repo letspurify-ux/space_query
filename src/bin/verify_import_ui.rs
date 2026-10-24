@@ -156,15 +156,16 @@ fn main() {
         Err(err) => failures.push(format!("default CSV: {err}")),
     }
 
-    // (2) Every format is on offer, and the two choices that mean nothing for a
-    //     format are visibly dead rather than quietly ignored.
+    // (2) Every text format is on offer (Parquet is binary: written, never
+    //     read), and the two choices that mean nothing for a format are visibly
+    //     dead rather than quietly ignored.
     let (formats, header_active, null_active) = state();
-    let expected_formats: Vec<String> = ExportFormat::ALL
+    let expected_formats: Vec<String> = space_query::ui::result_import::import_formats()
         .into_iter()
         .map(|format| format.label().to_string())
         .collect();
     if formats == expected_formats {
-        say("PASS: the modal offers every export format for import");
+        say("PASS: the modal offers every text export format for import");
     } else {
         failures.push(format!("the modal offered {formats:?}"));
     }

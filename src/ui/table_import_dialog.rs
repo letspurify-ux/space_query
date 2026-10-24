@@ -203,7 +203,7 @@ pub(crate) fn show(
     let table_row = read_only_row("Table:", table_label, row_h);
     form.fixed(&table_row, row_h);
 
-    let formats: Vec<ExportFormat> = ExportFormat::ALL.into_iter().collect();
+    let formats: Vec<ExportFormat> = crate::ui::result_import::import_formats();
     let mut format_row = Flex::default().with_size(0, row_h);
     format_row.set_type(FlexType::Row);
     format_row.set_spacing(DIALOG_SPACING);

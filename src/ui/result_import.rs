@@ -142,10 +142,22 @@ pub fn null_text_choice_applies(format: ExportFormat) -> bool {
     matches!(format, ExportFormat::Csv | ExportFormat::Tsv)
 }
 
+/// The formats an import reads: every format this app writes as text.
+///
+/// The parsers read text, so a binary format ([`ExportFormat::writes_text`]
+/// false — Parquet) is one this app writes and never reads. Derived rather than
+/// listed, so a new text format is offered here the day it is written.
+pub fn import_formats() -> Vec<ExportFormat> {
+    ExportFormat::ALL
+        .into_iter()
+        .filter(|format| format.writes_text())
+        .collect()
+}
+
 /// The format a file's extension implies, if any.
 pub fn detect_format(path: &Path) -> Option<ExportFormat> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    ExportFormat::ALL
+    import_formats()
         .into_iter()
         .find(|format| format.extension() == extension)
         // Extensions no format claims outright. `.text` sits beside `.txt`
@@ -173,6 +185,11 @@ pub fn parse(text: &str, options: &ImportOptions) -> Result<ImportedTable, Strin
         ExportFormat::Html => parse_html(text, options.has_header)?,
         ExportFormat::Markdown => parse_markdown(text)?,
         ExportFormat::SqlInserts => parse_sql_inserts(text)?,
+        // Not in `import_formats`, so no dialog offers it; said rather than
+        // misparsed if a caller passes it anyway.
+        ExportFormat::Parquet => {
+            return Err(format!("{} files cannot be imported.", options.format.label()))
+        }
     };
     validate(table)
 }
@@ -2528,6 +2545,22 @@ mod tests {
             assert_eq!(detect_format(Path::new(name)), Some(format), "{name}");
         }
         assert_eq!(detect_format(Path::new("rows.bin")), None);
+        // Written, never read: the importer parses text.
+        assert_eq!(detect_format(Path::new("rows.parquet")), None);
+    }
+
+    #[test]
+    fn the_importer_reads_every_text_format_and_no_binary_one() {
+        let formats = import_formats();
+        for format in ExportFormat::ALL {
+            assert_eq!(
+                formats.contains(&format),
+                format.writes_text(),
+                "{}",
+                format.label()
+            );
+        }
+        assert!(parse("PAR1", &options(ExportFormat::Parquet)).is_err());
     }
 
     #[test]
@@ -3862,7 +3895,7 @@ mod tests {
             rows: Vec::new(),
             null_text: NULL_TEXT.to_string(),
         };
-        for format in ExportFormat::ALL {
+        for format in import_formats() {
             if format == ExportFormat::SqlInserts {
                 // No rows means no INSERT statements, so there is no file.
                 continue;
@@ -3901,7 +3934,7 @@ mod tests {
             rows,
             null_text: NULL_TEXT.to_string(),
         };
-        for format in ExportFormat::ALL {
+        for format in import_formats() {
             let text = if format == ExportFormat::SqlInserts {
                 written(build_sql_inserts(&GridSqlSelection {
                     dialect: crate::ui::grid_sql_export::SqlWriteDialect::family_default(

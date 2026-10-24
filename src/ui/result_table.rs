@@ -10794,7 +10794,9 @@ impl ResultTableWidget {
                 // No connection to name a dialect, no rows, or no column a
                 // statement may name: nothing to write and nothing to complain
                 // about, which is exactly what an empty write is.
-                None => ExportPayload::Data(ExportContent::nothing()),
+                None => ExportPayload::Data(
+                    ExportContent::nothing().map_body(crate::ui::result_export::ExportBody::Text),
+                ),
             };
         }
         ExportPayload::Data(crate::ui::result_export::render_export_content(

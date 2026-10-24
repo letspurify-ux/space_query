@@ -8366,13 +8366,15 @@ impl MainWindow {
         // that quietly holds fewer is the kind of silence this app reports.
         let left_out = selection.restrict_to_writable_columns(generated);
         let note = crate::ui::grid_sql_export::left_out_generated_columns_note(&left_out);
-        let content = crate::ui::grid_sql_export::build_sql_inserts(&selection).map_text(|text| {
-            crate::ui::result_export::with_destination_prelude(
-                choice.format,
-                target.destination(),
-                text,
-            )
-        });
+        let content = crate::ui::grid_sql_export::build_sql_inserts(&selection)
+            .map_text(|text| {
+                crate::ui::result_export::with_destination_prelude(
+                    choice.format,
+                    target.destination(),
+                    text,
+                )
+            })
+            .map_body(crate::ui::result_export::ExportBody::Text);
         Self::deliver_export_content(sender, target, choice.format, content, note);
     }
 
@@ -8390,12 +8392,12 @@ impl MainWindow {
         sender: &std::sync::mpsc::Sender<FileActionResult>,
         target: ExportTarget,
         format: ExportFormat,
-        content: crate::ui::result_export::ExportContent,
+        content: crate::ui::result_export::ExportContent<crate::ui::result_export::ExportBody>,
         note: String,
     ) {
         match content.into_parts() {
-            Ok((text, row_count)) => {
-                Self::deliver_export(sender, target, format, text, row_count, note)
+            Ok((body, row_count)) => {
+                Self::deliver_export(sender, target, format, body, row_count, note)
             }
             Err(reason) => Self::send_export_notice(sender, reason),
         }
@@ -8466,24 +8468,30 @@ impl MainWindow {
         ))
     }
 
-    /// Hand finished export text to its target. Writing runs off the main
+    /// Hand a finished export body to its target. Writing runs off the main
     /// thread; the clipboard copy is queued so it happens on it.
     ///
     /// `note` is appended to whichever report the target gets, so both ends of
     /// an export say the same thing about what its script left out.
+    ///
+    /// A file takes either body as bytes. The clipboard takes text only: the
+    /// export dialog never pairs a binary format with it, and a pairing that
+    /// arrives anyway is reported, never copied as nothing.
     fn deliver_export(
         sender: &std::sync::mpsc::Sender<FileActionResult>,
         target: ExportTarget,
         format: ExportFormat,
-        content: String,
+        body: crate::ui::result_export::ExportBody,
         row_count: usize,
         note: String,
     ) {
-        match target {
-            ExportTarget::File(path) => {
+        use crate::ui::result_export::ExportBody;
+        match (target, body) {
+            (ExportTarget::File(path), body) => {
                 let sender = sender.clone();
                 thread::spawn(move || {
-                    let result = crate::utils::fs_atomic::write_file_atomically(&path, &content);
+                    let result =
+                        crate::utils::fs_atomic::write_file_atomically(&path, body.as_bytes());
                     let _ = sender.send(FileActionResult::Export {
                         path,
                         row_count,
@@ -8493,15 +8501,21 @@ impl MainWindow {
                     app::awake();
                 });
             }
-            ExportTarget::Clipboard => {
+            (ExportTarget::Clipboard, ExportBody::Text(text)) => {
                 let message = format!(
                     "Copied {row_count} rows to clipboard as {}{note}",
                     format.label()
                 );
                 let _ = sender.send(FileActionResult::CopyToClipboard {
-                    result: Ok((content, message)),
+                    result: Ok((text, message)),
                 });
                 app::awake();
+            }
+            (ExportTarget::Clipboard, ExportBody::Binary(_)) => {
+                let reason = format.clipboard_refusal().unwrap_or_else(|| {
+                    format!("{} cannot be copied to the clipboard.", format.label())
+                });
+                Self::send_export_notice(sender, reason);
             }
         }
     }

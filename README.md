@@ -31,7 +31,7 @@ library is needed to connect and run statements.
 | --- | --- |
 | Editor | Code completion over live metadata, signature hints, code snippets, SQL-aware formatter, multiple file tabs, find and replace, quick describe |
 | Execution | One statement, a selection, or a full script with SQL*Plus-style commands, bind variables, ref cursors, and per-statement timeouts |
-| Results | Independent result tabs, lazy fetch, sorting, in-grid text search, selection totals, export to CSV/TSV/JSON/XML/HTML/Markdown/SQL, and staged in-grid editing |
+| Results | Independent result tabs, lazy fetch, sorting, in-grid text search, selection totals, export to CSV/TSV/JSON/XML/HTML/Markdown/Parquet/SQL, and staged in-grid editing |
 | Objects | Filterable object tree, structure/index/constraint inspection, DDL generation, confirmed drop/truncate, file import into a table, and table browsing with database-side paging |
 | Operations | Session activity, persisted query history, application log, and crash reports |
 
@@ -632,10 +632,30 @@ export every row or the selection, and pick a file or the clipboard.
 | **XML** | `<results><row>…`; illegal characters in a column name become `_` |
 | **HTML** | A standalone document with a plain bordered table |
 | **Markdown** | Pipe table; `\|` is escaped and line breaks become `<br>` |
+| **Parquet** | A typed, Snappy-compressed Apache Parquet file; SQL `NULL` is a Parquet null. File only |
 | **SQL Inserts** | The same statements the context menu copies, for the whole result and straight to a file |
 
 **SQL Inserts** needs a live connection, because its literals follow the
-connected dialect; the other formats do not. Exporting every row completes an
+connected dialect; the other formats do not.
+
+**Parquet** is binary, so it is written to a file only: choosing it disables
+**Clipboard**. The grid holds each value as the text it shows, so a column is
+given a Parquet type only when **every** value in it converts to that type
+exactly; otherwise the column is written as that text. A file never holds a
+value the grid did not show.
+
+| Column | Written as | When |
+| --- | --- | --- |
+| Number | `INT64` | Every value is an integer that fits 64 bits |
+| Number | `DECIMAL(38, s)` | Every value is a plain decimal of at most 38 digits; `s` is the widest scale shown |
+| Boolean | `BOOLEAN` | Every value is `true` or `false` |
+| Date and time | `DATE` | Every value is `YYYY-MM-DD` |
+| Date and time | `TIMESTAMP` (local, µs or ns) | Every value is `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS[.f]` |
+| Anything else | `STRING` | Always: text, binary, intervals, and values with a time zone |
+
+A number in scientific notation, MySQL's `0000-00-00`, or a date in a custom
+Oracle NLS format keeps its column a `STRING`. A column holding only `NULL`
+proves nothing and is also a `STRING`. Parquet files are written, not imported. Exporting every row completes an
 open lazy fetch first, so the file holds the whole result rather than the rows
 scrolled into view. Exporting a selection never triggers a fetch.
 
@@ -653,8 +673,9 @@ this entry, since exporting only reads.
 ### Import a file into a table
 
 Right-click a table in the object browser and choose **Import Data...**. Every
-format the export writes can be read back, so a result exported from one
-database can be loaded into another.
+text format the export writes can be read back, so a result exported from one
+database can be loaded into another. Parquet, the one binary format, is not
+imported.
 
 ![The Import Data dialog: format, header and NULL choices, and the column mapping](docs/images/table-import.png)
 
@@ -870,7 +891,8 @@ cargo run --bin verify_import_ui
 # application's own menu bar.
 cargo run --bin verify_editor_convenience_ui
 
-# Export a table, import the file back, compare — every format, every backend.
+# Export a table, import the file back, compare — every text format, every
+# backend.
 cargo run --bin verify_import_live all
 
 # Explain plan shape and Go to Declaration — every backend.
@@ -893,7 +915,8 @@ cargo run --bin verify_value_edit_live all
 cargo run --bin verify_read_only_live all
 
 # The value filter, the local sort, the column arrangement and the export
-# formats, each checked against the server's own answer — every backend.
+# formats, each checked against the server's own answer, plus the Parquet type
+# each driver's rendering earns — every backend.
 cargo run --bin verify_grid_features_live all
 
 # The column arrangement and the value filter driven on a real grid: where the

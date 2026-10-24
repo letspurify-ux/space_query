@@ -24,6 +24,11 @@
 // which is itself asserted below. It is covered by `verify_grid_sql_export` and
 // `verify_grid_sql_export_live`.
 //
+// `Parquet` is binary, so it has no clipboard road to read back. What is
+// asserted instead is the modal itself: picking it disables "Clipboard" and
+// selects "File", and picking a text format again gives "Clipboard" back. Its
+// bytes are verified by `verify_result_export`.
+//
 // Usage: cargo run --bin verify_result_export_ui
 
 use fltk::{
@@ -64,6 +69,14 @@ struct ModalPlan {
     refused: bool,
     /// Retries spent waiting for the modal, so a miss ends the run.
     attempts: u32,
+    /// Instead of exporting, pick a binary format the way a user does, record
+    /// what the destination radios did, then pick a text format, record again,
+    /// and cancel.
+    probe_file_only: bool,
+    /// `(clipboard active, file selected)` after picking the binary format.
+    on_binary: Option<(bool, bool)>,
+    /// Whether "Clipboard" was active again after picking a text format.
+    clipboard_back: Option<bool>,
 }
 
 static PLAN: OnceLock<Mutex<ModalPlan>> = OnceLock::new();
@@ -78,6 +91,9 @@ fn plan() -> &'static Mutex<ModalPlan> {
             driven: false,
             refused: false,
             attempts: 0,
+            probe_file_only: false,
+            on_binary: None,
+            clipboard_back: None,
         })
     })
 }
@@ -216,7 +232,7 @@ fn main() {
     // one of them, plus the cancel path.
     let mut cases: Vec<(ExportFormat, ExportScope)> = ExportFormat::ALL
         .into_iter()
-        .filter(|format| *format != ExportFormat::SqlInserts)
+        .filter(|format| *format != ExportFormat::SqlInserts && format.writes_text())
         .map(|format| (format, ExportScope::All))
         .collect();
     cases.push((ExportFormat::Json, ExportScope::Selection));
@@ -254,6 +270,15 @@ fn main() {
         say("PASS: SQL Inserts is withheld while no connection can name the dialect");
     }
     say(&format!("      formats offered: {}", offered.join(", ")));
+
+    // A binary format is offered, and the modal will only pair it with a file.
+    if !offered.iter().any(|label| label == ExportFormat::Parquet.label()) {
+        failures.push("the modal did not offer Parquet".to_string());
+    }
+    match probe_file_only(&mut main_window) {
+        Ok(()) => say("PASS: Parquet disables Clipboard and selects File; a text format restores it"),
+        Err(err) => failures.push(format!("Parquet destination: {err}")),
+    }
 
     // Cancel must leave the clipboard alone.
     set_clipboard("sentinel");
@@ -441,7 +466,7 @@ fn verify_a_new_result_does_not_inherit_a_queued_export(failures: &mut Vec<Strin
         Some(Ok(ExportPayload::Data(built))) => failures.push(format!(
             "the queued export rendered the NEW result: {} rows, {:?}",
             built.rows(),
-            built.text()
+            built.into_parts().map(|(body, _)| body)
         )),
         Some(Ok(ExportPayload::Sql(_))) => failures.push(
             "a CSV export handed back a SQL Inserts snapshot, which it can never build".to_string(),
@@ -458,7 +483,7 @@ fn verify_a_new_result_does_not_inherit_a_queued_export(failures: &mut Vec<Strin
     if let Some(Ok(payload)) = after_close {
         failures.push(format!(
             "closing the old session ran the abandoned export after all: {:?}",
-            payload.data().map(|built| built.text().to_string())
+            payload.data().map(|built| built.into_parts().map(|(body, _)| body))
         ));
     }
 }
@@ -727,6 +752,85 @@ fn run_export(
     Ok(read_clipboard())
 }
 
+/// Open the real modal, pick Parquet and then CSV through the choice's own
+/// callback, and report what the destination radios did. Cancels, so the save
+/// panel a File export would open is never reached.
+fn probe_file_only(main_window: &mut MainWindow) -> Result<(), String> {
+    main_window.capture_tour_clear_result_selection();
+    pump(200);
+    {
+        let mut plan = plan()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        plan.format = ExportFormat::Parquet;
+        plan.scope = ExportScope::All;
+        plan.cancel = true;
+        plan.driven = false;
+        plan.refused = false;
+        plan.attempts = 0;
+        plan.probe_file_only = true;
+        plan.on_binary = None;
+        plan.clipboard_back = None;
+    }
+    app::add_timeout3(0.30, |_| drive_modal());
+    trigger_export_menu()?;
+    pump(1500);
+    let mut plan = plan()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    plan.probe_file_only = false;
+    if !plan.driven {
+        return Err("the export modal never appeared".to_string());
+    }
+    match plan.on_binary {
+        Some((false, true)) => {}
+        Some((clipboard_active, file_selected)) => {
+            return Err(format!(
+                "after picking Parquet: Clipboard active = {clipboard_active}, \
+                 File selected = {file_selected}"
+            ))
+        }
+        None => return Err("the probe never picked Parquet".to_string()),
+    }
+    match plan.clipboard_back {
+        Some(true) => Ok(()),
+        Some(false) => Err("Clipboard stayed disabled after picking CSV again".to_string()),
+        None => Err("the probe never picked a text format again".to_string()),
+    }
+}
+
+/// Pick `format` in the modal's format choice the way a click does: set the
+/// value, then run the choice's callback.
+fn pick_format(widgets: &[fltk::widget::Widget], format: ExportFormat) {
+    for widget in widgets {
+        if let Some(mut choice) = Choice::from_dyn_widget(widget) {
+            let labels: Vec<String> = (0..choice.size().saturating_sub(1))
+                .filter_map(|index| choice.text(index))
+                .collect();
+            if let Some(index) = labels.iter().position(|label| label == format.label()) {
+                choice.set_value(index as i32);
+                choice.do_callback();
+            }
+        }
+    }
+}
+
+/// `(Clipboard active, File selected)` as the modal shows them now.
+fn destination_state(widgets: &[fltk::widget::Widget]) -> (bool, bool) {
+    let mut clipboard_active = false;
+    let mut file_selected = false;
+    for widget in widgets {
+        if let Some(radio) = RadioRoundButton::from_dyn_widget(widget) {
+            match radio.label().as_str() {
+                "Clipboard" => clipboard_active = radio.active(),
+                "File" => file_selected = radio.is_set(),
+                _ => {}
+            }
+        }
+    }
+    (clipboard_active, file_selected)
+}
+
 /// Fire the real `Tools > Export Results` menu item.
 fn trigger_export_menu() -> Result<(), String> {
     let mut menu =
@@ -775,6 +879,13 @@ fn drive_modal() {
     let mut plan = plan()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if plan.probe_file_only {
+        pick_format(&widgets, ExportFormat::Parquet);
+        plan.on_binary = Some(destination_state(&widgets));
+        pick_format(&widgets, ExportFormat::Csv);
+        plan.clipboard_back = Some(destination_state(&widgets).0);
+    }
 
     for widget in &widgets {
         if let Some(mut choice) = Choice::from_dyn_widget(widget) {

@@ -3,11 +3,13 @@
 //! Pure functions over a snapshot of the grid — no FLTK, no database — so every
 //! byte that reaches a file or the clipboard is unit-testable.
 //!
-//! `SQL Inserts` is the one format that is not rendered here: it needs the
-//! connection's dialect and the resolved base table, and that logic already
-//! lives in [`crate::ui::grid_sql_export`]. [`render`] returns an empty string
-//! for it so a caller that forgets to route it produces nothing rather than
-//! something wrong.
+//! Two formats are not rendered here. `SQL Inserts` needs the connection's
+//! dialect and the resolved base table, and that logic already lives in
+//! [`crate::ui::grid_sql_export`]. `Parquet` is not text at all, and
+//! [`crate::ui::parquet_export`] writes its bytes. [`render`] returns an empty
+//! string for both so a caller that forgets to route them produces nothing
+//! rather than something wrong; [`render_export_content`] is the one fork that
+//! routes every format.
 
 use crate::db::SqlValueKind;
 
@@ -28,19 +30,21 @@ pub enum ExportFormat {
     Xml,
     Html,
     Markdown,
+    Parquet,
     SqlInserts,
 }
 
 impl ExportFormat {
     /// Offered order in the export dialog. CSV first because it is what the
     /// keyboard shortcut used to do on its own.
-    pub const ALL: [ExportFormat; 7] = [
+    pub const ALL: [ExportFormat; 8] = [
         ExportFormat::Csv,
         ExportFormat::Tsv,
         ExportFormat::Json,
         ExportFormat::Xml,
         ExportFormat::Html,
         ExportFormat::Markdown,
+        ExportFormat::Parquet,
         ExportFormat::SqlInserts,
     ];
 
@@ -52,6 +56,7 @@ impl ExportFormat {
             ExportFormat::Xml => "XML",
             ExportFormat::Html => "HTML",
             ExportFormat::Markdown => "Markdown",
+            ExportFormat::Parquet => "Parquet",
             ExportFormat::SqlInserts => "SQL Inserts",
         }
     }
@@ -64,8 +69,42 @@ impl ExportFormat {
             ExportFormat::Xml => "xml",
             ExportFormat::Html => "html",
             ExportFormat::Markdown => "md",
+            ExportFormat::Parquet => "parquet",
             ExportFormat::SqlInserts => "sql",
         }
+    }
+
+    /// Whether this format is text.
+    ///
+    /// The one fact both ends of a binary format turn on: only text can go on
+    /// the clipboard ([`Self::clipboard_refusal`]), and only text is what the
+    /// importer parses ([`crate::ui::result_import::import_formats`]). A
+    /// binary format renders to [`ExportBody::Binary`] and nothing else.
+    pub fn writes_text(self) -> bool {
+        match self {
+            ExportFormat::Csv
+            | ExportFormat::Tsv
+            | ExportFormat::Json
+            | ExportFormat::Xml
+            | ExportFormat::Html
+            | ExportFormat::Markdown
+            | ExportFormat::SqlInserts => true,
+            ExportFormat::Parquet => false,
+        }
+    }
+
+    /// Why this format cannot be put on the clipboard, or `None` when it can.
+    ///
+    /// The export dialog will not pair such a format with the clipboard; this
+    /// is the sentence it shows for that, and the one the delivery reports if a
+    /// pairing ever reaches it anyway.
+    pub fn clipboard_refusal(self) -> Option<String> {
+        (!self.writes_text()).then(|| {
+            format!(
+                "{} is a binary format, so it can only be exported to a file.",
+                self.label()
+            )
+        })
     }
 
     /// Single-entry filter string for the native save chooser.
@@ -86,12 +125,13 @@ impl ExportFormat {
             | ExportFormat::Xml
             | ExportFormat::Html
             | ExportFormat::Markdown
+            | ExportFormat::Parquet
             | ExportFormat::SqlInserts => "",
         }
     }
 }
 
-/// What a render or a SQL build produced: the text, and how many rows of the
+/// What a render or a SQL build produced: the body, and how many rows of the
 /// source it covers — or the sentence saying why nothing was written.
 ///
 /// One value, because the two are one fact. The row count used to be read off
@@ -105,32 +145,22 @@ impl ExportFormat {
 /// empty string, which a caller cannot tell from an empty result, so every
 /// refusal had to be asked by a separate gate that a caller could forget. The
 /// gate now lives inside the builder and its answer comes back with the rest.
+///
+/// `B` is the body's shape. The SQL builders and the text serializers produce
+/// a `String` and say so in their type, because the clipboard roads that use
+/// them can carry nothing else; an export that may be either says
+/// [`ExportBody`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExportContent {
-    /// `rows` is what the text actually covers, not what it was offered.
-    Written { text: String, rows: usize },
+pub enum ExportContent<B = String> {
+    /// `rows` is what the body actually covers, not what it was offered.
+    Written { body: B, rows: usize },
     /// Nothing was written, and this is what to tell the user.
     Refused(String),
 }
 
-impl ExportContent {
-    pub fn written(text: String, rows: usize) -> Self {
-        ExportContent::Written { text, rows }
-    }
-
-    /// A build that had nothing to write and nothing to complain about.
-    pub fn nothing() -> Self {
-        ExportContent::Written {
-            text: String::new(),
-            rows: 0,
-        }
-    }
-
-    pub fn text(&self) -> &str {
-        match self {
-            ExportContent::Written { text, .. } => text.as_str(),
-            ExportContent::Refused(_) => "",
-        }
+impl<B> ExportContent<B> {
+    pub fn written(body: B, rows: usize) -> Self {
+        ExportContent::Written { body, rows }
     }
 
     pub fn rows(&self) -> usize {
@@ -147,25 +177,99 @@ impl ExportContent {
         }
     }
 
+    /// Rewrap the body, leaving a refusal alone.
+    pub fn map_body<C>(self, wrap: impl FnOnce(B) -> C) -> ExportContent<C> {
+        match self {
+            ExportContent::Written { body, rows } => ExportContent::Written {
+                body: wrap(body),
+                rows,
+            },
+            ExportContent::Refused(reason) => ExportContent::Refused(reason),
+        }
+    }
+
+    /// The body and its row count, or the refusal to report.
+    pub fn into_parts(self) -> Result<(B, usize), String> {
+        match self {
+            ExportContent::Written { body, rows } => Ok((body, rows)),
+            ExportContent::Refused(reason) => Err(reason),
+        }
+    }
+}
+
+impl ExportContent<String> {
+    /// A build that had nothing to write and nothing to complain about.
+    pub fn nothing() -> Self {
+        ExportContent::Written {
+            body: String::new(),
+            rows: 0,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        match self {
+            ExportContent::Written { body, .. } => body.as_str(),
+            ExportContent::Refused(_) => "",
+        }
+    }
+
     /// Rewrite the text that was written, leaving a refusal alone.
     ///
     /// A refusal has no text to decorate: putting a byte-order mark in front of
     /// one would turn "nothing was written" into a one-character file.
     pub fn map_text(self, rewrite: impl FnOnce(String) -> String) -> Self {
+        self.map_body(rewrite)
+    }
+}
+
+impl ExportContent<ExportBody> {
+    /// Rewrite a TEXT body, leaving a binary one and a refusal alone.
+    ///
+    /// What is rewritten is a text prelude — a byte-order mark — and a binary
+    /// format has none: its file is its bytes.
+    pub fn map_text(self, rewrite: impl FnOnce(String) -> String) -> Self {
+        self.map_body(|body| match body {
+            ExportBody::Text(text) => ExportBody::Text(rewrite(text)),
+            binary @ ExportBody::Binary(_) => binary,
+        })
+    }
+}
+
+/// The finished body of an export, in the shape its format writes.
+///
+/// Which shape is decided by the format alone ([`ExportFormat::writes_text`]),
+/// and [`render_export_content`] is the one place that builds either.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExportBody {
+    /// A text format: what the clipboard receives, and — after the file's
+    /// byte-order mark — what a file holds.
+    Text(String),
+    /// A binary format: only a file can hold it.
+    Binary(Vec<u8>),
+}
+
+impl ExportBody {
+    /// The bytes a file of this body holds.
+    pub fn as_bytes(&self) -> &[u8] {
         match self {
-            ExportContent::Written { text, rows } => ExportContent::Written {
-                text: rewrite(text),
-                rows,
-            },
-            refused => refused,
+            ExportBody::Text(text) => text.as_bytes(),
+            ExportBody::Binary(bytes) => bytes,
         }
     }
 
-    /// The text and its row count, or the refusal to report.
-    pub fn into_parts(self) -> Result<(String, usize), String> {
+    /// The text, or `None` for a binary body.
+    pub fn as_text(&self) -> Option<&str> {
         match self {
-            ExportContent::Written { text, rows } => Ok((text, rows)),
-            ExportContent::Refused(reason) => Err(reason),
+            ExportBody::Text(text) => Some(text),
+            ExportBody::Binary(_) => None,
+        }
+    }
+
+    /// The text, or `None` for a binary body.
+    pub fn into_text(self) -> Option<String> {
+        match self {
+            ExportBody::Text(text) => Some(text),
+            ExportBody::Binary(_) => None,
         }
     }
 }
@@ -187,19 +291,19 @@ impl ExportContent {
 /// contain.
 #[derive(Clone, Debug)]
 pub enum ExportPayload {
-    /// Rendered text, ready for its destination.
-    Data(ExportContent),
+    /// A rendered body, ready for its destination.
+    Data(ExportContent<ExportBody>),
     /// The rows and columns a `SQL Inserts` build will use once the catalog has
     /// answered which columns the server computes.
     Sql(crate::ui::grid_sql_export::GridSqlSelection),
 }
 
 impl ExportPayload {
-    /// The finished bytes, for a caller that only ever asks for a data format.
+    /// The finished body, for a caller that only ever asks for a data format.
     ///
     /// `None` says the payload is a `SQL Inserts` snapshot, which is not text
     /// yet — a caller that gets one asked for a format it does not handle.
-    pub fn data(self) -> Option<ExportContent> {
+    pub fn data(self) -> Option<ExportContent<ExportBody>> {
         match self {
             ExportPayload::Data(content) => Some(content),
             ExportPayload::Sql(_) => None,
@@ -238,7 +342,7 @@ pub struct ExportGrid {
 impl ExportGrid {
     /// The cell at `index`. A column the row does not reach has no value at
     /// all, which is SQL NULL.
-    fn cell<'a>(&self, row: &'a [ExportCell], index: usize) -> &'a ExportCell {
+    pub(crate) fn cell<'a>(&self, row: &'a [ExportCell], index: usize) -> &'a ExportCell {
         row.get(index).unwrap_or(&None)
     }
 
@@ -280,7 +384,7 @@ impl ExportGrid {
         }
     }
 
-    fn kind(&self, index: usize) -> SqlValueKind {
+    pub(crate) fn kind(&self, index: usize) -> SqlValueKind {
         self.column_kinds
             .get(index)
             .copied()
@@ -303,17 +407,19 @@ pub fn render(format: ExportFormat, grid: &ExportGrid) -> String {
         ExportFormat::Markdown => render_markdown(grid),
         // Dialect-dependent; `grid_sql_export::build_sql_inserts` owns it.
         ExportFormat::SqlInserts => String::new(),
+        // Not text; `parquet_export::render` owns it.
+        ExportFormat::Parquet => String::new(),
     }
 }
 
-/// Render an export in `format`, choosing between the plain serializers above
-/// and the dialect-aware `SQL Inserts` builder.
+/// Render an export in `format`, choosing between the plain serializers above,
+/// the dialect-aware `SQL Inserts` builder, and the binary Parquet writer.
 ///
 /// The fork lives here rather than in the grid because the object browser
 /// exports a table without going through a grid at all. One fork means the two
 /// callers cannot disagree about which renderer a format belongs to — and in
-/// particular cannot route `SqlInserts` to [`render`], which deliberately
-/// answers with an empty string.
+/// particular cannot route `SqlInserts` or `Parquet` to [`render`], which
+/// deliberately answers with an empty string for both.
 ///
 /// `sql_selection` is only read for `SqlInserts`; passing `None` for that format
 /// yields nothing rather than wrong SQL.
@@ -326,13 +432,17 @@ pub fn render_export_content(
     format: ExportFormat,
     grid: &ExportGrid,
     sql_selection: Option<&crate::ui::grid_sql_export::GridSqlSelection>,
-) -> ExportContent {
+) -> ExportContent<ExportBody> {
     match format {
         ExportFormat::SqlInserts => match sql_selection {
             Some(selection) => crate::ui::grid_sql_export::build_sql_inserts(selection),
             None => ExportContent::nothing(),
-        },
-        format => ExportContent::written(render(format, grid), grid.rows.len()),
+        }
+        .map_body(ExportBody::Text),
+        ExportFormat::Parquet => {
+            crate::ui::parquet_export::render(grid).map_body(ExportBody::Binary)
+        }
+        format => ExportContent::written(ExportBody::Text(render(format, grid)), grid.rows.len()),
     }
 }
 
@@ -577,15 +687,15 @@ fn render_xml(grid: &ExportGrid) -> String {
 
 /// Make emitted field names unique.
 ///
-/// XML elements and JSON object keys are addressed BY NAME, so two columns that
-/// end up sharing one are one column to every reader — this app's own importer
-/// silently kept the first and dropped the rest. Duplicate result column names
-/// are ordinary (`SELECT a.id, b.id FROM …`), so uniqueness is the writer's job
-/// and belongs in one place both formats go through.
+/// XML elements, JSON object keys and Parquet fields are addressed BY NAME, so
+/// two columns that end up sharing one are one column to every reader — this
+/// app's own importer silently kept the first and dropped the rest. Duplicate
+/// result column names are ordinary (`SELECT a.id, b.id FROM …`), so uniqueness
+/// is the writer's job and belongs in one place every such format goes through.
 ///
 /// The first use of a name keeps it; every later one takes the lowest free
 /// `_<n>` suffix, counting from 2.
-fn unique_field_names(names: Vec<String>) -> Vec<String> {
+pub(crate) fn unique_field_names(names: Vec<String>) -> Vec<String> {
     let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
     names
         .into_iter()
@@ -795,6 +905,7 @@ mod tests {
             ExportFormat::Xml,
             ExportFormat::Html,
             ExportFormat::Markdown,
+            ExportFormat::Parquet,
             ExportFormat::SqlInserts,
         ] {
             assert_eq!(format.file_byte_order_mark(), "", "{}", format.label());
@@ -1141,8 +1252,8 @@ mod tests {
             Some(&selection(Vec::new())),
         );
         assert_eq!(refused.rows(), 0);
-        assert!(refused.text().is_empty());
         assert!(refused.refusal().is_some());
+        assert!(refused.into_parts().is_err());
 
         // A data format writes every row it was given, as it always did.
         for format in [ExportFormat::Csv, ExportFormat::Json, ExportFormat::Xml] {
