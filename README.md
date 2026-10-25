@@ -653,8 +653,8 @@ value the grid did not show.
 | Date and time | `TIMESTAMP` (local, µs or ns) | Every value is `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS[.f]` |
 | Anything else | `STRING` | Always: text, binary, intervals, and values with a time zone |
 
-A number in scientific notation, MySQL's `0000-00-00`, or a date in a custom
-Oracle NLS format keeps its column a `STRING`. A column holding only `NULL`
+A number in scientific notation or MySQL's `0000-00-00` keeps its column a
+`STRING`. A column holding only `NULL`
 proves nothing and is also a `STRING`. Parquet files are written, not imported. Exporting every row completes an
 open lazy fetch first, so the file holds the whole result rather than the rows
 scrolled into view. Exporting a selection never triggers a fetch.
