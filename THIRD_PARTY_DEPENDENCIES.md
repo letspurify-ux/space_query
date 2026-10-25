@@ -7,10 +7,10 @@ are maintained separately in `THIRD_PARTY_NOTICES.md`.
 
 ## Overview
 
-- Apache License 2.0 (174)
-- MIT License (43)
+- Apache License 2.0 (182)
+- MIT License (44)
 - Unicode License v3 (19)
-- BSD 3-Clause "New" or "Revised" License (2)
+- BSD 3-Clause "New" or "Revised" License (3)
 - ISC License (1)
 - Mozilla Public License 2.0 (1)
 - zlib License (1)
@@ -442,6 +442,7 @@ Used by:
 ### Apache License 2.0
 
 Used by:
+- parquet 60.0.0
 - static_assertions 1.1.0
 - utf8_iter 1.0.4
 - zeroize 1.8.2
@@ -1092,6 +1093,7 @@ Used by:
 ### Apache License 2.0
 
 Used by:
+- zerocopy-derive 0.8.42
 - zerocopy 0.8.42
 
 ```
@@ -3412,6 +3414,7 @@ limitations under the License.
 ### Apache License 2.0
 
 Used by:
+- ahash 0.8.12
 - arrayvec 0.7.8
 - autocfg 1.5.0
 - base64 0.21.7
@@ -3443,6 +3446,7 @@ Used by:
 - glob 0.3.3
 - hashbrown 0.15.5
 - hashbrown 0.16.1
+- hashbrown 0.17.1
 - heck 0.5.0
 - idna 1.1.0
 - idna_adapter 1.2.1
@@ -3455,6 +3459,7 @@ Used by:
 - log 0.4.29
 - mysql_common 0.32.4
 - num-bigint 0.4.6
+- num-bigint 0.5.1
 - num-complex 0.4.6
 - num-integer 0.1.46
 - num-iter 0.1.45
@@ -4530,6 +4535,7 @@ APPENDIX: How to apply the Apache License to your work.
 
 Used by:
 - getrandom 0.2.17
+- getrandom 0.3.4
 - getrandom 0.4.2
 - rand_chacha 0.3.1
 
@@ -5782,6 +5788,7 @@ Used by:
 - derive_utils 0.15.1
 - dirs-sys 0.5.0
 - dirs 6.0.0
+- half 2.7.1
 - ident_case 1.0.1
 - io-enum 1.2.1
 - itoa 1.0.17
@@ -5795,6 +5802,7 @@ Used by:
 - rand 0.8.5
 - rustc-hash 2.1.3
 - rustversion 1.0.22
+- seq-macro 0.3.6
 - serde 1.0.228
 - serde_core 1.0.228
 - serde_derive 1.0.228
@@ -6663,6 +6671,42 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
+### BSD 3-Clause "New" or "Revised" License
+
+Used by:
+- snap 1.1.2
+
+```
+Copyright 2011, The Snappy-Rust Authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+    * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+    * Neither the name of the copyright holder nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
 ### ISC License
 
 Used by:
@@ -7312,6 +7356,7 @@ SOFTWARE.
 
 Used by:
 - twox-hash 1.6.3
+- twox-hash 2.1.5
 
 ```
 The MIT License (MIT)
