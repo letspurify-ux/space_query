@@ -305,7 +305,7 @@ pub(crate) fn oracle_thin_result_cell(value: &OracleThinValue) -> Option<String>
             // Six fraction digits, or all nine when one finer than a
             // microsecond is set: a TIMESTAMP(9) cut to six is a value the row
             // does not hold, and every export writes what the cell says.
-            let fraction = if value.nanosecond % 1_000 == 0 {
+            let fraction = if crate::utils::arithmetic::safe_rem(value.nanosecond, 1_000) == 0 {
                 format!("{:06}", value.nanosecond / 1_000)
             } else {
                 format!("{:09}", value.nanosecond)
