@@ -691,7 +691,7 @@ fn parquet_fixture(target: Target) -> (Vec<(&'static str, &'static str)>, String
                 // 30 digits: past 64 bits, inside 38.
                 ("BIG", "decimal(38,0)"),
                 ("FLAG", "bool"),
-                // The app's default NLS formats: `yyyy-mm-dd hh24:mi:ss[.ff6]`.
+                // Both drivers format these fields themselves, NLS aside.
                 ("D", "timestamp[us]"),
                 ("TS", "timestamp[us]"),
                 // A zone is not a wall-clock time: kept as text.

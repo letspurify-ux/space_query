@@ -398,9 +398,10 @@ impl<'a> PlainDecimal<'a> {
 /// A date, or a date and time of day, as the grid shows them:
 /// `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS[.f]` with one to nine fraction digits.
 ///
-/// That is this app's own rendering of MySQL temporal values and of Oracle
-/// dates and timestamps under its default NLS formats. Anything else — a
-/// zone, an interval, MySQL's `0000-00-00`, a format the user chose — does
+/// That is how every driver renders a date or a timestamp: both Oracle
+/// drivers format the fields themselves, so no NLS format reaches the grid,
+/// and the MySQL family's text is ISO. Anything else — a zone, an interval,
+/// MySQL's `0000-00-00`, a year OCI prints with fewer than four digits — does
 /// not parse, and its column stays text.
 #[derive(Clone, Copy, Debug)]
 struct Moment {

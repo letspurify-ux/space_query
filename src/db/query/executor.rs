@@ -302,15 +302,17 @@ pub(crate) fn oracle_thin_result_cell(value: &OracleThinValue) -> Option<String>
             value.year, value.month, value.day, value.hour, value.minute, value.second
         )),
         OracleThinValue::Timestamp(value) => {
+            // Six fraction digits, or all nine when one finer than a
+            // microsecond is set: a TIMESTAMP(9) cut to six is a value the row
+            // does not hold, and every export writes what the cell says.
+            let fraction = if value.nanosecond % 1_000 == 0 {
+                format!("{:06}", value.nanosecond / 1_000)
+            } else {
+                format!("{:09}", value.nanosecond)
+            };
             let mut text = format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
-                value.year,
-                value.month,
-                value.day,
-                value.hour,
-                value.minute,
-                value.second,
-                value.nanosecond / 1_000
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{fraction}",
+                value.year, value.month, value.day, value.hour, value.minute, value.second
             );
             if let Some(suffix) = value.timezone_suffix() {
                 text.push_str(&suffix);

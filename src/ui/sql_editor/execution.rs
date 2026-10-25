@@ -31042,6 +31042,43 @@ mod oracle_thin_value_render_tests {
         );
     }
 
+    /// A TIMESTAMP(9) keeps every digit the server sent. It used to be cut to
+    /// six, so the grid, every export and Parquet's typed timestamp all stated
+    /// a value the row does not hold — and the OCI driver showed all nine.
+    #[test]
+    fn a_timestamp_cell_keeps_digits_finer_than_a_microsecond() {
+        let at = |nanosecond| {
+            OracleValue::Timestamp(tns_thin::OracleDateTime {
+                year: 2024,
+                month: 1,
+                day: 2,
+                hour: 3,
+                minute: 4,
+                second: 5,
+                nanosecond,
+                timezone_offset_minutes: None,
+                timezone_region_id: None,
+            })
+        };
+        assert_eq!(
+            oracle_thin_result_cell(&at(123_456_789)).as_deref(),
+            Some("2024-01-02 03:04:05.123456789")
+        );
+        assert_eq!(
+            oracle_thin_result_cell(&at(1)).as_deref(),
+            Some("2024-01-02 03:04:05.000000001")
+        );
+        // Nothing finer than a microsecond: the six digits it always showed.
+        assert_eq!(
+            oracle_thin_result_cell(&at(123_456_000)).as_deref(),
+            Some("2024-01-02 03:04:05.123456")
+        );
+        assert_eq!(
+            oracle_thin_result_cell(&at(0)).as_deref(),
+            Some("2024-01-02 03:04:05.000000")
+        );
+    }
+
     #[test]
     fn decoded_oracle_indexed_arrays_keep_indexes_and_values() {
         let value = OracleValue::IndexedArray(vec![
