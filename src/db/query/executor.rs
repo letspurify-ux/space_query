@@ -4216,6 +4216,22 @@ impl QueryExecutor {
         Ok((Self::owner_or_current_schema(conn, owner)?, object_name))
     }
 
+    /// The primary-key columns of `owner`.`table_name`. Its own statement, not
+    /// a column of the structure one: see [`ORACLE_PRIMARY_KEY_COLUMNS_SQL`].
+    fn primary_key_columns(
+        conn: &Connection,
+        owner: &str,
+        table_name: &str,
+    ) -> Result<HashSet<String>, OracleError> {
+        Ok(Self::query_single_text_column(
+            conn,
+            ORACLE_PRIMARY_KEY_COLUMNS_SQL,
+            &[&owner, &table_name],
+        )?
+        .into_iter()
+        .collect())
+    }
+
     fn query_single_text_column(
         conn: &Connection,
         sql: &str,
@@ -4269,6 +4285,7 @@ impl QueryExecutor {
             conn,
             owner_raw.map(|value| Self::normalize_object_name(&value)),
         )?;
+        let primary_key_columns = Self::primary_key_columns(conn, &owner, &name)?;
 
         let sql = r#"
             SELECT
@@ -4279,15 +4296,6 @@ impl QueryExecutor {
                 c.data_scale,
                 c.nullable,
                 c.data_default,
-                (SELECT 'PK' FROM all_cons_columns cc
-                 JOIN all_constraints con
-                   ON cc.owner = con.owner
-                  AND cc.constraint_name = con.constraint_name
-                 WHERE con.constraint_type = 'P'
-                   AND cc.owner = c.owner
-                   AND cc.table_name = c.table_name
-                   AND cc.column_name = c.column_name
-                   AND ROWNUM = 1) as is_pk,
                 {generated} as is_generated,
                 {invisible} as is_invisible
             FROM all_tab_columns c
@@ -4373,21 +4381,15 @@ impl QueryExecutor {
                     return Err(err);
                 }
             };
-            let is_primary_key = match row.get::<_, Option<String>>(7) {
-                Ok(value) => value.is_some(),
-                Err(err) => {
-                    logging::log_error("executor", &format!("Database operation failed: {err}"));
-                    return Err(err);
-                }
-            };
-            let is_generated = match row.get::<_, Option<String>>(8) {
+            let is_primary_key = primary_key_columns.contains(&name);
+            let is_generated = match row.get::<_, Option<String>>(7) {
                 Ok(value) => value.as_deref().map(str::trim) == Some("Y"),
                 Err(err) => {
                     logging::log_error("executor", &format!("Database operation failed: {err}"));
                     return Err(err);
                 }
             };
-            let is_invisible = match row.get::<_, Option<String>>(9) {
+            let is_invisible = match row.get::<_, Option<String>>(8) {
                 Ok(value) => value.as_deref().map(str::trim) == Some("Y"),
                 Err(err) => {
                     logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -9518,6 +9520,25 @@ impl ObjectBrowser {
         ))
     }
 
+    /// The thin half of `QueryExecutor::primary_key_columns`: the same
+    /// statement, [`ORACLE_PRIMARY_KEY_COLUMNS_SQL`].
+    fn thin_primary_key_columns(
+        conn: &mut OracleThinSession,
+        owner: &str,
+        table_name: &str,
+    ) -> Result<HashSet<String>, String> {
+        Ok(Self::thin_query_single_text_column(
+            conn,
+            ORACLE_PRIMARY_KEY_COLUMNS_SQL,
+            vec![
+                OracleThinBindValue::Text(owner.to_string()),
+                OracleThinBindValue::Text(table_name.to_string()),
+            ],
+        )?
+        .into_iter()
+        .collect())
+    }
+
     pub fn get_tables(conn: &Connection) -> Result<Vec<String>, OracleError> {
         let sql = "SELECT table_name FROM user_tables ORDER BY table_name";
         Self::get_object_list(conn, sql)
@@ -10173,33 +10194,13 @@ impl ObjectBrowser {
             Err(_) => {}
         }
 
-        let dict_sql = r#"
-            SELECT DISTINCT
-                p.procedure_name,
-                CASE
-                    WHEN EXISTS (
-                        SELECT 1 FROM all_arguments a
-                        WHERE a.owner = p.owner
-                        AND a.package_name = p.object_name
-                        AND a.object_name = p.procedure_name
-                        AND a.position = 0
-                        AND a.data_level = 0
-                        AND (a.overload = p.overload OR (a.overload IS NULL AND p.overload IS NULL))
-                    ) THEN 'FUNCTION'
-                    ELSE 'PROCEDURE'
-                END AS routine_type
-            FROM all_procedures p
-            WHERE p.owner = :1
-              AND p.object_type = 'PACKAGE'
-              AND p.object_name = :2
-              AND p.procedure_name IS NOT NULL
-            ORDER BY p.procedure_name
-        "#;
         let rows = Self::thin_query_text_rows(
             conn,
-            dict_sql,
+            ORACLE_PACKAGE_ROUTINES_FROM_DICTIONARY_SQL,
             2,
             vec![
+                OracleThinBindValue::Text(owner.clone()),
+                OracleThinBindValue::Text(package_name.clone()),
                 OracleThinBindValue::Text(owner),
                 OracleThinBindValue::Text(package_name),
             ],
@@ -10416,36 +10417,17 @@ impl ObjectBrowser {
         owner: &str,
         package_name: &str,
     ) -> Result<Vec<PackageRoutine>, OracleError> {
-        let sql = r#"
-                SELECT DISTINCT
-                    p.procedure_name,
-                    CASE
-                        WHEN EXISTS (
-                            SELECT 1 FROM all_arguments a
-                            WHERE a.owner = p.owner
-                            AND a.package_name = p.object_name
-                            AND a.object_name = p.procedure_name
-                            AND a.position = 0
-                            AND a.data_level = 0
-                            AND (a.overload = p.overload OR (a.overload IS NULL AND p.overload IS NULL))
-                        ) THEN 'FUNCTION'
-                        ELSE 'PROCEDURE'
-                    END AS routine_type
-                FROM all_procedures p
-                WHERE p.owner = :1
-                  AND p.object_type = 'PACKAGE'
-                  AND p.object_name = :2
-                  AND p.procedure_name IS NOT NULL
-                ORDER BY p.procedure_name
-            "#;
-        let mut stmt = match conn.statement(sql).build() {
+        let mut stmt = match conn
+            .statement(ORACLE_PACKAGE_ROUTINES_FROM_DICTIONARY_SQL)
+            .build()
+        {
             Ok(stmt) => stmt,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
                 return Err(err);
             }
         };
-        let rows = stmt.query(&[&owner, &package_name]);
+        let rows = stmt.query(&[&owner, &package_name, &owner, &package_name]);
         let rows = match rows {
             Ok(rows) => rows,
             Err(err) => {
@@ -11713,6 +11695,7 @@ impl ObjectBrowser {
     ) -> Result<Vec<TableColumnDetail>, OracleError> {
         let (owner, table_name) =
             QueryExecutor::split_current_schema_owner_object_name(conn, table_name)?;
+        let primary_key_columns = QueryExecutor::primary_key_columns(conn, &owner, &table_name)?;
         let sql = r#"
             SELECT
                 c.column_name,
@@ -11722,15 +11705,6 @@ impl ObjectBrowser {
                 c.data_scale,
                 c.nullable,
                 c.data_default,
-                (SELECT 'PK' FROM all_cons_columns cc
-                 JOIN all_constraints con
-                   ON cc.owner = con.owner
-                  AND cc.constraint_name = con.constraint_name
-                 WHERE con.owner = c.owner
-                   AND con.constraint_type = 'P'
-                   AND cc.table_name = c.table_name
-                   AND cc.column_name = c.column_name
-                   AND ROWNUM = 1) as is_pk,
                 {generated} as is_generated,
                 {invisible} as is_invisible
             FROM all_tab_columns c
@@ -11816,21 +11790,15 @@ impl ObjectBrowser {
                     return Err(err);
                 }
             };
-            let is_primary_key = match row.get::<_, Option<String>>(7) {
-                Ok(value) => value.is_some(),
-                Err(err) => {
-                    logging::log_error("executor", &format!("Database operation failed: {err}"));
-                    return Err(err);
-                }
-            };
-            let is_generated = match row.get::<_, Option<String>>(8) {
+            let is_primary_key = primary_key_columns.contains(&name);
+            let is_generated = match row.get::<_, Option<String>>(7) {
                 Ok(value) => value.as_deref().map(str::trim) == Some("Y"),
                 Err(err) => {
                     logging::log_error("executor", &format!("Database operation failed: {err}"));
                     return Err(err);
                 }
             };
-            let is_invisible = match row.get::<_, Option<String>>(9) {
+            let is_invisible = match row.get::<_, Option<String>>(8) {
                 Ok(value) => value.as_deref().map(str::trim) == Some("Y"),
                 Err(err) => {
                     logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -11860,6 +11828,7 @@ impl ObjectBrowser {
     ) -> Result<Vec<TableColumnDetail>, String> {
         let (owner, table_name) =
             Self::thin_split_current_schema_owner_object_name(conn, table_name)?;
+        let primary_key_columns = Self::thin_primary_key_columns(conn, &owner, &table_name)?;
         let sql = r#"
             SELECT
                 c.column_name,
@@ -11869,15 +11838,6 @@ impl ObjectBrowser {
                 TO_CHAR(c.data_scale),
                 c.nullable,
                 c.data_default,
-                (SELECT 'PK' FROM all_cons_columns cc
-                 JOIN all_constraints con
-                   ON cc.owner = con.owner
-                  AND cc.constraint_name = con.constraint_name
-                 WHERE con.owner = c.owner
-                   AND con.constraint_type = 'P'
-                   AND cc.table_name = c.table_name
-                   AND cc.column_name = c.column_name
-                   AND ROWNUM = 1) as is_pk,
                 {generated} as is_generated,
                 {invisible} as is_invisible
             FROM all_tab_columns c
@@ -11892,7 +11852,7 @@ impl ObjectBrowser {
         let rows = Self::thin_query_text_rows(
             conn,
             &sql,
-            10,
+            9,
             vec![
                 OracleThinBindValue::Text(owner),
                 OracleThinBindValue::Text(table_name),
@@ -11900,8 +11860,10 @@ impl ObjectBrowser {
         )?;
         let mut columns = Vec::new();
         for row in rows {
+            let name = row.first().cloned().unwrap_or_default();
+            let is_primary_key = primary_key_columns.contains(&name);
             columns.push(TableColumnDetail {
-                name: row.first().cloned().unwrap_or_default(),
+                name,
                 data_type: row.get(1).cloned().unwrap_or_default(),
                 data_length: row
                     .get(2)
@@ -11911,9 +11873,9 @@ impl ObjectBrowser {
                 data_scale: row.get(4).and_then(|value| Self::thin_optional_i32(value)),
                 nullable: row.get(5).map(|value| value == "Y").unwrap_or(false),
                 default_value: row.get(6).and_then(|value| Self::thin_optional_text(value)),
-                is_primary_key: row.get(7).map(|value| !value.is_empty()).unwrap_or(false),
-                is_generated: row.get(8).map(|value| value.trim() == "Y").unwrap_or(false),
-                is_invisible: row.get(9).map(|value| value.trim() == "Y").unwrap_or(false),
+                is_primary_key,
+                is_generated: row.get(7).map(|value| value.trim() == "Y").unwrap_or(false),
+                is_invisible: row.get(8).map(|value| value.trim() == "Y").unwrap_or(false),
             });
         }
 
@@ -12045,27 +12007,7 @@ impl ObjectBrowser {
     ) -> Result<Vec<ConstraintInfo>, OracleError> {
         let (owner, table_name) =
             QueryExecutor::split_current_schema_owner_object_name(conn, table_name)?;
-        let sql = r#"
-            SELECT
-                c.constraint_name,
-                c.constraint_type,
-                LISTAGG(cc.column_name, ', ') WITHIN GROUP (ORDER BY cc.position) as columns,
-                c.r_constraint_name,
-                (SELECT table_name
-                 FROM all_constraints refc
-                 WHERE refc.owner = c.r_owner
-                   AND refc.constraint_name = c.r_constraint_name) as ref_table
-            FROM all_constraints c
-            LEFT JOIN all_cons_columns cc
-              ON c.owner = cc.owner
-             AND c.constraint_name = cc.constraint_name
-            WHERE c.owner = :1
-              AND c.table_name = :2
-            GROUP BY c.constraint_name, c.constraint_type, c.r_constraint_name, c.r_owner
-            ORDER BY c.constraint_type, c.constraint_name
-        "#;
-
-        let mut stmt = match conn.statement(sql).build() {
+        let mut stmt = match conn.statement(ORACLE_TABLE_CONSTRAINTS_SQL).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -12141,29 +12083,9 @@ impl ObjectBrowser {
     ) -> Result<Vec<ConstraintInfo>, String> {
         let (owner, table_name) =
             Self::thin_split_current_schema_owner_object_name(conn, table_name)?;
-        let sql = r#"
-            SELECT
-                c.constraint_name,
-                c.constraint_type,
-                LISTAGG(cc.column_name, ', ') WITHIN GROUP (ORDER BY cc.position) as columns,
-                NVL(c.r_constraint_name, ''),
-                NVL((SELECT table_name
-                 FROM all_constraints refc
-                 WHERE refc.owner = c.r_owner
-                   AND refc.constraint_name = c.r_constraint_name), '') as ref_table
-            FROM all_constraints c
-            LEFT JOIN all_cons_columns cc
-              ON c.owner = cc.owner
-             AND c.constraint_name = cc.constraint_name
-            WHERE c.owner = :1
-              AND c.table_name = :2
-            GROUP BY c.constraint_name, c.constraint_type, c.r_constraint_name, c.r_owner
-            ORDER BY c.constraint_type, c.constraint_name
-        "#;
-
         let rows = Self::thin_query_text_rows(
             conn,
-            sql,
+            ORACLE_TABLE_CONSTRAINTS_SQL,
             5,
             vec![
                 OracleThinBindValue::Text(owner),
@@ -12202,20 +12124,10 @@ impl ObjectBrowser {
             logging::log_error("executor", &format!("Database operation failed: {err}"));
             err
         };
-        let sql = r#"
-            SELECT c.constraint_name, cc.column_name, rc.table_name, rcc.column_name
-            FROM all_constraints c
-            JOIN all_cons_columns cc
-              ON c.owner = cc.owner AND c.constraint_name = cc.constraint_name
-            JOIN all_constraints rc
-              ON c.r_owner = rc.owner AND c.r_constraint_name = rc.constraint_name
-            JOIN all_cons_columns rcc
-              ON rc.owner = rcc.owner AND rc.constraint_name = rcc.constraint_name
-             AND rcc.position = cc.position
-            WHERE c.owner = :1 AND c.table_name = :2 AND c.constraint_type = 'R'
-            ORDER BY c.constraint_name, cc.position
-        "#;
-        let mut stmt = conn.statement(sql).build().map_err(log)?;
+        let mut stmt = conn
+            .statement(ORACLE_TABLE_FOREIGN_KEYS_SQL)
+            .build()
+            .map_err(log)?;
         let rows = stmt.query(&[&owner, &table_name]).map_err(log)?;
 
         let mut grouped: Vec<(String, ForeignKeyInfo)> = Vec::new();
@@ -12242,22 +12154,9 @@ impl ObjectBrowser {
     ) -> Result<Vec<ForeignKeyInfo>, String> {
         let (owner, table_name) =
             Self::thin_split_current_schema_owner_object_name(conn, table_name)?;
-        let sql = r#"
-            SELECT c.constraint_name, cc.column_name, rc.table_name, rcc.column_name
-            FROM all_constraints c
-            JOIN all_cons_columns cc
-              ON c.owner = cc.owner AND c.constraint_name = cc.constraint_name
-            JOIN all_constraints rc
-              ON c.r_owner = rc.owner AND c.r_constraint_name = rc.constraint_name
-            JOIN all_cons_columns rcc
-              ON rc.owner = rcc.owner AND rc.constraint_name = rcc.constraint_name
-             AND rcc.position = cc.position
-            WHERE c.owner = :1 AND c.table_name = :2 AND c.constraint_type = 'R'
-            ORDER BY c.constraint_name, cc.position
-        "#;
         let rows = Self::thin_query_text_rows(
             conn,
-            sql,
+            ORACLE_TABLE_FOREIGN_KEYS_SQL,
             4,
             vec![
                 OracleThinBindValue::Text(owner),
@@ -12674,6 +12573,124 @@ pub(crate) const ORACLE_GENERATED_COLUMN_EXPR: &str = r#"
 pub(crate) const ORACLE_INVISIBLE_COLUMN_EXPR: &str =
     "CASE WHEN c.column_id IS NULL THEN 'Y' ELSE 'N' END";
 
+/// The PRIMARY KEY columns of ONE table, read once per table and never per
+/// column.
+///
+/// The structure statements used to ask it per column, as a scalar subquery
+/// correlated on the column row. Measured on 23ai, Oracle drove that subquery
+/// from the OWNER: for every column it visited every primary key the schema
+/// holds and read every constraint column of each of those tables, so a
+/// structure read cost (columns × the schema's constrained columns). One
+/// 10-column table took 30,000 logical reads in a schema of 119 primary keys
+/// and 677,000 in one of 2,000 — while View Indexes, a different statement,
+/// stayed at about 60. On a real schema that put View Structure, IntelliSense's
+/// alias columns (whose load is given 8 seconds) and quick describe out of
+/// reach. This statement is driven by the table and costs the same in either
+/// schema (~70).
+///
+/// ONE const for the same reason as the two above: the drivers must not
+/// describe the same table differently. Binds in appearance order, since the
+/// thin protocol pairs them by position.
+pub(crate) const ORACLE_PRIMARY_KEY_COLUMNS_SQL: &str = "SELECT cc.column_name \
+     FROM all_constraints con \
+     JOIN all_cons_columns cc \
+       ON cc.owner = con.owner \
+      AND cc.constraint_name = con.constraint_name \
+      AND cc.table_name = con.table_name \
+    WHERE con.owner = :1 \
+      AND con.table_name = :2 \
+      AND con.constraint_type = 'P'";
+
+/// The constraints of ONE table, each with its columns and — for a foreign key
+/// — the table it references.
+///
+/// The referenced table comes from `ALL_CONS_COLUMNS`, never from a second
+/// `ALL_CONSTRAINTS` looked up by the referenced constraint's NAME. Measured on
+/// 23ai, Oracle answered that name lookup by walking the whole dictionary's
+/// constraints — the data-linked `INT$INT$DBA_CONSTRAINTS` — once per foreign
+/// key, so a table with four foreign keys took 16,900 logical reads and CPU
+/// that grew with every constraint in the database. `ALL_CONS_COLUMNS` finds
+/// the same constraint by the same name through an index (a few dozen reads).
+/// A constraint's columns all belong to its one table, so `MIN` only folds the
+/// rows of a multi-column key into the single value a scalar subquery may
+/// return.
+///
+/// ONE const for both drivers, for the reason [`ORACLE_PRIMARY_KEY_COLUMNS_SQL`]
+/// gives.
+pub(crate) const ORACLE_TABLE_CONSTRAINTS_SQL: &str = r#"
+    SELECT
+        c.constraint_name,
+        c.constraint_type,
+        LISTAGG(cc.column_name, ', ') WITHIN GROUP (ORDER BY cc.position) as columns,
+        c.r_constraint_name,
+        (SELECT MIN(rcc.table_name)
+           FROM all_cons_columns rcc
+          WHERE rcc.owner = c.r_owner
+            AND rcc.constraint_name = c.r_constraint_name) as ref_table
+    FROM all_constraints c
+    LEFT JOIN all_cons_columns cc
+      ON c.owner = cc.owner
+     AND c.constraint_name = cc.constraint_name
+    WHERE c.owner = :1
+      AND c.table_name = :2
+    GROUP BY c.constraint_name, c.constraint_type, c.r_constraint_name, c.r_owner
+    ORDER BY c.constraint_type, c.constraint_name
+"#;
+
+/// The foreign keys of ONE table: each local column beside the referenced
+/// table and column at the same position.
+///
+/// The referenced side is read from `ALL_CONS_COLUMNS` alone, for the reason
+/// [`ORACLE_TABLE_CONSTRAINTS_SQL`] gives: a join to `ALL_CONSTRAINTS` on the
+/// referenced constraint's name, whose only contribution was the table name the
+/// referenced columns already carry, made Oracle hash-join against the whole
+/// dictionary's constraints on every IntelliSense foreign-key load (3,500
+/// logical reads on an idle 23ai, CPU growing with the database; ~200 now).
+pub(crate) const ORACLE_TABLE_FOREIGN_KEYS_SQL: &str = r#"
+    SELECT c.constraint_name, cc.column_name, rcc.table_name, rcc.column_name
+    FROM all_constraints c
+    JOIN all_cons_columns cc
+      ON c.owner = cc.owner AND c.constraint_name = cc.constraint_name
+    JOIN all_cons_columns rcc
+      ON rcc.owner = c.r_owner AND rcc.constraint_name = c.r_constraint_name
+     AND rcc.position = cc.position
+    WHERE c.owner = :1 AND c.table_name = :2 AND c.constraint_type = 'R'
+    ORDER BY c.constraint_name, cc.position
+"#;
+
+/// The members of ONE package, PROCEDURE or FUNCTION, read from the dictionary
+/// — the road a WRAPPED package takes, whose source no parser can read.
+///
+/// Whether a member returns a value is asked ONCE for the whole package: the
+/// package's position-0 arguments, joined to its members. It used to be a
+/// correlated `EXISTS` on `ALL_ARGUMENTS` per member, and Oracle answered each
+/// one by walking the whole dictionary's arguments (the data-linked
+/// `INT$DBA_ARGUMENTS`, every SYS package included): 8,600 logical reads for a
+/// three-member package on 23ai, ~10 ms of CPU per member. Binds in appearance
+/// order — owner and package for the arguments, then for the members — since
+/// the thin protocol pairs them by position.
+pub(crate) const ORACLE_PACKAGE_ROUTINES_FROM_DICTIONARY_SQL: &str = r#"
+    SELECT DISTINCT
+        p.procedure_name,
+        CASE WHEN r.object_name IS NULL THEN 'PROCEDURE' ELSE 'FUNCTION' END AS routine_type
+    FROM all_procedures p
+    LEFT JOIN (
+        SELECT DISTINCT a.object_name, a.overload
+        FROM all_arguments a
+        WHERE a.owner = :1
+          AND a.package_name = :2
+          AND a.position = 0
+          AND a.data_level = 0
+    ) r
+      ON r.object_name = p.procedure_name
+     AND (r.overload = p.overload OR (r.overload IS NULL AND p.overload IS NULL))
+    WHERE p.owner = :3
+      AND p.object_type = 'PACKAGE'
+      AND p.object_name = :4
+      AND p.procedure_name IS NOT NULL
+    ORDER BY p.procedure_name
+"#;
+
 /// Detailed column information for table structure
 #[derive(Debug, Clone)]
 pub struct TableColumnDetail {
@@ -12759,6 +12776,271 @@ pub struct ForeignKeyInfo {
     pub ref_columns: Vec<String>,
 }
 
+/// What both drivers' metadata-cost live tests share.
+///
+/// The fact they pin: reading ONE object's metadata costs about what that
+/// object's own rows cost, however much else the database holds. View
+/// Structure, IntelliSense's alias columns and quick describe all read the
+/// table structure, and on a real schema they fell behind while View Indexes,
+/// a different statement, stayed instant; View Constraints, IntelliSense's
+/// foreign keys and a wrapped package's member list had the same shape of
+/// defect against the whole database.
+#[cfg(test)]
+mod oracle_metadata_cost_fixture {
+    use super::{ConstraintInfo, ForeignKeyInfo, PackageRoutine, TableColumnDetail};
+
+    /// `session logical reads` of THIS session so far.
+    pub(super) const SESSION_LOGICAL_READS_SQL: &str = "SELECT m.value \
+         FROM v$mystat m \
+         JOIN v$statname n ON n.statistic# = m.statistic# \
+        WHERE n.name = 'session logical reads'";
+
+    /// Tables added to the schema that have nothing to do with the table being
+    /// read — each with the shape most real tables have, a primary key and a
+    /// few NOT NULL columns.
+    pub(super) const BYSTANDER_TABLES: usize = 200;
+
+    /// The table whose structure is read: ten columns, a two-column primary
+    /// key. A per-column cost multiplies by the column count, so the width
+    /// makes a regression louder rather than the test flakier.
+    pub(super) fn probe_table_ddl(table: &str) -> String {
+        format!(
+            "CREATE TABLE {table} (id NUMBER, tenant NUMBER, a VARCHAR2(20), b NUMBER, \
+             c DATE, d VARCHAR2(100) DEFAULT 'z', e NUMBER, f NUMBER, g VARCHAR2(10), \
+             h NUMBER, CONSTRAINT {table}_PK PRIMARY KEY (id, tenant))"
+        )
+    }
+
+    /// One round trip that creates every bystander table, `{prefix}_1` up.
+    pub(super) fn create_bystanders_block(prefix: &str) -> String {
+        format!(
+            "BEGIN FOR i IN 1..{BYSTANDER_TABLES} LOOP EXECUTE IMMEDIATE \
+             'CREATE TABLE {prefix}_' || i || ' (id NUMBER PRIMARY KEY, \
+             a NUMBER NOT NULL, b NUMBER NOT NULL, c NUMBER NOT NULL)'; END LOOP; END;"
+        )
+    }
+
+    /// One round trip that drops whichever bystander tables exist.
+    pub(super) fn drop_bystanders_block(prefix: &str) -> String {
+        format!(
+            "BEGIN FOR i IN 1..{BYSTANDER_TABLES} LOOP BEGIN EXECUTE IMMEDIATE \
+             'DROP TABLE {prefix}_' || i || ' PURGE'; EXCEPTION WHEN OTHERS THEN \
+             IF SQLCODE != -942 THEN RAISE; END IF; END; END LOOP; END;"
+        )
+    }
+
+    pub(super) fn assert_primary_key_columns(driver: &str, columns: &[TableColumnDetail]) {
+        let names = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["ID", "TENANT", "A", "B", "C", "D", "E", "F", "G", "H"],
+            "{driver}: columns in table order"
+        );
+        for column in columns {
+            assert_eq!(
+                column.is_primary_key,
+                matches!(column.name.as_str(), "ID" | "TENANT"),
+                "{driver}: primary-key flag of {}",
+                column.name
+            );
+        }
+    }
+
+    /// `before` and `after` are the logical reads ONE structure read cost,
+    /// without and with the bystander tables in the schema.
+    ///
+    /// Not an exact count: a dictionary-cache miss after the DDL can add a few
+    /// reads. The cost being pinned is of another order. Asked per column, the
+    /// primary-key lookup visited every PRIMARY KEY the owner holds and read
+    /// every constraint column of each of those tables, so the bystanders
+    /// alone added ~18,000 reads on 23ai, and a schema of thousands of tables
+    /// millions.
+    pub(super) fn assert_cost_independent_of_schema(driver: &str, before: u64, after: u64) {
+        assert!(
+            after.saturating_sub(before) < 1_000,
+            "{driver}: one structure read of a 10-column table cost {before} logical reads, \
+             then {after} once the schema held {BYSTANDER_TABLES} other tables: the read \
+             walks the whole schema"
+        );
+    }
+
+    /// Logical reads one read of ONE object's constraints, foreign keys or
+    /// package members may cost, per read.
+    ///
+    /// Budgets rather than a growth comparison, because what these reads used
+    /// to scan is not the schema but the database's dictionary as a whole —
+    /// on 23ai the CDB's data-linked `ALL_CONSTRAINTS`/`ALL_ARGUMENTS`, which a
+    /// test cannot grow the way it grows a schema. Each budget sits between two
+    /// measurements on the 23ai container, with room on both sides: the old
+    /// statements (constraints 16,900 for this fixture's four foreign keys,
+    /// foreign keys 3,500, package members 8,600 and more), and the WORST plan
+    /// either driver was given for the new ones (2,400 / 820 / 850 — OCI and
+    /// thin bind differently, so each gets its own child cursor, and one OCI
+    /// child joined in a different order at four times the thin child's cost).
+    pub(super) const CONSTRAINTS_READ_BUDGET: u64 = 6_000;
+    pub(super) const FOREIGN_KEYS_READ_BUDGET: u64 = 2_000;
+    pub(super) const PACKAGE_MEMBERS_READ_BUDGET: u64 = 4_000;
+
+    /// One round trip creating four parent tables, a child with one foreign
+    /// key to each (distinct referenced constraints, so no lookup can be
+    /// answered from a cache of the previous one), a PRIMARY KEY, a CHECK and a
+    /// UNIQUE — and a WRAPPED package spec, whose source no parser can read, so
+    /// its member list can only come from the dictionary fallback.
+    pub(super) fn create_constraint_routine_objects_block(prefix: &str) -> String {
+        let mut statements = (1..=4)
+            .map(|index| format!("CREATE TABLE {prefix}_P{index} (id NUMBER PRIMARY KEY)"))
+            .collect::<Vec<_>>();
+        statements.push(format!(
+            "CREATE TABLE {prefix}_C (id NUMBER CONSTRAINT {prefix}_C_PK PRIMARY KEY, \
+             a NUMBER CONSTRAINT {prefix}_C_FK1 REFERENCES {prefix}_P1 (id), \
+             b NUMBER CONSTRAINT {prefix}_C_FK2 REFERENCES {prefix}_P2 (id), \
+             c NUMBER CONSTRAINT {prefix}_C_FK3 REFERENCES {prefix}_P3 (id), \
+             d NUMBER CONSTRAINT {prefix}_C_FK4 REFERENCES {prefix}_P4 (id), \
+             e NUMBER CONSTRAINT {prefix}_C_CK CHECK (e > 0), \
+             f NUMBER CONSTRAINT {prefix}_C_UK UNIQUE)"
+        ));
+        let mut block = statements
+            .iter()
+            .map(|statement| format!("EXECUTE IMMEDIATE '{statement}';"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        block.push_str(&format!(
+            " DBMS_DDL.CREATE_WRAPPED('CREATE OR REPLACE PACKAGE {prefix}_PKG AS \
+             PROCEDURE do_it(a NUMBER); FUNCTION get_it(a NUMBER) RETURN NUMBER; \
+             PROCEDURE over(a NUMBER); FUNCTION over(a VARCHAR2) RETURN NUMBER; END;');"
+        ));
+        format!("BEGIN {block} END;")
+    }
+
+    /// One round trip dropping whichever of those objects exist.
+    pub(super) fn drop_constraint_routine_objects_block(prefix: &str) -> String {
+        let drops = [
+            format!("DROP PACKAGE {prefix}_PKG"),
+            format!("DROP TABLE {prefix}_C PURGE"),
+            format!("DROP TABLE {prefix}_P1 PURGE"),
+            format!("DROP TABLE {prefix}_P2 PURGE"),
+            format!("DROP TABLE {prefix}_P3 PURGE"),
+            format!("DROP TABLE {prefix}_P4 PURGE"),
+        ]
+        .iter()
+        .map(|statement| {
+            format!(
+                "BEGIN EXECUTE IMMEDIATE '{statement}'; EXCEPTION WHEN OTHERS THEN \
+                 IF SQLCODE NOT IN (-942, -4043) THEN RAISE; END IF; END;"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+        format!("BEGIN {drops} END;")
+    }
+
+    pub(super) fn assert_constraints(driver: &str, prefix: &str, constraints: &[ConstraintInfo]) {
+        let actual = constraints
+            .iter()
+            .map(|info| {
+                (
+                    info.name.clone(),
+                    info.constraint_type.clone(),
+                    info.columns.clone(),
+                    info.ref_table.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut expected = vec![(
+            format!("{prefix}_C_CK"),
+            "CHECK".to_string(),
+            "E".to_string(),
+            None,
+        )];
+        expected.push((
+            format!("{prefix}_C_PK"),
+            "PRIMARY KEY".to_string(),
+            "ID".to_string(),
+            None,
+        ));
+        for (index, column) in ["A", "B", "C", "D"].iter().enumerate() {
+            expected.push((
+                format!("{prefix}_C_FK{}", index + 1),
+                "FOREIGN KEY".to_string(),
+                column.to_string(),
+                Some(format!("{prefix}_P{}", index + 1)),
+            ));
+        }
+        expected.push((
+            format!("{prefix}_C_UK"),
+            "UNIQUE".to_string(),
+            "F".to_string(),
+            None,
+        ));
+        assert_eq!(actual, expected, "{driver}: constraints of {prefix}_C");
+    }
+
+    pub(super) fn assert_foreign_keys(driver: &str, prefix: &str, foreign_keys: &[ForeignKeyInfo]) {
+        let expected = ["A", "B", "C", "D"]
+            .iter()
+            .enumerate()
+            .map(|(index, column)| ForeignKeyInfo {
+                columns: vec![column.to_string()],
+                ref_table: format!("{prefix}_P{}", index + 1),
+                ref_columns: vec!["ID".to_string()],
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            foreign_keys, expected,
+            "{driver}: foreign keys of {prefix}_C"
+        );
+    }
+
+    pub(super) fn assert_wrapped_package_routines(driver: &str, routines: &[PackageRoutine]) {
+        let mut actual = routines
+            .iter()
+            .map(|routine| (routine.name.as_str(), routine.routine_type.as_str()))
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            [
+                ("DO_IT", "PROCEDURE"),
+                ("GET_IT", "FUNCTION"),
+                ("OVER", "FUNCTION"),
+                ("OVER", "PROCEDURE"),
+            ],
+            "{driver}: members of the wrapped package"
+        );
+    }
+
+    /// Every read's cost against its budget, reported together so one failing
+    /// read does not hide the others' numbers.
+    pub(super) fn assert_within_budgets(
+        driver: &str,
+        constraints: u64,
+        foreign_keys: u64,
+        package_members: u64,
+    ) {
+        let over = [
+            ("constraints read", constraints, CONSTRAINTS_READ_BUDGET),
+            ("foreign-key read", foreign_keys, FOREIGN_KEYS_READ_BUDGET),
+            (
+                "wrapped package's member read",
+                package_members,
+                PACKAGE_MEMBERS_READ_BUDGET,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, cost, budget)| cost >= budget)
+        .map(|(read, cost, budget)| format!("{read}: {cost} logical reads (budget {budget})"))
+        .collect::<Vec<_>>();
+        assert!(
+            over.is_empty(),
+            "{driver}: a per-object read is scanning the dictionary — {}",
+            over.join("; ")
+        );
+    }
+}
+
 #[cfg(test)]
 mod oracle_thin_object_metadata_live_tests {
     use super::{ObjectBrowser, QueryExecutor};
@@ -12812,6 +13094,114 @@ mod oracle_thin_object_metadata_live_tests {
         session
             .execute(&StatementRequest::statement(sql), 0)
             .expect("execute Oracle Thin metadata setup SQL");
+    }
+
+    /// Logical reads ONE call of `read` costs, after a warm-up call so a hard
+    /// parse is not part of the measurement.
+    fn thin_read_cost(
+        session: &mut OracleThinSession,
+        read: impl Fn(&mut OracleThinSession),
+    ) -> u64 {
+        use super::oracle_metadata_cost_fixture::SESSION_LOGICAL_READS_SQL;
+        let session_logical_reads = |session: &mut OracleThinSession| {
+            ObjectBrowser::thin_query_one_text(session, SESSION_LOGICAL_READS_SQL, Vec::new())
+                .expect("session logical reads")
+                .trim()
+                .parse::<u64>()
+                .expect("session logical reads is a number")
+        };
+        read(session);
+        let before = session_logical_reads(session);
+        read(session);
+        session_logical_reads(session) - before
+    }
+
+    fn thin_structure_read_cost(session: &mut OracleThinSession, table: &str) -> u64 {
+        thin_read_cost(session, |session| {
+            ObjectBrowser::get_thin_table_structure(session, table).expect("structure read");
+        })
+    }
+
+    #[test]
+    #[ignore = "requires a reachable Oracle listener"]
+    fn oracle_thin_constraint_and_routine_reads_stay_per_object() {
+        use super::oracle_metadata_cost_fixture as fixture;
+        let mut session = OracleThinSession::connect(live_config()).expect("connect Oracle Thin");
+        let prefix = format!("OQT_THIN_RC_{}", std::process::id());
+        let child = format!("{prefix}_C");
+        let package = format!("{prefix}_PKG");
+        execute(
+            &mut session,
+            fixture::drop_constraint_routine_objects_block(&prefix),
+        );
+        execute(
+            &mut session,
+            fixture::create_constraint_routine_objects_block(&prefix),
+        );
+
+        // The spec really is unreadable, so the member list below can only
+        // have come from the dictionary fallback.
+        let source = ObjectBrowser::thin_query_single_text_column(
+            &mut session,
+            "SELECT text FROM user_source WHERE name = :1 AND type = 'PACKAGE' ORDER BY line",
+            vec![OracleThinBindValue::Text(package.clone())],
+        )
+        .expect("package source");
+        let spec_routines = ObjectBrowser::parse_package_spec_routines(&source.join(""));
+
+        let constraints = ObjectBrowser::get_thin_table_constraints(&mut session, &child);
+        let foreign_keys = ObjectBrowser::get_thin_table_foreign_keys(&mut session, &child);
+        let routines = ObjectBrowser::get_thin_package_routines(&mut session, &package);
+        let constraints_cost = thin_read_cost(&mut session, |session| {
+            ObjectBrowser::get_thin_table_constraints(session, &child).expect("constraints");
+        });
+        let foreign_keys_cost = thin_read_cost(&mut session, |session| {
+            ObjectBrowser::get_thin_table_foreign_keys(session, &child).expect("foreign keys");
+        });
+        let routines_cost = thin_read_cost(&mut session, |session| {
+            ObjectBrowser::get_thin_package_routines(session, &package).expect("routines");
+        });
+
+        execute(
+            &mut session,
+            fixture::drop_constraint_routine_objects_block(&prefix),
+        );
+        assert!(
+            spec_routines.is_empty(),
+            "the wrapped spec parsed to {spec_routines:?}"
+        );
+        fixture::assert_constraints("thin", &prefix, &constraints.expect("constraints"));
+        fixture::assert_foreign_keys("thin", &prefix, &foreign_keys.expect("foreign keys"));
+        fixture::assert_wrapped_package_routines("thin", &routines.expect("routines"));
+        fixture::assert_within_budgets("thin", constraints_cost, foreign_keys_cost, routines_cost);
+    }
+
+    #[test]
+    #[ignore = "requires a reachable Oracle listener"]
+    fn oracle_thin_table_structure_cost_does_not_grow_with_the_schema() {
+        use super::oracle_metadata_cost_fixture as fixture;
+        let mut session = OracleThinSession::connect(live_config()).expect("connect Oracle Thin");
+        let suffix = std::process::id();
+        let table = format!("OQT_THIN_COST_{suffix}");
+        let bystanders = format!("OQT_THIN_COST_BY_{suffix}");
+        let drop_tables = |session: &mut OracleThinSession| {
+            let _ = session.execute(
+                &StatementRequest::statement(format!("DROP TABLE {table} PURGE")),
+                0,
+            );
+            execute(session, fixture::drop_bystanders_block(&bystanders));
+        };
+        drop_tables(&mut session);
+
+        execute(&mut session, fixture::probe_table_ddl(&table));
+        let before = thin_structure_read_cost(&mut session, &table);
+        execute(&mut session, fixture::create_bystanders_block(&bystanders));
+        let after = thin_structure_read_cost(&mut session, &table);
+        let columns = ObjectBrowser::get_thin_table_structure(&mut session, &table);
+
+        drop_tables(&mut session);
+        fixture::assert_primary_key_columns("thin", &columns.expect("table structure"));
+        fixture::assert_cost_independent_of_schema("thin", before, after);
     }
 
     #[test]
@@ -13290,6 +13680,119 @@ mod oracle_lazy_fetch_integration_tests {
         DatabaseConnection::test_connection(&info).expect("Oracle client should initialize");
         Connection::connect(&username, &password, info.connection_string())
             .expect("Oracle connection should succeed")
+    }
+
+    /// Logical reads ONE call of `read` costs, after a warm-up call so a hard
+    /// parse is not part of the measurement.
+    fn oci_read_cost(conn: &Connection, read: impl Fn()) -> u64 {
+        use super::oracle_metadata_cost_fixture::SESSION_LOGICAL_READS_SQL;
+        let session_logical_reads = || {
+            conn.query_row_as::<u64>(SESSION_LOGICAL_READS_SQL, &[])
+                .expect("session logical reads")
+        };
+        read();
+        let before = session_logical_reads();
+        read();
+        session_logical_reads() - before
+    }
+
+    /// The OCI half of `oracle_thin_constraint_and_routine_reads_stay_per_object`.
+    #[test]
+    #[ignore = "requires local Oracle reachable via ORACLE_TEST_* env vars"]
+    fn oracle_oci_constraint_and_routine_reads_stay_per_object() {
+        use super::oracle_metadata_cost_fixture as fixture;
+        use super::ObjectBrowser;
+        let conn = oracle_test_connection();
+        let prefix = format!("OQT_OCI_RC_{}", std::process::id());
+        let child = format!("{prefix}_C");
+        let package = format!("{prefix}_PKG");
+        conn.execute(
+            &fixture::drop_constraint_routine_objects_block(&prefix),
+            &[],
+        )
+        .expect("drop leftovers");
+        conn.execute(
+            &fixture::create_constraint_routine_objects_block(&prefix),
+            &[],
+        )
+        .expect("create objects");
+
+        let constraints = ObjectBrowser::get_table_constraints(&conn, &child);
+        let foreign_keys = ObjectBrowser::get_table_foreign_keys(&conn, &child);
+        let routines = ObjectBrowser::get_package_routines(&conn, &package);
+        let constraints_cost = oci_read_cost(&conn, || {
+            ObjectBrowser::get_table_constraints(&conn, &child).expect("constraints");
+        });
+        let foreign_keys_cost = oci_read_cost(&conn, || {
+            ObjectBrowser::get_table_foreign_keys(&conn, &child).expect("foreign keys");
+        });
+        let routines_cost = oci_read_cost(&conn, || {
+            ObjectBrowser::get_package_routines(&conn, &package).expect("routines");
+        });
+
+        conn.execute(
+            &fixture::drop_constraint_routine_objects_block(&prefix),
+            &[],
+        )
+        .expect("drop objects");
+        fixture::assert_constraints("OCI", &prefix, &constraints.expect("constraints"));
+        fixture::assert_foreign_keys("OCI", &prefix, &foreign_keys.expect("foreign keys"));
+        fixture::assert_wrapped_package_routines("OCI", &routines.expect("routines"));
+        fixture::assert_within_budgets("OCI", constraints_cost, foreign_keys_cost, routines_cost);
+    }
+
+    /// The OCI half of `oracle_thin_table_structure_cost_does_not_grow_with_the_schema`,
+    /// for both OCI statements that describe a table: the object tree's (also
+    /// IntelliSense's and quick describe's) and `DESCRIBE`'s.
+    #[test]
+    #[ignore = "requires local Oracle reachable via ORACLE_TEST_* env vars"]
+    fn oracle_oci_table_structure_cost_does_not_grow_with_the_schema() {
+        use super::oracle_metadata_cost_fixture as fixture;
+        use super::ObjectBrowser;
+        let conn = oracle_test_connection();
+        let suffix = std::process::id();
+        let table = format!("OQT_OCI_COST_{suffix}");
+        let bystanders = format!("OQT_OCI_COST_BY_{suffix}");
+        let drop_tables = || {
+            let _ = conn.execute(&format!("DROP TABLE {table} PURGE"), &[]);
+            conn.execute(&fixture::drop_bystanders_block(&bystanders), &[])
+                .expect("drop bystander tables");
+        };
+        let structure = || ObjectBrowser::get_table_structure(&conn, &table);
+        let describe = || QueryExecutor::describe_object(&conn, &table);
+        drop_tables();
+
+        conn.execute(&fixture::probe_table_ddl(&table), &[])
+            .expect("create probe table");
+        let structure_before = oci_read_cost(&conn, || {
+            assert_eq!(structure().expect("structure").len(), 10);
+        });
+        let describe_before = oci_read_cost(&conn, || {
+            assert_eq!(describe().expect("describe").len(), 10);
+        });
+        conn.execute(&fixture::create_bystanders_block(&bystanders), &[])
+            .expect("create bystander tables");
+        let structure_after = oci_read_cost(&conn, || {
+            assert_eq!(structure().expect("structure").len(), 10);
+        });
+        let describe_after = oci_read_cost(&conn, || {
+            assert_eq!(describe().expect("describe").len(), 10);
+        });
+        let structure_columns = structure();
+        let describe_columns = describe();
+
+        drop_tables();
+        fixture::assert_primary_key_columns(
+            "OCI structure",
+            &structure_columns.expect("structure"),
+        );
+        fixture::assert_primary_key_columns("OCI DESCRIBE", &describe_columns.expect("describe"));
+        fixture::assert_cost_independent_of_schema(
+            "OCI structure",
+            structure_before,
+            structure_after,
+        );
+        fixture::assert_cost_independent_of_schema("OCI DESCRIBE", describe_before, describe_after);
     }
 
     /// What Oracle says about the placeholders inside an `EXPLAIN PLAN … FOR`.
@@ -13967,20 +14470,7 @@ mod routine_definition_tests {
         for package_member in [true, false] {
             for columns in super::RoutineDictionaryColumns::TIERS {
                 let sql = ObjectBrowser::routine_dictionary_sql(package_member, columns);
-                let mut seen: Vec<usize> = Vec::new();
-                let bytes = sql.as_bytes();
-                for (index, byte) in bytes.iter().enumerate() {
-                    if *byte != b':' {
-                        continue;
-                    }
-                    let digits: String = sql[index + 1..]
-                        .chars()
-                        .take_while(char::is_ascii_digit)
-                        .collect();
-                    if let Ok(number) = digits.parse::<usize>() {
-                        seen.push(number);
-                    }
-                }
+                let seen = placeholder_numbers_in_appearance_order(&sql);
                 let expected: Vec<usize> = (1..=seen.len()).collect();
                 assert_eq!(
                     seen, expected,
@@ -13988,6 +14478,59 @@ mod routine_definition_tests {
                      1, 2, 3 ... in order"
                 );
             }
+        }
+    }
+
+    /// The numbers of a statement's `:N` placeholders, in the order they appear.
+    fn placeholder_numbers_in_appearance_order(sql: &str) -> Vec<usize> {
+        let mut seen: Vec<usize> = Vec::new();
+        for (index, byte) in sql.as_bytes().iter().enumerate() {
+            if *byte != b':' {
+                continue;
+            }
+            let digits: String = sql[index + 1..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if let Ok(number) = digits.parse::<usize>() {
+                seen.push(number);
+            }
+        }
+        seen
+    }
+
+    /// The per-object metadata statements both drivers share number their
+    /// binds in appearance order — the thin protocol pairs binds by position —
+    /// and take exactly as many as their callers supply.
+    #[test]
+    fn shared_object_metadata_sql_numbers_its_binds_in_appearance_order() {
+        for (name, sql, bound) in [
+            (
+                "ORACLE_PRIMARY_KEY_COLUMNS_SQL",
+                super::ORACLE_PRIMARY_KEY_COLUMNS_SQL,
+                2,
+            ),
+            (
+                "ORACLE_TABLE_CONSTRAINTS_SQL",
+                super::ORACLE_TABLE_CONSTRAINTS_SQL,
+                2,
+            ),
+            (
+                "ORACLE_TABLE_FOREIGN_KEYS_SQL",
+                super::ORACLE_TABLE_FOREIGN_KEYS_SQL,
+                2,
+            ),
+            (
+                "ORACLE_PACKAGE_ROUTINES_FROM_DICTIONARY_SQL",
+                super::ORACLE_PACKAGE_ROUTINES_FROM_DICTIONARY_SQL,
+                4,
+            ),
+        ] {
+            assert_eq!(
+                placeholder_numbers_in_appearance_order(sql),
+                (1..=bound).collect::<Vec<usize>>(),
+                "{name}: placeholders must read 1, 2, 3 ... in order, one per supplied bind"
+            );
         }
     }
 

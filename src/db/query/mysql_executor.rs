@@ -1673,6 +1673,35 @@ pub struct MysqlTableColumnDetail {
     pub extra: String,
 }
 
+/// The constraints of ONE table, each with its columns and the table a foreign
+/// key references.
+///
+/// Every `INFORMATION_SCHEMA` table here is restricted by its OWN constant
+/// schema and table name. MariaDB fills these tables by opening the tables they
+/// describe and can narrow that only from such constants; joined on another
+/// `INFORMATION_SCHEMA` table's columns (or given a constant in a LEFT JOIN's
+/// `ON`), it opens every table on the server — EXPLAIN said `Open_full_table;
+/// Scanned all databases` for `KEY_COLUMN_USAGE` and `REFERENTIAL_CONSTRAINTS`
+/// on every View Constraints. The key columns are therefore aggregated in a
+/// derived table of their own (its `GROUP BY` keeps it from being merged back
+/// into the join), and a foreign key's referenced table is read from
+/// `KEY_COLUMN_USAGE.REFERENCED_TABLE_NAME`, which both servers fill, instead
+/// of a third table. Placeholders, in order: schema and table for the key
+/// columns, then for the constraints — see `table_constraints_params`.
+const MYSQL_TABLE_CONSTRAINTS_SQL: &str = "SELECT tc.CONSTRAINT_NAME, tc.CONSTRAINT_TYPE, \
+     kcu.COLUMNS, kcu.REFERENCED_TABLE_NAME \
+     FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
+     LEFT JOIN ( \
+         SELECT CONSTRAINT_NAME, \
+                GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION SEPARATOR ', ') AS COLUMNS, \
+                MAX(REFERENCED_TABLE_NAME) AS REFERENCED_TABLE_NAME \
+         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+         GROUP BY CONSTRAINT_NAME \
+     ) kcu ON kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
+     WHERE tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ? \
+     ORDER BY tc.CONSTRAINT_TYPE, tc.CONSTRAINT_NAME";
+
 impl MysqlObjectBrowser {
     fn create_ddl_column_names(object_type: &str) -> &'static [&'static str] {
         match object_type {
@@ -2858,6 +2887,17 @@ impl MysqlObjectBrowser {
         Self::get_table_constraints_in_schema(conn, None, table_name)
     }
 
+    /// The parameters of [`MYSQL_TABLE_CONSTRAINTS_SQL`], in the order its
+    /// placeholders appear.
+    fn table_constraints_params(schema_name: Option<String>, table_name: &str) -> Vec<MysqlValue> {
+        vec![
+            schema_name.clone().into(),
+            table_name.into(),
+            schema_name.into(),
+            table_name.into(),
+        ]
+    }
+
     pub fn get_table_constraints_in_schema(
         conn: &mut Conn,
         schema_name: Option<&str>,
@@ -2865,22 +2905,8 @@ impl MysqlObjectBrowser {
     ) -> Result<Vec<ConstraintInfo>, MysqlError> {
         let schema_name = Self::effective_schema_param(conn, schema_name);
         let rows: Vec<(String, String, Option<String>, Option<String>)> = conn.exec(
-            "SELECT tc.CONSTRAINT_NAME, tc.CONSTRAINT_TYPE, \
-             GROUP_CONCAT(kcu.COLUMN_NAME ORDER BY kcu.ORDINAL_POSITION SEPARATOR ', ') AS columns, \
-             rc.REFERENCED_TABLE_NAME \
-             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
-             LEFT JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
-               ON tc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA \
-              AND tc.TABLE_NAME = kcu.TABLE_NAME \
-              AND tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME \
-             LEFT JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc \
-               ON tc.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA \
-              AND tc.TABLE_NAME = rc.TABLE_NAME \
-              AND tc.CONSTRAINT_NAME = rc.CONSTRAINT_NAME \
-             WHERE tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ? \
-             GROUP BY tc.CONSTRAINT_NAME, tc.CONSTRAINT_TYPE, rc.REFERENCED_TABLE_NAME \
-             ORDER BY tc.CONSTRAINT_TYPE, tc.CONSTRAINT_NAME",
-            (schema_name, table_name),
+            MYSQL_TABLE_CONSTRAINTS_SQL,
+            Self::table_constraints_params(schema_name, table_name),
         )?;
 
         Ok(rows
@@ -3451,12 +3477,13 @@ mod tests {
     }
     use super::{
         MysqlExecutor, MysqlObjectBrowser, MysqlResultSetSnapshot, MysqlSessionTimeoutRestore,
+        MYSQL_TABLE_CONSTRAINTS_SQL,
     };
     use crate::db::connection::{ConnectionInfo, DatabaseType};
     use crate::db::query::types::ColumnInfo;
     use crate::db::DatabaseConnection;
     use mysql::prelude::Queryable;
-    use mysql::{Error as MysqlError, MySqlError, Value as MysqlValue};
+    use mysql::{Conn, Error as MysqlError, MySqlError, Row, Value as MysqlValue};
     use std::env;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -4441,6 +4468,119 @@ mod tests {
                 .expect("max_statement_time should be present");
             assert!((value - 2.5).abs() < f64::EPSILON);
         }
+    }
+
+    /// View Constraints reads ONE table's catalog rows, and nothing else on the
+    /// server.
+    ///
+    /// On MariaDB an `INFORMATION_SCHEMA` table is filled by opening the tables
+    /// it describes, and it can only restrict which ones from a CONSTANT schema
+    /// and table name in its own condition — a join condition on another
+    /// `INFORMATION_SCHEMA` table's columns is not one, and neither is a
+    /// constant in a LEFT JOIN's `ON`. The statement used to join
+    /// `KEY_COLUMN_USAGE` and `REFERENTIAL_CONSTRAINTS` on `TABLE_CONSTRAINTS`,
+    /// and EXPLAIN said what that costs: `Open_full_table; Scanned all
+    /// databases` for both, on every View Constraints. On MySQL 8 the same
+    /// tables are views over the data dictionary and EXPLAIN reports no scan
+    /// either way, so there this pins the constraint list alone.
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_family_table_constraints_read_only_the_table_they_describe() {
+        let Some(mut connection) = mysql_timeout_restore_test_connection() else {
+            return;
+        };
+        let conn = connection
+            .get_mysql_connection_mut()
+            .expect("MySQL test connection should be live");
+        let suffix = std::process::id();
+        let parent = format!("sq_cons_parent_{suffix}");
+        let child = format!("sq_cons_child_{suffix}");
+        let drop_tables = |conn: &mut Conn| {
+            conn.query_drop(format!("DROP TABLE IF EXISTS {child}, {parent}"))
+                .expect("drop constraint fixture");
+        };
+        drop_tables(conn);
+        conn.query_drop(format!(
+            "CREATE TABLE {parent} (id INT PRIMARY KEY, k INT, UNIQUE KEY {parent}_k (k)) \
+             ENGINE=InnoDB"
+        ))
+        .expect("create parent");
+        conn.query_drop(format!(
+            "CREATE TABLE {child} (id INT, tenant INT, p INT, u INT, \
+             PRIMARY KEY (id, tenant), \
+             CONSTRAINT {child}_fk FOREIGN KEY (p) REFERENCES {parent} (id), \
+             CONSTRAINT {child}_uk UNIQUE (u, tenant), \
+             CONSTRAINT {child}_ck CHECK (u > 0)) ENGINE=InnoDB"
+        ))
+        .expect("create child");
+
+        let schema: Option<String> = conn
+            .query_first("SELECT DATABASE()")
+            .expect("current database");
+        let plan: Vec<Row> = conn
+            .exec(
+                format!("EXPLAIN {MYSQL_TABLE_CONSTRAINTS_SQL}"),
+                MysqlObjectBrowser::table_constraints_params(schema, &child),
+            )
+            .expect("EXPLAIN the constraints statement");
+        let scans = plan
+            .iter()
+            .map(|row| {
+                let table: Option<String> = row.get("table");
+                let extra: Option<String> = row.get("Extra");
+                (table.unwrap_or_default(), extra.unwrap_or_default())
+            })
+            .collect::<Vec<_>>();
+        let constraints = MysqlObjectBrowser::get_table_constraints_in_schema(conn, None, &child);
+
+        drop_tables(conn);
+        let actual = constraints
+            .expect("constraints")
+            .into_iter()
+            .map(|info| {
+                (
+                    info.name,
+                    info.constraint_type,
+                    info.columns,
+                    info.ref_table,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    format!("{child}_ck"),
+                    "CHECK".to_string(),
+                    String::new(),
+                    None
+                ),
+                (
+                    format!("{child}_fk"),
+                    "FOREIGN KEY".to_string(),
+                    "p".to_string(),
+                    Some(parent.clone()),
+                ),
+                (
+                    "PRIMARY".to_string(),
+                    "PRIMARY KEY".to_string(),
+                    "id, tenant".to_string(),
+                    None,
+                ),
+                (
+                    format!("{child}_uk"),
+                    "UNIQUE".to_string(),
+                    "u, tenant".to_string(),
+                    None,
+                ),
+            ]
+        );
+        assert!(
+            !scans
+                .iter()
+                .any(|(_, extra)| extra.contains("Scanned all databases")),
+            "View Constraints opens every table on the server: {scans:?}"
+        );
     }
 
     #[test]
