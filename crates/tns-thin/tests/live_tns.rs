@@ -4805,6 +4805,39 @@ fn plsql_clob_out_bind_returns_large_text() {
     assert!(value.ends_with('y'));
 }
 
+/// An OUT CLOB the caller sized past 32,767 bytes cannot ride the data
+/// interface — no VARCHAR2 bind is that long, and the server answers a longer
+/// value with ORA-06502 — so it comes back through a locator, whole.
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn plsql_clob_out_bind_sized_past_a_varchar2_returns_the_whole_text() {
+    let mut conn = connect();
+    let before = current_temp_lob_count(&mut conn);
+    let mut request = StatementRequest::statement(
+        "DECLARE doc CLOB; BEGIN \
+         FOR i IN 1..10 LOOP doc := doc || TO_CLOB(RPAD('x', 4000, 'x')); END LOOP; \
+         :1 := doc || TO_CLOB('tail'); \
+         END;",
+    );
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Clob,
+        max_len: u32::MAX,
+    });
+
+    let values = conn
+        .execute_out_binds(&request, &[])
+        .expect("PL/SQL CLOB OUT bind longer than a VARCHAR2");
+    let value = value_to_string(values.first().expect("CLOB OUT value"));
+
+    assert_eq!(value.len(), 40_004);
+    assert!(value.starts_with('x') && value.ends_with("tail"));
+    assert_eq!(
+        current_temp_lob_count(&mut conn),
+        before,
+        "the locator's temporary LOBs must be freed with the call"
+    );
+}
+
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_nclob_out_bind_returns_korean_text() {

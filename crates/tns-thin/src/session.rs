@@ -3470,6 +3470,32 @@ impl OracleThinSession {
                         value: Some(BindInputValue::LobLocator(locator)),
                     };
                 }
+                // An OUT CLOB sized past what the data interface carries. A
+                // short one is bound as a VARCHAR2 and comes back inline, but
+                // no VARCHAR2 bind is longer than 32,767 bytes, and a longer
+                // value is ORA-06502 for the whole call. It goes through a
+                // locator instead, on the road a large IN OUT CLOB already
+                // takes: an empty temporary LOB in, the routine's CLOB out.
+                BindValue::Out {
+                    column_type: OracleColumnType::Clob,
+                    max_len,
+                } if *max_len as usize > TNS_MAX_SHORT_LOB_INOUT_SIZE => {
+                    let locator = match self.create_temp_clob("") {
+                        Ok(locator) => locator,
+                        Err(error) => {
+                            let _ = self.free_temp_lobs(&temp_lob_locators);
+                            return Err(error);
+                        }
+                    };
+                    temp_lob_locators.push(locator.clone());
+                    *bind = BindValue::InOut {
+                        column_type: OracleColumnType::Clob,
+                        // The bind now carries a locator, so its buffer is
+                        // the locator's, as for `BindValue::LobLocator`.
+                        max_len: locator.len() as u32,
+                        value: Some(BindInputValue::LobLocator(locator)),
+                    };
+                }
                 _ => {}
             }
         }
@@ -5676,6 +5702,10 @@ fn bind_needs_lob_materialization(bind: &BindValue) -> bool {
             value: Some(BindInputValue::Text(text)),
             ..
         } => text.len() > 4000,
+        BindValue::Out {
+            column_type: OracleColumnType::Clob,
+            max_len,
+        } => *max_len as usize > TNS_MAX_SHORT_LOB_INOUT_SIZE,
         _ => false,
     }
 }

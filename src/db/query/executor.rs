@@ -1,8 +1,9 @@
-use oracle::sql_type::{OracleType, RefCursor, ToSql};
+use oracle::sql_type::{Clob, OracleType, RefCursor, ToSql};
 use oracle::{Connection, Error as OracleError, Row, Statement};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::time::{Duration, Instant};
 use tns_thin::exec::{
     BindValue as OracleThinBindValue, ColumnMetadata as OracleThinColumnMetadata,
@@ -44,11 +45,15 @@ const MAX_NESTED_CURSOR_DEPTH: usize = 8;
 /// and a `;` appended, from a setting it never made.
 ///
 /// `DBMS_METADATA.OPEN` + `ADD_TRANSFORM` return handles, and params set on a
-/// transform handle die with it, so nothing is left on the session. The
-/// `WITH FUNCTION` wrapper keeps the statement the same shape the drivers
-/// already speak — three text binds in (type, name, owner), one text column out
-/// — so both the OCI and the thin path are unchanged, and a missing object
-/// still raises the ORA-31603 both of them already key on.
+/// transform handle die with it, so nothing is left on the session.
+///
+/// It is an anonymous block, and the DDL comes back through an OUT bind: three
+/// text binds in (type, name, owner) and one CLOB out, in appearance order.
+/// It used to be a query — the same body as an inline `WITH FUNCTION`, selected
+/// from DUAL — which kept the drivers' fetch path unchanged, but `WITH
+/// FUNCTION` is 12.1 syntax and this app reaches 11.2: there every Generate
+/// DDL, and quick describe of anything described by its DDL, was ORA-00905. A
+/// block is PL/SQL every release parses, so one statement serves all of them.
 ///
 /// The physical-clause params are set one at a time and tolerate ORA-31600,
 /// because they only exist for object types that HAVE segments: a VIEW or a
@@ -56,8 +61,7 @@ const MAX_NESTED_CURSOR_DEPTH: usize = 8;
 /// `SESSION_TRANSFORM` hid that — Oracle silently ignores a session param an
 /// object type does not understand — so moving the params onto a handle made it
 /// visible, and the first VIEW after the move stopped producing DDL at all.
-const ORACLE_OBJECT_DDL_SQL: &str = "WITH FUNCTION scoped_object_ddl( \
-p_object_type IN VARCHAR2, p_object_name IN VARCHAR2, p_owner IN VARCHAR2) RETURN CLOB IS \
+const ORACLE_OBJECT_DDL_BLOCK: &str = "DECLARE \
 metadata_handle NUMBER; \
 transform_handle NUMBER; \
 generated CLOB; \
@@ -67,9 +71,9 @@ DBMS_METADATA.SET_TRANSFORM_PARAM(transform_handle, p_name, FALSE); \
 EXCEPTION WHEN OTHERS THEN IF SQLCODE != -31600 THEN RAISE; END IF; \
 END; \
 BEGIN \
-metadata_handle := DBMS_METADATA.OPEN(p_object_type); \
-DBMS_METADATA.SET_FILTER(metadata_handle, 'NAME', p_object_name); \
-DBMS_METADATA.SET_FILTER(metadata_handle, 'SCHEMA', p_owner); \
+metadata_handle := DBMS_METADATA.OPEN(:1); \
+DBMS_METADATA.SET_FILTER(metadata_handle, 'NAME', :2); \
+DBMS_METADATA.SET_FILTER(metadata_handle, 'SCHEMA', :3); \
 transform_handle := DBMS_METADATA.ADD_TRANSFORM(metadata_handle, 'DDL'); \
 drop_physical_clause('SEGMENT_ATTRIBUTES'); \
 drop_physical_clause('STORAGE'); \
@@ -77,9 +81,17 @@ drop_physical_clause('TABLESPACE'); \
 DBMS_METADATA.SET_TRANSFORM_PARAM(transform_handle, 'SQLTERMINATOR', TRUE); \
 generated := DBMS_METADATA.FETCH_CLOB(metadata_handle); \
 DBMS_METADATA.CLOSE(metadata_handle); \
-RETURN generated; \
-END; \
-SELECT scoped_object_ddl(:1, :2, :3) FROM DUAL";
+:4 := generated; \
+END;";
+
+/// How long the thin driver is told [`ORACLE_OBJECT_DDL_BLOCK`]'s OUT CLOB may
+/// be: no limit.
+///
+/// The size is what decides HOW the CLOB comes back. Sized within 32,767 bytes
+/// the driver binds it as a VARCHAR2, and a DDL longer than that — a package
+/// body easily is — is ORA-06502 for the whole block. Sized past it, the driver
+/// takes a locator and reads the text through it, whatever its length.
+const ORACLE_THIN_UNBOUNDED_OUT_CLOB: u32 = u32::MAX;
 
 /// Reads back the plan `EXPLAIN PLAN FOR` just wrote, named by the
 /// `STATEMENT_ID` that write stamped on it (bind `:1`).
@@ -9435,25 +9447,6 @@ impl ObjectBrowser {
             .ok_or_else(|| "Oracle Thin metadata query returned no rows".to_string())
     }
 
-    fn thin_query_one_typed_text(
-        conn: &mut OracleThinSession,
-        sql: &str,
-        column_type: OracleThinColumnType,
-        binds: Vec<OracleThinBindValue>,
-    ) -> Result<String, String> {
-        let mut request = OracleThinStatementRequest::query(sql, 0);
-        request.implicit_resultsets = false;
-        request.binds = binds;
-        conn.execute_typed_fetch_all(&request, &[column_type])
-            .map_err(|err| err.to_string())?
-            .rows
-            .into_iter()
-            .next()
-            .and_then(|row| row.into_iter().next())
-            .map(Self::thin_catalog_value_to_text)
-            .ok_or_else(|| "Oracle Thin metadata query returned no rows".to_string())
-    }
-
     fn thin_grouped_object_list(
         conn: &mut OracleThinSession,
         sql: &str,
@@ -12284,10 +12277,10 @@ impl ObjectBrowser {
     ) -> Result<String, OracleError> {
         let (owner, object_name) =
             QueryExecutor::split_current_schema_owner_object_name(conn, object_name)?;
-        // No session-level transform to set: `ORACLE_OBJECT_DDL_SQL` scopes the
-        // params to the metadata handle, so this session goes back to the pool
-        // exactly as it arrived.
-        let mut stmt = match conn.statement(ORACLE_OBJECT_DDL_SQL).build() {
+        // No session-level transform to set: `ORACLE_OBJECT_DDL_BLOCK` scopes
+        // the params to the metadata handle, so this session goes back to the
+        // pool exactly as it arrived.
+        let mut stmt = match conn.statement(ORACLE_OBJECT_DDL_BLOCK).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -12295,22 +12288,44 @@ impl ObjectBrowser {
             }
         };
         let object_type = Self::metadata_object_type(object_type);
-        let row = stmt.query_row(&[&object_type, &object_name, &owner]);
-        let row = match row {
-            Ok(row) => row,
+        let ddl = stmt
+            .execute(&[&object_type, &object_name, &owner, &OracleType::CLOB])
+            .and_then(|()| Self::out_clob_text(&stmt, 4));
+        match ddl {
+            Ok(ddl) => Ok(Self::normalize_generated_ddl(ddl)),
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
+                Err(err)
             }
-        };
-        let ddl: String = match row.get(0) {
-            Ok(ddl) => ddl,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
+        }
+    }
+
+    /// The whole text of the CLOB an executed block left in OUT bind
+    /// `position`.
+    ///
+    /// Read through the locator in ONE call, not through the driver's own
+    /// conversion to a `String`. That conversion reads 8,192 characters at a
+    /// time, and a CLOB counts UTF-16 code units: a character outside the BMP
+    /// lying across one of those boundaries is ORA-22831 for the whole read
+    /// (measured on 11.2 and 23ai, for a DDL carrying such characters).
+    fn out_clob_text(stmt: &Statement, position: usize) -> Result<String, OracleError> {
+        let mut clob: Clob = stmt.bind_value(position)?;
+        let mut bytes = Vec::new();
+        clob.read_to_end(&mut bytes).map_err(|err| {
+            // The driver hands its own error to `Read` wrapped; unwrapped, a
+            // cancel or a lost connection is still recognisable as one.
+            let message = err.to_string();
+            match err
+                .into_inner()
+                .map(|inner| inner.downcast::<OracleError>())
+            {
+                Some(Ok(driver_error)) => *driver_error,
+                #[allow(deprecated)]
+                _ => OracleError::InternalError(message),
             }
-        };
-        Ok(Self::normalize_generated_ddl(ddl))
+        })?;
+        #[allow(deprecated)]
+        String::from_utf8(bytes).map_err(|err| OracleError::InternalError(err.to_string()))
     }
 
     fn metadata_object_type(object_type: &str) -> String {
@@ -12339,23 +12354,30 @@ impl ObjectBrowser {
         let (owner, object_name) =
             Self::thin_split_current_schema_owner_object_name(conn, object_name)?;
         // The thin twin of the OCI path: the transform params ride on the
-        // metadata handle inside `ORACLE_OBJECT_DDL_SQL`, so nothing is left on
-        // this pooled session for the next tab to inherit.
-        let object_type = Self::metadata_object_type(object_type);
-        let binds = || {
-            vec![
-                OracleThinBindValue::Text(object_type.clone()),
-                OracleThinBindValue::Text(object_name.clone()),
-                OracleThinBindValue::Text(owner.clone()),
-            ]
-        };
-        let ddl = Self::thin_query_one_typed_text(
-            conn,
-            ORACLE_OBJECT_DDL_SQL,
-            OracleThinColumnType::Long,
-            binds(),
-        )?;
-        Ok(Self::normalize_generated_ddl(ddl))
+        // metadata handle inside `ORACLE_OBJECT_DDL_BLOCK`, so nothing is left
+        // on this pooled session for the next tab to inherit.
+        let mut request = OracleThinStatementRequest::statement(ORACLE_OBJECT_DDL_BLOCK);
+        request.implicit_resultsets = false;
+        request.binds = vec![
+            OracleThinBindValue::Text(Self::metadata_object_type(object_type)),
+            OracleThinBindValue::Text(object_name),
+            OracleThinBindValue::Text(owner),
+            OracleThinBindValue::Out {
+                column_type: OracleThinColumnType::Clob,
+                max_len: ORACLE_THIN_UNBOUNDED_OUT_CLOB,
+            },
+        ];
+        let execution = conn
+            .execute_out_binds_with_implicit(&request, &[])
+            .map_err(|err| err.to_string())?;
+        // The block's own cursor: `execute_*` leaves it open for its caller.
+        conn.close_cursor_later(execution.statement_cursor_id);
+        match execution.values.into_iter().next() {
+            Some(OracleThinValue::Text(ddl)) => Ok(Self::normalize_generated_ddl(ddl)),
+            other => Err(format!(
+                "Oracle Thin DDL block returned {other:?} where the DDL text was expected"
+            )),
+        }
     }
 
     pub fn get_thin_package_ddl(
@@ -13242,10 +13264,7 @@ mod oracle_table_structure_release_fixture {
 mod oracle_thin_object_metadata_live_tests {
     use super::{ObjectBrowser, QueryExecutor};
     use std::time::Duration;
-    use tns_thin::exec::{
-        BindValue as OracleThinBindValue, OracleColumnType as OracleThinColumnType,
-        StatementRequest,
-    };
+    use tns_thin::exec::{BindValue as OracleThinBindValue, StatementRequest};
     use tns_thin::{ConnectTarget, OracleThinConfig, OracleThinSession};
 
     fn live_protocol_env(name: &str) -> Option<u16> {
@@ -13514,7 +13533,10 @@ mod oracle_thin_object_metadata_live_tests {
                  END;"
             ),
         );
-        let large_package_body = (1..=180)
+        // Enough members that the body alone is longer than any VARCHAR2 bind
+        // (32,767 bytes), which is what the DDL block's OUT CLOB must outgrow.
+        const LARGE_PACKAGE_MEMBERS: usize = 600;
+        let large_package_body = (1..=LARGE_PACKAGE_MEMBERS)
             .map(|index| format!("PROCEDURE P_{index:03}(p_value IN VARCHAR2);"))
             .collect::<Vec<_>>()
             .join(" ");
@@ -13522,7 +13544,7 @@ mod oracle_thin_object_metadata_live_tests {
             &mut session,
             format!("CREATE OR REPLACE PACKAGE {large_package} AS {large_package_body} END;"),
         );
-        let large_package_body_impl = (1..=180)
+        let large_package_body_impl = (1..=LARGE_PACKAGE_MEMBERS)
             .map(|index| {
                 format!(
                     "PROCEDURE P_{index:03}(p_value IN VARCHAR2) IS BEGIN NULL; END P_{index:03};"
@@ -13645,52 +13667,27 @@ mod oracle_thin_object_metadata_live_tests {
         let large_ddl = ObjectBrowser::get_thin_package_ddl(&mut session, &large_package)
             .expect("large package DDL");
         assert!(
-            large_ddl.len() > 4000,
-            "large package DDL should exceed VARCHAR2 conversion limit"
-        );
-        assert!(
-            large_ddl.contains("P_180"),
+            large_ddl.contains(&format!("P_{LARGE_PACKAGE_MEMBERS:03}")),
             "large package DDL should include the final generated procedure"
         );
         assert!(
             large_ddl.contains("PACKAGE BODY"),
             "large package DDL should include the package body"
         );
-        let direct_large_ddl = ObjectBrowser::thin_query_one_typed_text(
-            &mut session,
-            "SELECT DBMS_METADATA.GET_DDL(:1, :2, SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')) FROM DUAL",
-            OracleThinColumnType::Long,
-            vec![
-                OracleThinBindValue::Text("PACKAGE".to_string()),
-                OracleThinBindValue::Text(large_package.clone()),
-            ],
-        )
-        .expect("direct CLOB-as-LONG DDL fetch");
+        // One CLOB longer than any VARCHAR2 bind: it is read through a
+        // locator, so it comes back whole whatever its length.
+        let large_body_ddl =
+            ObjectBrowser::get_thin_object_ddl(&mut session, "PACKAGE_BODY", &large_package)
+                .expect("large package body DDL");
         assert!(
-            direct_large_ddl.len() > 4000,
-            "direct CLOB-as-LONG DDL fetch should exceed VARCHAR2 conversion limit"
+            large_body_ddl.len() > 32_767,
+            "the package body DDL is {} bytes; the test needs one past 32,767",
+            large_body_ddl.len()
         );
         assert!(
-            direct_large_ddl.contains("P_180"),
-            "direct CLOB-as-LONG DDL fetch should include the final generated procedure"
-        );
-        let direct_body_ddl = ObjectBrowser::thin_query_one_typed_text(
-            &mut session,
-            "SELECT DBMS_METADATA.GET_DDL(:1, :2, SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')) FROM DUAL",
-            OracleThinColumnType::Long,
-            vec![
-                OracleThinBindValue::Text("PACKAGE_BODY".to_string()),
-                OracleThinBindValue::Text(large_package.clone()),
-            ],
-        )
-        .expect("direct package body CLOB-as-LONG DDL fetch");
-        assert!(
-            direct_body_ddl.len() > 4000,
-            "direct package body CLOB-as-LONG DDL fetch should exceed VARCHAR2 conversion limit"
-        );
-        assert!(
-            direct_body_ddl.contains("PACKAGE BODY") && direct_body_ddl.contains("P_180"),
-            "direct package body CLOB-as-LONG DDL fetch should include the body text"
+            large_body_ddl.contains("PACKAGE BODY")
+                && large_body_ddl.contains(&format!("END P_{LARGE_PACKAGE_MEMBERS:03};")),
+            "the package body DDL should run to its final procedure"
         );
         let explain = super::OracleExplainStatement::new("SELECT * FROM dual");
         // No cancel was sent here, and saying so is the point: the rollback

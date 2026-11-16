@@ -1510,14 +1510,27 @@ fn oracle_unqualified_object_metadata_resolves_current_schema_owner() {
     }
 }
 
+/// One DDL statement for both drivers and for every release and protocol.
+///
+/// It is an anonymous block with the DDL in an OUT CLOB — `WITH FUNCTION`, the
+/// query it used to be, is 12.1 syntax and was ORA-00905 on the 11.2 servers
+/// this app reaches. What stays pinned is what always was: the statement is
+/// shared, its transform is scoped to a handle, and the thin road reads the
+/// whole DDL the same way on every protocol instead of growing a chunked
+/// fallback for some of them.
 #[test]
 fn oracle_thin_get_ddl_uses_same_direct_query_for_all_protocol_versions() {
     let content = read_source("src/db/query/executor.rs");
     assert!(
-        content.contains("const ORACLE_OBJECT_DDL_SQL: &str = \"WITH FUNCTION scoped_object_ddl(")
-            && content.contains("SELECT scoped_object_ddl(:1, :2, :3) FROM DUAL"),
-        "Oracle object DDL should have one shared query, and it must scope its DBMS_METADATA \
+        content.contains("const ORACLE_OBJECT_DDL_BLOCK: &str = \"DECLARE \\")
+            && content.contains("metadata_handle := DBMS_METADATA.OPEN(:1); \\")
+            && content.contains(":4 := generated; \\"),
+        "Oracle object DDL should have one shared block, and it must scope its DBMS_METADATA \
          transform to a handle instead of the session"
+    );
+    assert!(
+        !content.contains("WITH FUNCTION scoped_object_ddl"),
+        "WITH FUNCTION is 12.1 syntax; the DDL statement has to parse on 11.2 too"
     );
 
     let thick_start = content
@@ -1529,8 +1542,9 @@ fn oracle_thin_get_ddl_uses_same_direct_query_for_all_protocol_versions() {
         .expect("thick object DDL function should precede metadata_object_type");
     let thick_body = &content[thick_start..thick_end];
     assert!(
-        thick_body.contains("conn.statement(ORACLE_OBJECT_DDL_SQL)"),
-        "Thick Oracle DDL generation should use the shared DBMS_METADATA.GET_DDL query"
+        thick_body.contains("conn.statement(ORACLE_OBJECT_DDL_BLOCK)")
+            && thick_body.contains("Self::out_clob_text(&stmt, 4)"),
+        "Thick Oracle DDL generation should run the shared block and read its OUT CLOB whole"
     );
 
     let thin_start = content
@@ -1542,10 +1556,11 @@ fn oracle_thin_get_ddl_uses_same_direct_query_for_all_protocol_versions() {
         .expect("Thin object DDL function should precede package DDL");
     let thin_body = &content[thin_start..thin_end];
     assert!(
-        thin_body.contains("thin_query_one_typed_text(")
-            && thin_body.contains("ORACLE_OBJECT_DDL_SQL")
-            && thin_body.contains("OracleThinColumnType::Long"),
-        "Thin Oracle DDL generation should directly fetch the shared DDL query as LONG"
+        thin_body.contains("ORACLE_OBJECT_DDL_BLOCK")
+            && thin_body.contains("execute_out_binds_with_implicit(")
+            && thin_body.contains("max_len: ORACLE_THIN_UNBOUNDED_OUT_CLOB"),
+        "Thin Oracle DDL generation should run the shared block and take its OUT CLOB through \
+         a locator, whatever its length"
     );
     for forbidden in [
         "uses_legacy_ttc_byte_chunks",

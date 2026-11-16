@@ -17,22 +17,50 @@
 //
 // This binary creates a plain table, regenerates its DDL through the real
 // `ObjectBrowser` helpers, and asserts both. It checks OCI once (no protocol
-// concept) and Thin across protocols 314/315/318/319.
+// concept) and Thin across every protocol of 314/315/318/319 the server
+// speaks: an 11.2 listener accepts 314 and nothing newer.
+//
+// The DDL comes back through an OUT CLOB, so a third check reads one that is
+// long: past 32,767 bytes (the longest VARCHAR2 bind, which a CLOB bound as
+// one cannot exceed) and with characters outside the BMP lying across the
+// places a LOB read may be cut.
 //
 // Usage:   cargo run --bin verify_ddl_transform_live
-// Env/DB:  docs/oracle.md (127.0.0.1:1521 service FREE, system/password).
+// Env/DB:  docs/oracle.md (127.0.0.1:1521 service FREE, system/password), or
+//          ORACLE_TEST_HOST / _PORT / _SERVICE_NAME / _USERNAME / _PASSWORD.
 //          OCI needs ORACLE_CLIENT_LIB_DIR pointing at a valid Instant Client.
 
 use oracle::Connection;
 use space_query::db::query::ObjectBrowser;
+use std::env;
 use tns_thin::exec::StatementRequest;
 use tns_thin::{ConnectTarget, OracleThinConfig, OracleThinSession};
 
-const HOST: &str = "127.0.0.1";
-const PORT: u16 = 1521;
-const SERVICE: &str = "FREE";
-const USER: &str = "system";
-const PASS: &str = "password";
+/// The server under test: host, port, service, user, password.
+struct Target {
+    host: String,
+    port: u16,
+    service: String,
+    user: String,
+    pass: String,
+}
+
+impl Target {
+    fn from_env() -> Self {
+        Self {
+            host: env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: env::var("ORACLE_TEST_PORT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1521),
+            service: env::var("ORACLE_TEST_SERVICE_NAME")
+                .or_else(|_| env::var("ORACLE_TEST_SERVICE"))
+                .unwrap_or_else(|_| "FREE".into()),
+            user: env::var("ORACLE_TEST_USERNAME").unwrap_or_else(|_| "system".into()),
+            pass: env::var("ORACLE_TEST_PASSWORD").unwrap_or_else(|_| "password".into()),
+        }
+    }
+}
 
 const TABLE: &str = "SQ_DDL_XFORM_T";
 const CREATE_SQL: &str = "CREATE TABLE SQ_DDL_XFORM_T (\
@@ -48,6 +76,47 @@ const CREATE_VIEW_SQL: &str =
 const PROC: &str = "SQ_DDL_XFORM_P";
 const CREATE_PROC_SQL: &str =
     "CREATE OR REPLACE PROCEDURE SQ_DDL_XFORM_P (p_id IN NUMBER) AS BEGIN NULL; END;";
+
+/// A procedure whose DDL is LONG, in the two ways an OUT CLOB can lose text.
+const LONG_PROC: &str = "SQ_DDL_XFORM_LONG_P";
+
+/// One character outside the BMP: two UTF-16 code units, which is how a CLOB
+/// counts, so a read cut at a code-unit offset can land inside it.
+const ASTRAL: char = '\u{1F600}';
+const ASTRAL_PER_LINE: usize = 400;
+const ASTRAL_LINES_PER_RUN: usize = 13;
+
+/// How many code units one LOB read may be cut at. It is the OCI driver's own
+/// chunk; a boundary of any other reader is a multiple or is never reached.
+const LOB_READ_UNITS: usize = 8_192;
+
+/// The comment body the long procedure carries: two runs of astral characters
+/// with ONE ordinary character between them.
+///
+/// Every line of a run is an EVEN number of code units (the characters, a
+/// newline and a space), so a run keeps one parity from its first character to
+/// its last, and each run is over 10,000 units: the first lies across unit
+/// 8,192 and the second across 16,384, the first two places a read ends. The
+/// single `x` between them shifts the second run by one unit, so whichever
+/// parity the text before the comment has, one of the two runs has a
+/// character sitting ACROSS its boundary. Lines, not one long line: a source
+/// line is stored in 4,000 bytes, and 11.2 does not survive generating DDL
+/// from one that is ten times that.
+fn astral_comment_body() -> String {
+    let line: String = std::iter::repeat_n(ASTRAL, ASTRAL_PER_LINE)
+        .chain("\n ".chars())
+        .collect();
+    let run = line.repeat(ASTRAL_LINES_PER_RUN);
+    format!("{run}x{run}")
+}
+
+/// Long past 32,767 bytes as well: the comment alone is over 41,000.
+fn create_long_proc_sql() -> String {
+    format!(
+        "CREATE OR REPLACE PROCEDURE {LONG_PROC} AS\n/* {}*/\nBEGIN NULL; END;",
+        astral_comment_body()
+    )
+}
 
 const THIN_PROTOCOLS: &[u16] = &[314, 315, 318, 319];
 
@@ -126,9 +195,53 @@ fn check_object_ddl(label: &str, ddl: &str, expected: &str) -> Result<(), String
     Ok(())
 }
 
-fn verify_oci() -> Result<(), String> {
-    let conn = Connection::connect(USER, PASS, format!("//{HOST}:{PORT}/{SERVICE}"))
-        .map_err(|e| format!("OCI connect: {e}"))?;
+/// The long procedure's DDL has to be the text that was compiled: all of it,
+/// and every astral character still one character.
+fn check_long_ddl(label: &str, ddl: &str) -> Result<(), String> {
+    if ddl.len() <= 32_767 {
+        return Err(format!(
+            "{label}: the long DDL came back as {} bytes; it is longer than 32,767",
+            ddl.len()
+        ));
+    }
+    let expected_astral = ASTRAL_PER_LINE * ASTRAL_LINES_PER_RUN * 2;
+    if !ddl.contains(&astral_comment_body()) {
+        let astral = ddl.chars().filter(|ch| *ch == ASTRAL).count();
+        return Err(format!(
+            "{label}: the long DDL lost text — {astral} of {expected_astral} astral characters \
+             survived, {} bytes in all",
+            ddl.len()
+        ));
+    }
+    // The fixture has to have put a character across a read boundary on THIS
+    // server, or the check above proved nothing about cut reads.
+    let mut units = 0usize;
+    let straddled = ddl.chars().any(|ch| {
+        let first_unit = units;
+        units += ch.len_utf16();
+        ch.len_utf16() == 2 && (first_unit + 1).is_multiple_of(LOB_READ_UNITS)
+    });
+    if !straddled {
+        return Err(format!(
+            "{label}: no astral character lies across a {LOB_READ_UNITS}-unit read boundary in \
+             this server's DDL, so the fixture no longer tests a cut read"
+        ));
+    }
+    println!(
+        "{label}: OK (long DDL whole: {} bytes, {expected_astral} astral characters, one across \
+         a read boundary)",
+        ddl.len()
+    );
+    Ok(())
+}
+
+fn verify_oci(target: &Target) -> Result<(), String> {
+    let conn = Connection::connect(
+        &target.user,
+        &target.pass,
+        format!("//{}:{}/{}", target.host, target.port, target.service),
+    )
+    .map_err(|e| format!("OCI connect: {e}"))?;
     let _ = conn.execute(&format!("DROP TABLE {TABLE} PURGE"), &[]);
     conn.execute(CREATE_SQL, &[])
         .map_err(|e| format!("OCI create: {e}"))?;
@@ -136,39 +249,61 @@ fn verify_oci() -> Result<(), String> {
         .map_err(|e| format!("OCI create view: {e}"))?;
     conn.execute(CREATE_PROC_SQL, &[])
         .map_err(|e| format!("OCI create procedure: {e}"))?;
+    conn.execute(&create_long_proc_sql(), &[])
+        .map_err(|e| format!("OCI create long procedure: {e}"))?;
     let view_ddl =
         ObjectBrowser::get_view_ddl(&conn, VIEW).map_err(|e| format!("OCI get_view_ddl: {e}"));
     let proc_ddl = ObjectBrowser::get_procedure_ddl(&conn, PROC)
         .map_err(|e| format!("OCI get_procedure_ddl: {e}"));
+    let long_ddl = ObjectBrowser::get_procedure_ddl(&conn, LONG_PROC)
+        .map_err(|e| format!("OCI get_procedure_ddl(long): {e}"));
     let ddl =
         ObjectBrowser::get_table_ddl(&conn, TABLE).map_err(|e| format!("OCI get_table_ddl: {e}"));
     // On the SAME session, before the table goes away.
     let probe = conn
         .query_row_as::<String>(SESSION_LEAK_PROBE_SQL, &[])
         .map_err(|e| format!("OCI session leak probe: {e}"));
+    let _ = conn.execute(&format!("DROP PROCEDURE {LONG_PROC}"), &[]);
     let _ = conn.execute(&format!("DROP PROCEDURE {PROC}"), &[]);
     let _ = conn.execute(&format!("DROP VIEW {VIEW}"), &[]);
     let _ = conn.execute(&format!("DROP TABLE {TABLE} PURGE"), &[]);
     check_ddl("OCI", &ddl?)?;
     check_object_ddl("OCI view", &view_ddl?, "CREATE OR REPLACE")?;
     check_object_ddl("OCI procedure", &proc_ddl?, "PROCEDURE")?;
+    check_long_ddl("OCI", &long_ddl?)?;
     check_session_untouched("OCI", &probe?)
 }
 
-fn thin_config(protocol: u16) -> OracleThinConfig {
+/// A thin session on `protocol` exactly, or — with `None` — on whatever the
+/// listener and the driver agree on.
+fn thin_config(target: &Target, protocol: Option<u16>) -> OracleThinConfig {
     let mut config = OracleThinConfig::new(
-        ConnectTarget::service_name(HOST.to_string(), PORT, SERVICE.to_string()),
-        USER.to_string(),
-        PASS.to_string(),
+        ConnectTarget::service_name(target.host.clone(), target.port, target.service.clone()),
+        target.user.clone(),
+        target.pass.clone(),
     );
-    config.connect_options.desired_protocol_version = protocol;
-    config.connect_options.minimum_protocol_version = protocol;
+    if let Some(protocol) = protocol {
+        config.connect_options.desired_protocol_version = protocol;
+        config.connect_options.minimum_protocol_version = protocol;
+    }
     config.connect_options.disable_oob_probe = true;
     config
 }
 
-fn verify_thin(protocol: u16) -> Result<(), String> {
-    let mut session = OracleThinSession::connect(thin_config(protocol))
+/// The newest protocol this server speaks. A release older than a protocol
+/// cannot be asked for it — an 11.2 listener accepts 314 and refuses the rest —
+/// and that is the server's limit, not a failure of what is checked here.
+fn newest_protocol(target: &Target) -> Result<u16, String> {
+    let session = OracleThinSession::connect(thin_config(target, None))
+        .map_err(|e| format!("thin connect: {e}"))?;
+    session
+        .capabilities()
+        .protocol_version
+        .ok_or_else(|| "thin session reported no protocol version".to_string())
+}
+
+fn verify_thin(target: &Target, protocol: u16) -> Result<(), String> {
+    let mut session = OracleThinSession::connect(thin_config(target, Some(protocol)))
         .map_err(|e| format!("thin {protocol} connect: {e}"))?;
     let negotiated = session.capabilities().protocol_version;
     println!("thin requested protocol {protocol}, negotiated {negotiated:?}");
@@ -181,12 +316,17 @@ fn verify_thin(protocol: u16) -> Result<(), String> {
         .map_err(|e| format!("thin {protocol} create: {e}"))?;
     let _ = session.execute(&StatementRequest::statement(CREATE_VIEW_SQL.to_string()), 0);
     let _ = session.execute(&StatementRequest::statement(CREATE_PROC_SQL.to_string()), 0);
+    session
+        .execute(&StatementRequest::statement(create_long_proc_sql()), 0)
+        .map_err(|e| format!("thin {protocol} create long procedure: {e}"))?;
     let ddl = ObjectBrowser::get_thin_object_ddl(&mut session, "TABLE", TABLE)
         .map_err(|e| format!("thin {protocol} get_thin_object_ddl: {e}"));
     let view_ddl = ObjectBrowser::get_thin_object_ddl(&mut session, "VIEW", VIEW)
         .map_err(|e| format!("thin {protocol} get_thin_object_ddl(VIEW): {e}"));
     let proc_ddl = ObjectBrowser::get_thin_object_ddl(&mut session, "PROCEDURE", PROC)
         .map_err(|e| format!("thin {protocol} get_thin_object_ddl(PROCEDURE): {e}"));
+    let long_ddl = ObjectBrowser::get_thin_object_ddl(&mut session, "PROCEDURE", LONG_PROC)
+        .map_err(|e| format!("thin {protocol} get_thin_object_ddl(long PROCEDURE): {e}"));
     // On the SAME session, before the table goes away.
     let probe = space_query::db::DatabaseConnection::oracle_thin_select_one_text_for_test(
         &mut session,
@@ -199,6 +339,10 @@ fn verify_thin(protocol: u16) -> Result<(), String> {
         0,
     );
     let _ = session.execute(
+        &StatementRequest::statement(format!("DROP PROCEDURE {LONG_PROC}")),
+        0,
+    );
+    let _ = session.execute(
         &StatementRequest::statement(format!("DROP PROCEDURE {PROC}")),
         0,
     );
@@ -207,29 +351,53 @@ fn verify_thin(protocol: u16) -> Result<(), String> {
     check_ddl(&label, &ddl?)?;
     check_object_ddl(&format!("{label} view"), &view_ddl?, "CREATE OR REPLACE")?;
     check_object_ddl(&format!("{label} procedure"), &proc_ddl?, "PROCEDURE")?;
+    check_long_ddl(&label, &long_ddl?)?;
     check_session_untouched(&label, &probe?)
 }
 
 fn main() {
+    let target = Target::from_env();
     let mut failures = Vec::new();
+    let mut passed = Vec::new();
 
     println!("\n########## OCI ##########");
-    if let Err(e) = verify_oci() {
-        eprintln!("FAIL [OCI]: {e}");
-        failures.push("OCI".to_string());
+    match verify_oci(&target) {
+        Ok(()) => passed.push("OCI".to_string()),
+        Err(e) => {
+            eprintln!("FAIL [OCI]: {e}");
+            failures.push("OCI".to_string());
+        }
     }
 
-    for &protocol in THIN_PROTOCOLS {
-        println!("\n########## Thin protocol {protocol} ##########");
-        if let Err(e) = verify_thin(protocol) {
-            eprintln!("FAIL [Thin {protocol}]: {e}");
-            failures.push(format!("Thin {protocol}"));
+    match newest_protocol(&target) {
+        Ok(newest) => {
+            for &protocol in THIN_PROTOCOLS {
+                if protocol > newest {
+                    println!(
+                        "\n########## Thin protocol {protocol}: not spoken by this server \
+                         (newest {newest}) ##########"
+                    );
+                    continue;
+                }
+                println!("\n########## Thin protocol {protocol} ##########");
+                match verify_thin(&target, protocol) {
+                    Ok(()) => passed.push(format!("Thin {protocol}")),
+                    Err(e) => {
+                        eprintln!("FAIL [Thin {protocol}]: {e}");
+                        failures.push(format!("Thin {protocol}"));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("FAIL [Thin]: {e}");
+            failures.push("Thin".to_string());
         }
     }
 
     println!("\n==================== SUMMARY ====================");
     if failures.is_empty() {
-        println!("ALL TARGETS PASSED (OCI + Thin 314/315/318/319)");
+        println!("ALL TARGETS PASSED ({})", passed.join(", "));
     } else {
         println!("FAILED: {}", failures.join(", "));
         std::process::exit(1);
