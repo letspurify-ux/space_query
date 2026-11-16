@@ -10189,24 +10189,43 @@ impl ObjectBrowser {
             Err(_) => {}
         }
 
-        let rows = Self::thin_query_text_rows(
+        let members = Self::thin_package_member_rows(
             conn,
-            ORACLE_PACKAGE_ROUTINES_FROM_DICTIONARY_SQL,
+            ORACLE_PACKAGE_MEMBERS_SQL,
+            &owner,
+            &package_name,
+        )?;
+        let functions = Self::thin_package_member_rows(
+            conn,
+            ORACLE_PACKAGE_FUNCTION_MEMBERS_SQL,
+            &owner,
+            &package_name,
+        )?;
+        Ok(Self::package_routines_from_dictionary(members, functions))
+    }
+
+    /// The thin half of [`Self::package_member_rows`].
+    fn thin_package_member_rows(
+        conn: &mut OracleThinSession,
+        sql: &str,
+        owner: &str,
+        package_name: &str,
+    ) -> Result<Vec<(String, Option<String>)>, String> {
+        Ok(Self::thin_query_text_rows(
+            conn,
+            sql,
             2,
             vec![
-                OracleThinBindValue::Text(owner.clone()),
-                OracleThinBindValue::Text(package_name.clone()),
-                OracleThinBindValue::Text(owner),
-                OracleThinBindValue::Text(package_name),
+                OracleThinBindValue::Text(owner.to_string()),
+                OracleThinBindValue::Text(package_name.to_string()),
             ],
-        )?;
-        Ok(rows
-            .into_iter()
-            .map(|row| PackageRoutine {
-                name: row.first().cloned().unwrap_or_default(),
-                routine_type: row.get(1).cloned().unwrap_or_default(),
-            })
-            .collect())
+        )?
+        .into_iter()
+        .map(|mut row| {
+            let overload = Self::dictionary_overload(row.pop());
+            (row.pop().unwrap_or_default(), overload)
+        })
+        .collect())
     }
 
     /// Parse package spec source text to extract PROCEDURE/FUNCTION declarations.
@@ -10412,52 +10431,79 @@ impl ObjectBrowser {
         owner: &str,
         package_name: &str,
     ) -> Result<Vec<PackageRoutine>, OracleError> {
-        let mut stmt = match conn
-            .statement(ORACLE_PACKAGE_ROUTINES_FROM_DICTIONARY_SQL)
-            .build()
-        {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let rows = stmt.query(&[&owner, &package_name, &owner, &package_name]);
-        let rows = match rows {
-            Ok(rows) => rows,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
+        let members =
+            Self::package_member_rows(conn, ORACLE_PACKAGE_MEMBERS_SQL, owner, package_name)?;
+        let functions = Self::package_member_rows(
+            conn,
+            ORACLE_PACKAGE_FUNCTION_MEMBERS_SQL,
+            owner,
+            package_name,
+        )?;
+        Ok(Self::package_routines_from_dictionary(members, functions))
+    }
 
-        let mut routines: Vec<PackageRoutine> = Vec::new();
+    /// The (member name, overload) rows of one of the two package-member
+    /// statements, both of which take the owner and the package.
+    fn package_member_rows(
+        conn: &Connection,
+        sql: &str,
+        owner: &str,
+        package_name: &str,
+    ) -> Result<Vec<(String, Option<String>)>, OracleError> {
+        let log = |err: OracleError| {
+            logging::log_error("executor", &format!("Database operation failed: {err}"));
+            err
+        };
+        let mut stmt = conn.statement(sql).build().map_err(log)?;
+        let rows = stmt.query(&[&owner, &package_name]).map_err(log)?;
+
+        let mut members = Vec::new();
         for row_result in rows {
-            let row: Row = match row_result {
-                Ok(row) => row,
-                Err(err) => {
-                    logging::log_error("executor", &format!("Database operation failed: {err}"));
-                    return Err(err);
-                }
-            };
-            let name: String = match row.get(0) {
-                Ok(name) => name,
-                Err(err) => {
-                    logging::log_error("executor", &format!("Database operation failed: {err}"));
-                    return Err(err);
-                }
-            };
-            let routine_type: String = match row.get(1) {
-                Ok(routine_type) => routine_type,
-                Err(err) => {
-                    logging::log_error("executor", &format!("Database operation failed: {err}"));
-                    return Err(err);
-                }
-            };
-            routines.push(PackageRoutine { name, routine_type });
+            let row: Row = row_result.map_err(log)?;
+            let name: String = row.get(0).map_err(log)?;
+            let overload: Option<String> = row.get(1).map_err(log)?;
+            members.push((name, Self::dictionary_overload(overload)));
         }
+        Ok(members)
+    }
 
-        Ok(routines)
+    /// An overload number as the dictionary states it: `None` for a member
+    /// that is not overloaded, whichever way the driver spells an absent value.
+    fn dictionary_overload(overload: Option<String>) -> Option<String> {
+        overload
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    /// A wrapped package's member list, from its two dictionary reads: every
+    /// member, a FUNCTION when the same name and overload number returns a
+    /// value and a PROCEDURE otherwise.
+    ///
+    /// The one place the two reads meet, for both drivers. A name the package
+    /// overloads as both kinds is listed once per kind, and the list is in name
+    /// order — what the single joined statement used to return.
+    fn package_routines_from_dictionary(
+        members: Vec<(String, Option<String>)>,
+        functions: Vec<(String, Option<String>)>,
+    ) -> Vec<PackageRoutine> {
+        let functions: HashSet<(String, Option<String>)> = functions.into_iter().collect();
+        let routines: std::collections::BTreeSet<(String, &'static str)> = members
+            .into_iter()
+            .map(|member| {
+                let routine_type = match functions.contains(&member) {
+                    true => "FUNCTION",
+                    false => "PROCEDURE",
+                };
+                (member.0, routine_type)
+            })
+            .collect();
+        routines
+            .into_iter()
+            .map(|(name, routine_type)| PackageRoutine {
+                name,
+                routine_type: routine_type.to_string(),
+            })
+            .collect()
     }
 
     // Keep for potential future use (bulk loading all packages at once)
@@ -12127,22 +12173,15 @@ impl ObjectBrowser {
             .map_err(log)?;
         let rows = stmt.query(&[&owner, &table_name]).map_err(log)?;
 
-        let mut grouped: Vec<(String, ForeignKeyInfo)> = Vec::new();
+        let mut foreign_keys = Vec::new();
         for row_result in rows {
             let row: Row = row_result.map_err(log)?;
-            let constraint_name: String = row.get(0).map_err(log)?;
-            let local_col: String = row.get(1).map_err(log)?;
-            let ref_table: String = row.get(2).map_err(log)?;
-            let ref_col: String = row.get(3).map_err(log)?;
-            Self::push_foreign_key_column(
-                &mut grouped,
-                constraint_name,
-                local_col,
-                ref_table,
-                ref_col,
-            );
+            let columns: Option<String> = row.get(1).map_err(log)?;
+            let ref_table: Option<String> = row.get(2).map_err(log)?;
+            let ref_columns: Option<String> = row.get(3).map_err(log)?;
+            foreign_keys.extend(Self::foreign_key_from_row(columns, ref_table, ref_columns));
         }
-        Ok(grouped.into_iter().map(|(_, fk)| fk).collect())
+        Ok(foreign_keys)
     }
 
     pub fn get_thin_table_foreign_keys(
@@ -12161,47 +12200,48 @@ impl ObjectBrowser {
             ],
         )?;
 
-        let mut grouped: Vec<(String, ForeignKeyInfo)> = Vec::new();
-        for row in rows {
-            let constraint_name = row.first().cloned().unwrap_or_default();
-            let local_col = row.get(1).cloned().unwrap_or_default();
-            let ref_table = row.get(2).cloned().unwrap_or_default();
-            let ref_col = row.get(3).cloned().unwrap_or_default();
-            Self::push_foreign_key_column(
-                &mut grouped,
-                constraint_name,
-                local_col,
-                ref_table,
-                ref_col,
-            );
-        }
-        Ok(grouped.into_iter().map(|(_, fk)| fk).collect())
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let mut cells = row.into_iter().skip(1);
+                Self::foreign_key_from_row(cells.next(), cells.next(), cells.next())
+            })
+            .collect())
     }
 
-    /// Append one (local column, referenced column) pair to the FK group for
-    /// `constraint_name`, starting a new group when the constraint changes.
-    /// Rows must be ordered by constraint name then column position.
-    fn push_foreign_key_column(
-        grouped: &mut Vec<(String, ForeignKeyInfo)>,
-        constraint_name: String,
-        local_col: String,
-        ref_table: String,
-        ref_col: String,
-    ) {
-        match grouped.last_mut() {
-            Some((name, fk)) if *name == constraint_name => {
-                fk.columns.push(local_col);
-                fk.ref_columns.push(ref_col);
-            }
-            _ => grouped.push((
-                constraint_name,
-                ForeignKeyInfo {
-                    columns: vec![local_col],
-                    ref_table,
-                    ref_columns: vec![ref_col],
-                },
-            )),
+    /// One [`ORACLE_TABLE_FOREIGN_KEYS_SQL`] row as a foreign key: its column
+    /// list, the referenced table and that table's column list.
+    ///
+    /// The one reader for both drivers. `None` for a key whose referenced side
+    /// the session cannot see — no table, so nothing to join to — whichever way
+    /// the driver spells the absent value. The two lists are paired by
+    /// position, so a side that is shorter than the other ends the pairing.
+    fn foreign_key_from_row(
+        columns: Option<String>,
+        ref_table: Option<String>,
+        ref_columns: Option<String>,
+    ) -> Option<ForeignKeyInfo> {
+        let names = |list: Option<String>| -> Vec<String> {
+            list.unwrap_or_default()
+                .split(ORACLE_NAME_LIST_SEPARATOR)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let ref_table = ref_table.filter(|table| !table.is_empty())?;
+        let mut columns = names(columns);
+        let mut ref_columns = names(ref_columns);
+        let paired = columns.len().min(ref_columns.len());
+        if paired == 0 {
+            return None;
         }
+        columns.truncate(paired);
+        ref_columns.truncate(paired);
+        Some(ForeignKeyInfo {
+            columns,
+            ref_table,
+            ref_columns,
+        })
     }
 
     /// Generate DDL for a table
@@ -12759,58 +12799,97 @@ pub(crate) const ORACLE_TABLE_CONSTRAINTS_SQL: &str = r#"
     ORDER BY c.constraint_type, c.constraint_name
 "#;
 
-/// The foreign keys of ONE table: each local column beside the referenced
-/// table and column at the same position.
+/// What separates the names in a column list one dictionary row carries.
 ///
-/// The referenced side is read from `ALL_CONS_COLUMNS` alone, for the reason
-/// [`ORACLE_TABLE_CONSTRAINTS_SQL`] gives: a join to `ALL_CONSTRAINTS` on the
-/// referenced constraint's name, whose only contribution was the table name the
-/// referenced columns already carry, made Oracle hash-join against the whole
-/// dictionary's constraints on every IntelliSense foreign-key load (3,500
-/// logical reads on an idle 23ai, CPU growing with the database; ~200 now).
+/// A double quotation mark, because it is one of the two characters no Oracle
+/// identifier can contain, quoted or not — so a list split on it comes apart
+/// into exactly the names that went in, whatever they are called.
+const ORACLE_NAME_LIST_SEPARATOR: char = '"';
+
+/// The foreign keys of ONE table, a row per key: its columns, the table it
+/// references and that table's columns, both lists in key position order and
+/// joined by [`ORACLE_NAME_LIST_SEPARATOR`].
+///
+/// `ALL_CONSTRAINTS` is the only view in the FROM clause, and each side's
+/// columns are a scalar subquery on `ALL_CONS_COLUMNS` by the constraint's own
+/// name. It used to JOIN the three, and the join order was the optimizer's to
+/// choose: measured on 23ai, the same statement cost about 200 logical reads
+/// one day, 8,761 freshly parsed on another, and 27,478 for every table once
+/// the first table it was parsed for had no foreign keys — hash joins over the
+/// whole dictionary's `CON$` and `CCOL$`, growing with the schema, on every
+/// IntelliSense foreign-key load. Written this way there is one driving view,
+/// found by owner, table and type, and one indexed lookup per key and side:
+/// for a table of five keys, 350 to 570 reads on 11.2 and 840 to 1,000 on 23ai
+/// across the two drivers, and — measured through thin — the same whichever
+/// table the statement was first parsed for. `NO_UNNEST` says as much to an
+/// optimizer that may turn a scalar subquery back into a join, which 12.1 and
+/// later can; the plans measured were the same with and without it.
+///
+/// A key whose referenced side cannot be seen has a NULL table and is left
+/// out by the reader, as the join left it out. `MIN` only folds the rows of a
+/// multi-column key into the single value a scalar subquery may return.
 pub(crate) const ORACLE_TABLE_FOREIGN_KEYS_SQL: &str = r#"
-    SELECT c.constraint_name, cc.column_name, rcc.table_name, rcc.column_name
+    SELECT c.constraint_name,
+           (SELECT /*+ NO_UNNEST */
+                   LISTAGG(cc.column_name, '"') WITHIN GROUP (ORDER BY cc.position)
+              FROM all_cons_columns cc
+             WHERE cc.owner = c.owner
+               AND cc.constraint_name = c.constraint_name),
+           (SELECT /*+ NO_UNNEST */ MIN(rcc.table_name)
+              FROM all_cons_columns rcc
+             WHERE rcc.owner = c.r_owner
+               AND rcc.constraint_name = c.r_constraint_name),
+           (SELECT /*+ NO_UNNEST */
+                   LISTAGG(rcc.column_name, '"') WITHIN GROUP (ORDER BY rcc.position)
+              FROM all_cons_columns rcc
+             WHERE rcc.owner = c.r_owner
+               AND rcc.constraint_name = c.r_constraint_name)
     FROM all_constraints c
-    JOIN all_cons_columns cc
-      ON c.owner = cc.owner AND c.constraint_name = cc.constraint_name
-    JOIN all_cons_columns rcc
-      ON rcc.owner = c.r_owner AND rcc.constraint_name = c.r_constraint_name
-     AND rcc.position = cc.position
     WHERE c.owner = :1 AND c.table_name = :2 AND c.constraint_type = 'R'
-    ORDER BY c.constraint_name, cc.position
+    ORDER BY c.constraint_name
 "#;
 
-/// The members of ONE package, PROCEDURE or FUNCTION, read from the dictionary
-/// — the road a WRAPPED package takes, whose source no parser can read.
+/// The members of ONE package as the dictionary lists them, by name and
+/// overload number — the first of the two reads a WRAPPED package's member
+/// list takes, since no parser can read its source.
 ///
-/// Whether a member returns a value is asked ONCE for the whole package: the
-/// package's position-0 arguments, joined to its members. It used to be a
-/// correlated `EXISTS` on `ALL_ARGUMENTS` per member, and Oracle answered each
-/// one by walking the whole dictionary's arguments (the data-linked
-/// `INT$DBA_ARGUMENTS`, every SYS package included): 8,600 logical reads for a
-/// three-member package on 23ai, ~10 ms of CPU per member. Binds in appearance
-/// order — owner and package for the arguments, then for the members — since
-/// the thin protocol pairs them by position.
-pub(crate) const ORACLE_PACKAGE_ROUTINES_FROM_DICTIONARY_SQL: &str = r#"
-    SELECT DISTINCT
-        p.procedure_name,
-        CASE WHEN r.object_name IS NULL THEN 'PROCEDURE' ELSE 'FUNCTION' END AS routine_type
+/// Two statements of one view each, joined by
+/// [`ObjectBrowser::package_routines_from_dictionary`], and never one statement
+/// joining the views. Joined, the package's functions were an inline view the
+/// optimizer was free to run once per MEMBER, and it did: a full scan of every
+/// argument in the dictionary for each one (5,300 logical reads on 11.2 and
+/// 6,100 on 23ai for a four-member package, growing with the member count and
+/// with every argument in the database). Even as the two branches of one
+/// `UNION ALL` they were not left alone — 216 reads on 11.2, for a scan of the
+/// index over every object, and 1,358 on 23ai. Apart, the whole member list
+/// costs 30 to 180 on either release and driver.
+pub(crate) const ORACLE_PACKAGE_MEMBERS_SQL: &str = r#"
+    SELECT p.procedure_name, p.overload
     FROM all_procedures p
-    LEFT JOIN (
-        SELECT DISTINCT a.object_name, a.overload
-        FROM all_arguments a
-        WHERE a.owner = :1
-          AND a.package_name = :2
-          AND a.position = 0
-          AND a.data_level = 0
-    ) r
-      ON r.object_name = p.procedure_name
-     AND (r.overload = p.overload OR (r.overload IS NULL AND p.overload IS NULL))
-    WHERE p.owner = :3
+    WHERE p.owner = :1
       AND p.object_type = 'PACKAGE'
-      AND p.object_name = :4
+      AND p.object_name = :2
       AND p.procedure_name IS NOT NULL
-    ORDER BY p.procedure_name
+"#;
+
+/// The members of ONE package that RETURN a value — its functions — by name
+/// and overload number: the second read of [`ORACLE_PACKAGE_MEMBERS_SQL`]'s
+/// pair. A function is a member with an argument at position 0.
+///
+/// The package is found by its OBJECT_ID, looked up once. `ALL_ARGUMENTS.
+/// PACKAGE_NAME` is an expression in the view, not a column of anything, so on
+/// 11.2 a predicate on it cannot use an index and reads every argument in the
+/// dictionary; `OBJECT_ID` is what the arguments are stored under.
+pub(crate) const ORACLE_PACKAGE_FUNCTION_MEMBERS_SQL: &str = r#"
+    SELECT a.object_name, a.overload
+    FROM all_arguments a
+    WHERE a.object_id = (SELECT MIN(o.object_id)
+                           FROM all_objects o
+                          WHERE o.owner = :1
+                            AND o.object_name = :2
+                            AND o.object_type = 'PACKAGE')
+      AND a.position = 0
+      AND a.data_level = 0
 "#;
 
 /// Detailed column information for table structure
@@ -12996,25 +13075,39 @@ mod oracle_metadata_cost_fixture {
     /// to scan is not the schema but the database's dictionary as a whole —
     /// on 23ai the CDB's data-linked `ALL_CONSTRAINTS`/`ALL_ARGUMENTS`, which a
     /// test cannot grow the way it grows a schema. Each budget sits between two
-    /// measurements on the 23ai container, with room on both sides: the old
-    /// statements (constraints 16,900 for this fixture's four foreign keys,
-    /// foreign keys 3,500, package members 8,600 and more), and the WORST plan
-    /// either driver was given for the new ones (2,400 / 820 / 850 — OCI and
-    /// thin bind differently, so each gets its own child cursor, and one OCI
-    /// child joined in a different order at four times the thin child's cost).
+    /// measurements, with room on both sides: what the read cost when it
+    /// walked the dictionary, and the most either driver pays now, on 11.2 or
+    /// on 23ai (OCI and thin bind differently, so each gets its own child
+    /// cursor and its own plan, and OCI's is the dearer one).
+    ///
+    /// * Constraints: 16,900 when the fixture had four foreign keys, 2,452 now
+    ///   that it has five.
+    /// * Foreign keys: 8,761 freshly parsed on 23ai and 27,478 once the
+    ///   statement had first been parsed for a table without any, 993 now.
+    /// * A wrapped package's members: 5,300 to 6,300 — every argument in the
+    ///   dictionary, once per member — and 178 now. Reading every argument
+    ///   ONCE is 1,144 on the 11.2 container and 1,511 on the 23ai one, and
+    ///   the budget is below that too.
     pub(super) const CONSTRAINTS_READ_BUDGET: u64 = 6_000;
     pub(super) const FOREIGN_KEYS_READ_BUDGET: u64 = 2_000;
-    pub(super) const PACKAGE_MEMBERS_READ_BUDGET: u64 = 4_000;
+    pub(super) const PACKAGE_MEMBERS_READ_BUDGET: u64 = 600;
 
-    /// One round trip creating four parent tables, a child with one foreign
+    /// One round trip creating five parent tables, a child with one foreign
     /// key to each (distinct referenced constraints, so no lookup can be
     /// answered from a cache of the previous one), a PRIMARY KEY, a CHECK and a
     /// UNIQUE — and a WRAPPED package spec, whose source no parser can read, so
     /// its member list can only come from the dictionary fallback.
+    ///
+    /// The fifth key is two columns wide and names them in the opposite order
+    /// to the one the table declares them in, so a reader that pairs a key's
+    /// columns by anything but their position in the KEY gets it wrong.
     pub(super) fn create_constraint_routine_objects_block(prefix: &str) -> String {
         let mut statements = (1..=4)
             .map(|index| format!("CREATE TABLE {prefix}_P{index} (id NUMBER PRIMARY KEY)"))
             .collect::<Vec<_>>();
+        statements.push(format!(
+            "CREATE TABLE {prefix}_P5 (k1 NUMBER, k2 NUMBER, PRIMARY KEY (k1, k2))"
+        ));
         statements.push(format!(
             "CREATE TABLE {prefix}_C (id NUMBER CONSTRAINT {prefix}_C_PK PRIMARY KEY, \
              a NUMBER CONSTRAINT {prefix}_C_FK1 REFERENCES {prefix}_P1 (id), \
@@ -13022,7 +13115,9 @@ mod oracle_metadata_cost_fixture {
              c NUMBER CONSTRAINT {prefix}_C_FK3 REFERENCES {prefix}_P3 (id), \
              d NUMBER CONSTRAINT {prefix}_C_FK4 REFERENCES {prefix}_P4 (id), \
              e NUMBER CONSTRAINT {prefix}_C_CK CHECK (e > 0), \
-             f NUMBER CONSTRAINT {prefix}_C_UK UNIQUE)"
+             f NUMBER CONSTRAINT {prefix}_C_UK UNIQUE, \
+             g NUMBER, h NUMBER, \
+             CONSTRAINT {prefix}_C_FK5 FOREIGN KEY (h, g) REFERENCES {prefix}_P5 (k1, k2))"
         ));
         let mut block = statements
             .iter()
@@ -13046,6 +13141,7 @@ mod oracle_metadata_cost_fixture {
             format!("DROP TABLE {prefix}_P2 PURGE"),
             format!("DROP TABLE {prefix}_P3 PURGE"),
             format!("DROP TABLE {prefix}_P4 PURGE"),
+            format!("DROP TABLE {prefix}_P5 PURGE"),
         ]
         .iter()
         .map(|statement| {
@@ -13083,11 +13179,11 @@ mod oracle_metadata_cost_fixture {
             "ID".to_string(),
             None,
         ));
-        for (index, column) in ["A", "B", "C", "D"].iter().enumerate() {
+        for (index, columns) in ["A", "B", "C", "D", "H, G"].iter().enumerate() {
             expected.push((
                 format!("{prefix}_C_FK{}", index + 1),
                 "FOREIGN KEY".to_string(),
-                column.to_string(),
+                columns.to_string(),
                 Some(format!("{prefix}_P{}", index + 1)),
             ));
         }
@@ -13101,7 +13197,7 @@ mod oracle_metadata_cost_fixture {
     }
 
     pub(super) fn assert_foreign_keys(driver: &str, prefix: &str, foreign_keys: &[ForeignKeyInfo]) {
-        let expected = ["A", "B", "C", "D"]
+        let mut expected = ["A", "B", "C", "D"]
             .iter()
             .enumerate()
             .map(|(index, column)| ForeignKeyInfo {
@@ -13110,6 +13206,12 @@ mod oracle_metadata_cost_fixture {
                 ref_columns: vec!["ID".to_string()],
             })
             .collect::<Vec<_>>();
+        // H references K1 and G references K2: the order the KEY names them in.
+        expected.push(ForeignKeyInfo {
+            columns: vec!["H".to_string(), "G".to_string()],
+            ref_table: format!("{prefix}_P5"),
+            ref_columns: vec!["K1".to_string(), "K2".to_string()],
+        });
         assert_eq!(
             foreign_keys, expected,
             "{driver}: foreign keys of {prefix}_C"
@@ -14827,9 +14929,14 @@ mod routine_definition_tests {
                 2,
             ),
             (
-                "ORACLE_PACKAGE_ROUTINES_FROM_DICTIONARY_SQL",
-                super::ORACLE_PACKAGE_ROUTINES_FROM_DICTIONARY_SQL,
-                4,
+                "ORACLE_PACKAGE_MEMBERS_SQL",
+                super::ORACLE_PACKAGE_MEMBERS_SQL,
+                2,
+            ),
+            (
+                "ORACLE_PACKAGE_FUNCTION_MEMBERS_SQL",
+                super::ORACLE_PACKAGE_FUNCTION_MEMBERS_SQL,
+                2,
             ),
         ] {
             assert_eq!(
@@ -14838,6 +14945,100 @@ mod routine_definition_tests {
                 "{name}: placeholders must read 1, 2, 3 ... in order, one per supplied bind"
             );
         }
+    }
+
+    /// A foreign-key row carries each side's columns as ONE list, so the list
+    /// has to come apart into exactly the names that went in, pair by position,
+    /// and say nothing for a key whose other side cannot be seen.
+    #[test]
+    fn a_foreign_key_row_is_read_by_position_and_only_when_both_sides_are_seen() {
+        let text = |value: &str| Some(value.to_string());
+        let key = |columns: &[&str], table: &str, ref_columns: &[&str]| {
+            Some(super::ForeignKeyInfo {
+                columns: columns.iter().map(|name| name.to_string()).collect(),
+                ref_table: table.to_string(),
+                ref_columns: ref_columns.iter().map(|name| name.to_string()).collect(),
+            })
+        };
+        // The statement and the reader split on the same character.
+        assert!(super::ORACLE_TABLE_FOREIGN_KEYS_SQL.contains(&format!(
+            "LISTAGG(cc.column_name, '{}')",
+            super::ORACLE_NAME_LIST_SEPARATOR
+        )));
+
+        assert_eq!(
+            ObjectBrowser::foreign_key_from_row(text("DEPT_ID"), text("DEPT"), text("ID")),
+            key(&["DEPT_ID"], "DEPT", &["ID"])
+        );
+        // Key order, not name order; and a name may hold anything but the
+        // separator — a comma, a space, a dot.
+        assert_eq!(
+            ObjectBrowser::foreign_key_from_row(
+                text("H\"G, x"),
+                text("My.Parent"),
+                text("K1\"K 2")
+            ),
+            key(&["H", "G, x"], "My.Parent", &["K1", "K 2"])
+        );
+        // The referenced side is not visible to this session: no table, so
+        // nothing to join to. OCI spells that NULL, thin the empty string.
+        for unseen in [None, text("")] {
+            assert_eq!(
+                ObjectBrowser::foreign_key_from_row(
+                    text("DEPT_ID"),
+                    unseen.clone(),
+                    unseen.clone()
+                ),
+                None
+            );
+        }
+        // A side with fewer names ends the pairing rather than misaligning it.
+        assert_eq!(
+            ObjectBrowser::foreign_key_from_row(text("A\"B\"C"), text("P"), text("X\"Y")),
+            key(&["A", "B"], "P", &["X", "Y"])
+        );
+    }
+
+    /// A wrapped package's member list is put together from two reads: a
+    /// member is a FUNCTION when the same name AND overload number returns a
+    /// value, and the list is in name order.
+    #[test]
+    fn a_wrapped_packages_members_take_their_kind_from_the_same_overload() {
+        let member =
+            |name: &str, overload: Option<&str>| (name.to_string(), overload.map(str::to_string));
+        let routines = ObjectBrowser::package_routines_from_dictionary(
+            vec![
+                member("OVER", Some("1")),
+                member("OVER", Some("2")),
+                member("GET_IT", None),
+                member("DO_IT", None),
+            ],
+            // Only the second OVER returns a value.
+            vec![member("GET_IT", None), member("OVER", Some("2"))],
+        );
+        let listed = routines
+            .iter()
+            .map(|routine| (routine.name.as_str(), routine.routine_type.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            [
+                ("DO_IT", "PROCEDURE"),
+                ("GET_IT", "FUNCTION"),
+                ("OVER", "FUNCTION"),
+                ("OVER", "PROCEDURE"),
+            ]
+        );
+        // The drivers spell "not overloaded" differently; it is one value here.
+        assert_eq!(ObjectBrowser::dictionary_overload(None), None);
+        assert_eq!(
+            ObjectBrowser::dictionary_overload(Some(String::new())),
+            None
+        );
+        assert_eq!(
+            ObjectBrowser::dictionary_overload(Some(" 2 ".to_string())),
+            Some("2".to_string())
+        );
     }
 
     /// A structure statement names `ALL_TAB_IDENTITY_COLS` only for a server
