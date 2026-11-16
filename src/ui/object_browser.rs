@@ -1000,11 +1000,15 @@ enum OracleSqlScopeShape {
 
 /// The longest variable name a generated Oracle script may declare.
 ///
-/// 128 bytes is the identifier limit of every Oracle release this app can
-/// reach — the thin driver refuses to negotiate below protocol 314. (A
-/// pre-12.2 server caps identifiers at 30, where a parameter name over 28
-/// characters would still overflow; no supported configuration reaches one.)
-const ORACLE_GENERATED_NAME_MAX: usize = 128;
+/// 30 bytes: the identifier limit of the OLDEST release this app reaches, which
+/// every later release accepts too. A server from 12.2 on takes 128, and this
+/// used to be 128 — on the belief that no reachable server was older. The thin
+/// driver negotiates down to protocol 314, which is 11.2, and there a parameter
+/// whose own name is 29 or 30 bytes got a `v_` local of 31 or 32 that the
+/// server refused (PLS-00114), for a script nobody could run. One limit for
+/// every release rather than the server's own: the name is only ever a local
+/// of the generated script, so the shorter one costs a 12.2 server nothing.
+const ORACLE_GENERATED_NAME_MAX: usize = 30;
 
 /// The longest variable name a generated MySQL/MariaDB script may use.
 ///
@@ -16854,38 +16858,44 @@ mod tests {
         // The call still names the parameter, so the value stays identifiable.
         assert!(mysql.contains(&format!("AS `{long_name}`;")));
 
-        // Oracle: 128 bytes, and the disambiguator has to fit too — two names
-        // that truncate to the same head must still come out distinct.
+        // Oracle: 30 bytes, the limit of the oldest release this app reaches
+        // (11.2) and one every later release accepts. Both a parameter at THAT
+        // release's own limit (30) and one at a 12.2 server's (128) are legal
+        // routines, and `v_` in front of either is over 30. The disambiguator
+        // has to fit too — two names that truncate to the same head must still
+        // come out distinct.
         // Uppercase, as the dictionary reports ordinary parameter names: a
         // lowercase one would come back quoted and stop testing length.
-        let oracle_name = format!("P_{}", "A".repeat(126));
-        let second = format!("{}B", &oracle_name[..127]);
-        assert_eq!(oracle_name.len(), 128);
-        assert_eq!(second.len(), 128);
-        let oracle = oracle_script(
-            "SQ_LONG_P",
-            "PROCEDURE",
-            &routine_definition(&[
-                procedure_argument(Some(&oracle_name), 1, Some("NUMBER"), "IN"),
-                procedure_argument(Some(&second), 2, Some("NUMBER"), "IN"),
-            ]),
-        );
-        let declared: Vec<&str> = oracle
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("v_"))
-            .filter_map(|rest| rest.split_whitespace().next())
-            .collect();
-        assert_eq!(declared.len(), 2, "both arguments declare a local");
-        for name in &declared {
-            assert!(
-                name.len() + 2 <= 128,
-                "declared name is {} bytes: v_{name}",
-                name.len() + 2
+        for parameter_len in [30usize, 128] {
+            let oracle_name = format!("P_{}", "A".repeat(parameter_len - 2));
+            let second = format!("{}B", &oracle_name[..parameter_len - 1]);
+            assert_eq!(oracle_name.len(), parameter_len);
+            assert_eq!(second.len(), parameter_len);
+            let oracle = oracle_script(
+                "SQ_LONG_P",
+                "PROCEDURE",
+                &routine_definition(&[
+                    procedure_argument(Some(&oracle_name), 1, Some("NUMBER"), "IN"),
+                    procedure_argument(Some(&second), 2, Some("NUMBER"), "IN"),
+                ]),
             );
+            let declared: Vec<&str> = oracle
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("v_"))
+                .filter_map(|rest| rest.split_whitespace().next())
+                .collect();
+            assert_eq!(declared.len(), 2, "both arguments declare a local");
+            for name in &declared {
+                assert!(
+                    name.len() + 2 <= 30,
+                    "a {parameter_len}-byte parameter declared a {}-byte local: v_{name}",
+                    name.len() + 2
+                );
+            }
+            assert_ne!(declared[0], declared[1], "truncation must stay unique");
+            assert!(oracle.contains(&format!("{oracle_name} => ")));
+            assert!(oracle.contains(&format!("{second} => ")));
         }
-        assert_ne!(declared[0], declared[1], "truncation must stay unique");
-        assert!(oracle.contains(&format!("{oracle_name} => ")));
-        assert!(oracle.contains(&format!("{second} => ")));
     }
 
     /// Neither MySQL engine has named association, so a generated `CALL` used

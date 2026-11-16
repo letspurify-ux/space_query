@@ -796,18 +796,41 @@ fn fetch_oracle_standalone_lookup(
     }
 }
 
+/// The longest identifier THIS server takes: 30 bytes before 12.2, 128 from
+/// then on. The server's own answer, from its login reply, whichever driver the
+/// round trip then runs on.
+fn oracle_identifier_limit() -> Result<usize, String> {
+    let (host, port, service, user, pass) = oracle_env();
+    let mut config = tns_thin::OracleThinConfig::new(
+        tns_thin::ConnectTarget::service_name(host, port, service),
+        user,
+        pass,
+    );
+    config.connect_options.disable_oob_probe = true;
+    let session = tns_thin::OracleThinSession::connect(config)
+        .map_err(|e| format!("identifier limit connect: {e}"))?;
+    Ok(session.max_identifier_length() as usize)
+}
+
+/// What the script generator budgets a generated name for: the identifier
+/// limit of the oldest release the app reaches, which every release accepts.
+const ORACLE_GENERATED_NAME_LIMIT: usize = 30;
+
 /// A parameter name AT the identifier limit, fetched through the STANDALONE
 /// (non-package) argument query — the branch the package round trip never
 /// touches.
 ///
-/// The generated variable name is not the catalog's: it adds `v_`, so an
-/// unbudgeted one is 130 bytes for a 128-byte parameter and the script will
-/// not compile. What the call is written with must stay the parameter's OWN
-/// full name.
+/// At THIS server's limit, because that is the longest name a routine on it can
+/// have: 30 bytes on 11.2, 128 from 12.2 on. The generated variable name is not
+/// the catalog's — it adds `v_` — so an unbudgeted one is two bytes over
+/// whichever limit applies and the script will not compile. What the call is
+/// written with must stay the parameter's OWN full name.
 fn oracle_long_name_round_trip(h: &mut Harness, target: Target) -> Result<(), String> {
     println!("  [generation round-trip: identifier-limit parameter name, standalone fetch]");
-    let long_in = format!("P_{}", "A".repeat(126));
-    let long_out = format!("{}B", &long_in[..127]);
+    let limit = oracle_identifier_limit()?;
+    println!("    this server's identifier limit: {limit} bytes");
+    let long_in = format!("P_{}", "A".repeat(limit - 2));
+    let long_out = format!("{}B", &long_in[..limit - 1]);
     let create = format!(
         "CREATE OR REPLACE PROCEDURE {GEN_LONGP}({long_in} IN NUMBER, {long_out} OUT NUMBER) IS\n\
          BEGIN\n  {long_out} := NVL({long_in}, 0) + 5;\nEND;"
@@ -839,7 +862,7 @@ fn oracle_long_name_round_trip(h: &mut Harness, target: Target) -> Result<(), St
         let over_limit = script
             .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
             .filter(|token| token.starts_with("v_"))
-            .find(|token| token.len() > 128);
+            .find(|token| token.len() > ORACLE_GENERATED_NAME_LIMIT);
         if let Some(token) = over_limit {
             return Err(format!(
                 "generated name is {} bytes, over Oracle's identifier limit: {token}",
