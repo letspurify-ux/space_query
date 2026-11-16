@@ -875,6 +875,12 @@ impl OracleThinSession {
         self.server_version.as_deref()
     }
 
+    /// The server's major release number (11, 12, 19, 23, ...), or `None` when
+    /// the server reported no version at login or one that cannot be read.
+    pub fn server_major_release(&self) -> Option<u32> {
+        major_release_from_auth_version_no(self.server_version.as_deref()?)
+    }
+
     pub fn username(&self) -> &str {
         &self.config.username
     }
@@ -12918,6 +12924,17 @@ fn process_auth_parameters(
     Ok(())
 }
 
+/// The major release packed into a server's `AUTH_VERSION_NO`.
+///
+/// The value is one number with the release's five fields packed into it.
+/// The lower fields moved with Oracle Database 18 (python-oracledb's
+/// `_get_version_tuple` reads them by capability), but the major release has
+/// been the top byte in both layouts, so nothing has to decide how to read it.
+fn major_release_from_auth_version_no(version_no: &str) -> Option<u32> {
+    let packed = version_no.trim().parse::<u32>().ok()?;
+    Some(packed >> 24)
+}
+
 fn verify_server_response(state: &AuthState) -> Result<(), OracleThinError> {
     let Some(combo_key) = state.combo_key.as_deref() else {
         return Ok(());
@@ -14833,24 +14850,24 @@ mod tests {
         encode_temp_clob_text, encode_vector, execute_flags_for_request,
         fetched_lob_locator_needs_free, generate_10g_password_hash, generate_11g_password_hash,
         generate_auth_credentials_from_session_key_parts, hex_encode_upper,
-        local_timezone_offset_string, normalize_cursor_ids, normalize_metadata_charset_form,
-        oracle_column_type_from_ora_type, oracle_column_type_from_ora_type_for_protocol,
-        process_auth_payload, process_describe_body, process_legacy_execute_error,
-        process_protocol_message, process_return_parameters, process_row_data,
-        process_server_side_piggyback, process_token, process_warning, read_boolean_value,
-        read_connect_data_packet, read_data_packet_with_control, read_data_packet_with_flags,
-        read_rowid_value, read_urowid_value, request_is_dml_returning, request_with_out_bind_types,
-        sql_dml_returning_has_duplicate_bind, thin_column_from_column_metadata,
-        thin_column_from_object_attr, validate_supported_protocol, verify_server_response,
-        windows_code_pages_for_encoding, write_bind_rows_for_request, write_bind_value,
-        write_bytes_with_length_for_capabilities, write_bytes_with_two_lengths,
-        write_close_cursors_piggyback, write_column_metadata, write_current_schema_piggyback,
-        write_data_packet, write_data_type_representations, write_end_to_end_piggyback,
-        write_eof_data_packet, write_function_code, write_session_state_piggyback, write_ub2,
-        write_ub4, write_ub8, AuthCredentials, AuthState, BreakSignal, CancelReadState,
-        EndToEndAttributes, OracleThinAppContext, OracleThinAuthMode, OracleThinCapabilities,
-        OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue, PacketCursor,
-        ServerSidePiggybackState, ThinColumn, BREAK_SIGNAL_INBAND, BREAK_SIGNAL_NONE,
+        local_timezone_offset_string, major_release_from_auth_version_no, normalize_cursor_ids,
+        normalize_metadata_charset_form, oracle_column_type_from_ora_type,
+        oracle_column_type_from_ora_type_for_protocol, process_auth_payload, process_describe_body,
+        process_legacy_execute_error, process_protocol_message, process_return_parameters,
+        process_row_data, process_server_side_piggyback, process_token, process_warning,
+        read_boolean_value, read_connect_data_packet, read_data_packet_with_control,
+        read_data_packet_with_flags, read_rowid_value, read_urowid_value, request_is_dml_returning,
+        request_with_out_bind_types, sql_dml_returning_has_duplicate_bind,
+        thin_column_from_column_metadata, thin_column_from_object_attr,
+        validate_supported_protocol, verify_server_response, windows_code_pages_for_encoding,
+        write_bind_rows_for_request, write_bind_value, write_bytes_with_length_for_capabilities,
+        write_bytes_with_two_lengths, write_close_cursors_piggyback, write_column_metadata,
+        write_current_schema_piggyback, write_data_packet, write_data_type_representations,
+        write_end_to_end_piggyback, write_eof_data_packet, write_function_code,
+        write_session_state_piggyback, write_ub2, write_ub4, write_ub8, AuthCredentials, AuthState,
+        BreakSignal, CancelReadState, EndToEndAttributes, OracleThinAppContext, OracleThinAuthMode,
+        OracleThinCapabilities, OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue,
+        PacketCursor, ServerSidePiggybackState, ThinColumn, BREAK_SIGNAL_INBAND, BREAK_SIGNAL_NONE,
         BREAK_SIGNAL_OOB, CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8,
         ORACLE_CHARSET_UTF8, TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_END_OF_RESPONSE,
         TNS_CCAP_EXPLICIT_BOUNDARY, TNS_CCAP_FIELD_VERSION, TNS_CCAP_FIELD_VERSION_20_1,
@@ -22684,6 +22701,20 @@ mod tests {
                 .map(String::as_str),
             Some("23.0.0.0.0")
         );
+    }
+
+    /// `AUTH_VERSION_NO` as two live servers sent it: the major release is the
+    /// top byte whichever layout the lower fields are in.
+    #[test]
+    fn major_release_is_the_top_byte_of_auth_version_no() {
+        // 11.2.0.2.0 (XE), the pre-18 layout.
+        assert_eq!(major_release_from_auth_version_no("186647040"), Some(11));
+        // 23.26 (Free), the layout Oracle Database 18 introduced.
+        assert_eq!(major_release_from_auth_version_no("387579904"), Some(23));
+        assert_eq!(major_release_from_auth_version_no(" 387579904 "), Some(23));
+        // Not the packed number a server sends: nothing to read a release from.
+        assert_eq!(major_release_from_auth_version_no("23.0.0.0.0"), None);
+        assert_eq!(major_release_from_auth_version_no(""), None);
     }
 
     #[test]

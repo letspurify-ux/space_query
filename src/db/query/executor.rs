@@ -4226,7 +4226,7 @@ impl QueryExecutor {
         Ok(Self::query_single_text_column(
             conn,
             ORACLE_PRIMARY_KEY_COLUMNS_SQL,
-            &[&owner, &table_name],
+            &[&owner, &owner, &table_name],
         )?
         .into_iter()
         .collect())
@@ -4286,6 +4286,7 @@ impl QueryExecutor {
             owner_raw.map(|value| Self::normalize_object_name(&value)),
         )?;
         let primary_key_columns = Self::primary_key_columns(conn, &owner, &name)?;
+        let generated = GeneratedColumnDictionary::of_oci(conn)?.expression();
 
         let sql = r#"
             SELECT
@@ -4304,7 +4305,7 @@ impl QueryExecutor {
             ORDER BY c.column_id
         "#;
         let sql = sql
-            .replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR)
+            .replace("{generated}", &generated)
             .replace("{invisible}", ORACLE_INVISIBLE_COLUMN_EXPR);
 
         let mut stmt = match conn.statement(&sql).build() {
@@ -9195,7 +9196,7 @@ impl RoutineDictionaryRead {
 ///
 /// `SQL_MACRO` and `POLYMORPHIC` were added to the view long after the oldest
 /// release this app can reach (the thin driver refuses to negotiate below
-/// protocol 314 = 12.2), and a column a release does not have is a PARSE
+/// protocol 314 = 11.2), and a column a release does not have is a PARSE
 /// error — which would take the whole read down with it. The read must
 /// therefore degrade per COLUMN, not per read: naming the missing column costs
 /// `PIPELINED`/`AGGREGATE` too, and those have been readable since long before
@@ -9531,6 +9532,7 @@ impl ObjectBrowser {
             conn,
             ORACLE_PRIMARY_KEY_COLUMNS_SQL,
             vec![
+                OracleThinBindValue::Text(owner.to_string()),
                 OracleThinBindValue::Text(owner.to_string()),
                 OracleThinBindValue::Text(table_name.to_string()),
             ],
@@ -11696,6 +11698,7 @@ impl ObjectBrowser {
         let (owner, table_name) =
             QueryExecutor::split_current_schema_owner_object_name(conn, table_name)?;
         let primary_key_columns = QueryExecutor::primary_key_columns(conn, &owner, &table_name)?;
+        let generated = GeneratedColumnDictionary::of_oci(conn)?.expression();
         let sql = r#"
             SELECT
                 c.column_name,
@@ -11713,7 +11716,7 @@ impl ObjectBrowser {
             ORDER BY c.column_id
         "#;
         let sql = sql
-            .replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR)
+            .replace("{generated}", &generated)
             .replace("{invisible}", ORACLE_INVISIBLE_COLUMN_EXPR);
 
         let mut stmt = match conn.statement(&sql).build() {
@@ -11829,6 +11832,7 @@ impl ObjectBrowser {
         let (owner, table_name) =
             Self::thin_split_current_schema_owner_object_name(conn, table_name)?;
         let primary_key_columns = Self::thin_primary_key_columns(conn, &owner, &table_name)?;
+        let generated = GeneratedColumnDictionary::of_thin(conn).expression();
         let sql = r#"
             SELECT
                 c.column_name,
@@ -11846,7 +11850,7 @@ impl ObjectBrowser {
             ORDER BY c.column_id
         "#;
         let sql = sql
-            .replace("{generated}", ORACLE_GENERATED_COLUMN_EXPR)
+            .replace("{generated}", &generated)
             .replace("{invisible}", ORACLE_INVISIBLE_COLUMN_EXPR);
 
         let rows = Self::thin_query_text_rows(
@@ -12533,39 +12537,123 @@ pub struct CompilationError {
     pub attribute: String,
 }
 
-/// The catalog expression that answers "can a value be written into this
-/// column?" for Oracle, as `'Y'`/`'N'`.
+/// Which dictionary views a table-structure read names to ask "can a value be
+/// written into this column?" — decided by the release of the server the
+/// statement is sent to, never assumed.
 ///
-/// ONE const because three statements ask it — OCI's table structure, the thin
-/// driver's, and `DESCRIBE` — and because the two drivers must never be able to
-/// give the object browser a different answer about the same table. It is a pair
-/// of scalar subqueries rather than joins on purpose: `ALL_TAB_COLUMNS.
-/// DATA_DEFAULT` is a `LONG`, and a `LONG` in the select list of a joined query
-/// is not something to rely on.
+/// The question has two halves, and the second is younger than the first.
+/// `ALL_TAB_COLS.VIRTUAL_COLUMN` covers virtual columns and has been there
+/// since 11g. `ALL_TAB_IDENTITY_COLS.GENERATION_TYPE` covers `GENERATED ALWAYS
+/// AS IDENTITY` — and only ALWAYS, because a `BY DEFAULT` identity accepts an
+/// explicit value and must stay importable — but identity columns, and the
+/// view that lists them, arrived with 12.1.
 ///
-/// `VIRTUAL_COLUMN` (11g and later) covers generated columns; `GENERATION_TYPE`
-/// from `ALL_TAB_IDENTITY_COLS` (12.1 and later, which is also the oldest server
-/// this app's own thin driver negotiates a protocol with) covers
-/// `GENERATED ALWAYS AS IDENTITY` — and only ALWAYS, because a `BY DEFAULT`
-/// identity accepts an explicit value and must stay importable.
-pub(crate) const ORACLE_GENERATED_COLUMN_EXPR: &str = r#"
-                CASE WHEN (SELECT tc.virtual_column
-                             FROM all_tab_cols tc
-                            WHERE tc.owner = c.owner
-                              AND tc.table_name = c.table_name
-                              AND tc.column_name = c.column_name) = 'YES'
-                       OR (SELECT ic.generation_type
-                             FROM all_tab_identity_cols ic
-                            WHERE ic.owner = c.owner
-                              AND ic.table_name = c.table_name
-                              AND ic.column_name = c.column_name) = 'ALWAYS'
-                     THEN 'Y' ELSE 'N' END"#;
+/// This app reaches older servers than that: the thin driver negotiates down
+/// to protocol 314, which is what an 11.2 listener accepts, and a current
+/// Instant Client still connects to one (both measured against 11.2.0.2). A
+/// view a release does not have is a PARSE error, ORA-00942, and it took the
+/// whole statement with it. On 11.2 no table's columns could be read at all,
+/// so View Structure, IntelliSense's column load, quick describe and
+/// `DESCRIBE` failed, while View Indexes and View Constraints — which name
+/// nothing that young — kept working.
+///
+/// The release is ASKED, not discovered by sending the richer statement and
+/// falling back when it fails. That would send a failing statement on every
+/// structure read of an old server, and a statement that names an object the
+/// server does not have is what `AUDIT NOT EXISTS` records against the user
+/// (measured on 11.2: one audit row per attempt).
+///
+/// ONE value for every statement that asks — OCI's table structure, the thin
+/// driver's, and `DESCRIBE` — so the two drivers cannot give the object browser
+/// a different answer about the same table. It is built from a session
+/// ([`Self::of_oci`], [`Self::of_thin`]), so a statement cannot name the
+/// younger view without having asked which server it is going to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneratedColumnDictionary {
+    /// 12.1 and later: virtual columns and `GENERATED ALWAYS AS IDENTITY`.
+    WithIdentityColumns,
+    /// Before 12.1: virtual columns, which are every server-computed column
+    /// such a release can hold.
+    BeforeIdentityColumns,
+}
+
+impl GeneratedColumnDictionary {
+    /// The first major release whose dictionary has `ALL_TAB_IDENTITY_COLS`.
+    const FIRST_RELEASE_WITH_IDENTITY_COLUMNS: u32 = 12;
+
+    /// "Is this a virtual column?", correlated on the structure statement's
+    /// `ALL_TAB_COLUMNS c`.
+    ///
+    /// A scalar subquery rather than a join on purpose, like the identity half
+    /// below: `ALL_TAB_COLUMNS.DATA_DEFAULT` is a `LONG`, and a `LONG` in the
+    /// select list of a joined query is not something to rely on.
+    const VIRTUAL_COLUMN: &'static str = "(SELECT tc.virtual_column \
+         FROM all_tab_cols tc \
+         WHERE tc.owner = c.owner \
+         AND tc.table_name = c.table_name \
+         AND tc.column_name = c.column_name) = 'YES'";
+
+    /// "Is this `GENERATED ALWAYS AS IDENTITY`?", correlated the same way.
+    const IDENTITY_ALWAYS: &'static str = "(SELECT ic.generation_type \
+         FROM all_tab_identity_cols ic \
+         WHERE ic.owner = c.owner \
+         AND ic.table_name = c.table_name \
+         AND ic.column_name = c.column_name) = 'ALWAYS'";
+
+    /// The dictionary of a server whose major release number is
+    /// `major_release`.
+    ///
+    /// A session that cannot say which release it is on gets the statement
+    /// EVERY release parses. The other guess is the one that cannot be
+    /// recovered from — the read fails outright, as it did — while this one
+    /// can only cost an identity column its flag.
+    fn for_major_release(major_release: Option<u32>) -> Self {
+        match major_release {
+            Some(major_release) if major_release >= Self::FIRST_RELEASE_WITH_IDENTITY_COLUMNS => {
+                Self::WithIdentityColumns
+            }
+            _ => Self::BeforeIdentityColumns,
+        }
+    }
+
+    /// The dictionary of the server behind an OCI connection. ODPI-C reads the
+    /// release once per connection and answers from memory after that.
+    fn of_oci(conn: &Connection) -> Result<Self, OracleError> {
+        match conn.server_version() {
+            Ok((version, _banner)) => {
+                Ok(Self::for_major_release(u32::try_from(version.major()).ok()))
+            }
+            Err(err) => {
+                logging::log_error("executor", &format!("Database operation failed: {err}"));
+                Err(err)
+            }
+        }
+    }
+
+    /// The dictionary of the server behind a thin session, which learned the
+    /// release at login.
+    fn of_thin(conn: &OracleThinSession) -> Self {
+        Self::for_major_release(conn.server_major_release())
+    }
+
+    /// The select-list expression: `'Y'` when the server computes the column's
+    /// value, `'N'` otherwise.
+    fn expression(self) -> String {
+        let computed = match self {
+            Self::WithIdentityColumns => {
+                format!("{} OR {}", Self::VIRTUAL_COLUMN, Self::IDENTITY_ALWAYS)
+            }
+            Self::BeforeIdentityColumns => Self::VIRTUAL_COLUMN.to_string(),
+        };
+        format!("CASE WHEN {computed} THEN 'Y' ELSE 'N' END")
+    }
+}
 
 /// The catalog expression that answers "does `SELECT *` return this column?"
 /// for Oracle, as `'Y'`/`'N'` for INVISIBLE.
 ///
-/// ONE const, for the same reason as [`ORACLE_GENERATED_COLUMN_EXPR`]: the two
-/// drivers must not be able to describe the same table differently. An
+/// ONE const, for the same reason [`GeneratedColumnDictionary`] is one value:
+/// the two drivers must not be able to describe the same table differently. An
 /// invisible column keeps its place in the table and loses its `COLUMN_ID`
 /// — measured on 23ai, where `USER_TAB_COLS` reports `COLUMN_ID = NULL` and
 /// `HIDDEN_COLUMN = 'YES'` for it while `ALL_TAB_COLUMNS` still lists it, and
@@ -12585,21 +12673,33 @@ pub(crate) const ORACLE_INVISIBLE_COLUMN_EXPR: &str =
 /// and 677,000 in one of 2,000 — while View Indexes, a different statement,
 /// stayed at about 60. On a real schema that put View Structure, IntelliSense's
 /// alias columns (whose load is given 8 seconds) and quick describe out of
-/// reach. This statement is driven by the table and costs the same in either
-/// schema (~70).
+/// reach.
+///
+/// The two dictionary views are read in two query blocks and never joined.
+/// Joined — `ALL_CONSTRAINTS` to `ALL_CONS_COLUMNS` on owner and constraint
+/// name — the order was the optimizer's to choose, and it chose by release:
+/// 23ai started from the table (~70 logical reads) and 11.2 from the OWNER,
+/// every constraint the schema holds (2,620 reads on an idle XE and 4,936 once
+/// the schema held 200 more tables, through the thin driver). Written this
+/// way there is no order to choose: the subquery finds the key's name in
+/// `ALL_CONSTRAINTS` alone, by owner, table and type, and `ALL_CONS_COLUMNS` is
+/// read by that one name. Through thin that is about 100 reads on 23ai and 260
+/// on 11.2, and through OCI about 300 on either; the same with or without the
+/// 200 tables on both drivers, and — measured through thin — whichever table
+/// was parsed first. `MIN` because a table has one primary key and a scalar
+/// subquery that could return two rows could fail the whole read.
 ///
 /// ONE const for the same reason as the two above: the drivers must not
-/// describe the same table differently. Binds in appearance order, since the
-/// thin protocol pairs them by position.
+/// describe the same table differently. Binds in appearance order — the owner
+/// once per query block — since the thin protocol pairs them by position.
 pub(crate) const ORACLE_PRIMARY_KEY_COLUMNS_SQL: &str = "SELECT cc.column_name \
-     FROM all_constraints con \
-     JOIN all_cons_columns cc \
-       ON cc.owner = con.owner \
-      AND cc.constraint_name = con.constraint_name \
-      AND cc.table_name = con.table_name \
-    WHERE con.owner = :1 \
-      AND con.table_name = :2 \
-      AND con.constraint_type = 'P'";
+     FROM all_cons_columns cc \
+    WHERE cc.owner = :1 \
+      AND cc.constraint_name = (SELECT MIN(con.constraint_name) \
+                                  FROM all_constraints con \
+                                 WHERE con.owner = :2 \
+                                   AND con.table_name = :3 \
+                                   AND con.constraint_type = 'P')";
 
 /// The constraints of ONE table, each with its columns and — for a foreign key
 /// — the table it references.
@@ -13041,6 +13141,103 @@ mod oracle_metadata_cost_fixture {
     }
 }
 
+/// What both drivers' "the structure read answers on every release" live tests
+/// share.
+///
+/// The fact they pin: a table's columns can be read from every Oracle release
+/// this app connects to, and each release still says everything IT knows about
+/// them. Run against 11.2 (which the thin driver reaches on protocol 314 and
+/// OCI through any client that still speaks to it) the structure read failed
+/// outright — ORA-00942 on `ALL_TAB_IDENTITY_COLS`, a 12.1 view — and with it
+/// View Structure, IntelliSense's column load, quick describe and `DESCRIBE`,
+/// while View Indexes and View Constraints, which name nothing newer, worked.
+#[cfg(test)]
+mod oracle_table_structure_release_fixture {
+    use super::TableColumnDetail;
+
+    /// How many `ALL_TAB_IDENTITY_COLS` views the server's own dictionary
+    /// holds: 1 from 12.1 on, 0 before.
+    ///
+    /// Asked of the dictionary rather than derived from a version number, so
+    /// the test's idea of "this server has identity columns" cannot share a
+    /// mistake with the code it checks.
+    pub(super) const IDENTITY_VIEW_COUNT_SQL: &str = "SELECT COUNT(*) FROM all_views \
+         WHERE owner = 'SYS' AND view_name = 'ALL_TAB_IDENTITY_COLS'";
+
+    /// A primary key, a NOT NULL column with a default, and a virtual column:
+    /// everything a release without identity columns can say about a column.
+    pub(super) fn probe_table_ddl(table: &str) -> String {
+        format!(
+            "CREATE TABLE {table} (id NUMBER PRIMARY KEY, \
+             name VARCHAR2(30) DEFAULT 'x' NOT NULL, \
+             doubled NUMBER GENERATED ALWAYS AS (id * 2) VIRTUAL)"
+        )
+    }
+
+    /// `generation` is `ALWAYS` or `BY DEFAULT`. One table each, because a
+    /// table may hold only one identity column.
+    pub(super) fn identity_table_ddl(table: &str, generation: &str) -> String {
+        format!("CREATE TABLE {table} (id NUMBER GENERATED {generation} AS IDENTITY, a NUMBER)")
+    }
+
+    pub(super) fn assert_probe_columns(driver: &str, columns: &[TableColumnDetail]) {
+        let facts = columns
+            .iter()
+            .map(|column| {
+                (
+                    column.name.as_str(),
+                    column.data_type.as_str(),
+                    column.nullable,
+                    column.is_primary_key,
+                    column.is_generated,
+                    column.is_invisible,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facts,
+            [
+                ("ID", "NUMBER", false, true, false, false),
+                ("NAME", "VARCHAR2", false, false, false, false),
+                ("DOUBLED", "NUMBER", true, false, true, false),
+            ],
+            "{driver}: (name, type, nullable, primary key, generated, invisible) in table order"
+        );
+        // `DATA_DEFAULT` is a LONG, the one column of this read no other
+        // metadata read fetches.
+        assert_eq!(
+            columns[1].default_value.as_deref().map(str::trim),
+            Some("'x'"),
+            "{driver}: NAME's default"
+        );
+    }
+
+    /// `always` and `by_default` are the structures of the two identity
+    /// tables. Only ALWAYS refuses a value, so only ALWAYS is generated.
+    pub(super) fn assert_identity_columns(
+        driver: &str,
+        always: &[TableColumnDetail],
+        by_default: &[TableColumnDetail],
+    ) {
+        let generated = |columns: &[TableColumnDetail]| {
+            columns
+                .iter()
+                .map(|column| (column.name.clone(), column.is_generated))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            generated(always),
+            [("ID".to_string(), true), ("A".to_string(), false)],
+            "{driver}: GENERATED ALWAYS AS IDENTITY"
+        );
+        assert_eq!(
+            generated(by_default),
+            [("ID".to_string(), false), ("A".to_string(), false)],
+            "{driver}: GENERATED BY DEFAULT AS IDENTITY"
+        );
+    }
+}
+
 #[cfg(test)]
 mod oracle_thin_object_metadata_live_tests {
     use super::{ObjectBrowser, QueryExecutor};
@@ -13202,6 +13399,61 @@ mod oracle_thin_object_metadata_live_tests {
         drop_tables(&mut session);
         fixture::assert_primary_key_columns("thin", &columns.expect("table structure"));
         fixture::assert_cost_independent_of_schema("thin", before, after);
+    }
+
+    /// Run it against the oldest server the driver reaches (11.2, protocol
+    /// 314) and against a current one: the first has no identity columns to
+    /// report, the second must still report them.
+    #[test]
+    #[ignore = "requires a reachable Oracle listener"]
+    fn oracle_thin_table_structure_answers_on_every_reachable_release() {
+        use super::oracle_table_structure_release_fixture as fixture;
+        let mut session = OracleThinSession::connect(live_config()).expect("connect Oracle Thin");
+        let suffix = std::process::id();
+        let table = format!("OQT_THIN_REL_{suffix}");
+        let always = format!("OQT_THIN_REL_A_{suffix}");
+        let by_default = format!("OQT_THIN_REL_D_{suffix}");
+        let drop_tables = |session: &mut OracleThinSession| {
+            for name in [&table, &always, &by_default] {
+                let _ = session.execute(
+                    &StatementRequest::statement(format!("DROP TABLE {name} PURGE")),
+                    0,
+                );
+            }
+        };
+        drop_tables(&mut session);
+
+        let has_identity_columns = ObjectBrowser::thin_query_one_text(
+            &mut session,
+            fixture::IDENTITY_VIEW_COUNT_SQL,
+            Vec::new(),
+        )
+        .expect("identity view count")
+        .trim()
+            != "0";
+        execute(&mut session, fixture::probe_table_ddl(&table));
+        let columns = ObjectBrowser::get_thin_table_structure(&mut session, &table);
+        let identity = has_identity_columns.then(|| {
+            execute(&mut session, fixture::identity_table_ddl(&always, "ALWAYS"));
+            execute(
+                &mut session,
+                fixture::identity_table_ddl(&by_default, "BY DEFAULT"),
+            );
+            (
+                ObjectBrowser::get_thin_table_structure(&mut session, &always),
+                ObjectBrowser::get_thin_table_structure(&mut session, &by_default),
+            )
+        });
+
+        drop_tables(&mut session);
+        fixture::assert_probe_columns("thin", &columns.expect("table structure"));
+        if let Some((always, by_default)) = identity {
+            fixture::assert_identity_columns(
+                "thin",
+                &always.expect("ALWAYS identity table structure"),
+                &by_default.expect("BY DEFAULT identity table structure"),
+            );
+        }
     }
 
     #[test]
@@ -13793,6 +14045,63 @@ mod oracle_lazy_fetch_integration_tests {
             structure_after,
         );
         fixture::assert_cost_independent_of_schema("OCI DESCRIBE", describe_before, describe_after);
+    }
+
+    /// The OCI half of `oracle_thin_table_structure_answers_on_every_reachable_release`,
+    /// for both OCI reads that describe a table.
+    #[test]
+    #[ignore = "requires local Oracle reachable via ORACLE_TEST_* env vars"]
+    fn oracle_oci_table_structure_answers_on_every_reachable_release() {
+        use super::oracle_table_structure_release_fixture as fixture;
+        use super::ObjectBrowser;
+        let conn = oracle_test_connection();
+        let suffix = std::process::id();
+        let table = format!("OQT_OCI_REL_{suffix}");
+        let always = format!("OQT_OCI_REL_A_{suffix}");
+        let by_default = format!("OQT_OCI_REL_D_{suffix}");
+        let drop_tables = || {
+            for name in [&table, &always, &by_default] {
+                let _ = conn.execute(&format!("DROP TABLE {name} PURGE"), &[]);
+            }
+        };
+        drop_tables();
+
+        let has_identity_columns = conn
+            .query_row_as::<u64>(fixture::IDENTITY_VIEW_COUNT_SQL, &[])
+            .expect("identity view count")
+            != 0;
+        conn.execute(&fixture::probe_table_ddl(&table), &[])
+            .expect("create probe table");
+        let structure = ObjectBrowser::get_table_structure(&conn, &table);
+        let describe = QueryExecutor::describe_object(&conn, &table);
+        let identity = has_identity_columns.then(|| {
+            conn.execute(&fixture::identity_table_ddl(&always, "ALWAYS"), &[])
+                .expect("create ALWAYS identity table");
+            conn.execute(&fixture::identity_table_ddl(&by_default, "BY DEFAULT"), &[])
+                .expect("create BY DEFAULT identity table");
+            (
+                ObjectBrowser::get_table_structure(&conn, &always),
+                ObjectBrowser::get_table_structure(&conn, &by_default),
+                QueryExecutor::describe_object(&conn, &always),
+                QueryExecutor::describe_object(&conn, &by_default),
+            )
+        });
+
+        drop_tables();
+        fixture::assert_probe_columns("OCI structure", &structure.expect("structure"));
+        fixture::assert_probe_columns("OCI DESCRIBE", &describe.expect("describe"));
+        if let Some((always, by_default, describe_always, describe_by_default)) = identity {
+            fixture::assert_identity_columns(
+                "OCI structure",
+                &always.expect("ALWAYS identity table structure"),
+                &by_default.expect("BY DEFAULT identity table structure"),
+            );
+            fixture::assert_identity_columns(
+                "OCI DESCRIBE",
+                &describe_always.expect("ALWAYS identity table describe"),
+                &describe_by_default.expect("BY DEFAULT identity table describe"),
+            );
+        }
     }
 
     /// What Oracle says about the placeholders inside an `EXPLAIN PLAN … FOR`.
@@ -14508,7 +14817,7 @@ mod routine_definition_tests {
             (
                 "ORACLE_PRIMARY_KEY_COLUMNS_SQL",
                 super::ORACLE_PRIMARY_KEY_COLUMNS_SQL,
-                2,
+                3,
             ),
             (
                 "ORACLE_TABLE_CONSTRAINTS_SQL",
@@ -14532,6 +14841,45 @@ mod routine_definition_tests {
                 "{name}: placeholders must read 1, 2, 3 ... in order, one per supplied bind"
             );
         }
+    }
+
+    /// A structure statement names `ALL_TAB_IDENTITY_COLS` only for a server
+    /// that has it.
+    ///
+    /// The view arrived with 12.1 and this app reaches 11.2, where naming it is
+    /// ORA-00942 for the whole statement — no columns at all, for a question
+    /// (is this an identity column?) whose answer on that release is always no.
+    #[test]
+    fn the_structure_statement_names_the_identity_view_only_for_a_release_that_has_it() {
+        use super::GeneratedColumnDictionary as Dictionary;
+        for (major_release, expected) in [
+            (Some(11), Dictionary::BeforeIdentityColumns),
+            (Some(12), Dictionary::WithIdentityColumns),
+            (Some(19), Dictionary::WithIdentityColumns),
+            (Some(23), Dictionary::WithIdentityColumns),
+            // A session that cannot say gets the statement every release parses.
+            (None, Dictionary::BeforeIdentityColumns),
+        ] {
+            assert_eq!(
+                Dictionary::for_major_release(major_release),
+                expected,
+                "major release {major_release:?}"
+            );
+        }
+
+        let with_identity = Dictionary::WithIdentityColumns.expression();
+        let before_identity = Dictionary::BeforeIdentityColumns.expression();
+        assert!(with_identity.contains("all_tab_identity_cols"));
+        assert!(
+            !before_identity.to_ascii_lowercase().contains("identity"),
+            "a pre-12.1 statement must not name anything about identity columns: {before_identity}"
+        );
+        // Both ask the half every release answers, and differ in nothing else.
+        assert_eq!(
+            with_identity.replace(&format!(" OR {}", Dictionary::IDENTITY_ALWAYS), ""),
+            before_identity,
+            "the two dictionaries must differ in nothing but the identity half"
+        );
     }
 
     /// Every column tier SELECTs the same seven columns in the same order.
